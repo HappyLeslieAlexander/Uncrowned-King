@@ -33,8 +33,13 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 hmac = "0.12"
 rand = "0.8"
+rustls = "0.23"
+rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = "0.26"
 toml = "0.8"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

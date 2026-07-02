@@ -1,6 +1,16 @@
-//! UncrownedKing client binary placeholder.
+//! UncrownedKing client binary.
 
+mod config;
+mod tls;
+
+use bytes::BytesMut;
 use clap::{Parser, Subcommand};
+use tokio::net::TcpStream;
+use tracing::info;
+use uk_auth::{AuthChallenge, AuthResponse, unix_now};
+use uk_proto::{Frame, FrameLimits, FrameType, Settings, read_frame, write_frame};
+
+use crate::config::ClientConfig;
 
 /// UK client command line.
 #[derive(Debug, Parser)]
@@ -8,15 +18,17 @@ use clap::{Parser, Subcommand};
 struct Args {
     /// Path to client TOML config.
     #[arg(long)]
-    config: Option<String>,
+    config: String,
     /// Client subcommand.
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 /// Client mode.
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Connect to the server and complete UK authentication.
+    Handshake,
     /// Start a local SOCKS5 listener. Full implementation lands in the relay milestone.
     Socks5 {
         /// Local listen address.
@@ -25,10 +37,56 @@ enum Command {
     },
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing_subscriber::fmt::init();
     let args = Args::parse();
-    println!("uk-client v0.1 placeholder config={:?}", args.config);
-    if let Some(Command::Socks5 { listen }) = args.command {
-        println!("socks5 placeholder listen={listen}");
+    let config = ClientConfig::load(&args.config)?;
+    match args.command {
+        Command::Handshake => run_handshake(config).await?,
+        Command::Socks5 { listen } => {
+            println!("socks5 placeholder listen={listen}");
+        }
     }
+    Ok(())
+}
+
+async fn run_handshake(
+    config: ClientConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let connector = tls::connector(&config.ca_cert_path)?;
+    let tcp = TcpStream::connect(&config.server_addr).await?;
+    let server_name = tls::server_name(config.server_name.clone())?;
+    let mut stream = connector.connect(server_name, tcp).await?;
+    let exporter = tls::exporter(&stream)?;
+
+    let challenge_frame = read_frame(&mut stream, FrameLimits::default()).await?;
+    if challenge_frame.header.frame_type != FrameType::AuthChallenge {
+        return Err("expected AUTH_CHALLENGE".into());
+    }
+    let mut challenge_payload = challenge_frame.payload;
+    let challenge = AuthChallenge::decode(&mut challenge_payload)?;
+
+    let response = AuthResponse::for_challenge(
+        config.key_id.as_bytes(),
+        config.secret.as_bytes(),
+        &exporter,
+        &challenge,
+        unix_now(),
+        Vec::new(),
+    )?;
+    let mut response_payload = BytesMut::new();
+    response.encode(&mut response_payload)?;
+    let response_frame = Frame::new(FrameType::AuthResponse, 0, 0, response_payload.freeze())?;
+    write_frame(&mut stream, &response_frame).await?;
+
+    let settings_frame = read_frame(&mut stream, FrameLimits::default()).await?;
+    if settings_frame.header.frame_type != FrameType::Settings {
+        return Err("expected SETTINGS".into());
+    }
+    let mut settings_payload = settings_frame.payload;
+    let settings = Settings::decode(&mut settings_payload)?;
+    info!(event = "auth.success", max_frame_size = ?settings.get(uk_proto::SettingKey::MaxFrameSize));
+    println!("uk-client handshake ok");
+    Ok(())
 }

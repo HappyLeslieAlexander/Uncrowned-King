@@ -2,11 +2,13 @@
 
 pub mod error;
 pub mod frame;
+pub mod io;
 pub mod settings;
 pub mod target;
 pub mod varint;
 
 pub use error::{ProtocolError, ProtocolResult};
 pub use frame::{Frame, FrameHeader, FrameLimits, FrameType};
+pub use io::{FrameIoError, FrameIoResult, read_frame, write_frame};
 pub use settings::{SettingKey, Settings};
 pub use target::Target;

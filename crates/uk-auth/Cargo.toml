@@ -7,11 +7,12 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+bytes.workspace = true
 hmac.workspace = true
 rand.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+uk-proto = { path = "../uk-proto" }
 
 [lints]
 workspace = true
-

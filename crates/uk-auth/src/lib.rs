@@ -5,14 +5,20 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use bytes::{Buf, BufMut};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
 use thiserror::Error;
+use uk_proto::{ProtocolError, varint};
 
 type HmacSha256 = Hmac<Sha256>;
 
 const AUTH_LABEL: &[u8] = b"UK-AUTH-v1";
+/// TLS/QUIC exporter label used by UK authentication.
+pub const EXPORTER_LABEL: &[u8] = b"EXPORTER-UK-v1";
+/// Maximum accepted key id length.
+pub const MAX_KEY_ID_LEN: usize = 64;
 
 /// Authentication result alias.
 pub type AuthResult<T> = Result<T, AuthError>;
@@ -38,6 +44,12 @@ pub enum AuthError {
     /// Secret material is too short.
     #[error("secret must be at least 32 bytes")]
     SecretTooShort,
+    /// Authentication payload is malformed.
+    #[error("invalid auth payload: {0}")]
+    InvalidPayload(&'static str),
+    /// Protocol codec failure inside an auth payload.
+    #[error("protocol error: {0}")]
+    Protocol(#[from] ProtocolError),
 }
 
 /// Credential lifecycle state.
@@ -135,6 +147,42 @@ impl AuthChallenge {
             limits: Vec::new(),
         }
     }
+
+    /// Encodes this challenge as an `AUTH_CHALLENGE` payload.
+    pub fn encode(&self, dst: &mut impl BufMut) -> AuthResult<()> {
+        dst.put_slice(&self.server_nonce);
+        dst.put_u64(self.server_time);
+        dst.put_slice(&self.session_id);
+        varint::encode(self.server_capabilities.len() as u64, dst)?;
+        dst.put_slice(&self.server_capabilities);
+        varint::encode(self.limits.len() as u64, dst)?;
+        dst.put_slice(&self.limits);
+        Ok(())
+    }
+
+    /// Decodes an `AUTH_CHALLENGE` payload.
+    pub fn decode(src: &mut impl Buf) -> AuthResult<Self> {
+        if src.remaining() < 56 {
+            return Err(AuthError::InvalidPayload("challenge is truncated"));
+        }
+        let mut server_nonce = [0_u8; 32];
+        src.copy_to_slice(&mut server_nonce);
+        let server_time = src.get_u64();
+        let mut session_id = [0_u8; 16];
+        src.copy_to_slice(&mut session_id);
+        let server_capabilities = read_varbytes(src, "server capabilities")?;
+        let limits = read_varbytes(src, "limits")?;
+        if src.has_remaining() {
+            return Err(AuthError::InvalidPayload("trailing challenge bytes"));
+        }
+        Ok(Self {
+            server_nonce,
+            server_time,
+            session_id,
+            server_capabilities,
+            limits,
+        })
+    }
 }
 
 /// Client authentication response data.
@@ -150,6 +198,83 @@ pub struct AuthResponse {
     pub client_capabilities: Vec<u8>,
     /// 32-byte HMAC tag.
     pub tag: [u8; 32],
+}
+
+impl AuthResponse {
+    /// Creates and signs a fresh response for `challenge`.
+    pub fn for_challenge(
+        key_id: impl Into<Vec<u8>>,
+        secret: &[u8],
+        exporter_32: &[u8; 32],
+        challenge: &AuthChallenge,
+        client_time: u64,
+        client_capabilities: Vec<u8>,
+    ) -> AuthResult<Self> {
+        let key_id = key_id.into();
+        if key_id.is_empty() || key_id.len() > MAX_KEY_ID_LEN {
+            return Err(AuthError::InvalidPayload("invalid key id length"));
+        }
+        let mut client_nonce = [0_u8; 32];
+        rand::thread_rng().fill_bytes(&mut client_nonce);
+        let tag = compute_auth_tag(
+            secret,
+            exporter_32,
+            challenge,
+            &key_id,
+            &client_nonce,
+            client_time,
+            &client_capabilities,
+        )?;
+        Ok(Self {
+            key_id,
+            client_nonce,
+            client_time,
+            client_capabilities,
+            tag,
+        })
+    }
+
+    /// Encodes this response as an `AUTH_RESPONSE` payload.
+    pub fn encode(&self, dst: &mut impl BufMut) -> AuthResult<()> {
+        if self.key_id.len() > MAX_KEY_ID_LEN {
+            return Err(AuthError::InvalidPayload("key id is too long"));
+        }
+        varint::encode(self.key_id.len() as u64, dst)?;
+        dst.put_slice(&self.key_id);
+        dst.put_slice(&self.client_nonce);
+        dst.put_u64(self.client_time);
+        varint::encode(self.client_capabilities.len() as u64, dst)?;
+        dst.put_slice(&self.client_capabilities);
+        dst.put_slice(&self.tag);
+        Ok(())
+    }
+
+    /// Decodes an `AUTH_RESPONSE` payload.
+    pub fn decode(src: &mut impl Buf) -> AuthResult<Self> {
+        let key_id = read_varbytes(src, "key id")?;
+        if key_id.is_empty() || key_id.len() > MAX_KEY_ID_LEN {
+            return Err(AuthError::InvalidPayload("invalid key id length"));
+        }
+        if src.remaining() < 72 {
+            return Err(AuthError::InvalidPayload("response is truncated"));
+        }
+        let mut client_nonce = [0_u8; 32];
+        src.copy_to_slice(&mut client_nonce);
+        let client_time = src.get_u64();
+        let client_capabilities = read_varbytes(src, "client capabilities")?;
+        if src.remaining() != 32 {
+            return Err(AuthError::InvalidPayload("invalid tag length"));
+        }
+        let mut tag = [0_u8; 32];
+        src.copy_to_slice(&mut tag);
+        Ok(Self {
+            key_id,
+            client_nonce,
+            client_time,
+            client_capabilities,
+            tag,
+        })
+    }
 }
 
 /// In-memory replay cache for accepted nonce pairs.
@@ -294,6 +419,14 @@ fn auth_mac(
     Ok(mac)
 }
 
+fn read_varbytes(src: &mut impl Buf, name: &'static str) -> AuthResult<Vec<u8>> {
+    let len = usize::try_from(varint::decode(src)?).map_err(|_| ProtocolError::InvalidVarint)?;
+    if src.remaining() < len {
+        return Err(AuthError::InvalidPayload(name));
+    }
+    Ok(src.copy_to_bytes(len).to_vec())
+}
+
 /// Returns the current unix time in seconds.
 pub fn unix_now() -> u64 {
     SystemTime::now()
@@ -339,6 +472,24 @@ mod tests {
             tag,
         };
         (credential, exporter, challenge, response)
+    }
+
+    #[test]
+    fn roundtrips_challenge_payload() {
+        let (_, _, challenge, _) = fixture();
+        let mut out = Vec::new();
+        challenge.encode(&mut out).unwrap();
+        let mut bytes = bytes::Bytes::from(out);
+        assert_eq!(AuthChallenge::decode(&mut bytes).unwrap(), challenge);
+    }
+
+    #[test]
+    fn roundtrips_response_payload() {
+        let (_, _, _, response) = fixture();
+        let mut out = Vec::new();
+        response.encode(&mut out).unwrap();
+        let mut bytes = bytes::Bytes::from(out);
+        assert_eq!(AuthResponse::decode(&mut bytes).unwrap(), response);
     }
 
     #[test]
