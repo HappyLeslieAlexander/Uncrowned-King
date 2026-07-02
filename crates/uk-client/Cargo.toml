@@ -1,0 +1,22 @@
+[package]
+name = "uk-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "uk-client"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+tracing.workspace = true
+uk-auth = { path = "../uk-auth" }
+uk-policy = { path = "../uk-policy" }
+uk-proto = { path = "../uk-proto" }
+
+[lints]
+workspace = true
+

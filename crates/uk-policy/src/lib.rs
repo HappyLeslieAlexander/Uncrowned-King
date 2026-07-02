@@ -1,0 +1,406 @@
+//! Minimal policy engine for UncrownedKing.
+
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    ops::RangeInclusive,
+    str::FromStr,
+};
+
+use serde::Deserialize;
+use thiserror::Error;
+use uk_proto::Target;
+
+/// Policy result alias.
+pub type PolicyResult<T> = Result<T, PolicyError>;
+
+/// Policy parsing errors.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum PolicyError {
+    /// Invalid CIDR string.
+    #[error("invalid cidr {0}")]
+    InvalidCidr(String),
+    /// Invalid port range.
+    #[error("invalid port range")]
+    InvalidPortRange,
+    /// TOML parse failure.
+    #[error("invalid policy toml: {0}")]
+    InvalidToml(String),
+}
+
+/// Final decision returned by the policy engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyDecision {
+    /// Access is allowed.
+    Allow,
+    /// Access is denied.
+    Deny,
+}
+
+/// Context known when evaluating a policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyContext<'a> {
+    /// Authenticated key id.
+    pub key_id: &'a [u8],
+    /// Optional policy group.
+    pub policy_group: Option<&'a str>,
+    /// Requested target before DNS resolution.
+    pub target: &'a Target,
+    /// IPs resolved from a domain, if resolution has happened.
+    pub resolved_ips: &'a [IpAddr],
+}
+
+/// A complete ordered policy set. First matching rule wins.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicySet {
+    rules: Vec<PolicyRule>,
+}
+
+impl PolicySet {
+    /// Creates a policy set from rules.
+    pub fn new(rules: Vec<PolicyRule>) -> Self {
+        Self { rules }
+    }
+
+    /// Parses a TOML policy set.
+    pub fn from_toml(input: &str) -> PolicyResult<Self> {
+        let raw: RawPolicySet =
+            toml::from_str(input).map_err(|err| PolicyError::InvalidToml(err.to_string()))?;
+        raw.try_into()
+    }
+
+    /// Evaluates the target. Unmatched requests are denied.
+    pub fn evaluate(&self, context: &PolicyContext<'_>) -> PolicyDecision {
+        if target_or_resolution_contains_metadata_ip(context.target, context.resolved_ips) {
+            return PolicyDecision::Deny;
+        }
+
+        for rule in &self.rules {
+            if rule.matches(context) {
+                return rule.action;
+            }
+        }
+
+        PolicyDecision::Deny
+    }
+}
+
+/// One ordered policy rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyRule {
+    /// Action returned when all configured predicates match.
+    pub action: PolicyDecision,
+    /// Optional exact key id match.
+    pub key_id: Option<Vec<u8>>,
+    /// Optional exact policy group match.
+    pub policy_group: Option<String>,
+    /// Optional domain suffix match.
+    pub domain_suffix: Option<String>,
+    /// Optional CIDR match against literal or resolved IPs.
+    pub cidr: Option<Cidr>,
+    /// Optional port range match.
+    pub ports: Option<RangeInclusive<u16>>,
+    /// Whether private IP targets match.
+    pub private: Option<bool>,
+}
+
+impl PolicyRule {
+    /// Creates a rule with an action and no predicates.
+    pub fn new(action: PolicyDecision) -> Self {
+        Self {
+            action,
+            key_id: None,
+            policy_group: None,
+            domain_suffix: None,
+            cidr: None,
+            ports: None,
+            private: None,
+        }
+    }
+
+    fn matches(&self, context: &PolicyContext<'_>) -> bool {
+        if self
+            .key_id
+            .as_ref()
+            .is_some_and(|key_id| key_id.as_slice() != context.key_id)
+        {
+            return false;
+        }
+        if self.policy_group.as_deref().is_some_and(|group| {
+            context
+                .policy_group
+                .is_none_or(|context_group| context_group != group)
+        }) {
+            return false;
+        }
+        if self.domain_suffix.as_deref().is_some_and(|suffix| {
+            target_domain(context.target).is_none_or(|domain| !domain.ends_with(suffix))
+        }) {
+            return false;
+        }
+        if self
+            .ports
+            .as_ref()
+            .is_some_and(|ports| !ports.contains(&context.target.port()))
+        {
+            return false;
+        }
+        if self.cidr.as_ref().is_some_and(|cidr| {
+            !target_ips(context.target, context.resolved_ips)
+                .into_iter()
+                .any(|ip| cidr.contains(ip))
+        }) {
+            return false;
+        }
+        if self.private.is_some_and(|want_private| {
+            !target_ips(context.target, context.resolved_ips)
+                .into_iter()
+                .any(|ip| is_private(ip) == want_private)
+        }) {
+            return false;
+        }
+        true
+    }
+}
+
+/// IP network matcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cidr {
+    /// IPv4 CIDR.
+    V4(Ipv4Addr, u8),
+    /// IPv6 CIDR.
+    V6(Ipv6Addr, u8),
+}
+
+impl Cidr {
+    /// Returns true when `ip` is inside this CIDR.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self, ip) {
+            (Self::V4(network, prefix), IpAddr::V4(ip)) => {
+                let mask = ipv4_mask(*prefix);
+                u32::from(*network) & mask == u32::from(ip) & mask
+            }
+            (Self::V6(network, prefix), IpAddr::V6(ip)) => {
+                let mask = ipv6_mask(*prefix);
+                u128::from(*network) & mask == u128::from(ip) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+impl FromStr for Cidr {
+    type Err = PolicyError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let (addr, prefix) = input
+            .split_once('/')
+            .ok_or_else(|| PolicyError::InvalidCidr(input.to_owned()))?;
+        let prefix: u8 = prefix
+            .parse()
+            .map_err(|_| PolicyError::InvalidCidr(input.to_owned()))?;
+        let ip: IpAddr = addr
+            .parse()
+            .map_err(|_| PolicyError::InvalidCidr(input.to_owned()))?;
+        match ip {
+            IpAddr::V4(ip) if prefix <= 32 => Ok(Self::V4(ip, prefix)),
+            IpAddr::V6(ip) if prefix <= 128 => Ok(Self::V6(ip, prefix)),
+            _ => Err(PolicyError::InvalidCidr(input.to_owned())),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPolicySet {
+    rules: Vec<RawPolicyRule>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPolicyRule {
+    action: String,
+    key_id: Option<String>,
+    policy_group: Option<String>,
+    domain_suffix: Option<String>,
+    cidr: Option<String>,
+    port_start: Option<u16>,
+    port_end: Option<u16>,
+    private: Option<bool>,
+}
+
+impl TryFrom<RawPolicySet> for PolicySet {
+    type Error = PolicyError;
+
+    fn try_from(raw: RawPolicySet) -> Result<Self, Self::Error> {
+        raw.rules
+            .into_iter()
+            .map(PolicyRule::try_from)
+            .collect::<PolicyResult<Vec<_>>>()
+            .map(Self::new)
+    }
+}
+
+impl TryFrom<RawPolicyRule> for PolicyRule {
+    type Error = PolicyError;
+
+    fn try_from(raw: RawPolicyRule) -> Result<Self, Self::Error> {
+        let action = if raw.action.eq_ignore_ascii_case("allow") {
+            PolicyDecision::Allow
+        } else {
+            PolicyDecision::Deny
+        };
+        let ports = match (raw.port_start, raw.port_end) {
+            (Some(start), Some(end)) if start <= end && start != 0 => Some(start..=end),
+            (None, None) => None,
+            _ => return Err(PolicyError::InvalidPortRange),
+        };
+        Ok(Self {
+            action,
+            key_id: raw.key_id.map(String::into_bytes),
+            policy_group: raw.policy_group,
+            domain_suffix: raw.domain_suffix,
+            cidr: raw.cidr.as_deref().map(Cidr::from_str).transpose()?,
+            ports,
+            private: raw.private,
+        })
+    }
+}
+
+fn target_domain(target: &Target) -> Option<&str> {
+    match target {
+        Target::Domain(domain, _) => Some(domain),
+        Target::Ipv4(_, _) | Target::Ipv6(_, _) => None,
+    }
+}
+
+fn target_ips(target: &Target, resolved_ips: &[IpAddr]) -> Vec<IpAddr> {
+    match target {
+        Target::Domain(_, _) => resolved_ips.to_vec(),
+        Target::Ipv4(ip, _) => vec![IpAddr::V4(*ip)],
+        Target::Ipv6(ip, _) => vec![IpAddr::V6(*ip)],
+    }
+}
+
+fn target_or_resolution_contains_metadata_ip(target: &Target, resolved_ips: &[IpAddr]) -> bool {
+    target_ips(target, resolved_ips)
+        .into_iter()
+        .any(|ip| ip == IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)))
+}
+
+fn is_private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        IpAddr::V6(ip) => ip.is_unique_local() || ip.is_loopback(),
+    }
+}
+
+fn ipv4_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    }
+}
+
+fn ipv6_mask(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context<'a>(
+        target: &'a Target,
+        policy_group: Option<&'a str>,
+        resolved_ips: &'a [IpAddr],
+    ) -> PolicyContext<'a> {
+        PolicyContext {
+            key_id: b"client-a",
+            policy_group,
+            target,
+            resolved_ips,
+        }
+    }
+
+    #[test]
+    fn allows_domain_suffix() {
+        let mut rule = PolicyRule::new(PolicyDecision::Allow);
+        rule.policy_group = Some("default".to_owned());
+        rule.domain_suffix = Some(".example.com".to_owned());
+        rule.ports = Some(443..=443);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Domain("api.example.com".to_owned(), 443);
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &[])),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn denies_private_ip_by_rule() {
+        let mut rule = PolicyRule::new(PolicyDecision::Deny);
+        rule.private = Some(true);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Ipv4(Ipv4Addr::new(10, 0, 0, 1), 22);
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &[])),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn denies_metadata_ip_even_when_allow_rule_matches() {
+        let rule = PolicyRule::new(PolicyDecision::Allow);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Ipv4(Ipv4Addr::new(169, 254, 169, 254), 80);
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &[])),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn denies_domain_resolving_to_metadata_ip() {
+        let rule = PolicyRule::new(PolicyDecision::Allow);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Domain("metadata.example".to_owned(), 80);
+        let resolved = [IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))];
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &resolved)),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn denies_unmatched_target() {
+        let policy = PolicySet::default();
+        let target = Target::Domain("example.com".to_owned(), 443);
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &[])),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn parses_toml_policy() {
+        let policy = PolicySet::from_toml(
+            r#"
+            [[rules]]
+            action = "allow"
+            policy_group = "ops"
+            cidr = "10.20.0.0/16"
+            port_start = 22
+            port_end = 22
+            "#,
+        )
+        .unwrap();
+        let target = Target::Ipv4(Ipv4Addr::new(10, 20, 1, 2), 22);
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("ops"), &[])),
+            PolicyDecision::Allow
+        );
+    }
+}
