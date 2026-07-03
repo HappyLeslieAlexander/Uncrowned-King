@@ -82,6 +82,9 @@ impl Settings {
                 settings.set(key, value);
             }
         }
+        if src.has_remaining() {
+            return Err(ProtocolError::InvalidSettings("trailing settings bytes"));
+        }
         Ok(settings)
     }
 }
@@ -109,5 +112,14 @@ mod tests {
         let mut bytes = Bytes::from_static(&[0x02, 0x01, 0x40, 0x80, 0x3f, 0x01]);
         let settings = Settings::decode(&mut bytes).unwrap();
         assert_eq!(settings.get(SettingKey::MaxFrameSize), Some(128));
+    }
+
+    #[test]
+    fn rejects_trailing_settings_bytes() {
+        let mut bytes = Bytes::from_static(&[0x01, 0x01, 0x40, 0x80, 0xff]);
+        assert_eq!(
+            Settings::decode(&mut bytes),
+            Err(ProtocolError::InvalidSettings("trailing settings bytes"))
+        );
     }
 }

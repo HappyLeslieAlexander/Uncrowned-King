@@ -196,7 +196,8 @@ Known keys:
 | `7` | `protocol_revision` |
 
 Unknown optional settings may be ignored. Required setting semantics will be
-added after v0.1.
+added after v0.1. Decoders must reject trailing bytes after the declared
+setting pairs.
 
 ## 7. Error Codes
 
