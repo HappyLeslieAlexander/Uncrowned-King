@@ -99,7 +99,8 @@ Target target
 u16    open_flags
 ```
 
-v0.1 defines no non-zero `open_flags`.
+v0.1 defines no non-zero `open_flags`. Encoders and decoders must reject
+non-zero `open_flags`.
 
 `TCP_DATA` payload is uninterpreted TCP byte data.
 

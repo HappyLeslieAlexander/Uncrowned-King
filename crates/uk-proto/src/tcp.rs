@@ -30,6 +30,7 @@ impl TcpOpen {
 
     /// Encodes this payload into `dst`.
     pub fn encode(&self, dst: &mut impl BufMut) -> ProtocolResult<()> {
+        validate_open_flags(self.open_flags)?;
         self.target.encode(dst)?;
         dst.put_u16(self.open_flags);
         Ok(())
@@ -42,6 +43,7 @@ impl TcpOpen {
             return Err(ProtocolError::Truncated);
         }
         let open_flags = src.get_u16();
+        validate_open_flags(open_flags)?;
         if src.has_remaining() {
             return Err(ProtocolError::InvalidTcpPayload("trailing tcp open bytes"));
         }
@@ -82,6 +84,14 @@ impl TcpClose {
     }
 }
 
+fn validate_open_flags(open_flags: u16) -> ProtocolResult<()> {
+    if open_flags == TCP_OPEN_FLAGS_NONE {
+        Ok(())
+    } else {
+        Err(ProtocolError::InvalidTcpPayload("unknown tcp open flags"))
+    }
+}
+
 fn validate_close_code(close_code: u16) -> ProtocolResult<()> {
     match close_code {
         TCP_CLOSE_NORMAL | TCP_CLOSE_ERROR => Ok(()),
@@ -91,6 +101,8 @@ fn validate_close_code(close_code: u16) -> ProtocolResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use bytes::Bytes;
 
     use super::*;
@@ -123,6 +135,25 @@ mod tests {
         assert_eq!(
             TcpOpen::decode(&mut bytes),
             Err(ProtocolError::InvalidTcpPayload("trailing tcp open bytes"))
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_tcp_open_flags() {
+        let mut bytes = Bytes::from_static(&[0x02, 0x04, 127, 0, 0, 1, 0x1f, 0x90, 0x00, 0x01]);
+        assert_eq!(
+            TcpOpen::decode(&mut bytes),
+            Err(ProtocolError::InvalidTcpPayload("unknown tcp open flags"))
+        );
+    }
+
+    #[test]
+    fn rejects_encoding_unknown_tcp_open_flags() {
+        let open = TcpOpen::new(Target::Ipv4(Ipv4Addr::LOCALHOST, 8080), 1);
+        let mut out = Vec::new();
+        assert_eq!(
+            open.encode(&mut out),
+            Err(ProtocolError::InvalidTcpPayload("unknown tcp open flags"))
         );
     }
 
