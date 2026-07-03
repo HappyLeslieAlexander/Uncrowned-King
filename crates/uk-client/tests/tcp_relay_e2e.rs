@@ -72,6 +72,7 @@ const KEY_ID: &str = "e2e-client";
 const SECRET: &str = "0123456789abcdef0123456789abcdef";
 const SOCKS_REPLY_SUCCEEDED: u8 = 0x00;
 const SOCKS_REPLY_NOT_ALLOWED: u8 = 0x02;
+const SOCKS_REPLY_HOST_UNREACHABLE: u8 = 0x04;
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -83,6 +84,11 @@ async fn relays_tcp_through_socks5_to_echo_target() -> Result<(), TestError> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn maps_policy_denied_to_socks_not_allowed() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_policy_denied_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maps_target_unavailable_to_socks_host_unreachable() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_target_unavailable_e2e()).await?
 }
 
 async fn run_tcp_relay_e2e() -> Result<(), TestError> {
@@ -110,6 +116,18 @@ async fn run_policy_denied_e2e() -> Result<(), TestError> {
     let denied_target = unused_loopback_addr().await?;
     let (_socks, connect_reply) = open_socks_connect(harness.socks_addr, denied_target).await?;
     assert_eq!(connect_reply[1], SOCKS_REPLY_NOT_ALLOWED);
+    Ok(())
+}
+
+async fn run_target_unavailable_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let unavailable_target = unused_loopback_addr().await?;
+    let harness =
+        RelayHarness::start(Some(allow_loopback_policy(unavailable_target.port()))).await?;
+    let (_socks, connect_reply) =
+        open_socks_connect(harness.socks_addr, unavailable_target).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_HOST_UNREACHABLE);
     Ok(())
 }
 
