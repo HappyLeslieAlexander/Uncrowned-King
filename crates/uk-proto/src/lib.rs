@@ -3,6 +3,7 @@
 /// TLS/QUIC ALPN protocol identifier for Uncrowned King v0.1.
 pub const ALPN_PROTOCOL: &[u8] = b"uk/1";
 
+pub mod endpoint;
 pub mod error;
 pub mod flow;
 pub mod frame;
@@ -13,6 +14,7 @@ pub mod target;
 pub mod tcp;
 pub mod varint;
 
+pub use endpoint::{EndpointError, validate_host_port_endpoint};
 pub use error::{ProtocolError, ProtocolResult};
 pub use flow::{
     FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, is_client_initiated_flow_id, is_server_initiated_flow_id,

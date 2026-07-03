@@ -1,9 +1,10 @@
 //! Client configuration.
 
-use std::{error::Error, fs, net::SocketAddr, path::Path};
+use std::{error::Error, fs, path::Path};
 
 use serde::Deserialize;
 use uk_auth::{AuthError, validate_key_id, validate_shared_secret};
+use uk_proto::validate_host_port_endpoint;
 
 /// Client TOML configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -67,43 +68,8 @@ pub fn validate_endpoint(
     name: &'static str,
     value: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if let Ok(addr) = value.parse::<SocketAddr>() {
-        return validate_port(name, addr.port());
-    }
-
-    let (host, port) = split_host_port(value).ok_or_else(|| {
-        format!("{name} must be a host:port endpoint; bracket IPv6 literals like [::1]:443")
-    })?;
-    if host.is_empty() || host.bytes().any(|byte| byte.is_ascii_control()) {
-        return Err(format!("{name} has an invalid host").into());
-    }
-    let port = port
-        .parse::<u16>()
-        .map_err(|_| format!("{name} has an invalid port"))?;
-    validate_port(name, port)
-}
-
-fn split_host_port(value: &str) -> Option<(&str, &str)> {
-    if let Some(rest) = value.strip_prefix('[') {
-        let end = rest.find(']')?;
-        let host = &rest[..end];
-        let port = rest[end + 1..].strip_prefix(':')?;
-        Some((host, port))
-    } else {
-        let (host, port) = value.rsplit_once(':')?;
-        if host.contains(':') {
-            return None;
-        }
-        Some((host, port))
-    }
-}
-
-fn validate_port(name: &'static str, port: u16) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if port == 0 {
-        Err(format!("{name} port must be 1..=65535").into())
-    } else {
-        Ok(())
-    }
+    validate_host_port_endpoint(name, value)?;
+    Ok(())
 }
 
 #[cfg(test)]
