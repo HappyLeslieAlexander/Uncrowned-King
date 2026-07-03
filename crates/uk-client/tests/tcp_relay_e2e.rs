@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    net::{Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process,
     sync::atomic::{AtomicU64, Ordering},
@@ -102,6 +102,11 @@ async fn maps_target_unavailable_to_socks_host_unreachable() -> Result<(), TestE
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relays_domain_socks_target_to_echo_target() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_domain_relay_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relays_ipv6_socks_target_to_echo_target() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_ipv6_relay_e2e()).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -309,6 +314,24 @@ async fn run_domain_relay_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+async fn run_ipv6_relay_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, echo_task) = spawn_ipv6_echo_target().await?;
+    let harness = RelayHarness::start(Some(allow_ipv6_loopback_policy(target_addr.port()))).await?;
+
+    let (mut socks, connect_reply) = open_socks_connect(harness.socks_addr, target_addr).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    socks.write_all(b"uncrowned king ipv6 e2e").await?;
+    let mut echoed = vec![0_u8; "uncrowned king ipv6 e2e".len()];
+    socks.read_exact(&mut echoed).await?;
+    assert_eq!(echoed, b"uncrowned king ipv6 e2e");
+
+    echo_task.await??;
+    Ok(())
+}
+
 async fn run_target_unavailable_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -509,6 +532,20 @@ async fn spawn_localhost_echo_target()
     Ok((addr, task))
 }
 
+async fn spawn_ipv6_echo_target()
+-> Result<(SocketAddr, tokio::task::JoinHandle<Result<(), TestError>>), TestError> {
+    let listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await?;
+    let addr = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut buf = [0_u8; 1024];
+        let read = stream.read(&mut buf).await?;
+        stream.write_all(&buf[..read]).await?;
+        Ok(())
+    });
+    Ok((addr, task))
+}
+
 async fn wait_for_listener(
     name: &str,
     addr: SocketAddr,
@@ -535,29 +572,22 @@ async fn open_socks_connect(
     socks_addr: SocketAddr,
     target_addr: SocketAddr,
 ) -> Result<(TcpStream, [u8; 10]), TestError> {
-    let SocketAddr::V4(target_addr) = target_addr else {
-        return Err("e2e tests only support IPv4 targets".into());
-    };
-    let octets = target_addr.ip().octets();
     let port = target_addr.port();
+    let mut request = vec![0x05, 0x01, 0x00, 0x05, 0x01, 0x00];
+    match target_addr {
+        SocketAddr::V4(addr) => {
+            request.push(0x01);
+            request.extend_from_slice(&addr.ip().octets());
+        }
+        SocketAddr::V6(addr) => {
+            request.push(0x04);
+            request.extend_from_slice(&addr.ip().octets());
+        }
+    }
+    request.extend_from_slice(&port.to_be_bytes());
+
     let mut socks = TcpStream::connect(socks_addr).await?;
-    socks
-        .write_all(&[
-            0x05,
-            0x01,
-            0x00,
-            0x05,
-            0x01,
-            0x00,
-            0x01,
-            octets[0],
-            octets[1],
-            octets[2],
-            octets[3],
-            (port >> 8) as u8,
-            port as u8,
-        ])
-        .await?;
+    socks.write_all(&request).await?;
 
     let mut method_response = [0_u8; 2];
     socks.read_exact(&mut method_response).await?;
@@ -657,6 +687,18 @@ fn allow_loopback_policy(port: u16) -> String {
         [[rules]]
         action = "allow"
         cidr = "127.0.0.1/32"
+        port_start = {port}
+        port_end = {port}
+        "#
+    )
+}
+
+fn allow_ipv6_loopback_policy(port: u16) -> String {
+    format!(
+        r#"
+        [[rules]]
+        action = "allow"
+        cidr = "::1/128"
         port_start = {port}
         port_end = {port}
         "#

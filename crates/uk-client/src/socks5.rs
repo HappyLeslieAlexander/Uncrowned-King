@@ -184,6 +184,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn negotiates_ipv6_connect() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
+        let mut request = vec![0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x04];
+        request.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        request.extend_from_slice(&443_u16.to_be_bytes());
+
+        client.write_all(&request).await.unwrap();
+
+        let mut method_response = [0_u8; 2];
+        client.read_exact(&mut method_response).await.unwrap();
+        assert_eq!(method_response, [0x05, 0x00]);
+
+        let target = server_task.await.unwrap().unwrap();
+        assert_eq!(target, Target::Ipv6(Ipv6Addr::LOCALHOST, 443));
+    }
+
+    #[tokio::test]
     async fn rejects_greeting_without_methods() {
         let (mut client, mut server) = tokio::io::duplex(128);
         let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
