@@ -1,6 +1,6 @@
 //! Server configuration.
 
-use std::{error::Error, fs, path::Path};
+use std::{collections::HashSet, error::Error, fs, path::Path};
 
 use serde::Deserialize;
 use uk_auth::{
@@ -40,10 +40,16 @@ impl ServerConfig {
 
     /// Converts static credential config into auth records.
     pub fn credentials(&self) -> Result<Vec<Credential>, AuthError> {
-        self.credentials
-            .iter()
-            .map(CredentialConfig::to_credential)
-            .collect()
+        let mut seen_key_ids = HashSet::new();
+        let mut credentials = Vec::with_capacity(self.credentials.len());
+        for credential_config in &self.credentials {
+            let credential = credential_config.to_credential()?;
+            if !seen_key_ids.insert(credential.key_id.clone()) {
+                return Err(AuthError::DuplicateCredentialKeyId);
+            }
+            credentials.push(credential);
+        }
+        Ok(credentials)
     }
 
     /// Loads the configured policy set. Missing policy config means deny-all.
@@ -743,6 +749,31 @@ status = "disabledd"
         assert_eq!(
             config.credentials(),
             Err(AuthError::InvalidCredentialStatus)
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_credential_key_id() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+
+[[credentials]]
+key_id = "client-a"
+secret = "0123456789abcdef0123456789abcdef"
+
+[[credentials]]
+key_id = "client-a"
+secret = "abcdef0123456789abcdef0123456789"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.credentials(),
+            Err(AuthError::DuplicateCredentialKeyId)
         );
     }
 }

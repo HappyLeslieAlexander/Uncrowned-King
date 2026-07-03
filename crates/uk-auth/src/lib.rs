@@ -57,6 +57,9 @@ pub enum AuthError {
     /// Credential status text is not recognized.
     #[error("credential status must be active, disabled, or retired")]
     InvalidCredentialStatus,
+    /// Two configured credentials use the same key id.
+    #[error("duplicate credential key id")]
+    DuplicateCredentialKeyId,
     /// Authentication payload is malformed.
     #[error("invalid auth payload: {0}")]
     InvalidPayload(&'static str),
