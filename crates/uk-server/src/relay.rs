@@ -91,6 +91,7 @@ enum EnqueueError {
 struct TargetFlowControl {
     buffered_bytes: Arc<AtomicUsize>,
     closed: Arc<AtomicBool>,
+    aborted: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -266,32 +267,45 @@ async fn handle_session_frame(
         FrameType::TcpData => {
             if !frame.payload.is_empty() {
                 let flow_id = frame.header.id;
-                if let Some(target) = target_writers.get(&flow_id) {
+                let mut should_remove = false;
+                let mut should_send_resource_limit = false;
+                if let Some(target) = target_writers.get_mut(&flow_id) {
                     match target
                         .enqueue_data(frame.payload, context.limits.max_buffered_bytes_per_flow)
                     {
                         Ok(()) => {}
                         Err(EnqueueError::Closed) => {
-                            target_writers.remove(&flow_id);
+                            target.mark_client_to_target_closed();
+                            should_remove = target.is_fully_closed();
                         }
                         Err(EnqueueError::ResourceLimit) => {
-                            send_resource_limit(context.carrier_writer, flow_id).await?;
-                            send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR)
-                                .await?;
-                            target_writers.remove(&flow_id);
+                            target.abort();
+                            should_remove = true;
+                            should_send_resource_limit = true;
                         }
                     }
                 } else {
                     send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+                }
+                if should_send_resource_limit {
+                    send_resource_limit(context.carrier_writer, flow_id).await?;
+                    send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
+                }
+                if should_remove {
+                    target_writers.remove(&flow_id);
                 }
             }
             Ok(())
         }
         FrameType::TcpClose => {
             let mut payload = frame.payload;
-            let _close = TcpClose::decode(&mut payload)?;
+            let close = TcpClose::decode(&mut payload)?;
             let should_remove = if let Some(target) = target_writers.get_mut(&frame.header.id) {
-                target.close_client_to_target();
+                if close.close_code == TCP_CLOSE_NORMAL {
+                    target.close_client_to_target();
+                } else {
+                    target.abort();
+                }
                 target.is_fully_closed()
             } else {
                 false
@@ -382,6 +396,7 @@ async fn handle_tcp_open(
     spawn_target_reader(
         flow_id,
         target_reader,
+        flow_control.clone(),
         Arc::clone(context.carrier_writer),
         context.event_tx.clone(),
         context.shutdown.clone(),
@@ -402,6 +417,7 @@ async fn handle_tcp_open(
 fn spawn_target_reader(
     flow_id: u64,
     target_reader: OwnedReadHalf,
+    flow_control: TargetFlowControl,
     carrier_writer: CarrierWriter,
     event_tx: mpsc::UnboundedSender<FlowEvent>,
     shutdown: SessionShutdown,
@@ -410,6 +426,7 @@ fn spawn_target_reader(
         match relay_target_to_client(
             flow_id,
             target_reader,
+            flow_control,
             &carrier_writer,
             &event_tx,
             &shutdown,
@@ -530,6 +547,7 @@ impl Default for TargetFlowControl {
         Self {
             buffered_bytes: Arc::new(AtomicUsize::new(0)),
             closed: Arc::new(AtomicBool::new(false)),
+            aborted: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -567,6 +585,15 @@ impl TargetFlowControl {
 
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    fn abort(&self) {
+        self.aborted.store(true, Ordering::SeqCst);
+        self.close();
+    }
+
+    fn is_aborted(&self) -> bool {
+        self.aborted.load(Ordering::SeqCst)
     }
 }
 
@@ -617,6 +644,13 @@ impl TargetFlow {
         let _ = self.commands.try_send(TargetCommand::Close);
     }
 
+    fn abort(&mut self) {
+        self.target_to_client_open = false;
+        self.client_to_target_open = false;
+        self.control.abort();
+        let _ = self.commands.try_send(TargetCommand::Close);
+    }
+
     fn mark_target_to_client_closed(&mut self) {
         self.target_to_client_open = false;
     }
@@ -634,17 +668,18 @@ impl TargetFlow {
 async fn relay_target_to_client(
     flow_id: u64,
     mut target_reader: OwnedReadHalf,
+    flow_control: TargetFlowControl,
     carrier_writer: &CarrierWriter,
     event_tx: &mpsc::UnboundedSender<FlowEvent>,
     shutdown: &SessionShutdown,
 ) -> Result<(), AnyError> {
     let mut target_buf = Box::new([0_u8; RELAY_BUFFER_SIZE]);
     loop {
-        if shutdown.is_closed() {
+        if shutdown.is_closed() || flow_control.is_aborted() {
             return Ok(());
         }
         let read = target_reader.read(target_buf.as_mut()).await?;
-        if shutdown.is_closed() {
+        if shutdown.is_closed() || flow_control.is_aborted() {
             return Ok(());
         }
         if read == 0 {
@@ -845,6 +880,7 @@ mod tests {
         assert!(!flow.client_to_target_open);
         assert!(flow.target_to_client_open);
         assert!(!flow.is_fully_closed());
+        assert!(!flow.control.is_aborted());
 
         flow.mark_target_to_client_closed();
 
@@ -864,5 +900,17 @@ mod tests {
         flow.close_client_to_target();
 
         assert!(flow.is_fully_closed());
+    }
+
+    #[test]
+    fn abort_marks_both_directions_closed() {
+        let mut flow = test_target_flow();
+
+        flow.abort();
+
+        assert!(!flow.client_to_target_open);
+        assert!(!flow.target_to_client_open);
+        assert!(flow.is_fully_closed());
+        assert!(flow.control.is_aborted());
     }
 }
