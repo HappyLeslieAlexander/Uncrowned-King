@@ -102,7 +102,7 @@ struct TargetFlowControl {
 
 #[derive(Debug, Clone)]
 struct TargetFlow {
-    commands: mpsc::Sender<TargetCommand>,
+    commands: Option<mpsc::Sender<TargetCommand>>,
     control: TargetFlowControl,
     target_to_client_open: bool,
     client_to_target_open: bool,
@@ -527,6 +527,9 @@ async fn relay_client_to_target(
             }
         }
     }
+    if flow_control.is_closed() && !flow_control.is_aborted() && !shutdown.is_closed() {
+        target_writer.shutdown().await?;
+    }
     Ok(())
 }
 
@@ -624,14 +627,14 @@ impl TargetFlowControl {
 impl TargetFlow {
     fn new(commands: mpsc::Sender<TargetCommand>, control: TargetFlowControl) -> Self {
         Self {
-            commands,
+            commands: Some(commands),
             control,
             target_to_client_open: true,
             client_to_target_open: true,
         }
     }
 
-    fn enqueue_data(&self, payload: Bytes, byte_limit: usize) -> Result<(), EnqueueError> {
+    fn enqueue_data(&mut self, payload: Bytes, byte_limit: usize) -> Result<(), EnqueueError> {
         if self.control.is_closed() {
             return Err(EnqueueError::Closed);
         }
@@ -642,7 +645,12 @@ impl TargetFlow {
             return Err(EnqueueError::ResourceLimit);
         }
 
-        match self.commands.try_send(TargetCommand::Data(payload)) {
+        let Some(commands) = &self.commands else {
+            self.control.release_bytes(payload_len);
+            return Err(EnqueueError::Closed);
+        };
+
+        match commands.try_send(TargetCommand::Data(payload)) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.control.release_bytes(payload_len);
@@ -663,16 +671,27 @@ impl TargetFlow {
         }
     }
 
-    fn close_client_to_target_queue(&self) {
+    fn close_client_to_target_queue(&mut self) {
         self.control.close();
-        let _ = self.commands.try_send(TargetCommand::Close);
+        let drop_sender = match self.commands.as_ref() {
+            Some(commands) => match commands.try_send(TargetCommand::Close) {
+                Ok(()) => false,
+                Err(mpsc::error::TrySendError::Closed(_) | mpsc::error::TrySendError::Full(_)) => {
+                    true
+                }
+            },
+            None => false,
+        };
+        if drop_sender {
+            self.commands = None;
+        }
     }
 
     fn abort(&mut self) {
         self.target_to_client_open = false;
         self.client_to_target_open = false;
         self.control.abort();
-        let _ = self.commands.try_send(TargetCommand::Close);
+        self.close_client_to_target_queue();
     }
 
     fn mark_target_to_client_closed(&mut self) {
@@ -948,6 +967,41 @@ mod tests {
         assert!(!flow.target_to_client_open);
         assert!(flow.is_fully_closed());
         assert!(flow.control.is_aborted());
+    }
+
+    #[tokio::test]
+    async fn half_close_drops_full_target_queue_sender() {
+        let (commands, mut commands_rx) = mpsc::channel(1);
+        let mut flow = TargetFlow::new(commands, TargetFlowControl::default());
+
+        flow.enqueue_data(Bytes::from_static(b"queued"), 1024)
+            .unwrap();
+        flow.close_client_to_target();
+
+        assert!(flow.commands.is_none());
+        assert!(flow.control.is_closed());
+        match commands_rx.recv().await {
+            Some(TargetCommand::Data(payload)) => {
+                assert_eq!(payload, Bytes::from_static(b"queued"));
+            }
+            other => panic!("unexpected target command: {other:?}"),
+        }
+        assert!(commands_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn half_close_enqueues_close_when_target_queue_has_capacity() {
+        let (commands, mut commands_rx) = mpsc::channel(1);
+        let mut flow = TargetFlow::new(commands, TargetFlowControl::default());
+
+        flow.close_client_to_target();
+
+        assert!(flow.commands.is_some());
+        assert!(flow.control.is_closed());
+        assert!(matches!(
+            commands_rx.recv().await,
+            Some(TargetCommand::Close)
+        ));
     }
 
     #[test]
