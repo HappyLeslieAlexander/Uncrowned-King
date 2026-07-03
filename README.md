@@ -61,6 +61,8 @@ Set `idle_timeout_seconds = 0` to disable the relay session idle timeout.
 Set `handshake_timeout_seconds = 0` to disable the TLS/auth handshake timeout.
 Set `target_connect_timeout_seconds = 0` to disable the server target dial timeout.
 Replay cache limits must be greater than zero.
+Credential `key_id` values must be unique. When set, `policy_group` must be
+non-empty printable text.
 
 Client configs may also set `handshake_timeout_seconds = 10` to bound the
 server connection, TLS handshake, authentication exchange, and SETTINGS read.
