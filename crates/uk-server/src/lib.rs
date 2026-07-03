@@ -27,7 +27,10 @@ pub async fn run(config: ServerConfig) -> Result<(), AnyError> {
     config.validate_limits()?;
     let credentials = Arc::new(config.credentials()?);
     let policy_set = Arc::new(config.policy_set()?);
-    let replay_cache = Arc::new(Mutex::new(ReplayCache::default()));
+    let replay_cache = Arc::new(Mutex::new(ReplayCache::with_max_entries(
+        Duration::from_secs(config.replay_cache_window_seconds()),
+        usize_limit(config.replay_cache_max_entries()),
+    )));
     let tls_config = tls::server_config(&config.cert_path, &config.key_path)?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
     let listener = TcpListener::bind(&config.listen).await?;

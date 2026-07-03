@@ -15,6 +15,8 @@ max_buffered_bytes_per_flow = 2097152
 handshake_timeout_seconds = 10
 target_connect_timeout_seconds = 10
 tcp_half_close_timeout_seconds = 30
+replay_cache_window_seconds = 300
+replay_cache_max_entries = 65536
 
 [[credentials]]
 key_id = "local-dev"

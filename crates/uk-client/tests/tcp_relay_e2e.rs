@@ -620,6 +620,8 @@ fn test_limits() -> LimitConfig {
         handshake_timeout_seconds: Some(3),
         target_connect_timeout_seconds: Some(3),
         tcp_half_close_timeout_seconds: Some(3),
+        replay_cache_window_seconds: None,
+        replay_cache_max_entries: None,
     }
 }
 

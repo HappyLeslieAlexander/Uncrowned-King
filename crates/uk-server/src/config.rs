@@ -3,8 +3,10 @@
 use std::{error::Error, fs, path::Path};
 
 use serde::Deserialize;
-use uk_auth::{AuthError, Credential, CredentialStatus};
+use uk_auth::{AuthError, Credential, CredentialStatus, DEFAULT_REPLAY_CACHE_MAX_ENTRIES};
 use uk_policy::PolicySet;
+
+const DEFAULT_REPLAY_CACHE_WINDOW_SECONDS: u64 = 300;
 
 /// Server TOML configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -60,6 +62,11 @@ impl ServerConfig {
             "max_buffered_bytes_per_flow",
             self.max_buffered_bytes_per_flow(),
         )?;
+        reject_zero_limit(
+            "replay_cache_window_seconds",
+            self.replay_cache_window_seconds(),
+        )?;
+        reject_zero_limit("replay_cache_max_entries", self.replay_cache_max_entries())?;
         Ok(())
     }
 
@@ -126,6 +133,22 @@ impl ServerConfig {
             .and_then(|limits| limits.tcp_half_close_timeout_seconds)
             .unwrap_or(30)
     }
+
+    /// Replay cache retention window in seconds.
+    pub fn replay_cache_window_seconds(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.replay_cache_window_seconds)
+            .unwrap_or(DEFAULT_REPLAY_CACHE_WINDOW_SECONDS)
+    }
+
+    /// Maximum accepted nonce pairs retained by the replay cache.
+    pub fn replay_cache_max_entries(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.replay_cache_max_entries)
+            .unwrap_or(DEFAULT_REPLAY_CACHE_MAX_ENTRIES as u64)
+    }
 }
 
 fn reject_zero_limit(name: &str, value: u64) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -157,6 +180,10 @@ pub struct LimitConfig {
     pub target_connect_timeout_seconds: Option<u64>,
     /// TCP half-close drain timeout in seconds.
     pub tcp_half_close_timeout_seconds: Option<u64>,
+    /// Replay cache retention window in seconds.
+    pub replay_cache_window_seconds: Option<u64>,
+    /// Maximum accepted nonce pairs retained by the replay cache.
+    pub replay_cache_max_entries: Option<u64>,
 }
 
 /// One configured credential.
@@ -332,6 +359,35 @@ tcp_half_close_timeout_seconds = 11
     }
 
     #[test]
+    fn defaults_replay_cache_limits() {
+        assert_eq!(minimal_config().replay_cache_window_seconds(), 300);
+        assert_eq!(
+            minimal_config().replay_cache_max_entries(),
+            DEFAULT_REPLAY_CACHE_MAX_ENTRIES as u64
+        );
+    }
+
+    #[test]
+    fn parses_replay_cache_limits() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+replay_cache_window_seconds = 120
+replay_cache_max_entries = 8192
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.replay_cache_window_seconds(), 120);
+        assert_eq!(config.replay_cache_max_entries(), 8192);
+    }
+
+    #[test]
     fn rejects_unknown_server_config_fields() {
         let result = toml::from_str::<ServerConfig>(
             r#"
@@ -428,6 +484,42 @@ credentials = []
 
 [limits]
 max_buffered_bytes_per_flow = 0
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_replay_cache_window() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+replay_cache_window_seconds = 0
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_replay_cache_entries() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+replay_cache_max_entries = 0
 "#,
         )
         .unwrap();

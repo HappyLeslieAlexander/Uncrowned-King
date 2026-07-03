@@ -213,6 +213,8 @@ max_frame_size = 65536 bytes
 max_pre_auth_bytes = 4096 bytes
 max_target_host_len = 255 bytes
 max_key_id_len = 64 bytes
+replay_cache_window_seconds = 300
+replay_cache_max_entries = 65536 nonce pairs
 ```
 
 Implementations may reduce these limits. They must not silently accept frames above configured limits.

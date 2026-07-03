@@ -45,11 +45,15 @@ idle_timeout_seconds = 300
 max_buffered_bytes_per_flow = 2097152
 handshake_timeout_seconds = 10
 target_connect_timeout_seconds = 10
+tcp_half_close_timeout_seconds = 30
+replay_cache_window_seconds = 300
+replay_cache_max_entries = 65536
 ```
 
 Set `idle_timeout_seconds = 0` to disable the relay session idle timeout.
 Set `handshake_timeout_seconds = 0` to disable the TLS/auth handshake timeout.
 Set `target_connect_timeout_seconds = 0` to disable the server target dial timeout.
+Replay cache limits must be greater than zero.
 
 Client configs may also set `handshake_timeout_seconds = 10` to bound the
 server connection, TLS handshake, authentication exchange, and SETTINGS read.
