@@ -51,6 +51,18 @@ impl ServerConfig {
         Ok(PolicySet::from_toml(&text)?)
     }
 
+    /// Validates configured resource limits.
+    pub fn validate_limits(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        reject_zero_limit("max_pre_auth_bytes", self.max_pre_auth_bytes())?;
+        reject_zero_limit("max_frame_size", self.max_frame_size())?;
+        reject_zero_limit("max_streams", self.max_streams())?;
+        reject_zero_limit(
+            "max_buffered_bytes_per_flow",
+            self.max_buffered_bytes_per_flow(),
+        )?;
+        Ok(())
+    }
+
     /// Configured pre-auth frame limit.
     pub fn max_pre_auth_bytes(&self) -> u64 {
         self.limits
@@ -113,6 +125,14 @@ impl ServerConfig {
             .as_ref()
             .and_then(|limits| limits.tcp_half_close_timeout_seconds)
             .unwrap_or(30)
+    }
+}
+
+fn reject_zero_limit(name: &str, value: u64) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if value == 0 {
+        Err(format!("{name} must be greater than zero").into())
+    } else {
+        Ok(())
     }
 }
 
@@ -217,6 +237,11 @@ idle_timeout_seconds = 42
     #[test]
     fn defaults_buffered_bytes_per_flow_limit() {
         assert_eq!(minimal_config().max_buffered_bytes_per_flow(), 2_097_152);
+    }
+
+    #[test]
+    fn accepts_default_limits() {
+        assert!(minimal_config().validate_limits().is_ok());
     }
 
     #[test]
@@ -336,6 +361,78 @@ max_streamz = 64
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_zero_pre_auth_limit() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_pre_auth_bytes = 0
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_frame_limit() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_frame_size = 0
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_stream_limit() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_streams = 0
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_buffered_bytes_per_flow_limit() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_buffered_bytes_per_flow = 0
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate_limits().is_err());
     }
 
     #[test]

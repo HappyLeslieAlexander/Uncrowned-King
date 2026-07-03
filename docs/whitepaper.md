@@ -376,6 +376,9 @@ max_buffered_bytes_per_flow
 max_outbound_dials_per_session
 ```
 
+Capacity limits must be greater than zero. Timeout fields may use zero only
+when the implementation explicitly documents zero as disabling that timeout.
+
 When limits are exceeded, the server returns `RESOURCE_LIMIT` or closes the offending flow.
 
 ## 13. Performance Requirements

@@ -52,6 +52,7 @@ async fn main() -> Result<(), AnyError> {
 }
 
 async fn run(config: ServerConfig) -> Result<(), AnyError> {
+    config.validate_limits()?;
     let credentials = Arc::new(config.credentials()?);
     let policy_set = Arc::new(config.policy_set()?);
     let replay_cache = Arc::new(Mutex::new(ReplayCache::default()));
@@ -81,6 +82,7 @@ async fn run(config: ServerConfig) -> Result<(), AnyError> {
 }
 
 fn check_config(config: &ServerConfig) -> Result<(), AnyError> {
+    config.validate_limits()?;
     let _credentials = config.credentials()?;
     let _policy_set = config.policy_set()?;
     let _tls_config = tls::server_config(&config.cert_path, &config.key_path)?;
