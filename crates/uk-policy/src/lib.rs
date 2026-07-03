@@ -173,11 +173,10 @@ impl PolicyRule {
         }) {
             return false;
         }
-        if self.private.is_some_and(|want_private| {
-            !target_ips(context.target, context.resolved_ips)
-                .into_iter()
-                .any(|ip| is_private(ip) == want_private)
-        }) {
+        if self
+            .private
+            .is_some_and(|want_private| !private_matches(context, want_private))
+        {
             return false;
         }
         true
@@ -378,6 +377,18 @@ fn target_or_resolution_contains_metadata_ip(target: &Target, resolved_ips: &[Ip
         .any(|ip| ip == IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)))
 }
 
+fn private_matches(context: &PolicyContext<'_>, want_private: bool) -> bool {
+    let ips = target_ips(context.target, context.resolved_ips);
+    if ips.is_empty() {
+        return false;
+    }
+    if want_private {
+        ips.into_iter().any(is_private)
+    } else {
+        ips.into_iter().all(|ip| !is_private(ip))
+    }
+}
+
 fn is_private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
@@ -515,6 +526,40 @@ mod tests {
         let target = Target::Ipv4(Ipv4Addr::new(10, 0, 0, 1), 22);
         assert_eq!(
             policy.evaluate(&context(&target, Some("default"), &[])),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn private_true_matches_any_private_resolution() {
+        let mut rule = PolicyRule::new(PolicyDecision::Deny);
+        rule.private = Some(true);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Domain("mixed.example".to_owned(), 443);
+        let resolved = [
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        ];
+
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &resolved)),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn private_false_requires_all_public_resolution() {
+        let mut rule = PolicyRule::new(PolicyDecision::Allow);
+        rule.private = Some(false);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Domain("mixed.example".to_owned(), 443);
+        let resolved = [
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        ];
+
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &resolved)),
             PolicyDecision::Deny
         );
     }

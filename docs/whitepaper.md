@@ -276,6 +276,8 @@ Domain predicates must not be empty or contain ASCII control characters.
 Policy `key_id` predicates use the same `1..=64` byte bound as authentication
 key identifiers. Policy group predicates must not be empty or contain ASCII
 control characters.
+For private-address predicates, `private=true` matches when any candidate IP is
+private, while `private=false` matches only when every candidate IP is public.
 
 Policy actions must be explicit `allow` or `deny`; unknown action strings are
 configuration errors.
