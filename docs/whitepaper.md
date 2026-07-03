@@ -552,6 +552,7 @@ protocol_revision
 ```
 
 Peers must fail the session when `protocol_revision` is missing or unsupported.
+Advertised `max_frame_size` and `max_streams` values must be greater than zero.
 
 ## 19. Minimum Viable Implementation
 

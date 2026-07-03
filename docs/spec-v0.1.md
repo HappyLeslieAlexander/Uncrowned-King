@@ -204,6 +204,8 @@ trailing bytes after the declared setting pairs.
 
 Peers must send `protocol_revision = 1` in v0.1 SETTINGS. A peer that receives a
 missing or unsupported protocol revision must fail the session.
+If `max_frame_size` or `max_streams` is present, the value must be greater than
+zero.
 
 ## 7. Error Codes
 

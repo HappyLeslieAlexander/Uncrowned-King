@@ -72,10 +72,26 @@ async fn connect_authenticated_inner(
 }
 
 fn validate_server_settings(settings: &Settings) -> Result<(), AnyError> {
-    match settings.get(SettingKey::ProtocolRevision) {
-        Some(1) => Ok(()),
-        Some(revision) => Err(format!("unsupported protocol revision {revision}").into()),
-        None => Err("missing protocol revision".into()),
+    let Some(revision) = settings.get(SettingKey::ProtocolRevision) else {
+        return Err("missing protocol revision".into());
+    };
+    if revision != 1 {
+        return Err(format!("unsupported protocol revision {revision}").into());
+    }
+    reject_zero_setting(settings, SettingKey::MaxFrameSize, "max_frame_size")?;
+    reject_zero_setting(settings, SettingKey::MaxStreams, "max_streams")?;
+    Ok(())
+}
+
+fn reject_zero_setting(
+    settings: &Settings,
+    key: SettingKey,
+    name: &'static str,
+) -> Result<(), AnyError> {
+    if settings.get(key) == Some(0) {
+        Err(format!("{name} must be greater than zero").into())
+    } else {
+        Ok(())
     }
 }
 
@@ -106,6 +122,24 @@ mod tests {
     fn rejects_unsupported_protocol_revision() {
         let mut settings = Settings::default();
         settings.set(SettingKey::ProtocolRevision, 2);
+
+        assert!(validate_server_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_max_frame_size() {
+        let mut settings = Settings::default();
+        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::MaxFrameSize, 0);
+
+        assert!(validate_server_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_max_streams() {
+        let mut settings = Settings::default();
+        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::MaxStreams, 0);
 
         assert!(validate_server_settings(&settings).is_err());
     }
