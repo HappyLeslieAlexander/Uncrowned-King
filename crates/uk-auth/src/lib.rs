@@ -22,6 +22,8 @@ pub const MAX_KEY_ID_LEN: usize = 64;
 /// Minimum accepted shared secret length in bytes.
 pub const MIN_SECRET_LEN: usize = 32;
 const MIN_RESPONSE_TAIL_LEN: usize = 73;
+/// Default replay cache retention window in seconds.
+pub const DEFAULT_REPLAY_CACHE_WINDOW_SECONDS: u64 = 300;
 /// Default maximum accepted nonce pairs retained by the replay cache.
 pub const DEFAULT_REPLAY_CACHE_MAX_ENTRIES: usize = 65_536;
 
@@ -347,7 +349,7 @@ impl ReplayCache {
 
 impl Default for ReplayCache {
     fn default() -> Self {
-        Self::new(Duration::from_secs(300))
+        Self::new(Duration::from_secs(DEFAULT_REPLAY_CACHE_WINDOW_SECONDS))
     }
 }
 

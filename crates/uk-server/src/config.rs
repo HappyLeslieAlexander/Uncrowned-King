@@ -3,10 +3,11 @@
 use std::{error::Error, fs, path::Path};
 
 use serde::Deserialize;
-use uk_auth::{AuthError, Credential, CredentialStatus, DEFAULT_REPLAY_CACHE_MAX_ENTRIES};
+use uk_auth::{
+    AuthError, Credential, CredentialStatus, DEFAULT_REPLAY_CACHE_MAX_ENTRIES,
+    DEFAULT_REPLAY_CACHE_WINDOW_SECONDS,
+};
 use uk_policy::PolicySet;
-
-const DEFAULT_REPLAY_CACHE_WINDOW_SECONDS: u64 = 300;
 
 /// Server TOML configuration.
 #[derive(Debug, Clone, Deserialize)]
