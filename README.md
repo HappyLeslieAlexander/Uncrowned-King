@@ -34,13 +34,17 @@ port_end = 443
 ```
 
 Server limits can advertise and enforce the maximum frame size and concurrent
-TCP streams per authenticated session:
+TCP streams per authenticated session, plus the authenticated session idle
+timeout:
 
 ```toml
 [limits]
 max_frame_size = 65536
 max_streams = 64
+idle_timeout_seconds = 300
 ```
+
+Set `idle_timeout_seconds = 0` to disable the relay session idle timeout.
 
 ## Repository Layout
 

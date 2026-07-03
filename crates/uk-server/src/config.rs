@@ -73,6 +73,14 @@ impl ServerConfig {
             .and_then(|limits| limits.max_streams)
             .unwrap_or(64)
     }
+
+    /// Configured idle timeout in seconds. Zero disables idle timeout.
+    pub fn idle_timeout_seconds(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.idle_timeout_seconds)
+            .unwrap_or(300)
+    }
 }
 
 /// Server resource limits.
@@ -85,6 +93,8 @@ pub struct LimitConfig {
     pub max_frame_size: Option<u64>,
     /// Maximum concurrent TCP streams per authenticated session.
     pub max_streams: Option<u64>,
+    /// Idle timeout for authenticated relay sessions in seconds.
+    pub idle_timeout_seconds: Option<u64>,
 }
 
 /// One configured credential.
@@ -120,5 +130,45 @@ impl CredentialConfig {
         credential.not_after = self.not_after;
         credential.policy_group.clone_from(&self.policy_group);
         Ok(credential)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_config() -> ServerConfig {
+        ServerConfig {
+            listen: "127.0.0.1:0".to_owned(),
+            cert_path: "cert.pem".to_owned(),
+            key_path: "key.pem".to_owned(),
+            auth_skew_seconds: None,
+            limits: None,
+            policy_path: None,
+            credentials: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn defaults_idle_timeout() {
+        assert_eq!(minimal_config().idle_timeout_seconds(), 300);
+    }
+
+    #[test]
+    fn parses_idle_timeout_limit() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+idle_timeout_seconds = 42
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.idle_timeout_seconds(), 42);
     }
 }

@@ -116,6 +116,10 @@ async fn handle_connection(
     settings.set(SettingKey::ProtocolRevision, 1);
     settings.set(SettingKey::MaxFrameSize, config.max_frame_size());
     settings.set(SettingKey::MaxStreams, config.max_streams());
+    settings.set(
+        SettingKey::IdleTimeoutSeconds,
+        config.idle_timeout_seconds(),
+    );
     let mut settings_payload = BytesMut::new();
     settings.encode(&mut settings_payload)?;
     let settings_frame = Frame::new(FrameType::Settings, 0, 0, settings_payload.freeze())?;
@@ -129,6 +133,11 @@ async fn handle_connection(
             max_frame_size: config.max_frame_size(),
         },
         config.max_streams(),
+        idle_timeout(config.idle_timeout_seconds()),
     )
     .await
+}
+
+fn idle_timeout(seconds: u64) -> Option<Duration> {
+    (seconds != 0).then(|| Duration::from_secs(seconds))
 }

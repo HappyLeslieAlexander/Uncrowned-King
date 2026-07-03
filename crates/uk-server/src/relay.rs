@@ -6,6 +6,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
 use bytes::{Bytes, BytesMut};
@@ -48,6 +49,13 @@ enum OpenFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FlowEvent {
     TargetClosed(u64),
+    TargetActivity,
+}
+
+enum SessionEvent {
+    Flow(Option<FlowEvent>),
+    Frame(Frame),
+    IdleTimeout,
 }
 
 #[derive(Debug)]
@@ -62,6 +70,7 @@ pub(crate) async fn relay_session(
     policy_set: Arc<PolicySet>,
     limits: FrameLimits,
     max_streams: u64,
+    idle_timeout: Option<Duration>,
 ) -> Result<(), AnyError> {
     let mut state = ServerSessionState::Authenticated;
     transition(&mut state, ServerSessionState::Relaying);
@@ -72,16 +81,14 @@ pub(crate) async fn relay_session(
     let mut target_writers = FlowTable::new();
 
     loop {
-        tokio::select! {
-            event = event_rx.recv() => {
-                if let Some(FlowEvent::TargetClosed(flow_id)) = event
-                    && target_writers.remove(&flow_id).is_some()
-                {
+        match next_session_event(&mut carrier_reader, &mut event_rx, limits, idle_timeout).await? {
+            SessionEvent::Flow(Some(FlowEvent::TargetClosed(flow_id))) => {
+                if target_writers.remove(&flow_id).is_some() {
                     info!(event = "tcp.closed", flow_id);
                 }
             }
-            frame = read_frame(&mut carrier_reader, limits) => {
-                let frame = frame?;
+            SessionEvent::Flow(Some(FlowEvent::TargetActivity) | None) => {}
+            SessionEvent::Frame(frame) => {
                 handle_session_frame(
                     frame,
                     &credential,
@@ -90,8 +97,33 @@ pub(crate) async fn relay_session(
                     &event_tx,
                     &mut target_writers,
                     max_streams,
-                ).await?;
+                )
+                .await?;
             }
+            SessionEvent::IdleTimeout => {
+                info!(event = "server.session.idle_timeout");
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn next_session_event(
+    carrier_reader: &mut tokio::io::ReadHalf<TlsStream<TcpStream>>,
+    event_rx: &mut mpsc::UnboundedReceiver<FlowEvent>,
+    limits: FrameLimits,
+    idle_timeout: Option<Duration>,
+) -> Result<SessionEvent, AnyError> {
+    if let Some(idle_timeout) = idle_timeout {
+        tokio::select! {
+            event = event_rx.recv() => Ok(SessionEvent::Flow(event)),
+            frame = read_frame(carrier_reader, limits) => Ok(SessionEvent::Frame(frame?)),
+            () = tokio::time::sleep(idle_timeout) => Ok(SessionEvent::IdleTimeout),
+        }
+    } else {
+        tokio::select! {
+            event = event_rx.recv() => Ok(SessionEvent::Flow(event)),
+            frame = read_frame(carrier_reader, limits) => Ok(SessionEvent::Frame(frame?)),
         }
     }
 }
@@ -228,7 +260,9 @@ fn spawn_target_reader(
     event_tx: mpsc::UnboundedSender<FlowEvent>,
 ) {
     tokio::spawn(async move {
-        if let Err(err) = relay_target_to_client(flow_id, target_reader, &carrier_writer).await {
+        if let Err(err) =
+            relay_target_to_client(flow_id, target_reader, &carrier_writer, &event_tx).await
+        {
             warn!(event = "tcp.target.read.error", flow_id, error = %err);
             let _ = send_error(&carrier_writer, flow_id, ErrorCode::TargetUnavailable).await;
             let _ = send_tcp_close(&carrier_writer, flow_id, TCP_CLOSE_ERROR).await;
@@ -274,6 +308,7 @@ async fn relay_target_to_client(
     flow_id: u64,
     mut target_reader: OwnedReadHalf,
     carrier_writer: &CarrierWriter,
+    event_tx: &mpsc::UnboundedSender<FlowEvent>,
 ) -> Result<(), AnyError> {
     let mut target_buf = Box::new([0_u8; RELAY_BUFFER_SIZE]);
     loop {
@@ -288,6 +323,7 @@ async fn relay_target_to_client(
             Bytes::copy_from_slice(&target_buf[..read]),
         )
         .await?;
+        let _ = event_tx.send(FlowEvent::TargetActivity);
     }
 }
 
