@@ -51,6 +51,11 @@ struct ClientSession {
     next_flow_id: AtomicU64,
 }
 
+struct ClientSessionManager {
+    config: ClientConfig,
+    current: Mutex<Option<Arc<ClientSession>>>,
+}
+
 struct ClientFlow {
     id: u64,
     frames: mpsc::Receiver<Frame>,
@@ -66,18 +71,74 @@ pub(crate) async fn run_socks5_listener(
     config: ClientConfig,
     listen: String,
 ) -> Result<(), AnyError> {
-    let session = ClientSession::connect(&config).await?;
+    let sessions = Arc::new(ClientSessionManager::new(config));
     let listener = TcpListener::bind(&listen).await?;
     info!(event = "socks5.listen", listen = %listen);
 
     loop {
         let (local, peer) = listener.accept().await?;
-        let session = Arc::clone(&session);
+        let sessions = Arc::clone(&sessions);
         tokio::spawn(async move {
-            if let Err(err) = handle_socks_connection(local, session).await {
+            if let Err(err) = handle_socks_connection(local, sessions).await {
                 warn!(event = "socks5.connection.error", peer = %peer, error = %err);
             }
         });
+    }
+}
+
+impl ClientSessionManager {
+    fn new(config: ClientConfig) -> Self {
+        Self {
+            config,
+            current: Mutex::new(None),
+        }
+    }
+
+    async fn open_flow(&self, target: Target) -> Result<OpenOutcome, AnyError> {
+        let mut last_error = None;
+        for attempt in 0..2 {
+            let session = self.current_session().await?;
+            match session.open_flow(target.clone()).await {
+                Ok(outcome) => return Ok(outcome),
+                Err(err) => {
+                    warn!(
+                        event = "client.session.open.error",
+                        attempt,
+                        error = %err
+                    );
+                    self.invalidate(&session).await;
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| "failed to open uk flow".into()))
+    }
+
+    async fn current_session(&self) -> Result<Arc<ClientSession>, AnyError> {
+        let mut current = self.current.lock().await;
+        if let Some(session) = current.as_ref()
+            && !session.is_closed()
+        {
+            return Ok(Arc::clone(session));
+        }
+
+        *current = None;
+        info!(event = "client.session.connect");
+        let session = ClientSession::connect(&self.config).await?;
+        *current = Some(Arc::clone(&session));
+        Ok(session)
+    }
+
+    async fn invalidate(&self, session: &Arc<ClientSession>) {
+        session.close().await;
+        let mut current = self.current.lock().await;
+        if current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, session))
+        {
+            *current = None;
+        }
     }
 }
 
@@ -97,14 +158,28 @@ impl ClientSession {
         Ok(session)
     }
 
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    async fn close(&self) {
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            self.flows.lock().await.clear();
+            let mut writer = self.writer.lock().await;
+            if let Err(err) = writer.shutdown().await {
+                debug!(event = "client.session.shutdown.error", error = %err);
+            }
+        }
+    }
+
     async fn open_flow(self: &Arc<Self>, target: Target) -> Result<OpenOutcome, AnyError> {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.is_closed() {
             return Err("uk session is closed".into());
         }
         let flow_id = self.allocate_flow_id();
         let (sender, frames) = mpsc::channel(FLOW_FRAME_QUEUE_CAPACITY);
         self.flows.lock().await.insert(flow_id, sender);
-        if self.closed.load(Ordering::SeqCst) {
+        if self.is_closed() {
             self.flows.lock().await.remove(&flow_id);
             return Err("uk session is closed".into());
         }
@@ -161,7 +236,37 @@ impl ClientSession {
         let mut payload = BytesMut::new();
         open.encode(&mut payload)?;
         let frame = Frame::new(FrameType::TcpOpen, 0, flow_id, payload.freeze())?;
-        write_frame_locked(&self.writer, &frame).await
+        self.write_frame(&frame).await
+    }
+
+    async fn send_tcp_data(&self, flow_id: u64, payload: Bytes) -> Result<(), AnyError> {
+        let frame = Frame::new(FrameType::TcpData, 0, flow_id, payload)?;
+        self.write_frame(&frame).await
+    }
+
+    async fn send_tcp_close(&self, flow_id: u64, close_code: u16) -> Result<(), AnyError> {
+        let mut payload = BytesMut::new();
+        TcpClose::new(close_code).encode(&mut payload)?;
+        let frame = Frame::new(FrameType::TcpClose, 0, flow_id, payload.freeze())?;
+        self.write_frame(&frame).await
+    }
+
+    async fn write_pong(&self, request_frame: &Frame) -> Result<(), AnyError> {
+        let pong_frame = Frame::new(
+            FrameType::Pong,
+            0,
+            request_frame.header.id,
+            request_frame.payload.clone(),
+        )?;
+        self.write_frame(&pong_frame).await
+    }
+
+    async fn write_frame(&self, frame: &Frame) -> Result<(), AnyError> {
+        let result = write_frame_locked(&self.writer, frame).await;
+        if result.is_err() {
+            self.close().await;
+        }
+        result
     }
 }
 
@@ -190,8 +295,7 @@ fn spawn_carrier_reader(
 }
 
 async fn close_session(session: &ClientSession) {
-    session.closed.store(true, Ordering::SeqCst);
-    session.flows.lock().await.clear();
+    session.close().await;
 }
 
 async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(), AnyError> {
@@ -210,7 +314,7 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
             }
             Ok(())
         }
-        FrameType::Ping => write_pong(&session.writer, &frame).await,
+        FrameType::Ping => session.write_pong(&frame).await,
         FrameType::Pong => Ok(()),
         _ => Err("unexpected frame on client session".into()),
     }
@@ -218,13 +322,13 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
 
 async fn handle_socks_connection(
     mut local: TcpStream,
-    session: Arc<ClientSession>,
+    sessions: Arc<ClientSessionManager>,
 ) -> Result<(), AnyError> {
     let mut state = ClientConnectionState::NegotiatingSocks;
     let target = socks5::negotiate_connect(&mut local).await?;
 
     transition(&mut state, ClientConnectionState::Opening);
-    let flow = match session.open_flow(target).await {
+    let flow = match sessions.open_flow(target).await {
         Ok(OpenOutcome::Open(flow)) => flow,
         Ok(OpenOutcome::Rejected(reply)) => {
             socks5::send_reply(&mut local, reply).await?;
@@ -258,11 +362,11 @@ async fn relay_tcp(mut local: TcpStream, mut flow: ClientFlow) -> Result<(), Any
             read = local.read(local_buf.as_mut()), if local_to_remote_open => {
                 let read = read?;
                 if read == 0 {
-                    send_tcp_close(&flow.session.writer, flow.id, TCP_CLOSE_NORMAL).await?;
+                    flow.session.send_tcp_close(flow.id, TCP_CLOSE_NORMAL).await?;
                     local_to_remote_open = false;
                 } else {
-                    send_tcp_data(
-                        &flow.session.writer,
+                    flow.session
+                        .send_tcp_data(
                         flow.id,
                         Bytes::copy_from_slice(&local_buf[..read]),
                     )
@@ -325,36 +429,6 @@ fn map_error_payload(mut payload: Bytes) -> Result<socks5::Reply, AnyError> {
         | ErrorCode::AuthFailed => socks5::Reply::GeneralFailure,
     };
     Ok(reply)
-}
-
-async fn send_tcp_data(
-    writer: &CarrierWriter,
-    flow_id: u64,
-    payload: Bytes,
-) -> Result<(), AnyError> {
-    let frame = Frame::new(FrameType::TcpData, 0, flow_id, payload)?;
-    write_frame_locked(writer, &frame).await
-}
-
-async fn send_tcp_close(
-    writer: &CarrierWriter,
-    flow_id: u64,
-    close_code: u16,
-) -> Result<(), AnyError> {
-    let mut payload = BytesMut::new();
-    TcpClose::new(close_code).encode(&mut payload)?;
-    let frame = Frame::new(FrameType::TcpClose, 0, flow_id, payload.freeze())?;
-    write_frame_locked(writer, &frame).await
-}
-
-async fn write_pong(writer: &CarrierWriter, request_frame: &Frame) -> Result<(), AnyError> {
-    let pong_frame = Frame::new(
-        FrameType::Pong,
-        0,
-        request_frame.header.id,
-        request_frame.payload.clone(),
-    )?;
-    write_frame_locked(writer, &pong_frame).await
 }
 
 async fn write_frame_locked(writer: &CarrierWriter, frame: &Frame) -> Result<(), AnyError> {
