@@ -5,6 +5,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -75,6 +76,9 @@ const SOCKS_REPLY_NOT_ALLOWED: u8 = 0x02;
 const SOCKS_REPLY_HOST_UNREACHABLE: u8 = 0x04;
 const HALF_CLOSE_REQUEST: &[u8] = b"uncrowned king half-close request";
 const HALF_CLOSE_RESPONSE: &[u8] = b"uncrowned king half-close response";
+const TARGET_HALF_CLOSE_GREETING: &[u8] = b"uncrowned king target half-close greeting";
+const TARGET_HALF_CLOSE_LATE_REQUEST: &[u8] = b"uncrowned king target half-close late request";
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -101,6 +105,11 @@ async fn relays_domain_socks_target_to_echo_target() -> Result<(), TestError> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preserves_client_half_close_until_target_response() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_half_close_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preserves_client_writes_after_target_half_close() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_target_half_close_e2e()).await?
 }
 
 async fn run_tcp_relay_e2e() -> Result<(), TestError> {
@@ -152,6 +161,30 @@ async fn run_half_close_e2e() -> Result<(), TestError> {
 
     let target_received = target_task.await??;
     assert_eq!(target_received, HALF_CLOSE_REQUEST);
+    Ok(())
+}
+
+async fn run_target_half_close_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, target_task) =
+        spawn_write_shutdown_then_read_target(TARGET_HALF_CLOSE_GREETING).await?;
+    let harness = RelayHarness::start(Some(allow_loopback_policy(target_addr.port()))).await?;
+
+    let (mut socks, connect_reply) = open_socks_connect(harness.socks_addr, target_addr).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    let mut greeting = vec![0_u8; TARGET_HALF_CLOSE_GREETING.len()];
+    socks.read_exact(&mut greeting).await?;
+    assert_eq!(greeting, TARGET_HALF_CLOSE_GREETING);
+    let mut eof = [0_u8; 1];
+    assert_eq!(socks.read(&mut eof).await?, 0);
+
+    socks.write_all(TARGET_HALF_CLOSE_LATE_REQUEST).await?;
+    socks.shutdown().await?;
+
+    let target_received = target_task.await??;
+    assert_eq!(target_received, TARGET_HALF_CLOSE_LATE_REQUEST);
     Ok(())
 }
 
@@ -272,6 +305,29 @@ async fn spawn_echo_target()
         let read = stream.read(&mut buf).await?;
         stream.write_all(&buf[..read]).await?;
         Ok(())
+    });
+    Ok((addr, task))
+}
+
+async fn spawn_write_shutdown_then_read_target(
+    greeting: &'static [u8],
+) -> Result<
+    (
+        SocketAddr,
+        tokio::task::JoinHandle<Result<Vec<u8>, TestError>>,
+    ),
+    TestError,
+> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        stream.write_all(greeting).await?;
+        stream.shutdown().await?;
+
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await?;
+        Ok(received)
     });
     Ok((addr, task))
 }
@@ -413,7 +469,8 @@ fn test_limits() -> LimitConfig {
 
 fn create_temp_dir() -> Result<PathBuf, TestError> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let dir = std::env::temp_dir().join(format!("uk-e2e-{}-{now}", process::id()));
+    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("uk-e2e-{}-{now}-{id}", process::id()));
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
