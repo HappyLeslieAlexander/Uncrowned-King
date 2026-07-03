@@ -8,16 +8,22 @@ on:
 
 jobs:
   rust:
-    name: Rust
+    name: Rust (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain:
+          - 1.85.0
+          - stable
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install ${{ matrix.toolchain }} --profile minimal
+          rustup default ${{ matrix.toolchain }}
           rustup component add rustfmt clippy
 
       - name: Format

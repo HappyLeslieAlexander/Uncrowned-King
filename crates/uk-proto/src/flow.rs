@@ -8,12 +8,12 @@ pub const FLOW_ID_STEP: u64 = 2;
 
 /// Returns true when `flow_id` is a valid client-initiated flow id.
 pub const fn is_client_initiated_flow_id(flow_id: u64) -> bool {
-    flow_id != 0 && !flow_id.is_multiple_of(2)
+    flow_id != 0 && flow_id % 2 == 1
 }
 
 /// Returns true when `flow_id` is a valid server-initiated flow id.
 pub const fn is_server_initiated_flow_id(flow_id: u64) -> bool {
-    flow_id != 0 && flow_id.is_multiple_of(2)
+    flow_id != 0 && flow_id % 2 == 0
 }
 
 #[cfg(test)]
