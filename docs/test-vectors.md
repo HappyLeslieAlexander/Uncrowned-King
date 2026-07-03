@@ -86,7 +86,16 @@ Expected HMAC-SHA256 tag:
 5e 57 19 da a9 35 5d c6 03 16 9b 92 76 3d b0 21
 ```
 
-## 6. Error Frame
+## 6. Settings
+
+`SETTINGS` payload with `max_frame_size = 65536`, `max_streams = 64`, and
+`protocol_revision = 1`:
+
+```text
+03 01 80 01 00 00 02 40 40 07 01
+```
+
+## 7. Error Frame
 
 `POLICY_DENIED` payload:
 

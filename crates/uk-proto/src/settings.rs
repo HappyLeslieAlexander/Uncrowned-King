@@ -111,6 +111,23 @@ mod tests {
     }
 
     #[test]
+    fn encodes_settings_vector() {
+        let mut settings = Settings::default();
+        settings.set(SettingKey::MaxFrameSize, 65_536);
+        settings.set(SettingKey::MaxStreams, 64);
+        settings.set(SettingKey::ProtocolRevision, 1);
+
+        let mut out = Vec::new();
+        settings.encode(&mut out).unwrap();
+        assert_eq!(
+            out,
+            [
+                0x03, 0x01, 0x80, 0x01, 0x00, 0x00, 0x02, 0x40, 0x40, 0x07, 0x01
+            ]
+        );
+    }
+
+    #[test]
     fn ignores_unknown_optional_settings() {
         let mut bytes = Bytes::from_static(&[0x02, 0x01, 0x40, 0x80, 0x3f, 0x01]);
         let settings = Settings::decode(&mut bytes).unwrap();
