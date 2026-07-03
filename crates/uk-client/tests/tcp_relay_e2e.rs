@@ -70,6 +70,8 @@ VODOlcdwgEkE3j5MxS0brpI9
 
 const KEY_ID: &str = "e2e-client";
 const SECRET: &str = "0123456789abcdef0123456789abcdef";
+const SOCKS_REPLY_SUCCEEDED: u8 = 0x00;
+const SOCKS_REPLY_NOT_ALLOWED: u8 = 0x02;
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -78,102 +80,112 @@ async fn relays_tcp_through_socks5_to_echo_target() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_tcp_relay_e2e()).await?
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maps_policy_denied_to_socks_not_allowed() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_policy_denied_e2e()).await?
+}
+
 async fn run_tcp_relay_e2e() -> Result<(), TestError> {
     init_tracing();
 
-    let temp_dir = create_temp_dir()?;
-    let cert_path = temp_dir.join("server-cert.pem");
-    let key_path = temp_dir.join("server-key.pem");
-    let policy_path = temp_dir.join("policy.toml");
-    fs::write(&cert_path, CERT_PEM)?;
-    fs::write(&key_path, KEY_PEM)?;
-
     let (target_addr, echo_task) = spawn_echo_target().await?;
-    fs::write(
-        &policy_path,
-        format!(
-            r#"
-            [[rules]]
-            action = "allow"
-            cidr = "127.0.0.1/32"
-            port_start = {}
-            port_end = {}
-            "#,
-            target_addr.port(),
-            target_addr.port()
-        ),
-    )?;
+    let harness = RelayHarness::start(Some(allow_loopback_policy(target_addr.port()))).await?;
 
-    let server_addr = unused_loopback_addr().await?;
-    let socks_addr = unused_loopback_addr().await?;
-    let mut server_task = tokio::spawn(uk_server::run(ServerConfig {
-        listen: server_addr.to_string(),
-        cert_path: path_string(&cert_path),
-        key_path: path_string(&key_path),
-        auth_skew_seconds: Some(30),
-        limits: Some(test_limits()),
-        policy_path: Some(path_string(&policy_path)),
-        credentials: vec![CredentialConfig {
-            key_id: KEY_ID.to_owned(),
-            secret: SECRET.to_owned(),
-            status: Some("active".to_owned()),
-            not_before: None,
-            not_after: None,
-            policy_group: Some("default".to_owned()),
-        }],
-    }));
-    wait_for_listener("uk-server", server_addr, &mut server_task).await?;
-
-    let mut client_task = tokio::spawn(run_socks5_listener(
-        ClientConfig {
-            server_addr: server_addr.to_string(),
-            server_name: "localhost".to_owned(),
-            ca_cert_path: path_string(&cert_path),
-            key_id: KEY_ID.to_owned(),
-            secret: SECRET.to_owned(),
-            handshake_timeout_seconds: Some(3),
-            socks_handshake_timeout_seconds: Some(3),
-            tcp_open_timeout_seconds: Some(3),
-        },
-        socks_addr.to_string(),
-    ));
-    wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
-
-    let mut socks = TcpStream::connect(socks_addr).await?;
-    socks
-        .write_all(&[
-            0x05,
-            0x01,
-            0x00,
-            0x05,
-            0x01,
-            0x00,
-            0x01,
-            127,
-            0,
-            0,
-            1,
-            (target_addr.port() >> 8) as u8,
-            target_addr.port() as u8,
-        ])
-        .await?;
-
-    let mut method_response = [0_u8; 2];
-    socks.read_exact(&mut method_response).await?;
-    assert_eq!(method_response, [0x05, 0x00]);
-    let mut connect_reply = [0_u8; 10];
-    socks.read_exact(&mut connect_reply).await?;
-    assert_eq!(connect_reply[1], 0x00);
+    let (mut socks, connect_reply) = open_socks_connect(harness.socks_addr, target_addr).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
 
     socks.write_all(b"uncrowned king e2e").await?;
     let mut echoed = vec![0_u8; "uncrowned king e2e".len()];
     socks.read_exact(&mut echoed).await?;
     assert_eq!(echoed, b"uncrowned king e2e");
 
-    client_task.abort();
-    server_task.abort();
     echo_task.await??;
     Ok(())
+}
+
+async fn run_policy_denied_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = RelayHarness::start(None).await?;
+    let denied_target = unused_loopback_addr().await?;
+    let (_socks, connect_reply) = open_socks_connect(harness.socks_addr, denied_target).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_NOT_ALLOWED);
+    Ok(())
+}
+
+struct RelayHarness {
+    temp_dir: PathBuf,
+    socks_addr: SocketAddr,
+    server_task: JoinHandle<Result<(), TestError>>,
+    client_task: JoinHandle<Result<(), TestError>>,
+}
+
+impl RelayHarness {
+    async fn start(policy_toml: Option<String>) -> Result<Self, TestError> {
+        let temp_dir = create_temp_dir()?;
+        let cert_path = temp_dir.join("server-cert.pem");
+        let key_path = temp_dir.join("server-key.pem");
+        fs::write(&cert_path, CERT_PEM)?;
+        fs::write(&key_path, KEY_PEM)?;
+
+        let policy_path = if let Some(policy_toml) = policy_toml {
+            let policy_path = temp_dir.join("policy.toml");
+            fs::write(&policy_path, policy_toml)?;
+            Some(policy_path)
+        } else {
+            None
+        };
+
+        let server_addr = unused_loopback_addr().await?;
+        let socks_addr = unused_loopback_addr().await?;
+        let mut server_task = tokio::spawn(uk_server::run(ServerConfig {
+            listen: server_addr.to_string(),
+            cert_path: path_string(&cert_path),
+            key_path: path_string(&key_path),
+            auth_skew_seconds: Some(30),
+            limits: Some(test_limits()),
+            policy_path: policy_path.as_deref().map(path_string),
+            credentials: vec![CredentialConfig {
+                key_id: KEY_ID.to_owned(),
+                secret: SECRET.to_owned(),
+                status: Some("active".to_owned()),
+                not_before: None,
+                not_after: None,
+                policy_group: Some("default".to_owned()),
+            }],
+        }));
+        wait_for_listener("uk-server", server_addr, &mut server_task).await?;
+
+        let mut client_task = tokio::spawn(run_socks5_listener(
+            ClientConfig {
+                server_addr: server_addr.to_string(),
+                server_name: "localhost".to_owned(),
+                ca_cert_path: path_string(&cert_path),
+                key_id: KEY_ID.to_owned(),
+                secret: SECRET.to_owned(),
+                handshake_timeout_seconds: Some(3),
+                socks_handshake_timeout_seconds: Some(3),
+                tcp_open_timeout_seconds: Some(3),
+            },
+            socks_addr.to_string(),
+        ));
+        wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+
+        Ok(Self {
+            temp_dir,
+            socks_addr,
+            server_task,
+            client_task,
+        })
+    }
+}
+
+impl Drop for RelayHarness {
+    fn drop(&mut self) {
+        self.client_task.abort();
+        self.server_task.abort();
+        let _ = fs::remove_dir_all(&self.temp_dir);
+    }
 }
 
 async fn spawn_echo_target()
@@ -212,6 +224,42 @@ async fn wait_for_listener(
     Err(format!("listener did not start at {addr}").into())
 }
 
+async fn open_socks_connect(
+    socks_addr: SocketAddr,
+    target_addr: SocketAddr,
+) -> Result<(TcpStream, [u8; 10]), TestError> {
+    let SocketAddr::V4(target_addr) = target_addr else {
+        return Err("e2e tests only support IPv4 targets".into());
+    };
+    let octets = target_addr.ip().octets();
+    let port = target_addr.port();
+    let mut socks = TcpStream::connect(socks_addr).await?;
+    socks
+        .write_all(&[
+            0x05,
+            0x01,
+            0x00,
+            0x05,
+            0x01,
+            0x00,
+            0x01,
+            octets[0],
+            octets[1],
+            octets[2],
+            octets[3],
+            (port >> 8) as u8,
+            port as u8,
+        ])
+        .await?;
+
+    let mut method_response = [0_u8; 2];
+    socks.read_exact(&mut method_response).await?;
+    assert_eq!(method_response, [0x05, 0x00]);
+    let mut connect_reply = [0_u8; 10];
+    socks.read_exact(&mut connect_reply).await?;
+    Ok((socks, connect_reply))
+}
+
 async fn unused_loopback_addr() -> Result<SocketAddr, TestError> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let addr = listener.local_addr()?;
@@ -237,6 +285,18 @@ fn create_temp_dir() -> Result<PathBuf, TestError> {
     let dir = std::env::temp_dir().join(format!("uk-e2e-{}-{now}", process::id()));
     fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+fn allow_loopback_policy(port: u16) -> String {
+    format!(
+        r#"
+        [[rules]]
+        action = "allow"
+        cidr = "127.0.0.1/32"
+        port_start = {port}
+        port_end = {port}
+        "#
+    )
 }
 
 fn path_string(path: &Path) -> String {
