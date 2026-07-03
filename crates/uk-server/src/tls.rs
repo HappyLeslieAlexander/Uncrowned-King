@@ -48,7 +48,11 @@ fn ensure_alpn(protocol: Option<&[u8]>) -> Result<(), TlsError> {
 fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, TlsError> {
     let mut reader = BufReader::new(File::open(path)?);
     let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
-    Ok(certs)
+    if certs.is_empty() {
+        Err("missing certificate".into())
+    } else {
+        Ok(certs)
+    }
 }
 
 fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>, TlsError> {
@@ -58,6 +62,11 @@ fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>, TlsError> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::*;
 
     #[test]
@@ -73,5 +82,33 @@ mod tests {
     #[test]
     fn rejects_wrong_alpn() {
         assert!(ensure_alpn(Some(b"h2")).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_cert_chain() {
+        let path = temp_file("empty-cert", b"");
+
+        assert!(load_certs(&path).is_err());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_empty_private_key_file() {
+        let path = temp_file("empty-key", b"");
+
+        assert!(load_private_key(&path).is_err());
+
+        let _ = fs::remove_file(path);
+    }
+
+    fn temp_file(name: &str, contents: &[u8]) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("uk-server-tls-{name}-{now}.pem"));
+        fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
     }
 }

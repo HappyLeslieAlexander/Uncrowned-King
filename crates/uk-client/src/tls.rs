@@ -58,11 +58,20 @@ fn ensure_alpn(protocol: Option<&[u8]>) -> Result<(), TlsError> {
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, TlsError> {
     let mut reader = BufReader::new(File::open(path)?);
     let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
-    Ok(certs)
+    if certs.is_empty() {
+        Err("missing certificate".into())
+    } else {
+        Ok(certs)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::*;
 
     #[test]
@@ -78,5 +87,24 @@ mod tests {
     #[test]
     fn rejects_wrong_alpn() {
         assert!(ensure_alpn(Some(b"h2")).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_ca_bundle() {
+        let path = temp_file("empty-ca", b"");
+
+        assert!(load_certs(&path).is_err());
+
+        let _ = fs::remove_file(path);
+    }
+
+    fn temp_file(name: &str, contents: &[u8]) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("uk-client-tls-{name}-{now}.pem"));
+        fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
     }
 }
