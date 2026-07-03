@@ -160,12 +160,11 @@ pub struct CredentialConfig {
 impl CredentialConfig {
     fn to_credential(&self) -> Result<Credential, AuthError> {
         let status_text = self.status.as_deref().unwrap_or("active");
-        let status = if status_text == "active" {
-            CredentialStatus::Active
-        } else if status_text == "retired" {
-            CredentialStatus::Retired
-        } else {
-            CredentialStatus::Disabled
+        let status = match status_text {
+            "active" => CredentialStatus::Active,
+            "disabled" => CredentialStatus::Disabled,
+            "retired" => CredentialStatus::Retired,
+            _ => return Err(AuthError::InvalidCredentialStatus),
         };
         let mut credential = Credential::active(self.key_id.as_bytes(), self.secret.as_bytes())?;
         credential.status = status;
@@ -406,5 +405,47 @@ secret = "too-short"
         .unwrap();
 
         assert_eq!(config.credentials(), Err(AuthError::SecretTooShort));
+    }
+
+    #[test]
+    fn accepts_disabled_credential_status() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+
+[[credentials]]
+key_id = "client"
+secret = "0123456789abcdef0123456789abcdef"
+status = "disabled"
+"#,
+        )
+        .unwrap();
+
+        let credentials = config.credentials().unwrap();
+        assert_eq!(credentials[0].status, CredentialStatus::Disabled);
+    }
+
+    #[test]
+    fn rejects_unknown_credential_status() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+
+[[credentials]]
+key_id = "client"
+secret = "0123456789abcdef0123456789abcdef"
+status = "disabledd"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.credentials(),
+            Err(AuthError::InvalidCredentialStatus)
+        );
     }
 }

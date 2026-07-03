@@ -49,6 +49,9 @@ pub enum AuthError {
     /// Key id length is outside the protocol bounds.
     #[error("key id length must be 1..=64 bytes")]
     InvalidKeyIdLength,
+    /// Credential status text is not recognized.
+    #[error("credential status must be active, disabled, or retired")]
+    InvalidCredentialStatus,
     /// Authentication payload is malformed.
     #[error("invalid auth payload: {0}")]
     InvalidPayload(&'static str),
