@@ -14,7 +14,7 @@ The repository currently focuses on the first runnable v0.1 TCP path:
 - challenge-response HMAC authentication in `uk-auth`
 - minimal policy decisions in `uk-policy`
 - TLS/TCP authenticated server sessions in `uk-server`
-- SOCKS5 CONNECT entry point and TCP relay in `uk-client`
+- SOCKS5 CONNECT entry point and multiplexed TCP relay in `uk-client`
 
 The first runnable proxy target is:
 
