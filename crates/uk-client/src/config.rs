@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 /// Client TOML configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     /// UK server socket address.
     pub server_addr: String,
@@ -100,5 +101,21 @@ socks_handshake_timeout_seconds = 5
         .unwrap();
 
         assert_eq!(config.socks_handshake_timeout_seconds(), 5);
+    }
+
+    #[test]
+    fn rejects_unknown_client_config_fields() {
+        let result = toml::from_str::<ClientConfig>(
+            r#"
+server_addr = "127.0.0.1:443"
+server_name = "localhost"
+ca_cert_path = "ca.pem"
+key_id = "client"
+secret = "secret"
+handshake_timeout_secondz = 4
+"#,
+        );
+
+        assert!(result.is_err());
     }
 }

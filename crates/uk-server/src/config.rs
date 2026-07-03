@@ -8,6 +8,7 @@ use uk_policy::PolicySet;
 
 /// Server TOML configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// TCP listen address.
     pub listen: String,
@@ -110,6 +111,7 @@ impl ServerConfig {
 /// Server resource limits.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(clippy::struct_field_names)]
+#[serde(deny_unknown_fields)]
 pub struct LimitConfig {
     /// Maximum pre-authentication frame payload.
     pub max_pre_auth_bytes: Option<u64>,
@@ -129,6 +131,7 @@ pub struct LimitConfig {
 
 /// One configured credential.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialConfig {
     /// Opaque key id.
     pub key_id: String,
@@ -269,5 +272,55 @@ target_connect_timeout_seconds = 7
         .unwrap();
 
         assert_eq!(config.target_connect_timeout_seconds(), 7);
+    }
+
+    #[test]
+    fn rejects_unknown_server_config_fields() {
+        let result = toml::from_str::<ServerConfig>(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+unknown = true
+credentials = []
+"#,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_limit_fields() {
+        let result = toml::from_str::<ServerConfig>(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_streamz = 64
+"#,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_credential_fields() {
+        let result = toml::from_str::<ServerConfig>(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+
+[[credentials]]
+key_id = "client"
+secret = "secret"
+policy_grop = "default"
+"#,
+        );
+
+        assert!(result.is_err());
     }
 }
