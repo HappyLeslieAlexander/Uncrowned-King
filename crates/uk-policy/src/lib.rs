@@ -220,11 +220,13 @@ impl FromStr for Cidr {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawPolicySet {
     rules: Vec<RawPolicyRule>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawPolicyRule {
     action: String,
     key_id: Option<String>,
@@ -439,5 +441,19 @@ mod tests {
             policy.evaluate(&context(&target, Some("ops"), &resolved)),
             PolicyDecision::Allow
         );
+    }
+
+    #[test]
+    fn rejects_unknown_policy_fields() {
+        let err = PolicySet::from_toml(
+            r#"
+            [[rules]]
+            action = "allow"
+            domainn = "example.com"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, PolicyError::InvalidToml(_)));
     }
 }
