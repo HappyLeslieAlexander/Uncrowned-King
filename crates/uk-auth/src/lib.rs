@@ -21,6 +21,7 @@ pub const EXPORTER_LABEL: &[u8] = b"EXPORTER-UK-v1";
 pub const MAX_KEY_ID_LEN: usize = 64;
 /// Minimum accepted shared secret length in bytes.
 pub const MIN_SECRET_LEN: usize = 32;
+const MIN_RESPONSE_TAIL_LEN: usize = 73;
 
 /// Authentication result alias.
 pub type AuthResult<T> = Result<T, AuthError>;
@@ -255,7 +256,7 @@ impl AuthResponse {
     pub fn decode(src: &mut impl Buf) -> AuthResult<Self> {
         let key_id = read_varbytes(src, "key id")?;
         validate_key_id(&key_id)?;
-        if src.remaining() < 72 {
+        if src.remaining() < MIN_RESPONSE_TAIL_LEN {
             return Err(AuthError::InvalidPayload("response is truncated"));
         }
         let mut client_nonce = [0_u8; 32];
@@ -547,6 +548,48 @@ mod tests {
         response.encode(&mut out).unwrap();
         let mut bytes = bytes::Bytes::from(out);
         assert_eq!(AuthResponse::decode(&mut bytes).unwrap(), response);
+    }
+
+    #[test]
+    fn rejects_truncated_empty_capability_response() {
+        let (credential, _, _, response) = fixture();
+        let response = AuthResponse {
+            key_id: credential.key_id,
+            client_nonce: response.client_nonce,
+            client_time: response.client_time,
+            client_capabilities: Vec::new(),
+            tag: response.tag,
+        };
+        let mut out = Vec::new();
+        response.encode(&mut out).unwrap();
+        out.pop();
+        let mut bytes = bytes::Bytes::from(out);
+
+        assert_eq!(
+            AuthResponse::decode(&mut bytes),
+            Err(AuthError::InvalidPayload("response is truncated"))
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_response_bytes() {
+        let (credential, _, _, response) = fixture();
+        let response = AuthResponse {
+            key_id: credential.key_id,
+            client_nonce: response.client_nonce,
+            client_time: response.client_time,
+            client_capabilities: Vec::new(),
+            tag: response.tag,
+        };
+        let mut out = Vec::new();
+        response.encode(&mut out).unwrap();
+        out.push(0);
+        let mut bytes = bytes::Bytes::from(out);
+
+        assert_eq!(
+            AuthResponse::decode(&mut bytes),
+            Err(AuthError::InvalidPayload("invalid tag length"))
+        );
     }
 
     #[test]
