@@ -64,6 +64,7 @@ impl TcpClose {
 
     /// Encodes this payload into `dst`.
     pub fn encode(&self, dst: &mut impl BufMut) -> ProtocolResult<()> {
+        validate_close_code(self.close_code)?;
         dst.put_u16(self.close_code);
         Ok(())
     }
@@ -75,9 +76,16 @@ impl TcpClose {
                 "tcp close must contain one close code",
             ));
         }
-        Ok(Self {
-            close_code: src.get_u16(),
-        })
+        let close_code = src.get_u16();
+        validate_close_code(close_code)?;
+        Ok(Self { close_code })
+    }
+}
+
+fn validate_close_code(close_code: u16) -> ProtocolResult<()> {
+    match close_code {
+        TCP_CLOSE_NORMAL | TCP_CLOSE_ERROR => Ok(()),
+        _ => Err(ProtocolError::InvalidTcpPayload("unknown tcp close code")),
     }
 }
 
@@ -115,6 +123,25 @@ mod tests {
         assert_eq!(
             TcpOpen::decode(&mut bytes),
             Err(ProtocolError::InvalidTcpPayload("trailing tcp open bytes"))
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_tcp_close_code() {
+        let mut bytes = Bytes::from_static(&[0x00, 0x02]);
+        assert_eq!(
+            TcpClose::decode(&mut bytes),
+            Err(ProtocolError::InvalidTcpPayload("unknown tcp close code"))
+        );
+    }
+
+    #[test]
+    fn rejects_encoding_unknown_tcp_close_code() {
+        let close = TcpClose::new(2);
+        let mut out = Vec::new();
+        assert_eq!(
+            close.encode(&mut out),
+            Err(ProtocolError::InvalidTcpPayload("unknown tcp close code"))
         );
     }
 }

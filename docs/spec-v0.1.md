@@ -124,6 +124,8 @@ Known close codes:
 | `0` | normal close |
 | `1` | generic error |
 
+Decoders must reject unknown close codes.
+
 ## 5. Authentication Payloads
 
 The carrier supplies a 32-byte TLS/QUIC exporter binding. Until carriers are
