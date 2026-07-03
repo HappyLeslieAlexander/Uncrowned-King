@@ -202,6 +202,9 @@ Unknown optional settings may be ignored. Required setting semantics will be
 added after v0.1. Decoders must reject duplicate known setting keys and
 trailing bytes after the declared setting pairs.
 
+Peers must send `protocol_revision = 1` in v0.1 SETTINGS. A peer that receives a
+missing or unsupported protocol revision must fail the session.
+
 ## 7. Error Codes
 
 `ERROR`, `POLICY_DENIED`, and `RESOURCE_LIMIT` payloads carry one coarse code:

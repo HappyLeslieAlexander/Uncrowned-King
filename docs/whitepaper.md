@@ -551,6 +551,8 @@ idle_timeout
 protocol_revision
 ```
 
+Peers must fail the session when `protocol_revision` is missing or unsupported.
+
 ## 19. Minimum Viable Implementation
 
 UK v1 should implement:

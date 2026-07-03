@@ -7,7 +7,7 @@ use tokio::{net::TcpStream, time};
 use tokio_rustls::client::TlsStream;
 use tracing::info;
 use uk_auth::{AuthChallenge, AuthResponse, unix_now};
-use uk_proto::{Frame, FrameLimits, FrameType, Settings, read_frame, write_frame};
+use uk_proto::{Frame, FrameLimits, FrameType, SettingKey, Settings, read_frame, write_frame};
 
 use crate::{config::ClientConfig, tls};
 
@@ -63,13 +63,50 @@ async fn connect_authenticated_inner(
     }
     let mut settings_payload = settings_frame.payload;
     let settings = Settings::decode(&mut settings_payload)?;
+    validate_server_settings(&settings)?;
     info!(
         event = "auth.success",
-        max_frame_size = ?settings.get(uk_proto::SettingKey::MaxFrameSize)
+        max_frame_size = ?settings.get(SettingKey::MaxFrameSize)
     );
     Ok((stream, settings))
 }
 
+fn validate_server_settings(settings: &Settings) -> Result<(), AnyError> {
+    match settings.get(SettingKey::ProtocolRevision) {
+        Some(1) => Ok(()),
+        Some(revision) => Err(format!("unsupported protocol revision {revision}").into()),
+        None => Err("missing protocol revision".into()),
+    }
+}
+
 fn handshake_timeout(seconds: u64) -> Option<Duration> {
     (seconds != 0).then(|| Duration::from_secs(seconds))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_supported_protocol_revision() {
+        let mut settings = Settings::default();
+        settings.set(SettingKey::ProtocolRevision, 1);
+
+        assert!(validate_server_settings(&settings).is_ok());
+    }
+
+    #[test]
+    fn rejects_missing_protocol_revision() {
+        let settings = Settings::default();
+
+        assert!(validate_server_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn rejects_unsupported_protocol_revision() {
+        let mut settings = Settings::default();
+        settings.set(SettingKey::ProtocolRevision, 2);
+
+        assert!(validate_server_settings(&settings).is_err());
+    }
 }
