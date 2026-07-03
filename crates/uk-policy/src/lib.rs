@@ -8,6 +8,7 @@ use std::{
 
 use serde::Deserialize;
 use thiserror::Error;
+use uk_auth::validate_key_id;
 use uk_proto::Target;
 
 /// Policy result alias.
@@ -28,6 +29,12 @@ pub enum PolicyError {
     /// Invalid domain predicate.
     #[error("invalid policy domain {0}")]
     InvalidDomain(String),
+    /// Invalid key id predicate.
+    #[error("invalid policy key id {0}")]
+    InvalidKeyId(String),
+    /// Invalid policy group predicate.
+    #[error("invalid policy group {0}")]
+    InvalidPolicyGroup(String),
     /// TOML parse failure.
     #[error("invalid policy toml: {0}")]
     InvalidToml(String),
@@ -274,8 +281,11 @@ impl TryFrom<RawPolicyRule> for PolicyRule {
         };
         Ok(Self {
             action,
-            key_id: raw.key_id.map(String::into_bytes),
-            policy_group: raw.policy_group,
+            key_id: raw.key_id.map(validate_key_id_match).transpose()?,
+            policy_group: raw
+                .policy_group
+                .map(validate_policy_group_match)
+                .transpose()?,
             domain: raw.domain.map(validate_domain_match).transpose()?,
             domain_suffix: raw
                 .domain_suffix
@@ -292,6 +302,19 @@ fn target_domain(target: &Target) -> Option<&str> {
     match target {
         Target::Domain(domain, _) => Some(domain),
         Target::Ipv4(_, _) | Target::Ipv6(_, _) => None,
+    }
+}
+
+fn validate_key_id_match(key_id: String) -> PolicyResult<Vec<u8>> {
+    validate_key_id(key_id.as_bytes()).map_err(|_| PolicyError::InvalidKeyId(key_id.clone()))?;
+    Ok(key_id.into_bytes())
+}
+
+fn validate_policy_group_match(group: String) -> PolicyResult<String> {
+    if group.is_empty() || group.bytes().any(|byte| byte.is_ascii_control()) {
+        Err(PolicyError::InvalidPolicyGroup(group))
+    } else {
+        Ok(group)
     }
 }
 
@@ -581,6 +604,63 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err, PolicyError::InvalidAction("alow".to_owned()));
+    }
+
+    #[test]
+    fn rejects_empty_policy_key_id() {
+        let err = PolicySet::from_toml(
+            r#"
+            [[rules]]
+            action = "allow"
+            key_id = ""
+            "#,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, PolicyError::InvalidKeyId(String::new()));
+    }
+
+    #[test]
+    fn rejects_long_policy_key_id() {
+        let err = PolicySet::from_toml(&format!(
+            r#"
+            [[rules]]
+            action = "allow"
+            key_id = "{}"
+            "#,
+            "k".repeat(65)
+        ))
+        .unwrap_err();
+
+        assert_eq!(err, PolicyError::InvalidKeyId("k".repeat(65)));
+    }
+
+    #[test]
+    fn rejects_empty_policy_group() {
+        let err = PolicySet::from_toml(
+            r#"
+            [[rules]]
+            action = "allow"
+            policy_group = ""
+            "#,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, PolicyError::InvalidPolicyGroup(String::new()));
+    }
+
+    #[test]
+    fn rejects_control_character_policy_group() {
+        let err = PolicySet::from_toml(
+            r#"
+            [[rules]]
+            action = "allow"
+            policy_group = "ops\nprod"
+            "#,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, PolicyError::InvalidPolicyGroup("ops\nprod".to_owned()));
     }
 
     #[test]

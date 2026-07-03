@@ -272,6 +272,9 @@ Domain suffix matches are DNS label-boundary matches. For example,
 `badexample.com`.
 
 Domain predicates must not be empty or contain ASCII control characters.
+Policy `key_id` predicates use the same `1..=64` byte bound as authentication
+key identifiers. Policy group predicates must not be empty or contain ASCII
+control characters.
 
 Policy actions must be explicit `allow` or `deny`; unknown action strings are
 configuration errors.

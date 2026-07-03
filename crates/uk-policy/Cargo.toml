@@ -10,8 +10,8 @@ repository.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+uk-auth = { path = "../uk-auth" }
 uk-proto = { path = "../uk-proto" }
 
 [lints]
 workspace = true
-

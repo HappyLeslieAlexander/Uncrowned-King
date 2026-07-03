@@ -837,6 +837,7 @@ dependencies = [
  "serde",
  "thiserror",
  "toml",
+ "uk-auth",
  "uk-proto",
 ]
 
