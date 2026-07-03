@@ -28,6 +28,7 @@ use crate::{config::ClientConfig, session, socks5};
 const FLOW_ID_ALLOCATION_ATTEMPTS: usize = 1024;
 const FLOW_FRAME_QUEUE_CAPACITY: usize = 32;
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
+const DEFAULT_MAX_STREAMS: u64 = 64;
 
 type AnyError = Box<dyn Error + Send + Sync>;
 type CarrierWriter = Arc<Mutex<WriteHalf<TlsStream<TcpStream>>>>;
@@ -46,6 +47,7 @@ struct ClientSession {
     writer: CarrierWriter,
     flows: FlowTable,
     limits: FrameLimits,
+    max_streams: u64,
     closed: AtomicBool,
     next_flow_id: AtomicU64,
 }
@@ -150,6 +152,7 @@ impl ClientSession {
             writer: Arc::new(Mutex::new(carrier_writer)),
             flows: Arc::new(Mutex::new(HashMap::new())),
             limits,
+            max_streams: max_streams(&settings),
             closed: AtomicBool::new(false),
             next_flow_id: AtomicU64::new(FIRST_CLIENT_FLOW_ID),
         });
@@ -175,7 +178,9 @@ impl ClientSession {
         if self.is_closed() {
             return Err("uk session is closed".into());
         }
-        let (flow_id, frames) = self.reserve_flow().await?;
+        let Some((flow_id, frames)) = self.reserve_flow().await? else {
+            return Ok(OpenOutcome::Rejected(socks5::Reply::GeneralFailure));
+        };
         if self.is_closed() {
             self.flows.lock().await.remove(&flow_id);
             return Err("uk session is closed".into());
@@ -228,7 +233,7 @@ impl ClientSession {
         self.next_flow_id.fetch_add(FLOW_ID_STEP, Ordering::Relaxed)
     }
 
-    async fn reserve_flow(&self) -> Result<(u64, mpsc::Receiver<Frame>), AnyError> {
+    async fn reserve_flow(&self) -> Result<Option<(u64, mpsc::Receiver<Frame>)>, AnyError> {
         for _ in 0..FLOW_ID_ALLOCATION_ATTEMPTS {
             let flow_id = self.allocate_flow_id();
             if !is_client_initiated_flow_id(flow_id) {
@@ -237,9 +242,12 @@ impl ClientSession {
 
             let (sender, frames) = mpsc::channel(FLOW_FRAME_QUEUE_CAPACITY);
             let mut flows = self.flows.lock().await;
+            if flows.len() as u64 >= self.max_streams {
+                return Ok(None);
+            }
             if let Entry::Vacant(entry) = flows.entry(flow_id) {
                 entry.insert(sender);
-                return Ok((flow_id, frames));
+                return Ok(Some((flow_id, frames)));
             }
         }
 
@@ -466,6 +474,12 @@ fn frame_limits(settings: &uk_proto::Settings) -> FrameLimits {
             .get(SettingKey::MaxFrameSize)
             .unwrap_or(DEFAULT_MAX_FRAME_SIZE),
     }
+}
+
+fn max_streams(settings: &uk_proto::Settings) -> u64 {
+    settings
+        .get(SettingKey::MaxStreams)
+        .unwrap_or(DEFAULT_MAX_STREAMS)
 }
 
 fn transition(state: &mut ClientConnectionState, next: ClientConnectionState) {
