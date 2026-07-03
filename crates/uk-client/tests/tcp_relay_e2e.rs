@@ -82,6 +82,7 @@ const TARGET_HALF_CLOSE_LATE_REQUEST: &[u8] = b"uncrowned king target half-close
 const TARGET_HALF_CLOSE_TIMEOUT_GREETING: &[u8] =
     b"uncrowned king target half-close timeout greeting";
 const LARGE_PAYLOAD_LEN: usize = 128 * 1024 + 123;
+const SMALL_FRAME_PAYLOAD_LEN: usize = 8 * 1024 + 37;
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
@@ -149,6 +150,11 @@ async fn closes_flow_when_buffered_byte_limit_is_exceeded() -> Result<(), TestEr
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relays_large_payload_across_frames() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_large_payload_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relays_large_payload_with_small_frame_limit() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_small_frame_limit_e2e()).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -247,6 +253,29 @@ async fn run_large_payload_e2e() -> Result<(), TestError> {
     let payload = large_payload();
     let (target_addr, target_task) = spawn_fixed_size_echo_target(payload.len()).await?;
     let harness = RelayHarness::start(Some(allow_loopback_policy(target_addr.port()))).await?;
+
+    let (mut socks, connect_reply) = open_socks_connect(harness.socks_addr, target_addr).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    socks.write_all(&payload).await?;
+    let mut echoed = vec![0_u8; payload.len()];
+    socks.read_exact(&mut echoed).await?;
+    assert_eq!(echoed, payload);
+
+    target_task.await??;
+    Ok(())
+}
+
+async fn run_small_frame_limit_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let payload = patterned_payload(SMALL_FRAME_PAYLOAD_LEN);
+    let (target_addr, target_task) = spawn_fixed_size_echo_target(payload.len()).await?;
+    let harness = RelayHarness::start_with_limits(
+        Some(allow_loopback_policy(target_addr.port())),
+        test_limits_with_max_frame_size(1024),
+    )
+    .await?;
 
     let (mut socks, connect_reply) = open_socks_connect(harness.socks_addr, target_addr).await?;
     assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
@@ -801,6 +830,12 @@ fn test_limits_with_max_streams(max_streams: u64) -> LimitConfig {
     limits
 }
 
+fn test_limits_with_max_frame_size(max_frame_size: u64) -> LimitConfig {
+    let mut limits = test_limits();
+    limits.max_frame_size = Some(max_frame_size);
+    limits
+}
+
 fn test_limits_with_idle_timeout(idle_timeout_seconds: u64) -> LimitConfig {
     let mut limits = test_limits();
     limits.idle_timeout_seconds = Some(idle_timeout_seconds);
@@ -820,9 +855,11 @@ fn test_limits_with_half_close_timeout(tcp_half_close_timeout_seconds: u64) -> L
 }
 
 fn large_payload() -> Vec<u8> {
-    (0..LARGE_PAYLOAD_LEN)
-        .map(|index| (index % 251) as u8)
-        .collect()
+    patterned_payload(LARGE_PAYLOAD_LEN)
+}
+
+fn patterned_payload(len: usize) -> Vec<u8> {
+    (0..len).map(|index| (index % 251) as u8).collect()
 }
 
 fn create_temp_dir() -> Result<PathBuf, TestError> {

@@ -13,6 +13,9 @@ pub const TCP_CLOSE_NORMAL: u16 = 0;
 /// Generic TCP flow close caused by an error.
 pub const TCP_CLOSE_ERROR: u16 = 1;
 
+/// Minimum `max_frame_size` that can carry every valid v0.1 TCP control payload.
+pub const MIN_TCP_RELAY_FRAME_SIZE: u64 = 262;
+
 /// Payload carried by a `TCP_OPEN` frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpOpen {

@@ -8,7 +8,7 @@ use uk_auth::{
     DEFAULT_REPLAY_CACHE_WINDOW_SECONDS,
 };
 use uk_policy::PolicySet;
-use uk_proto::validate_host_port_endpoint;
+use uk_proto::{MIN_TCP_RELAY_FRAME_SIZE, validate_host_port_endpoint};
 
 /// Server TOML configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -59,6 +59,11 @@ impl ServerConfig {
     pub fn validate_limits(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         reject_zero_limit("max_pre_auth_bytes", self.max_pre_auth_bytes())?;
         reject_zero_limit("max_frame_size", self.max_frame_size())?;
+        reject_small_limit(
+            "max_frame_size",
+            self.max_frame_size(),
+            MIN_TCP_RELAY_FRAME_SIZE,
+        )?;
         reject_zero_limit("max_streams", self.max_streams())?;
         reject_zero_limit(
             "max_buffered_bytes_per_flow",
@@ -162,6 +167,18 @@ impl ServerConfig {
 fn reject_zero_limit(name: &str, value: u64) -> Result<(), Box<dyn Error + Send + Sync>> {
     if value == 0 {
         Err(format!("{name} must be greater than zero").into())
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_small_limit(
+    name: &str,
+    value: u64,
+    minimum: u64,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if value < minimum {
+        Err(format!("{name} must be at least {minimum}").into())
     } else {
         Ok(())
     }
@@ -521,6 +538,24 @@ credentials = []
 
 [limits]
 max_frame_size = 0
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_too_small_frame_limit() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_frame_size = 261
 "#,
         )
         .unwrap();

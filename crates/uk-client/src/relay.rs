@@ -52,6 +52,7 @@ struct ClientSession {
     writer: CarrierWriter,
     flows: FlowTable,
     limits: FrameLimits,
+    data_frame_size: usize,
     max_streams: u64,
     open_timeout: Option<Duration>,
     closed: AtomicBool,
@@ -168,6 +169,7 @@ impl ClientSession {
             writer: Arc::new(Mutex::new(carrier_writer)),
             flows: Arc::new(Mutex::new(HashMap::new())),
             limits,
+            data_frame_size: tcp_data_frame_size(limits),
             max_streams: max_streams(&settings),
             open_timeout: timeout(config.tcp_open_timeout_seconds()),
             closed: AtomicBool::new(false),
@@ -419,7 +421,8 @@ async fn negotiate_socks_connect(
 async fn relay_tcp(mut local: TcpStream, mut flow: ClientFlow) -> Result<(), AnyError> {
     let mut local_to_remote_open = true;
     let mut remote_to_local_open = true;
-    let mut local_buf = Box::new([0_u8; RELAY_BUFFER_SIZE]);
+    let data_frame_size = flow.session.data_frame_size;
+    let mut local_buf = vec![0_u8; data_frame_size].into_boxed_slice();
 
     while local_to_remote_open || remote_to_local_open {
         tokio::select! {
@@ -545,6 +548,11 @@ fn max_streams(settings: &uk_proto::Settings) -> u64 {
     settings
         .get(SettingKey::MaxStreams)
         .unwrap_or(DEFAULT_MAX_STREAMS)
+}
+
+fn tcp_data_frame_size(limits: FrameLimits) -> usize {
+    usize::try_from(limits.max_frame_size)
+        .map_or(RELAY_BUFFER_SIZE, |limit| limit.min(RELAY_BUFFER_SIZE))
 }
 
 fn timeout(seconds: u64) -> Option<Duration> {
@@ -701,5 +709,21 @@ mod tests {
         assert!(validate_endpoint("socks listen", "127.0.0.1").is_err());
         assert!(validate_endpoint("socks listen", "127.0.0.1:0").is_err());
         assert!(validate_endpoint("socks listen", "::1:1080").is_err());
+    }
+
+    #[test]
+    fn caps_tcp_data_frame_size_to_peer_limit() {
+        assert_eq!(
+            tcp_data_frame_size(FrameLimits {
+                max_frame_size: 1024
+            }),
+            1024
+        );
+        assert_eq!(
+            tcp_data_frame_size(FrameLimits {
+                max_frame_size: 65_536
+            }),
+            RELAY_BUFFER_SIZE
+        );
     }
 }

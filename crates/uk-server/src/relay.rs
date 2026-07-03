@@ -43,6 +43,7 @@ type FlowTable = HashMap<u64, TargetFlow>;
 pub(crate) struct RelayLimits {
     frame: FrameLimits,
     max_streams: u64,
+    data_frame_size: usize,
     max_buffered_bytes_per_flow: usize,
     target_connect_timeout: Option<Duration>,
     tcp_half_close_timeout: Option<Duration>,
@@ -424,6 +425,7 @@ async fn handle_tcp_open(
         Arc::clone(context.carrier_writer),
         context.event_tx.clone(),
         context.shutdown.clone(),
+        context.limits.data_frame_size,
     );
     spawn_target_writer(
         flow_id,
@@ -445,6 +447,7 @@ fn spawn_target_reader(
     carrier_writer: CarrierWriter,
     event_tx: mpsc::UnboundedSender<FlowEvent>,
     shutdown: SessionShutdown,
+    data_frame_size: usize,
 ) {
     tokio::spawn(async move {
         match relay_target_to_client(
@@ -454,6 +457,7 @@ fn spawn_target_reader(
             &carrier_writer,
             &event_tx,
             &shutdown,
+            data_frame_size,
         )
         .await
         {
@@ -534,7 +538,7 @@ async fn relay_client_to_target(
 }
 
 impl RelayLimits {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         frame: FrameLimits,
         max_streams: u64,
         max_buffered_bytes_per_flow: usize,
@@ -544,6 +548,7 @@ impl RelayLimits {
         Self {
             frame,
             max_streams,
+            data_frame_size: tcp_data_frame_size(frame),
             max_buffered_bytes_per_flow,
             target_connect_timeout,
             tcp_half_close_timeout,
@@ -715,8 +720,9 @@ async fn relay_target_to_client(
     carrier_writer: &CarrierWriter,
     event_tx: &mpsc::UnboundedSender<FlowEvent>,
     shutdown: &SessionShutdown,
+    data_frame_size: usize,
 ) -> Result<(), AnyError> {
-    let mut target_buf = Box::new([0_u8; RELAY_BUFFER_SIZE]);
+    let mut target_buf = vec![0_u8; data_frame_size].into_boxed_slice();
     loop {
         if shutdown.is_closed() || flow_control.is_aborted() {
             return Ok(());
@@ -917,6 +923,11 @@ fn transition(state: &mut ServerSessionState, next: ServerSessionState) {
     *state = next;
 }
 
+fn tcp_data_frame_size(limits: FrameLimits) -> usize {
+    usize::try_from(limits.max_frame_size)
+        .map_or(RELAY_BUFFER_SIZE, |limit| limit.min(RELAY_BUFFER_SIZE))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1043,5 +1054,21 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(OpenFailure::TargetTimeout)));
+    }
+
+    #[test]
+    fn caps_tcp_data_frame_size_to_frame_limit() {
+        assert_eq!(
+            tcp_data_frame_size(FrameLimits {
+                max_frame_size: 1024
+            }),
+            1024
+        );
+        assert_eq!(
+            tcp_data_frame_size(FrameLimits {
+                max_frame_size: 65_536
+            }),
+            RELAY_BUFFER_SIZE
+        );
     }
 }

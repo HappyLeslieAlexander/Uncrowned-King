@@ -8,8 +8,8 @@ use tokio_rustls::client::TlsStream;
 use tracing::info;
 use uk_auth::{AuthChallenge, AuthResponse, unix_now};
 use uk_proto::{
-    Frame, FrameLimits, FrameType, SettingKey, Settings, read_frame, validate_connection_frame,
-    write_frame,
+    Frame, FrameLimits, FrameType, MIN_TCP_RELAY_FRAME_SIZE, SettingKey, Settings, read_frame,
+    validate_connection_frame, write_frame,
 };
 
 use crate::{config::ClientConfig, tls};
@@ -81,6 +81,12 @@ fn validate_server_settings(settings: &Settings) -> Result<(), AnyError> {
     }
     reject_zero_setting(settings, SettingKey::MaxFrameSize, "max_frame_size")?;
     reject_zero_setting(settings, SettingKey::MaxStreams, "max_streams")?;
+    reject_small_setting(
+        settings,
+        SettingKey::MaxFrameSize,
+        "max_frame_size",
+        MIN_TCP_RELAY_FRAME_SIZE,
+    )?;
     Ok(())
 }
 
@@ -91,6 +97,19 @@ fn reject_zero_setting(
 ) -> Result<(), AnyError> {
     if settings.get(key) == Some(0) {
         Err(format!("{name} must be greater than zero").into())
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_small_setting(
+    settings: &Settings,
+    key: SettingKey,
+    name: &'static str,
+    minimum: u64,
+) -> Result<(), AnyError> {
+    if settings.get(key).is_some_and(|value| value < minimum) {
+        Err(format!("{name} must be at least {minimum}").into())
     } else {
         Ok(())
     }
@@ -132,6 +151,15 @@ mod tests {
         let mut settings = Settings::default();
         settings.set(SettingKey::ProtocolRevision, 1);
         settings.set(SettingKey::MaxFrameSize, 0);
+
+        assert!(validate_server_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn rejects_too_small_max_frame_size() {
+        let mut settings = Settings::default();
+        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::MaxFrameSize, MIN_TCP_RELAY_FRAME_SIZE - 1);
 
         assert!(validate_server_settings(&settings).is_err());
     }
