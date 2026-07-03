@@ -129,6 +129,11 @@ async fn reconnects_after_server_idle_timeout() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_idle_reconnect_e2e()).await?
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closes_target_when_socks_client_disconnects() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_client_disconnect_e2e()).await?
+}
+
 async fn run_tcp_relay_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -154,6 +159,21 @@ async fn run_policy_denied_e2e() -> Result<(), TestError> {
     let denied_target = unused_loopback_addr().await?;
     let (_socks, connect_reply) = open_socks_connect(harness.socks_addr, denied_target).await?;
     assert_eq!(connect_reply[1], SOCKS_REPLY_NOT_ALLOWED);
+    Ok(())
+}
+
+async fn run_client_disconnect_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, target_task) = spawn_read_to_eof_target().await?;
+    let harness = RelayHarness::start(Some(allow_loopback_policy(target_addr.port()))).await?;
+
+    let (socks, connect_reply) = open_socks_connect(harness.socks_addr, target_addr).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+    drop(socks);
+
+    let target_received = target_task.await??;
+    assert!(target_received.is_empty());
     Ok(())
 }
 
