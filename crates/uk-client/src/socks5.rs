@@ -184,6 +184,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_greeting_without_methods() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
+
+        client.write_all(&[0x05, 0x00]).await.unwrap();
+
+        let mut method_response = [0_u8; 2];
+        client.read_exact(&mut method_response).await.unwrap();
+        assert_eq!(method_response, [0x05, 0xff]);
+        assert!(server_task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_greeting_without_no_auth_method() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
+
+        client.write_all(&[0x05, 0x02, 0x01, 0x02]).await.unwrap();
+
+        let mut method_response = [0_u8; 2];
+        client.read_exact(&mut method_response).await.unwrap();
+        assert_eq!(method_response, [0x05, 0xff]);
+        assert!(server_task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
     async fn rejects_unsupported_command() {
         let (mut client, mut server) = tokio::io::duplex(128);
         let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
@@ -280,6 +306,26 @@ mod tests {
             .write_all(&[
                 0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, 0x01, 0xff, 0x00, 0x50,
             ])
+            .await
+            .unwrap();
+
+        let mut method_response = [0_u8; 2];
+        client.read_exact(&mut method_response).await.unwrap();
+        assert_eq!(method_response, [0x05, 0x00]);
+
+        let mut reply = [0_u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], Reply::HostUnreachable.code());
+        assert!(server_task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_domain_with_failure_reply() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
+
+        client
+            .write_all(&[0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, 0x00, 0x00, 0x50])
             .await
             .unwrap();
 
