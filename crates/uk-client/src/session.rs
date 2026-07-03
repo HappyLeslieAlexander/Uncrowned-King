@@ -38,6 +38,7 @@ async fn connect_authenticated_inner(
     let tcp = TcpStream::connect(&config.server_addr).await?;
     let server_name = tls::server_name(config.server_name.clone())?;
     let mut stream = connector.connect(server_name, tcp).await?;
+    tls::verify_alpn(&stream)?;
     let exporter = tls::exporter(&stream)?;
 
     let challenge_frame = read_frame(&mut stream, FrameLimits::default()).await?;

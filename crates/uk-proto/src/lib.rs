@@ -1,5 +1,8 @@
 //! Core Uncrowned King wire encoding.
 
+/// TLS/QUIC ALPN protocol identifier for Uncrowned King v0.1.
+pub const ALPN_PROTOCOL: &[u8] = b"uk/1";
+
 pub mod error;
 pub mod flow;
 pub mod frame;

@@ -67,6 +67,8 @@ Native carriers should use:
 uk/1
 ```
 
+Implementations must verify that native TLS or QUIC carriers negotiated this ALPN value before accepting UK frames.
+
 HTTP/2 and WebSocket deployments may identify UK inside the encrypted HTTP request after normal TLS negotiation.
 
 ### 3.3 0-RTT

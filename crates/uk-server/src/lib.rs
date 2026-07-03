@@ -114,6 +114,7 @@ async fn complete_handshake(
     config: &ServerConfig,
 ) -> Result<(TlsStream<tokio::net::TcpStream>, uk_auth::Credential), AnyError> {
     let mut stream = acceptor.accept(tcp).await?;
+    tls::verify_alpn(&stream)?;
     let exporter = tls::exporter(&stream)?;
     let challenge = AuthChallenge::generate(unix_now());
 
