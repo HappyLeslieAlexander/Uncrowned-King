@@ -182,6 +182,13 @@ impl Frame {
 
     /// Encodes the complete frame into a new byte buffer.
     pub fn encode(&self) -> ProtocolResult<Bytes> {
+        let payload_len =
+            u64::try_from(self.payload.len()).map_err(|_| ProtocolError::InvalidVarint)?;
+        if self.header.length != payload_len {
+            return Err(ProtocolError::InvalidFrame(
+                "frame header length does not match payload length",
+            ));
+        }
         let mut out = BytesMut::new();
         self.header.encode(&mut out)?;
         out.extend_from_slice(&self.payload);
@@ -254,6 +261,19 @@ mod tests {
         assert_eq!(
             FrameHeader::decode(&mut bytes, FrameLimits::default()),
             Err(ProtocolError::UnsupportedFlag(0x0100))
+        );
+    }
+
+    #[test]
+    fn rejects_encoding_mismatched_payload_length() {
+        let mut frame = Frame::new(FrameType::TcpData, 0, 1, Bytes::from_static(b"abc")).unwrap();
+        frame.header.length = 2;
+
+        assert_eq!(
+            frame.encode(),
+            Err(ProtocolError::InvalidFrame(
+                "frame header length does not match payload length"
+            ))
         );
     }
 
