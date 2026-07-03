@@ -132,6 +132,11 @@ async fn maps_stream_limit_to_socks_general_failure() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closes_flow_when_buffered_byte_limit_is_exceeded() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_buffered_limit_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relays_large_payload_across_frames() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_large_payload_e2e()).await?
 }
@@ -290,6 +295,28 @@ async fn run_stream_limit_e2e() -> Result<(), TestError> {
     first_socks.shutdown().await?;
     let target_received = target_task.await??;
     assert_eq!(target_received, b"x");
+    Ok(())
+}
+
+async fn run_buffered_limit_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, target_task) = spawn_read_to_eof_target().await?;
+    let harness = RelayHarness::start_with_limits(
+        Some(allow_loopback_policy(target_addr.port())),
+        test_limits_with_buffered_bytes_per_flow(1),
+    )
+    .await?;
+
+    let (mut socks, connect_reply) = open_socks_connect(harness.socks_addr, target_addr).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    socks.write_all(b"over limit").await?;
+    let mut eof = [0_u8; 1];
+    assert_eq!(socks.read(&mut eof).await?, 0);
+
+    let target_received = target_task.await??;
+    assert!(target_received.is_empty());
     Ok(())
 }
 
@@ -732,6 +759,12 @@ fn test_limits_with_max_streams(max_streams: u64) -> LimitConfig {
 fn test_limits_with_idle_timeout(idle_timeout_seconds: u64) -> LimitConfig {
     let mut limits = test_limits();
     limits.idle_timeout_seconds = Some(idle_timeout_seconds);
+    limits
+}
+
+fn test_limits_with_buffered_bytes_per_flow(max_buffered_bytes_per_flow: u64) -> LimitConfig {
+    let mut limits = test_limits();
+    limits.max_buffered_bytes_per_flow = Some(max_buffered_bytes_per_flow);
     limits
 }
 
