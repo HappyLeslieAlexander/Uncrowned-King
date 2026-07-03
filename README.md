@@ -87,8 +87,8 @@ crates/
 ## Development
 
 ```sh
-cargo check --workspace
-cargo test --workspace
-cargo fmt --check
-cargo clippy --workspace --all-targets
+cargo fmt --all --check
+cargo check --workspace --locked
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
