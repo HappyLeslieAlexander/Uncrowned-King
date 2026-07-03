@@ -110,8 +110,10 @@ where
             let mut domain = vec![0_u8; usize::from(len)];
             stream.read_exact(&mut domain).await?;
             let port = read_port(stream).await?;
-            let domain = String::from_utf8(domain)
-                .map_err(|_| protocol_error("socks domain is not utf-8"))?;
+            let Ok(domain) = String::from_utf8(domain) else {
+                send_reply(stream, Reply::HostUnreachable).await?;
+                return Err(protocol_error("socks domain is not utf-8"));
+            };
             Target::Domain(domain, port)
         }
         ATYP_IPV6 => {
@@ -126,7 +128,10 @@ where
         }
     };
 
-    validate_target(&target)?;
+    if let Err(err) = validate_target(&target) {
+        send_reply(stream, Reply::HostUnreachable).await?;
+        return Err(err);
+    }
     Ok(target)
 }
 
@@ -195,6 +200,50 @@ mod tests {
         let mut reply = [0_u8; 10];
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply[1], Reply::CommandNotSupported.code());
+        assert!(server_task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_port_with_failure_reply() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
+
+        client
+            .write_all(&[
+                0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x00, 0x00,
+            ])
+            .await
+            .unwrap();
+
+        let mut method_response = [0_u8; 2];
+        client.read_exact(&mut method_response).await.unwrap();
+        assert_eq!(method_response, [0x05, 0x00]);
+
+        let mut reply = [0_u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], Reply::HostUnreachable.code());
+        assert!(server_task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_domain_with_failure_reply() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
+
+        client
+            .write_all(&[
+                0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, 0x01, 0xff, 0x00, 0x50,
+            ])
+            .await
+            .unwrap();
+
+        let mut method_response = [0_u8; 2];
+        client.read_exact(&mut method_response).await.unwrap();
+        assert_eq!(method_response, [0x05, 0x00]);
+
+        let mut reply = [0_u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], Reply::HostUnreachable.code());
         assert!(server_task.await.unwrap().is_err());
     }
 }
