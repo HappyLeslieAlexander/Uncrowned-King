@@ -22,6 +22,8 @@ pub const MAX_KEY_ID_LEN: usize = 64;
 /// Minimum accepted shared secret length in bytes.
 pub const MIN_SECRET_LEN: usize = 32;
 const MIN_RESPONSE_TAIL_LEN: usize = 73;
+/// Default maximum accepted nonce pairs retained by the replay cache.
+pub const DEFAULT_REPLAY_CACHE_MAX_ENTRIES: usize = 65_536;
 
 /// Authentication result alias.
 pub type AuthResult<T> = Result<T, AuthError>;
@@ -282,14 +284,23 @@ impl AuthResponse {
 #[derive(Debug, Clone)]
 pub struct ReplayCache {
     window: Duration,
+    max_entries: usize,
     entries: HashMap<ReplayKey, u64>,
 }
 
 impl ReplayCache {
     /// Creates a cache retaining accepted nonces for `window`.
     pub fn new(window: Duration) -> Self {
+        Self::with_max_entries(window, DEFAULT_REPLAY_CACHE_MAX_ENTRIES)
+    }
+
+    /// Creates a cache retaining at most `max_entries` accepted nonces for `window`.
+    ///
+    /// A zero entry limit is treated as one so the cache still rejects immediate replays.
+    pub fn with_max_entries(window: Duration, max_entries: usize) -> Self {
         Self {
             window,
+            max_entries: max_entries.max(1),
             entries: HashMap::new(),
         }
     }
@@ -309,6 +320,9 @@ impl ReplayCache {
         if self.entries.contains_key(&key) {
             return Err(AuthError::Replay);
         }
+        if self.entries.len() >= self.max_entries {
+            self.evict_oldest();
+        }
         self.entries.insert(key, now);
         Ok(())
     }
@@ -317,6 +331,17 @@ impl ReplayCache {
         let window = self.window.as_secs();
         self.entries
             .retain(|_, inserted_at| now.saturating_sub(*inserted_at) <= window);
+    }
+
+    fn evict_oldest(&mut self) {
+        if let Some(oldest_key) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, inserted_at)| **inserted_at)
+            .map(|(key, _)| *key)
+        {
+            self.entries.remove(&oldest_key);
+        }
     }
 }
 
@@ -714,5 +739,104 @@ mod tests {
             ),
             Err(AuthError::Replay)
         );
+    }
+
+    #[test]
+    fn replay_cache_prunes_expired_entries() {
+        let mut replay_cache = ReplayCache::with_max_entries(Duration::from_secs(10), 4);
+        let first = ReplayKey {
+            server_nonce: [0x10; 32],
+            client_nonce: [0x20; 32],
+        };
+        let second = ReplayKey {
+            server_nonce: [0x11; 32],
+            client_nonce: [0x21; 32],
+        };
+
+        replay_cache
+            .check_and_insert(100, first.server_nonce, first.client_nonce)
+            .unwrap();
+        replay_cache
+            .check_and_insert(111, second.server_nonce, second.client_nonce)
+            .unwrap();
+
+        assert!(!replay_cache.entries.contains_key(&first));
+        assert!(replay_cache.entries.contains_key(&second));
+        assert_eq!(replay_cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn replay_cache_evicts_oldest_entry_when_full() {
+        let mut replay_cache = ReplayCache::with_max_entries(Duration::from_secs(300), 2);
+        let oldest = ReplayKey {
+            server_nonce: [0x30; 32],
+            client_nonce: [0x40; 32],
+        };
+        let middle = ReplayKey {
+            server_nonce: [0x31; 32],
+            client_nonce: [0x41; 32],
+        };
+        let newest = ReplayKey {
+            server_nonce: [0x32; 32],
+            client_nonce: [0x42; 32],
+        };
+
+        replay_cache
+            .check_and_insert(100, oldest.server_nonce, oldest.client_nonce)
+            .unwrap();
+        replay_cache
+            .check_and_insert(101, middle.server_nonce, middle.client_nonce)
+            .unwrap();
+        replay_cache
+            .check_and_insert(102, newest.server_nonce, newest.client_nonce)
+            .unwrap();
+
+        assert!(!replay_cache.entries.contains_key(&oldest));
+        assert!(replay_cache.entries.contains_key(&middle));
+        assert!(replay_cache.entries.contains_key(&newest));
+        assert_eq!(replay_cache.entries.len(), 2);
+    }
+
+    #[test]
+    fn replay_cache_rejects_replay_before_capacity_eviction() {
+        let mut replay_cache = ReplayCache::with_max_entries(Duration::from_secs(300), 1);
+        let key = ReplayKey {
+            server_nonce: [0x50; 32],
+            client_nonce: [0x60; 32],
+        };
+
+        replay_cache
+            .check_and_insert(100, key.server_nonce, key.client_nonce)
+            .unwrap();
+
+        assert_eq!(
+            replay_cache.check_and_insert(101, key.server_nonce, key.client_nonce),
+            Err(AuthError::Replay)
+        );
+        assert_eq!(replay_cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn replay_cache_treats_zero_capacity_as_one_entry() {
+        let mut replay_cache = ReplayCache::with_max_entries(Duration::from_secs(300), 0);
+        let first = ReplayKey {
+            server_nonce: [0x70; 32],
+            client_nonce: [0x80; 32],
+        };
+        let second = ReplayKey {
+            server_nonce: [0x71; 32],
+            client_nonce: [0x81; 32],
+        };
+
+        replay_cache
+            .check_and_insert(100, first.server_nonce, first.client_nonce)
+            .unwrap();
+        replay_cache
+            .check_and_insert(101, second.server_nonce, second.client_nonce)
+            .unwrap();
+
+        assert!(!replay_cache.entries.contains_key(&first));
+        assert!(replay_cache.entries.contains_key(&second));
+        assert_eq!(replay_cache.entries.len(), 1);
     }
 }
