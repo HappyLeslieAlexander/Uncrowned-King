@@ -714,6 +714,86 @@ mod tests {
     }
 
     #[test]
+    fn rejects_disabled_credential() {
+        let (mut credential, exporter, challenge, response) = fixture();
+        credential.status = CredentialStatus::Disabled;
+        let mut replay_cache = ReplayCache::default();
+
+        assert_eq!(
+            verify_auth_response(
+                &[credential],
+                &exporter,
+                &challenge,
+                &response,
+                1_700_000_001,
+                Duration::from_secs(30),
+                &mut replay_cache
+            ),
+            Err(AuthError::CredentialNotActive)
+        );
+    }
+
+    #[test]
+    fn rejects_retired_credential() {
+        let (mut credential, exporter, challenge, response) = fixture();
+        credential.status = CredentialStatus::Retired;
+        let mut replay_cache = ReplayCache::default();
+
+        assert_eq!(
+            verify_auth_response(
+                &[credential],
+                &exporter,
+                &challenge,
+                &response,
+                1_700_000_001,
+                Duration::from_secs(30),
+                &mut replay_cache
+            ),
+            Err(AuthError::CredentialNotActive)
+        );
+    }
+
+    #[test]
+    fn rejects_credential_before_not_before() {
+        let (mut credential, exporter, challenge, response) = fixture();
+        credential.not_before = Some(1_700_000_010);
+        let mut replay_cache = ReplayCache::default();
+
+        assert_eq!(
+            verify_auth_response(
+                &[credential],
+                &exporter,
+                &challenge,
+                &response,
+                1_700_000_001,
+                Duration::from_secs(30),
+                &mut replay_cache
+            ),
+            Err(AuthError::CredentialNotActive)
+        );
+    }
+
+    #[test]
+    fn rejects_credential_after_not_after() {
+        let (mut credential, exporter, challenge, response) = fixture();
+        credential.not_after = Some(1_700_000_000);
+        let mut replay_cache = ReplayCache::default();
+
+        assert_eq!(
+            verify_auth_response(
+                &[credential],
+                &exporter,
+                &challenge,
+                &response,
+                1_700_000_001,
+                Duration::from_secs(30),
+                &mut replay_cache
+            ),
+            Err(AuthError::CredentialNotActive)
+        );
+    }
+
+    #[test]
     fn rejects_replayed_nonce() {
         let (credential, exporter, challenge, response) = fixture();
         let mut replay_cache = ReplayCache::default();
