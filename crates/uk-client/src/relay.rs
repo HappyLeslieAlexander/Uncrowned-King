@@ -373,6 +373,7 @@ async fn handle_socks_connection(
     sessions: Arc<ClientSessionManager>,
     socks_handshake_timeout: Option<Duration>,
 ) -> Result<(), AnyError> {
+    local.set_nodelay(true)?;
     let mut state = ClientConnectionState::NegotiatingSocks;
     let target = negotiate_socks_connect(&mut local, socks_handshake_timeout).await?;
 

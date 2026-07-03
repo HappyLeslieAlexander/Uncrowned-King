@@ -37,6 +37,7 @@ async fn connect_authenticated_inner(
 ) -> Result<(TlsStream<TcpStream>, Settings), AnyError> {
     let connector = tls::connector(&config.ca_cert_path)?;
     let tcp = TcpStream::connect(&config.server_addr).await?;
+    tcp.set_nodelay(true)?;
     let server_name = tls::server_name(config.server_name.clone())?;
     let mut stream = connector.connect(server_name, tcp).await?;
     tls::verify_alpn(&stream)?;

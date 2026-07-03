@@ -820,7 +820,12 @@ async fn connect_socket_addrs(addrs: &[SocketAddr]) -> Result<TcpStream, OpenFai
     let mut last_error = None;
     for addr in addrs {
         match TcpStream::connect(*addr).await {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                stream
+                    .set_nodelay(true)
+                    .map_err(OpenFailure::TargetUnavailable)?;
+                return Ok(stream);
+            }
             Err(err) => last_error = Some(err),
         }
     }

@@ -75,6 +75,7 @@ async fn handle_connection(
     replay_cache: Arc<Mutex<ReplayCache>>,
     config: ServerConfig,
 ) -> Result<(), AnyError> {
+    tcp.set_nodelay(true)?;
     let (stream, credential) =
         if let Some(timeout) = handshake_timeout(config.handshake_timeout_seconds()) {
             match time::timeout(
