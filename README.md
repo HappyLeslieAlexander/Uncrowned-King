@@ -76,6 +76,9 @@ uk-server --config examples/server.toml config-check
 uk-client --config examples/client.toml config-check
 ```
 
+Configured endpoints use `host:port` syntax. IPv6 literals must be bracketed,
+for example `[::1]:9443`; port `0` is rejected by config validation.
+
 ## Repository Layout
 
 ```text
