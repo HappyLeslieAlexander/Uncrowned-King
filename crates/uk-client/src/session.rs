@@ -7,7 +7,10 @@ use tokio::{net::TcpStream, time};
 use tokio_rustls::client::TlsStream;
 use tracing::info;
 use uk_auth::{AuthChallenge, AuthResponse, unix_now};
-use uk_proto::{Frame, FrameLimits, FrameType, SettingKey, Settings, read_frame, write_frame};
+use uk_proto::{
+    Frame, FrameLimits, FrameType, SettingKey, Settings, read_frame, validate_connection_frame,
+    write_frame,
+};
 
 use crate::{config::ClientConfig, tls};
 
@@ -38,9 +41,7 @@ async fn connect_authenticated_inner(
     let exporter = tls::exporter(&stream)?;
 
     let challenge_frame = read_frame(&mut stream, FrameLimits::default()).await?;
-    if challenge_frame.header.frame_type != FrameType::AuthChallenge {
-        return Err("expected AUTH_CHALLENGE".into());
-    }
+    validate_connection_frame(&challenge_frame, FrameType::AuthChallenge)?;
     let mut challenge_payload = challenge_frame.payload;
     let challenge = AuthChallenge::decode(&mut challenge_payload)?;
 
@@ -58,9 +59,7 @@ async fn connect_authenticated_inner(
     write_frame(&mut stream, &response_frame).await?;
 
     let settings_frame = read_frame(&mut stream, FrameLimits::default()).await?;
-    if settings_frame.header.frame_type != FrameType::Settings {
-        return Err("expected SETTINGS".into());
-    }
+    validate_connection_frame(&settings_frame, FrameType::Settings)?;
     let mut settings_payload = settings_frame.payload;
     let settings = Settings::decode(&mut settings_payload)?;
     validate_server_settings(&settings)?;

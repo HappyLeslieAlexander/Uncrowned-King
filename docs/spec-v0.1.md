@@ -42,6 +42,8 @@ bytes   payload
 - v0.1 defines no known flags. Any required flag must be rejected.
 - `length` is the number of payload bytes and must not exceed the configured
   frame limit.
+- `AUTH_CHALLENGE`, `AUTH_RESPONSE`, and `SETTINGS` are connection-scoped and
+  must use `id = 0`.
 
 Frame types:
 

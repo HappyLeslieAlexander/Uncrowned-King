@@ -12,7 +12,10 @@ use tokio::{net::TcpListener, sync::Mutex, time};
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tracing::{info, warn};
 use uk_auth::{AuthChallenge, AuthResponse, ReplayCache, unix_now, verify_auth_response};
-use uk_proto::{Frame, FrameLimits, FrameType, SettingKey, Settings, read_frame, write_frame};
+use uk_proto::{
+    Frame, FrameLimits, FrameType, SettingKey, Settings, read_frame, validate_connection_frame,
+    write_frame,
+};
 
 use crate::config::ServerConfig;
 
@@ -155,9 +158,7 @@ async fn complete_handshake(
     )
     .await?;
 
-    if response_frame.header.frame_type != FrameType::AuthResponse {
-        return Err("expected AUTH_RESPONSE".into());
-    }
+    validate_connection_frame(&response_frame, FrameType::AuthResponse)?;
 
     let mut response_payload = response_frame.payload;
     let response = AuthResponse::decode(&mut response_payload)?;

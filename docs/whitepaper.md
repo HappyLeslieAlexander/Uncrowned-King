@@ -180,6 +180,7 @@ struct Frame {
 `version` is `1`.
 
 `flags` are split into optional and required ranges. If an unknown required flag is present, the receiver must close the connection with `ERROR_UNSUPPORTED_FLAG`.
+Connection-scoped frames such as authentication and settings must use `id = 0`.
 
 ### 6.1 Frame Types
 

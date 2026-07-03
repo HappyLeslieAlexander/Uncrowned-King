@@ -200,6 +200,21 @@ impl Frame {
     }
 }
 
+/// Validates a connection-scoped frame type and id.
+pub fn validate_connection_frame(frame: &Frame, expected_type: FrameType) -> ProtocolResult<()> {
+    if frame.header.frame_type != expected_type {
+        return Err(ProtocolError::InvalidFrame(
+            "unexpected connection frame type",
+        ));
+    }
+    if frame.header.id != 0 {
+        return Err(ProtocolError::InvalidFrame(
+            "connection frame id must be zero",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_flags(flags: u16) -> ProtocolResult<()> {
     let required = flags & REQUIRED_FLAG_MASK;
     if required == 0 {
@@ -260,6 +275,40 @@ mod tests {
         assert_eq!(
             Frame::decode(&mut bytes, FrameLimits::default()),
             Err(ProtocolError::Truncated)
+        );
+    }
+
+    #[test]
+    fn accepts_connection_frame_with_zero_id() {
+        let frame = Frame::new(FrameType::Settings, 0, 0, Bytes::new()).unwrap();
+
+        assert_eq!(
+            validate_connection_frame(&frame, FrameType::Settings),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_connection_frame_with_nonzero_id() {
+        let frame = Frame::new(FrameType::Settings, 0, 7, Bytes::new()).unwrap();
+
+        assert_eq!(
+            validate_connection_frame(&frame, FrameType::Settings),
+            Err(ProtocolError::InvalidFrame(
+                "connection frame id must be zero"
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_unexpected_connection_frame_type() {
+        let frame = Frame::new(FrameType::Ping, 0, 0, Bytes::new()).unwrap();
+
+        assert_eq!(
+            validate_connection_frame(&frame, FrameType::Settings),
+            Err(ProtocolError::InvalidFrame(
+                "unexpected connection frame type"
+            ))
         );
     }
 }

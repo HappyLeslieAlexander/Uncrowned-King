@@ -34,6 +34,9 @@ pub enum ProtocolError {
     /// A frame type value is unknown.
     #[error("unknown frame type 0x{0:02x}")]
     UnknownFrameType(u8),
+    /// A frame violated connection or flow-level frame rules.
+    #[error("invalid frame: {0}")]
+    InvalidFrame(&'static str),
     /// A settings payload was malformed.
     #[error("invalid settings: {0}")]
     InvalidSettings(&'static str),
