@@ -271,6 +271,9 @@ Domain suffix matches are DNS label-boundary matches. For example,
 `example.com` matches `example.com` and `api.example.com`, but not
 `badexample.com`.
 
+Policy actions must be explicit `allow` or `deny`; unknown action strings are
+configuration errors.
+
 Example policy:
 
 ```text

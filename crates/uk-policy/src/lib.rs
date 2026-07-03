@@ -22,6 +22,9 @@ pub enum PolicyError {
     /// Invalid port range.
     #[error("invalid port range")]
     InvalidPortRange,
+    /// Invalid action string.
+    #[error("invalid policy action {0}")]
+    InvalidAction(String),
     /// TOML parse failure.
     #[error("invalid policy toml: {0}")]
     InvalidToml(String),
@@ -256,8 +259,10 @@ impl TryFrom<RawPolicyRule> for PolicyRule {
     fn try_from(raw: RawPolicyRule) -> Result<Self, Self::Error> {
         let action = if raw.action.eq_ignore_ascii_case("allow") {
             PolicyDecision::Allow
-        } else {
+        } else if raw.action.eq_ignore_ascii_case("deny") {
             PolicyDecision::Deny
+        } else {
+            return Err(PolicyError::InvalidAction(raw.action));
         };
         let ports = match (raw.port_start, raw.port_end) {
             (Some(start), Some(end)) if start <= end && start != 0 => Some(start..=end),
@@ -535,5 +540,19 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, PolicyError::InvalidToml(_)));
+    }
+
+    #[test]
+    fn rejects_unknown_policy_actions() {
+        let err = PolicySet::from_toml(
+            r#"
+            [[rules]]
+            action = "alow"
+            domain = "example.com"
+            "#,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, PolicyError::InvalidAction("alow".to_owned()));
     }
 }
