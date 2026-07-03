@@ -54,9 +54,9 @@ server connection, TLS handshake, authentication exchange, and SETTINGS read.
 When running the SOCKS5 listener, `socks_handshake_timeout_seconds = 10` bounds
 the local SOCKS greeting and CONNECT request.
 
-Example configs live under `examples/`. After creating the referenced local
-certificate and key files, validate configs without opening listeners or
-outbound sessions:
+Example configs live under `examples/`; see `examples/README.md` for local
+certificate generation. Validate configs without opening listeners or outbound
+sessions:
 
 ```sh
 uk-server --config examples/server.toml config-check
