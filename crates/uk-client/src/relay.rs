@@ -424,28 +424,36 @@ async fn relay_tcp(mut local: TcpStream, mut flow: ClientFlow) -> Result<(), Any
                     .await?;
                 }
             }
-            frame = flow.frames.recv(), if remote_to_local_open => {
+            frame = flow.frames.recv(), if local_to_remote_open || remote_to_local_open => {
                 let Some(frame) = frame else {
                     local.shutdown().await?;
+                    local_to_remote_open = false;
                     remote_to_local_open = false;
                     continue;
                 };
                 match frame.header.frame_type {
                     FrameType::TcpData => {
+                        if !remote_to_local_open {
+                            return Err("tcp data received after remote close".into());
+                        }
                         if !frame.payload.is_empty() {
                             local.write_all(&frame.payload).await?;
                         }
                     }
                     FrameType::TcpClose => {
                         let mut payload = frame.payload;
-                        let _close = TcpClose::decode(&mut payload)?;
+                        let close = TcpClose::decode(&mut payload)?;
                         local.shutdown().await?;
                         remote_to_local_open = false;
+                        if close.close_code != TCP_CLOSE_NORMAL {
+                            local_to_remote_open = false;
+                        }
                     }
                     FrameType::Error | FrameType::PolicyDenied | FrameType::ResourceLimit => {
                         let mut payload = frame.payload;
                         let _status = ErrorPayload::decode(&mut payload)?;
                         local.shutdown().await?;
+                        local_to_remote_open = false;
                         remote_to_local_open = false;
                     }
                     _ => return Err("unexpected frame while relaying tcp flow".into()),
