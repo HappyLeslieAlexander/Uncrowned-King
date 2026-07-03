@@ -139,6 +139,11 @@ async fn closes_target_when_socks_client_disconnects() -> Result<(), TestError> 
     tokio::time::timeout(Duration::from_secs(10), run_client_disconnect_e2e()).await?
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closes_idle_socks_handshake_after_timeout() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_socks_handshake_timeout_e2e()).await?
+}
+
 async fn run_tcp_relay_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -179,6 +184,17 @@ async fn run_client_disconnect_e2e() -> Result<(), TestError> {
 
     let target_received = target_task.await??;
     assert!(target_received.is_empty());
+    Ok(())
+}
+
+async fn run_socks_handshake_timeout_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = RelayHarness::start_with_client_socks_timeout(None, 1).await?;
+    let mut socks = TcpStream::connect(harness.socks_addr).await?;
+    let mut byte = [0_u8; 1];
+
+    assert_eq!(socks.read(&mut byte).await?, 0);
     Ok(())
 }
 
@@ -356,9 +372,29 @@ impl RelayHarness {
         Self::start_with_limits(policy_toml, test_limits()).await
     }
 
+    async fn start_with_client_socks_timeout(
+        policy_toml: Option<String>,
+        socks_handshake_timeout_seconds: u64,
+    ) -> Result<Self, TestError> {
+        Self::start_with_limits_and_client_socks_timeout(
+            policy_toml,
+            test_limits(),
+            socks_handshake_timeout_seconds,
+        )
+        .await
+    }
+
     async fn start_with_limits(
         policy_toml: Option<String>,
         limits: LimitConfig,
+    ) -> Result<Self, TestError> {
+        Self::start_with_limits_and_client_socks_timeout(policy_toml, limits, 3).await
+    }
+
+    async fn start_with_limits_and_client_socks_timeout(
+        policy_toml: Option<String>,
+        limits: LimitConfig,
+        socks_handshake_timeout_seconds: u64,
     ) -> Result<Self, TestError> {
         let temp_dir = create_temp_dir()?;
         let cert_path = temp_dir.join("server-cert.pem");
@@ -402,7 +438,7 @@ impl RelayHarness {
                 key_id: KEY_ID.to_owned(),
                 secret: SECRET.to_owned(),
                 handshake_timeout_seconds: Some(3),
-                socks_handshake_timeout_seconds: Some(3),
+                socks_handshake_timeout_seconds: Some(socks_handshake_timeout_seconds),
                 tcp_open_timeout_seconds: Some(3),
             },
             socks_addr.to_string(),
