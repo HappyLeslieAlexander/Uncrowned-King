@@ -42,6 +42,7 @@ timeout:
 max_frame_size = 65536
 max_streams = 64
 idle_timeout_seconds = 300
+max_buffered_bytes_per_flow = 2097152
 ```
 
 Set `idle_timeout_seconds = 0` to disable the relay session idle timeout.

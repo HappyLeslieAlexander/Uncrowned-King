@@ -129,10 +129,13 @@ async fn handle_connection(
         stream,
         credential,
         policy_set,
-        FrameLimits {
-            max_frame_size: config.max_frame_size(),
-        },
-        config.max_streams(),
+        relay::RelayLimits::new(
+            FrameLimits {
+                max_frame_size: config.max_frame_size(),
+            },
+            config.max_streams(),
+            usize_limit(config.max_buffered_bytes_per_flow()),
+        ),
         idle_timeout(config.idle_timeout_seconds()),
     )
     .await
@@ -140,4 +143,8 @@ async fn handle_connection(
 
 fn idle_timeout(seconds: u64) -> Option<Duration> {
     (seconds != 0).then(|| Duration::from_secs(seconds))
+}
+
+fn usize_limit(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
 }

@@ -5,7 +5,10 @@ use std::{
     error::Error,
     io,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -33,7 +36,14 @@ const TARGET_WRITE_QUEUE_CAPACITY: usize = 32;
 
 type AnyError = Box<dyn Error + Send + Sync>;
 type CarrierWriter = Arc<Mutex<WriteHalf<TlsStream<TcpStream>>>>;
-type FlowTable = HashMap<u64, mpsc::Sender<TargetCommand>>;
+type FlowTable = HashMap<u64, TargetFlow>;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RelayLimits {
+    frame: FrameLimits,
+    max_streams: u64,
+    max_buffered_bytes_per_flow: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServerSessionState {
@@ -65,12 +75,29 @@ enum TargetCommand {
     Close,
 }
 
+#[derive(Debug)]
+enum EnqueueError {
+    Closed,
+    ResourceLimit,
+}
+
+#[derive(Debug, Clone)]
+struct TargetFlowControl {
+    buffered_bytes: Arc<AtomicUsize>,
+    closed: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone)]
+struct TargetFlow {
+    commands: mpsc::Sender<TargetCommand>,
+    control: TargetFlowControl,
+}
+
 pub(crate) async fn relay_session(
     carrier: TlsStream<TcpStream>,
     credential: Credential,
     policy_set: Arc<PolicySet>,
-    limits: FrameLimits,
-    max_streams: u64,
+    limits: RelayLimits,
     idle_timeout: Option<Duration>,
 ) -> Result<(), AnyError> {
     let mut state = ServerSessionState::Authenticated;
@@ -82,7 +109,14 @@ pub(crate) async fn relay_session(
     let mut target_writers = FlowTable::new();
 
     loop {
-        match next_session_event(&mut carrier_reader, &mut event_rx, limits, idle_timeout).await? {
+        match next_session_event(
+            &mut carrier_reader,
+            &mut event_rx,
+            limits.frame,
+            idle_timeout,
+        )
+        .await?
+        {
             SessionEvent::Flow(Some(FlowEvent::TargetClosed(flow_id))) => {
                 if target_writers.remove(&flow_id).is_some() {
                     info!(event = "tcp.closed", flow_id);
@@ -97,7 +131,7 @@ pub(crate) async fn relay_session(
                     &carrier_writer,
                     &event_tx,
                     &mut target_writers,
-                    max_streams,
+                    limits,
                 )
                 .await?;
             }
@@ -136,12 +170,12 @@ async fn handle_session_frame(
     carrier_writer: &CarrierWriter,
     event_tx: &mpsc::UnboundedSender<FlowEvent>,
     target_writers: &mut FlowTable,
-    max_streams: u64,
+    limits: RelayLimits,
 ) -> Result<(), AnyError> {
     match frame.header.frame_type {
         FrameType::TcpOpen => {
             if is_client_initiated_flow_id(frame.header.id) {
-                if target_writers.len() as u64 >= max_streams {
+                if target_writers.len() as u64 >= limits.max_streams {
                     send_resource_limit(carrier_writer, frame.header.id).await?;
                     send_tcp_close(carrier_writer, frame.header.id, TCP_CLOSE_ERROR).await?;
                     return Ok(());
@@ -163,12 +197,16 @@ async fn handle_session_frame(
             if !frame.payload.is_empty() {
                 let flow_id = frame.header.id;
                 if let Some(target) = target_writers.get(&flow_id) {
-                    if target
-                        .send(TargetCommand::Data(frame.payload))
-                        .await
-                        .is_err()
-                    {
-                        target_writers.remove(&flow_id);
+                    match target.enqueue_data(frame.payload, limits.max_buffered_bytes_per_flow) {
+                        Ok(()) => {}
+                        Err(EnqueueError::Closed) => {
+                            target_writers.remove(&flow_id);
+                        }
+                        Err(EnqueueError::ResourceLimit) => {
+                            send_resource_limit(carrier_writer, flow_id).await?;
+                            send_tcp_close(carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
+                            target_writers.remove(&flow_id);
+                        }
                     }
                 } else {
                     send_error(carrier_writer, flow_id, ErrorCode::Protocol).await?;
@@ -180,7 +218,7 @@ async fn handle_session_frame(
             let mut payload = frame.payload;
             let _close = TcpClose::decode(&mut payload)?;
             if let Some(target) = target_writers.remove(&frame.header.id) {
-                let _ = target.send(TargetCommand::Close).await;
+                target.close();
             }
             Ok(())
         }
@@ -196,7 +234,7 @@ async fn handle_tcp_open(
     frame: Frame,
     credential: &Credential,
     policy_set: &PolicySet,
-) -> Result<Option<(u64, mpsc::Sender<TargetCommand>)>, AnyError> {
+) -> Result<Option<(u64, TargetFlow)>, AnyError> {
     let flow_id = frame.header.id;
     if flow_id == 0 {
         send_error(carrier_writer, flow_id, ErrorCode::Protocol).await?;
@@ -244,6 +282,8 @@ async fn handle_tcp_open(
 
     let (target_reader, target_writer) = target_stream.into_split();
     let (target_writer_tx, target_writer_rx) = mpsc::channel(TARGET_WRITE_QUEUE_CAPACITY);
+    let flow_control = TargetFlowControl::default();
+    let target_flow = TargetFlow::new(target_writer_tx, flow_control.clone());
     send_tcp_data(carrier_writer, flow_id, Bytes::new()).await?;
     spawn_target_reader(
         flow_id,
@@ -255,11 +295,12 @@ async fn handle_tcp_open(
         flow_id,
         target_writer,
         target_writer_rx,
+        flow_control,
         Arc::clone(carrier_writer),
         event_tx.clone(),
     );
     info!(event = "tcp.open", flow_id, target = ?target);
-    Ok(Some((flow_id, target_writer_tx)))
+    Ok(Some((flow_id, target_flow)))
 }
 
 fn spawn_target_reader(
@@ -284,11 +325,12 @@ fn spawn_target_writer(
     flow_id: u64,
     target_writer: OwnedWriteHalf,
     commands: mpsc::Receiver<TargetCommand>,
+    flow_control: TargetFlowControl,
     carrier_writer: CarrierWriter,
     event_tx: mpsc::UnboundedSender<FlowEvent>,
 ) {
     tokio::spawn(async move {
-        if let Err(err) = relay_client_to_target(target_writer, commands).await {
+        if let Err(err) = relay_client_to_target(target_writer, commands, flow_control).await {
             warn!(event = "tcp.target.write.error", flow_id, error = %err);
             let _ = send_error(&carrier_writer, flow_id, ErrorCode::TargetUnavailable).await;
             let _ = send_tcp_close(&carrier_writer, flow_id, TCP_CLOSE_ERROR).await;
@@ -300,17 +342,124 @@ fn spawn_target_writer(
 async fn relay_client_to_target(
     mut target_writer: OwnedWriteHalf,
     mut commands: mpsc::Receiver<TargetCommand>,
+    flow_control: TargetFlowControl,
 ) -> Result<(), AnyError> {
     while let Some(command) = commands.recv().await {
         match command {
-            TargetCommand::Data(payload) => target_writer.write_all(&payload).await?,
+            TargetCommand::Data(payload) => {
+                let payload_len = payload.len();
+                if flow_control.is_closed() {
+                    flow_control.release_bytes(payload_len);
+                    return Ok(());
+                }
+
+                let write_result = target_writer.write_all(&payload).await;
+                flow_control.release_bytes(payload_len);
+                write_result?;
+            }
             TargetCommand::Close => {
+                flow_control.close();
                 target_writer.shutdown().await?;
                 return Ok(());
             }
         }
     }
     Ok(())
+}
+
+impl RelayLimits {
+    pub(crate) const fn new(
+        frame: FrameLimits,
+        max_streams: u64,
+        max_buffered_bytes_per_flow: usize,
+    ) -> Self {
+        Self {
+            frame,
+            max_streams,
+            max_buffered_bytes_per_flow,
+        }
+    }
+}
+
+impl Default for TargetFlowControl {
+    fn default() -> Self {
+        Self {
+            buffered_bytes: Arc::new(AtomicUsize::new(0)),
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl TargetFlowControl {
+    fn reserve_bytes(&self, amount: usize, limit: usize) -> bool {
+        let mut current = self.buffered_bytes.load(Ordering::SeqCst);
+        loop {
+            let Some(next) = current.checked_add(amount) else {
+                return false;
+            };
+            if next > limit {
+                return false;
+            }
+            match self.buffered_bytes.compare_exchange(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release_bytes(&self, amount: usize) {
+        let previous = self.buffered_bytes.fetch_sub(amount, Ordering::SeqCst);
+        debug_assert!(previous >= amount);
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+}
+
+impl TargetFlow {
+    fn new(commands: mpsc::Sender<TargetCommand>, control: TargetFlowControl) -> Self {
+        Self { commands, control }
+    }
+
+    fn enqueue_data(&self, payload: Bytes, byte_limit: usize) -> Result<(), EnqueueError> {
+        if self.control.is_closed() {
+            return Err(EnqueueError::Closed);
+        }
+
+        let payload_len = payload.len();
+        if !self.control.reserve_bytes(payload_len, byte_limit) {
+            self.close();
+            return Err(EnqueueError::ResourceLimit);
+        }
+
+        match self.commands.try_send(TargetCommand::Data(payload)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.control.release_bytes(payload_len);
+                Err(EnqueueError::Closed)
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.control.release_bytes(payload_len);
+                self.close();
+                Err(EnqueueError::ResourceLimit)
+            }
+        }
+    }
+
+    fn close(&self) {
+        self.control.close();
+        let _ = self.commands.try_send(TargetCommand::Close);
+    }
 }
 
 async fn relay_target_to_client(

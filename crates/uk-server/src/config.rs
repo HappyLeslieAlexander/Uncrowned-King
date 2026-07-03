@@ -81,6 +81,14 @@ impl ServerConfig {
             .and_then(|limits| limits.idle_timeout_seconds)
             .unwrap_or(300)
     }
+
+    /// Maximum queued client-to-target bytes per TCP flow.
+    pub fn max_buffered_bytes_per_flow(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.max_buffered_bytes_per_flow)
+            .unwrap_or(2_097_152)
+    }
 }
 
 /// Server resource limits.
@@ -95,6 +103,8 @@ pub struct LimitConfig {
     pub max_streams: Option<u64>,
     /// Idle timeout for authenticated relay sessions in seconds.
     pub idle_timeout_seconds: Option<u64>,
+    /// Maximum queued client-to-target bytes per TCP flow.
+    pub max_buffered_bytes_per_flow: Option<u64>,
 }
 
 /// One configured credential.
@@ -170,5 +180,28 @@ idle_timeout_seconds = 42
         .unwrap();
 
         assert_eq!(config.idle_timeout_seconds(), 42);
+    }
+
+    #[test]
+    fn defaults_buffered_bytes_per_flow_limit() {
+        assert_eq!(minimal_config().max_buffered_bytes_per_flow(), 2_097_152);
+    }
+
+    #[test]
+    fn parses_buffered_bytes_per_flow_limit() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_buffered_bytes_per_flow = 4096
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.max_buffered_bytes_per_flow(), 4096);
     }
 }
