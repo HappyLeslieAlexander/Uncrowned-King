@@ -25,6 +25,9 @@ pub enum PolicyError {
     /// Invalid action string.
     #[error("invalid policy action {0}")]
     InvalidAction(String),
+    /// Invalid domain predicate.
+    #[error("invalid policy domain {0}")]
+    InvalidDomain(String),
     /// TOML parse failure.
     #[error("invalid policy toml: {0}")]
     InvalidToml(String),
@@ -273,8 +276,11 @@ impl TryFrom<RawPolicyRule> for PolicyRule {
             action,
             key_id: raw.key_id.map(String::into_bytes),
             policy_group: raw.policy_group,
-            domain: raw.domain,
-            domain_suffix: raw.domain_suffix,
+            domain: raw.domain.map(validate_domain_match).transpose()?,
+            domain_suffix: raw
+                .domain_suffix
+                .map(validate_domain_suffix_match)
+                .transpose()?,
             cidr: raw.cidr.as_deref().map(Cidr::from_str).transpose()?,
             ports,
             private: raw.private,
@@ -286,6 +292,27 @@ fn target_domain(target: &Target) -> Option<&str> {
     match target {
         Target::Domain(domain, _) => Some(domain),
         Target::Ipv4(_, _) | Target::Ipv6(_, _) => None,
+    }
+}
+
+fn validate_domain_match(domain: String) -> PolicyResult<String> {
+    let normalized = normalize_domain(&domain);
+    if normalized.is_empty()
+        || normalized.starts_with('.')
+        || domain.bytes().any(|byte| byte.is_ascii_control())
+    {
+        Err(PolicyError::InvalidDomain(domain))
+    } else {
+        Ok(domain)
+    }
+}
+
+fn validate_domain_suffix_match(suffix: String) -> PolicyResult<String> {
+    let normalized = normalize_domain(&suffix);
+    if normalized.is_empty() || suffix.bytes().any(|byte| byte.is_ascii_control()) {
+        Err(PolicyError::InvalidDomain(suffix))
+    } else {
+        Ok(suffix)
     }
 }
 
@@ -554,5 +581,64 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err, PolicyError::InvalidAction("alow".to_owned()));
+    }
+
+    #[test]
+    fn rejects_empty_policy_domain() {
+        let err = PolicySet::from_toml(
+            r#"
+            [[rules]]
+            action = "allow"
+            domain = ""
+            "#,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, PolicyError::InvalidDomain(String::new()));
+    }
+
+    #[test]
+    fn rejects_empty_policy_domain_suffix() {
+        let err = PolicySet::from_toml(
+            r#"
+            [[rules]]
+            action = "allow"
+            domain_suffix = ""
+            "#,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, PolicyError::InvalidDomain(String::new()));
+    }
+
+    #[test]
+    fn rejects_root_only_policy_domain_suffix() {
+        let err = PolicySet::from_toml(
+            r#"
+            [[rules]]
+            action = "allow"
+            domain_suffix = "."
+            "#,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, PolicyError::InvalidDomain(".".to_owned()));
+    }
+
+    #[test]
+    fn rejects_control_character_policy_domains() {
+        let err = PolicySet::from_toml(
+            r#"
+            [[rules]]
+            action = "allow"
+            domain = "bad\nname.example"
+            "#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            PolicyError::InvalidDomain("bad\nname.example".to_owned())
+        );
     }
 }
