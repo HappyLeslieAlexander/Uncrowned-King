@@ -72,6 +72,7 @@ VODOlcdwgEkE3j5MxS0brpI9
 const KEY_ID: &str = "e2e-client";
 const SECRET: &str = "0123456789abcdef0123456789abcdef";
 const SOCKS_REPLY_SUCCEEDED: u8 = 0x00;
+const SOCKS_REPLY_GENERAL_FAILURE: u8 = 0x01;
 const SOCKS_REPLY_NOT_ALLOWED: u8 = 0x02;
 const SOCKS_REPLY_HOST_UNREACHABLE: u8 = 0x04;
 const HALF_CLOSE_REQUEST: &[u8] = b"uncrowned king half-close request";
@@ -110,6 +111,11 @@ async fn preserves_client_half_close_until_target_response() -> Result<(), TestE
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preserves_client_writes_after_target_half_close() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_target_half_close_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maps_stream_limit_to_socks_general_failure() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_stream_limit_e2e()).await?
 }
 
 async fn run_tcp_relay_e2e() -> Result<(), TestError> {
@@ -161,6 +167,30 @@ async fn run_half_close_e2e() -> Result<(), TestError> {
 
     let target_received = target_task.await??;
     assert_eq!(target_received, HALF_CLOSE_REQUEST);
+    Ok(())
+}
+
+async fn run_stream_limit_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, target_task) = spawn_read_to_eof_target().await?;
+    let harness = RelayHarness::start_with_limits(
+        Some(allow_loopback_policy(target_addr.port())),
+        test_limits_with_max_streams(1),
+    )
+    .await?;
+
+    let (mut first_socks, first_reply) =
+        open_socks_connect(harness.socks_addr, target_addr).await?;
+    assert_eq!(first_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    let (_second_socks, second_reply) = open_socks_connect(harness.socks_addr, target_addr).await?;
+    assert_eq!(second_reply[1], SOCKS_REPLY_GENERAL_FAILURE);
+
+    first_socks.write_all(b"x").await?;
+    first_socks.shutdown().await?;
+    let target_received = target_task.await??;
+    assert_eq!(target_received, b"x");
     Ok(())
 }
 
@@ -229,6 +259,13 @@ struct RelayHarness {
 
 impl RelayHarness {
     async fn start(policy_toml: Option<String>) -> Result<Self, TestError> {
+        Self::start_with_limits(policy_toml, test_limits()).await
+    }
+
+    async fn start_with_limits(
+        policy_toml: Option<String>,
+        limits: LimitConfig,
+    ) -> Result<Self, TestError> {
         let temp_dir = create_temp_dir()?;
         let cert_path = temp_dir.join("server-cert.pem");
         let key_path = temp_dir.join("server-key.pem");
@@ -250,7 +287,7 @@ impl RelayHarness {
             cert_path: path_string(&cert_path),
             key_path: path_string(&key_path),
             auth_skew_seconds: Some(30),
-            limits: Some(test_limits()),
+            limits: Some(limits),
             policy_path: policy_path.as_deref().map(path_string),
             credentials: vec![CredentialConfig {
                 key_id: KEY_ID.to_owned(),
@@ -305,6 +342,24 @@ async fn spawn_echo_target()
         let read = stream.read(&mut buf).await?;
         stream.write_all(&buf[..read]).await?;
         Ok(())
+    });
+    Ok((addr, task))
+}
+
+async fn spawn_read_to_eof_target() -> Result<
+    (
+        SocketAddr,
+        tokio::task::JoinHandle<Result<Vec<u8>, TestError>>,
+    ),
+    TestError,
+> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await?;
+        Ok(received)
     });
     Ok((addr, task))
 }
@@ -465,6 +520,12 @@ fn test_limits() -> LimitConfig {
         target_connect_timeout_seconds: Some(3),
         tcp_half_close_timeout_seconds: Some(3),
     }
+}
+
+fn test_limits_with_max_streams(max_streams: u64) -> LimitConfig {
+    let mut limits = test_limits();
+    limits.max_streams = Some(max_streams);
+    limits
 }
 
 fn create_temp_dir() -> Result<PathBuf, TestError> {
