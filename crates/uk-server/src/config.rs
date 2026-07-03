@@ -1,6 +1,6 @@
 //! Server configuration.
 
-use std::{error::Error, fs, path::Path};
+use std::{error::Error, fs, net::SocketAddr, path::Path};
 
 use serde::Deserialize;
 use uk_auth::{
@@ -69,6 +69,11 @@ impl ServerConfig {
         )?;
         reject_zero_limit("replay_cache_max_entries", self.replay_cache_max_entries())?;
         Ok(())
+    }
+
+    /// Validates configured network endpoints without resolving DNS.
+    pub fn validate_network_endpoints(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        validate_host_port("listen", &self.listen)
     }
 
     /// Configured pre-auth frame limit.
@@ -155,6 +160,46 @@ impl ServerConfig {
 fn reject_zero_limit(name: &str, value: u64) -> Result<(), Box<dyn Error + Send + Sync>> {
     if value == 0 {
         Err(format!("{name} must be greater than zero").into())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_host_port(name: &'static str, value: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return validate_port(name, addr.port());
+    }
+
+    let (host, port) = split_host_port(value).ok_or_else(|| {
+        format!("{name} must be a host:port endpoint; bracket IPv6 literals like [::1]:443")
+    })?;
+    if host.is_empty() || host.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(format!("{name} has an invalid host").into());
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| format!("{name} has an invalid port"))?;
+    validate_port(name, port)
+}
+
+fn split_host_port(value: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = value.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let host = &rest[..end];
+        let port = rest[end + 1..].strip_prefix(':')?;
+        Some((host, port))
+    } else {
+        let (host, port) = value.rsplit_once(':')?;
+        if host.contains(':') {
+            return None;
+        }
+        Some((host, port))
+    }
+}
+
+fn validate_port(name: &'static str, port: u16) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if port == 0 {
+        Err(format!("{name} port must be 1..=65535").into())
     } else {
         Ok(())
     }
@@ -270,6 +315,46 @@ idle_timeout_seconds = 42
     #[test]
     fn accepts_default_limits() {
         assert!(minimal_config().validate_limits().is_ok());
+    }
+
+    #[test]
+    fn accepts_domain_listen_addr() {
+        let mut config = minimal_config();
+        config.listen = "localhost:9443".to_owned();
+
+        assert!(config.validate_network_endpoints().is_ok());
+    }
+
+    #[test]
+    fn accepts_bracketed_ipv6_listen_addr() {
+        let mut config = minimal_config();
+        config.listen = "[::1]:9443".to_owned();
+
+        assert!(config.validate_network_endpoints().is_ok());
+    }
+
+    #[test]
+    fn rejects_listen_addr_without_port() {
+        let mut config = minimal_config();
+        config.listen = "localhost".to_owned();
+
+        assert!(config.validate_network_endpoints().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_listen_addr_port() {
+        let mut config = minimal_config();
+        config.listen = "127.0.0.1:0".to_owned();
+
+        assert!(config.validate_network_endpoints().is_err());
+    }
+
+    #[test]
+    fn rejects_unbracketed_ipv6_listen_addr() {
+        let mut config = minimal_config();
+        config.listen = "::1:9443".to_owned();
+
+        assert!(config.validate_network_endpoints().is_err());
     }
 
     #[test]

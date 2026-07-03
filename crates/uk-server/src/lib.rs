@@ -24,6 +24,7 @@ pub type AnyError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Runs the UK server listener until the task is cancelled or the listener fails.
 pub async fn run(config: ServerConfig) -> Result<(), AnyError> {
+    config.validate_network_endpoints()?;
     config.validate_limits()?;
     let credentials = Arc::new(config.credentials()?);
     let policy_set = Arc::new(config.policy_set()?);
@@ -58,6 +59,7 @@ pub async fn run(config: ServerConfig) -> Result<(), AnyError> {
 
 /// Validates server config, credentials, policy, and TLS material.
 pub fn check_config(config: &ServerConfig) -> Result<(), AnyError> {
+    config.validate_network_endpoints()?;
     config.validate_limits()?;
     let _credentials = config.credentials()?;
     let _policy_set = config.policy_set()?;
