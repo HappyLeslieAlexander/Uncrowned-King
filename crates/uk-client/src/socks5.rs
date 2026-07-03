@@ -85,11 +85,13 @@ where
 {
     let version = stream.read_u8().await?;
     if version != VERSION {
+        send_reply(stream, Reply::GeneralFailure).await?;
         return Err(protocol_error("unsupported socks request version"));
     }
     let command = stream.read_u8().await?;
     let reserved = stream.read_u8().await?;
     if reserved != 0 {
+        send_reply(stream, Reply::GeneralFailure).await?;
         return Err(protocol_error("invalid socks reserved byte"));
     }
     let addr_type = stream.read_u8().await?;
@@ -200,6 +202,50 @@ mod tests {
         let mut reply = [0_u8; 10];
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply[1], Reply::CommandNotSupported.code());
+        assert!(server_task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_bad_request_version_with_failure_reply() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
+
+        client
+            .write_all(&[
+                0x05, 0x01, 0x00, 0x04, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x00, 0x50,
+            ])
+            .await
+            .unwrap();
+
+        let mut method_response = [0_u8; 2];
+        client.read_exact(&mut method_response).await.unwrap();
+        assert_eq!(method_response, [0x05, 0x00]);
+
+        let mut reply = [0_u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], Reply::GeneralFailure.code());
+        assert!(server_task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_bad_reserved_byte_with_failure_reply() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
+
+        client
+            .write_all(&[
+                0x05, 0x01, 0x00, 0x05, 0x01, 0xff, 0x01, 127, 0, 0, 1, 0x00, 0x50,
+            ])
+            .await
+            .unwrap();
+
+        let mut method_response = [0_u8; 2];
+        client.read_exact(&mut method_response).await.unwrap();
+        assert_eq!(method_response, [0x05, 0x00]);
+
+        let mut reply = [0_u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], Reply::GeneralFailure.code());
         assert!(server_task.await.unwrap().is_err());
     }
 
