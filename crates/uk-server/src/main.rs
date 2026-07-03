@@ -8,13 +8,15 @@ use std::{sync::Arc, time::Duration};
 
 use bytes::BytesMut;
 use clap::Parser;
-use tokio::{net::TcpListener, sync::Mutex};
-use tokio_rustls::TlsAcceptor;
+use tokio::{net::TcpListener, sync::Mutex, time};
+use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tracing::{info, warn};
 use uk_auth::{AuthChallenge, AuthResponse, ReplayCache, unix_now, verify_auth_response};
 use uk_proto::{Frame, FrameLimits, FrameType, SettingKey, Settings, read_frame, write_frame};
 
 use crate::config::ServerConfig;
+
+type AnyError = Box<dyn std::error::Error + Send + Sync>;
 
 /// UK server command line.
 #[derive(Debug, Parser)]
@@ -26,14 +28,14 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> Result<(), AnyError> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
     let config = ServerConfig::load(&args.config)?;
     run(config).await
 }
 
-async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run(config: ServerConfig) -> Result<(), AnyError> {
     let credentials = Arc::new(config.credentials()?);
     let policy_set = Arc::new(config.policy_set()?);
     let replay_cache = Arc::new(Mutex::new(ReplayCache::default()));
@@ -69,7 +71,45 @@ async fn handle_connection(
     policy_set: Arc<uk_policy::PolicySet>,
     replay_cache: Arc<Mutex<ReplayCache>>,
     config: ServerConfig,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), AnyError> {
+    let (stream, credential) =
+        if let Some(timeout) = handshake_timeout(config.handshake_timeout_seconds()) {
+            match time::timeout(
+                timeout,
+                complete_handshake(acceptor, tcp, credentials, replay_cache, &config),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => return Err("handshake timeout".into()),
+            }
+        } else {
+            complete_handshake(acceptor, tcp, credentials, replay_cache, &config).await?
+        };
+
+    relay::relay_session(
+        stream,
+        credential,
+        policy_set,
+        relay::RelayLimits::new(
+            FrameLimits {
+                max_frame_size: config.max_frame_size(),
+            },
+            config.max_streams(),
+            usize_limit(config.max_buffered_bytes_per_flow()),
+        ),
+        idle_timeout(config.idle_timeout_seconds()),
+    )
+    .await
+}
+
+async fn complete_handshake(
+    acceptor: TlsAcceptor,
+    tcp: tokio::net::TcpStream,
+    credentials: Arc<Vec<uk_auth::Credential>>,
+    replay_cache: Arc<Mutex<ReplayCache>>,
+    config: &ServerConfig,
+) -> Result<(TlsStream<tokio::net::TcpStream>, uk_auth::Credential), AnyError> {
     let mut stream = acceptor.accept(tcp).await?;
     let exporter = tls::exporter(&stream)?;
     let challenge = AuthChallenge::generate(unix_now());
@@ -125,23 +165,14 @@ async fn handle_connection(
     let settings_frame = Frame::new(FrameType::Settings, 0, 0, settings_payload.freeze())?;
     write_frame(&mut stream, &settings_frame).await?;
 
-    relay::relay_session(
-        stream,
-        credential,
-        policy_set,
-        relay::RelayLimits::new(
-            FrameLimits {
-                max_frame_size: config.max_frame_size(),
-            },
-            config.max_streams(),
-            usize_limit(config.max_buffered_bytes_per_flow()),
-        ),
-        idle_timeout(config.idle_timeout_seconds()),
-    )
-    .await
+    Ok((stream, credential))
 }
 
 fn idle_timeout(seconds: u64) -> Option<Duration> {
+    (seconds != 0).then(|| Duration::from_secs(seconds))
+}
+
+fn handshake_timeout(seconds: u64) -> Option<Duration> {
     (seconds != 0).then(|| Duration::from_secs(seconds))
 }
 

@@ -89,6 +89,14 @@ impl ServerConfig {
             .and_then(|limits| limits.max_buffered_bytes_per_flow)
             .unwrap_or(2_097_152)
     }
+
+    /// TLS and authentication handshake timeout in seconds. Zero disables it.
+    pub fn handshake_timeout_seconds(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.handshake_timeout_seconds)
+            .unwrap_or(10)
+    }
 }
 
 /// Server resource limits.
@@ -105,6 +113,8 @@ pub struct LimitConfig {
     pub idle_timeout_seconds: Option<u64>,
     /// Maximum queued client-to-target bytes per TCP flow.
     pub max_buffered_bytes_per_flow: Option<u64>,
+    /// TLS and authentication handshake timeout in seconds.
+    pub handshake_timeout_seconds: Option<u64>,
 }
 
 /// One configured credential.
@@ -203,5 +213,28 @@ max_buffered_bytes_per_flow = 4096
         .unwrap();
 
         assert_eq!(config.max_buffered_bytes_per_flow(), 4096);
+    }
+
+    #[test]
+    fn defaults_handshake_timeout() {
+        assert_eq!(minimal_config().handshake_timeout_seconds(), 10);
+    }
+
+    #[test]
+    fn parses_handshake_timeout() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+handshake_timeout_seconds = 3
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.handshake_timeout_seconds(), 3);
     }
 }
