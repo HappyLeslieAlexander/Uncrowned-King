@@ -1,6 +1,7 @@
 //! UncrownedKing server binary.
 
 mod config;
+mod relay;
 mod tls;
 
 use std::{sync::Arc, time::Duration};
@@ -34,6 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let credentials = Arc::new(config.credentials()?);
+    let policy_set = Arc::new(config.policy_set()?);
     let replay_cache = Arc::new(Mutex::new(ReplayCache::default()));
     let tls_config = tls::server_config(&config.cert_path, &config.key_path)?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
@@ -45,12 +47,14 @@ async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error + Sen
         let (tcp, peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let credentials = Arc::clone(&credentials);
+        let policy_set = Arc::clone(&policy_set);
         let replay_cache = Arc::clone(&replay_cache);
         let config = config.clone();
 
         tokio::spawn(async move {
             if let Err(err) =
-                handle_connection(acceptor, tcp, credentials, replay_cache, config).await
+                handle_connection(acceptor, tcp, credentials, policy_set, replay_cache, config)
+                    .await
             {
                 warn!(event = "protocol.error", peer = %peer, error = %err);
             }
@@ -62,6 +66,7 @@ async fn handle_connection(
     acceptor: TlsAcceptor,
     tcp: tokio::net::TcpStream,
     credentials: Arc<Vec<uk_auth::Credential>>,
+    policy_set: Arc<uk_policy::PolicySet>,
     replay_cache: Arc<Mutex<ReplayCache>>,
     config: ServerConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -89,16 +94,18 @@ async fn handle_connection(
     let mut response_payload = response_frame.payload;
     let response = AuthResponse::decode(&mut response_payload)?;
     let now = unix_now();
-    let mut replay_cache = replay_cache.lock().await;
-    let credential = verify_auth_response(
-        &credentials,
-        &exporter,
-        &challenge,
-        &response,
-        now,
-        Duration::from_secs(config.auth_skew_seconds.unwrap_or(30)),
-        &mut replay_cache,
-    )?;
+    let credential = {
+        let mut replay_cache = replay_cache.lock().await;
+        verify_auth_response(
+            &credentials,
+            &exporter,
+            &challenge,
+            &response,
+            now,
+            Duration::from_secs(config.auth_skew_seconds.unwrap_or(30)),
+            &mut replay_cache,
+        )?
+    };
 
     info!(
         event = "auth.success",
@@ -113,5 +120,13 @@ async fn handle_connection(
     let settings_frame = Frame::new(FrameType::Settings, 0, 0, settings_payload.freeze())?;
     write_frame(&mut stream, &settings_frame).await?;
 
-    Ok(())
+    relay::relay_session(
+        stream,
+        credential,
+        policy_set,
+        FrameLimits {
+            max_frame_size: config.max_frame_size(),
+        },
+    )
+    .await
 }

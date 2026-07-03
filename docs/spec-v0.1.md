@@ -86,7 +86,37 @@ Validation:
 - IPv4 host length must be exactly 4.
 - IPv6 host length must be exactly 16.
 
-## 4. Authentication Payloads
+## 4. TCP Relay Payloads
+
+`TCP_OPEN` payload:
+
+```text
+Target target
+u16    open_flags
+```
+
+v0.1 defines no non-zero `open_flags`.
+
+`TCP_DATA` payload is uninterpreted TCP byte data.
+
+When a `TCP_OPEN` is accepted, the server sends a zero-length `TCP_DATA` on the
+same `id` as the open acknowledgement before forwarding target bytes. Rejection
+uses `POLICY_DENIED`, `RESOURCE_LIMIT`, or `ERROR`, followed by `TCP_CLOSE`.
+
+`TCP_CLOSE` payload:
+
+```text
+u16 close_code
+```
+
+Known close codes:
+
+| Code | Name |
+| ---: | --- |
+| `0` | normal close |
+| `1` | generic error |
+
+## 5. Authentication Payloads
 
 The carrier supplies a 32-byte TLS/QUIC exporter binding. Until carriers are
 implemented, tests pass this value explicitly.
@@ -131,7 +161,7 @@ HMAC-SHA256(
 )
 ```
 
-## 5. SETTINGS Payload
+## 6. SETTINGS Payload
 
 v0.1 settings use repeated key/value pairs:
 
@@ -157,7 +187,7 @@ Known keys:
 Unknown optional settings may be ignored. Required setting semantics will be
 added after v0.1.
 
-## 6. Error Codes
+## 7. Error Codes
 
 | Code | Name |
 | ---: | --- |
@@ -170,4 +200,3 @@ added after v0.1.
 | `7` | `ERROR_POLICY_DENIED` |
 | `8` | `ERROR_RESOURCE_LIMIT` |
 | `9` | `ERROR_PROTOCOL` |
-

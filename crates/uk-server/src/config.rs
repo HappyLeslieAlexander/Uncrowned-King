@@ -1,9 +1,10 @@
 //! Server configuration.
 
-use std::{fs, path::Path};
+use std::{error::Error, fs, path::Path};
 
 use serde::Deserialize;
 use uk_auth::{AuthError, Credential, CredentialStatus};
+use uk_policy::PolicySet;
 
 /// Server TOML configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -18,6 +19,8 @@ pub struct ServerConfig {
     pub auth_skew_seconds: Option<u64>,
     /// Optional limits.
     pub limits: Option<LimitConfig>,
+    /// Optional TOML policy file. If omitted, the server denies all targets.
+    pub policy_path: Option<String>,
     /// Static credential list.
     pub credentials: Vec<CredentialConfig>,
 }
@@ -36,6 +39,15 @@ impl ServerConfig {
             .iter()
             .map(CredentialConfig::to_credential)
             .collect()
+    }
+
+    /// Loads the configured policy set. Missing policy config means deny-all.
+    pub fn policy_set(&self) -> Result<PolicySet, Box<dyn Error + Send + Sync>> {
+        let Some(path) = &self.policy_path else {
+            return Ok(PolicySet::default());
+        };
+        let text = fs::read_to_string(path)?;
+        Ok(PolicySet::from_toml(&text)?)
     }
 
     /// Configured pre-auth frame limit.

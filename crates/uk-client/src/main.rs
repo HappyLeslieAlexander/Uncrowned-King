@@ -1,14 +1,12 @@
 //! UncrownedKing client binary.
 
 mod config;
+mod relay;
+mod session;
+mod socks5;
 mod tls;
 
-use bytes::BytesMut;
 use clap::{Parser, Subcommand};
-use tokio::net::TcpStream;
-use tracing::info;
-use uk_auth::{AuthChallenge, AuthResponse, unix_now};
-use uk_proto::{Frame, FrameLimits, FrameType, Settings, read_frame, write_frame};
 
 use crate::config::ClientConfig;
 
@@ -29,7 +27,7 @@ struct Args {
 enum Command {
     /// Connect to the server and complete UK authentication.
     Handshake,
-    /// Start a local SOCKS5 listener. Full implementation lands in the relay milestone.
+    /// Start a local SOCKS5 listener.
     Socks5 {
         /// Local listen address.
         #[arg(long, default_value = "127.0.0.1:1080")]
@@ -45,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match args.command {
         Command::Handshake => run_handshake(config).await?,
         Command::Socks5 { listen } => {
-            println!("socks5 placeholder listen={listen}");
+            relay::run_socks5_listener(config, listen).await?;
         }
     }
     Ok(())
@@ -54,39 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 async fn run_handshake(
     config: ClientConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let connector = tls::connector(&config.ca_cert_path)?;
-    let tcp = TcpStream::connect(&config.server_addr).await?;
-    let server_name = tls::server_name(config.server_name.clone())?;
-    let mut stream = connector.connect(server_name, tcp).await?;
-    let exporter = tls::exporter(&stream)?;
-
-    let challenge_frame = read_frame(&mut stream, FrameLimits::default()).await?;
-    if challenge_frame.header.frame_type != FrameType::AuthChallenge {
-        return Err("expected AUTH_CHALLENGE".into());
-    }
-    let mut challenge_payload = challenge_frame.payload;
-    let challenge = AuthChallenge::decode(&mut challenge_payload)?;
-
-    let response = AuthResponse::for_challenge(
-        config.key_id.as_bytes(),
-        config.secret.as_bytes(),
-        &exporter,
-        &challenge,
-        unix_now(),
-        Vec::new(),
-    )?;
-    let mut response_payload = BytesMut::new();
-    response.encode(&mut response_payload)?;
-    let response_frame = Frame::new(FrameType::AuthResponse, 0, 0, response_payload.freeze())?;
-    write_frame(&mut stream, &response_frame).await?;
-
-    let settings_frame = read_frame(&mut stream, FrameLimits::default()).await?;
-    if settings_frame.header.frame_type != FrameType::Settings {
-        return Err("expected SETTINGS".into());
-    }
-    let mut settings_payload = settings_frame.payload;
-    let settings = Settings::decode(&mut settings_payload)?;
-    info!(event = "auth.success", max_frame_size = ?settings.get(uk_proto::SettingKey::MaxFrameSize));
+    let (_stream, _settings) = session::connect_authenticated(&config).await?;
     println!("uk-client handshake ok");
     Ok(())
 }

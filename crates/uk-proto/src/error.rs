@@ -37,4 +37,7 @@ pub enum ProtocolError {
     /// A settings payload was malformed.
     #[error("invalid settings: {0}")]
     InvalidSettings(&'static str),
+    /// A TCP relay payload was malformed.
+    #[error("invalid tcp payload: {0}")]
+    InvalidTcpPayload(&'static str),
 }

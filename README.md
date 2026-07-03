@@ -6,18 +6,31 @@ being developed in small, testable increments.
 
 ## Current Milestone
 
-The repository currently focuses on the v0.1 protocol foundation:
+The repository currently focuses on the first runnable v0.1 TCP path:
 
 - binary frame and QUIC-style varint encoding in `uk-proto`
 - strict target encoding in `uk-proto`
+- TCP open/close payload encoding in `uk-proto`
 - challenge-response HMAC authentication in `uk-auth`
 - minimal policy decisions in `uk-policy`
-- placeholder `uk-server` and `uk-client` binaries
+- TLS/TCP authenticated server sessions in `uk-server`
+- SOCKS5 CONNECT entry point and TCP relay in `uk-client`
 
 The first runnable proxy target is:
 
 ```text
 SOCKS5 client -> UK over TLS/TCP -> UK server -> TCP target
+```
+
+Server policy is deny-all unless `policy_path` is set in the server config. A
+minimal allow policy looks like:
+
+```toml
+[[rules]]
+action = "allow"
+domain_suffix = ".example.com"
+port_start = 443
+port_end = 443
 ```
 
 ## Repository Layout
@@ -43,4 +56,3 @@ cargo test --workspace
 cargo fmt --check
 cargo clippy --workspace --all-targets
 ```
-
