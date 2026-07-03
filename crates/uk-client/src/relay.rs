@@ -390,6 +390,9 @@ async fn handle_socks_connection(
     let flow_id = flow.id;
     let flow_session = Arc::clone(&flow.session);
     let relay_result = relay_tcp(local, flow).await;
+    if relay_result.is_err() {
+        let _ = flow_session.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await;
+    }
     flow_session.flows.lock().await.remove(&flow_id);
     transition(&mut state, ClientConnectionState::Closed);
     relay_result
