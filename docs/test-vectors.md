@@ -52,6 +52,12 @@ Full frame with payload `61 62 63`:
 02 04 7f 00 00 01 1f 90 00 00
 ```
 
+`TCP_OPEN` payload for IPv6 target `[::1]:5353` with no open flags:
+
+```text
+03 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01 14 e9 00 00
+```
+
 `TCP_CLOSE` payload for normal close:
 
 ```text

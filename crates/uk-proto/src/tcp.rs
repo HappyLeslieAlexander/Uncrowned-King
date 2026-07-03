@@ -101,7 +101,7 @@ fn validate_close_code(close_code: u16) -> ProtocolResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     use bytes::Bytes;
 
@@ -117,6 +117,20 @@ mod tests {
         open.encode(&mut out).unwrap();
         let mut bytes = Bytes::from(out);
         assert_eq!(TcpOpen::decode(&mut bytes).unwrap(), open);
+    }
+
+    #[test]
+    fn encodes_ipv6_tcp_open_vector() {
+        let open = TcpOpen::new(Target::Ipv6(Ipv6Addr::LOCALHOST, 5353), TCP_OPEN_FLAGS_NONE);
+        let mut out = Vec::new();
+        open.encode(&mut out).unwrap();
+        assert_eq!(
+            out,
+            [
+                0x03, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x01, 0x14, 0xe9, 0x00, 0x00,
+            ]
+        );
     }
 
     #[test]
