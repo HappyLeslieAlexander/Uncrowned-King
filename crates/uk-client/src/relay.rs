@@ -71,6 +71,12 @@ enum OpenOutcome {
     Rejected(socks5::Reply),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenResponse {
+    Accepted,
+    Rejected(socks5::Reply),
+}
+
 pub(crate) async fn run_socks5_listener(
     config: ClientConfig,
     listen: String,
@@ -221,30 +227,16 @@ impl ClientSession {
                 .await
                 .ok_or("uk session closed while opening flow")?
         };
-        match frame.header.frame_type {
-            FrameType::TcpData if frame.payload.is_empty() => Ok(OpenOutcome::Open(flow)),
-            FrameType::PolicyDenied => {
-                expect_error_payload(frame.payload, ErrorCode::PolicyDenied)?;
-                self.flows.lock().await.remove(&flow_id);
-                Ok(OpenOutcome::Rejected(socks5::Reply::NotAllowed))
-            }
-            FrameType::ResourceLimit => {
-                expect_error_payload(frame.payload, ErrorCode::ResourceLimit)?;
-                self.flows.lock().await.remove(&flow_id);
-                Ok(OpenOutcome::Rejected(socks5::Reply::GeneralFailure))
-            }
-            FrameType::Error => {
-                let reply = map_error_payload(frame.payload)?;
+        match decode_open_response(frame) {
+            Ok(OpenResponse::Accepted) => Ok(OpenOutcome::Open(flow)),
+            Ok(OpenResponse::Rejected(reply)) => {
                 self.flows.lock().await.remove(&flow_id);
                 Ok(OpenOutcome::Rejected(reply))
             }
-            FrameType::TcpClose => {
-                let mut payload = frame.payload;
-                let _close = TcpClose::decode(&mut payload)?;
+            Err(err) => {
                 self.flows.lock().await.remove(&flow_id);
-                Ok(OpenOutcome::Rejected(socks5::Reply::ConnectionRefused))
+                Err(err)
             }
-            _ => Err("unexpected frame while opening tcp flow".into()),
         }
     }
 
@@ -480,6 +472,27 @@ async fn relay_tcp(mut local: TcpStream, mut flow: ClientFlow) -> Result<(), Any
     Ok(())
 }
 
+fn decode_open_response(frame: Frame) -> Result<OpenResponse, AnyError> {
+    match frame.header.frame_type {
+        FrameType::TcpData if frame.payload.is_empty() => Ok(OpenResponse::Accepted),
+        FrameType::PolicyDenied => {
+            expect_error_payload(frame.payload, ErrorCode::PolicyDenied)?;
+            Ok(OpenResponse::Rejected(socks5::Reply::NotAllowed))
+        }
+        FrameType::ResourceLimit => {
+            expect_error_payload(frame.payload, ErrorCode::ResourceLimit)?;
+            Ok(OpenResponse::Rejected(socks5::Reply::GeneralFailure))
+        }
+        FrameType::Error => Ok(OpenResponse::Rejected(map_error_payload(frame.payload)?)),
+        FrameType::TcpClose => {
+            let mut payload = frame.payload;
+            let _close = TcpClose::decode(&mut payload)?;
+            Ok(OpenResponse::Rejected(socks5::Reply::ConnectionRefused))
+        }
+        _ => Err("unexpected frame while opening tcp flow".into()),
+    }
+}
+
 fn expect_error_payload(mut payload: Bytes, code: ErrorCode) -> Result<(), AnyError> {
     let status = ErrorPayload::decode(&mut payload)?;
     if status.code == code {
@@ -534,4 +547,53 @@ fn timeout(seconds: u64) -> Option<Duration> {
 fn transition(state: &mut ClientConnectionState, next: ClientConnectionState) {
     debug!(event = "client.connection.state", from = ?*state, to = ?next);
     *state = next;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FLOW_ID: u64 = 1;
+
+    fn status_payload(code: ErrorCode) -> Bytes {
+        let mut payload = BytesMut::new();
+        ErrorPayload::new(code).encode(&mut payload).unwrap();
+        payload.freeze()
+    }
+
+    #[test]
+    fn decodes_open_ack() {
+        let frame = Frame::new(FrameType::TcpData, 0, FLOW_ID, Bytes::new()).unwrap();
+
+        assert_eq!(decode_open_response(frame).unwrap(), OpenResponse::Accepted);
+    }
+
+    #[test]
+    fn decodes_policy_denied_open_response() {
+        let frame = Frame::new(
+            FrameType::PolicyDenied,
+            0,
+            FLOW_ID,
+            status_payload(ErrorCode::PolicyDenied),
+        )
+        .unwrap();
+
+        assert_eq!(
+            decode_open_response(frame).unwrap(),
+            OpenResponse::Rejected(socks5::Reply::NotAllowed)
+        );
+    }
+
+    #[test]
+    fn rejects_non_empty_tcp_data_as_open_ack() {
+        let frame = Frame::new(
+            FrameType::TcpData,
+            0,
+            FLOW_ID,
+            Bytes::from_static(b"early data"),
+        )
+        .unwrap();
+
+        assert!(decode_open_response(frame).is_err());
+    }
 }
