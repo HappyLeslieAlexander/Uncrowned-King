@@ -919,8 +919,23 @@ async fn write_frame_locked(writer: &CarrierWriter, frame: &Frame) -> Result<(),
 }
 
 fn transition(state: &mut ServerSessionState, next: ServerSessionState) {
-    debug!(event = "server.session.state", from = ?*state, to = ?next);
+    let from = *state;
+    debug_assert!(
+        is_valid_session_transition(from, next),
+        "invalid server session state transition"
+    );
+    debug!(event = "server.session.state", from = ?from, to = ?next);
     *state = next;
+}
+
+const fn is_valid_session_transition(from: ServerSessionState, next: ServerSessionState) -> bool {
+    matches!(
+        (from, next),
+        (
+            ServerSessionState::Authenticated,
+            ServerSessionState::Relaying
+        )
+    )
 }
 
 fn tcp_data_frame_size(limits: FrameLimits) -> usize {
@@ -1070,5 +1085,21 @@ mod tests {
             }),
             RELAY_BUFFER_SIZE
         );
+    }
+
+    #[test]
+    fn accepts_server_session_transition_to_relaying() {
+        assert!(is_valid_session_transition(
+            ServerSessionState::Authenticated,
+            ServerSessionState::Relaying
+        ));
+    }
+
+    #[test]
+    fn rejects_server_session_state_regression() {
+        assert!(!is_valid_session_transition(
+            ServerSessionState::Relaying,
+            ServerSessionState::Authenticated
+        ));
     }
 }

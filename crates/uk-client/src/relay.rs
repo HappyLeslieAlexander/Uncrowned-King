@@ -387,6 +387,7 @@ async fn handle_socks_connection(
         Err(err) => {
             let _ = socks5::send_reply(&mut local, socks5::Reply::GeneralFailure).await;
             transition(&mut state, ClientConnectionState::Closing);
+            transition(&mut state, ClientConnectionState::Closed);
             return Err(err);
         }
     };
@@ -397,6 +398,7 @@ async fn handle_socks_connection(
     let flow_session = Arc::clone(&flow.session);
     let relay_result = relay_tcp(local, flow).await;
     if relay_result.is_err() {
+        transition(&mut state, ClientConnectionState::Closing);
         let _ = flow_session.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await;
     }
     flow_session.flows.lock().await.remove(&flow_id);
@@ -560,8 +562,37 @@ fn timeout(seconds: u64) -> Option<Duration> {
 }
 
 fn transition(state: &mut ClientConnectionState, next: ClientConnectionState) {
-    debug!(event = "client.connection.state", from = ?*state, to = ?next);
+    let from = *state;
+    debug_assert!(
+        is_valid_connection_transition(from, next),
+        "invalid client connection state transition"
+    );
+    debug!(event = "client.connection.state", from = ?from, to = ?next);
     *state = next;
+}
+
+const fn is_valid_connection_transition(
+    from: ClientConnectionState,
+    next: ClientConnectionState,
+) -> bool {
+    matches!(
+        (from, next),
+        (
+            ClientConnectionState::NegotiatingSocks,
+            ClientConnectionState::Opening
+        ) | (
+            ClientConnectionState::Opening,
+            ClientConnectionState::Relaying
+                | ClientConnectionState::Closing
+                | ClientConnectionState::Closed
+        ) | (
+            ClientConnectionState::Relaying,
+            ClientConnectionState::Closing | ClientConnectionState::Closed
+        ) | (
+            ClientConnectionState::Closing,
+            ClientConnectionState::Closed
+        )
+    )
 }
 
 #[cfg(test)]
@@ -725,5 +756,55 @@ mod tests {
             }),
             RELAY_BUFFER_SIZE
         );
+    }
+
+    #[test]
+    fn accepts_client_connection_state_transitions() {
+        let valid = [
+            (
+                ClientConnectionState::NegotiatingSocks,
+                ClientConnectionState::Opening,
+            ),
+            (
+                ClientConnectionState::Opening,
+                ClientConnectionState::Relaying,
+            ),
+            (
+                ClientConnectionState::Opening,
+                ClientConnectionState::Closing,
+            ),
+            (
+                ClientConnectionState::Opening,
+                ClientConnectionState::Closed,
+            ),
+            (
+                ClientConnectionState::Relaying,
+                ClientConnectionState::Closing,
+            ),
+            (
+                ClientConnectionState::Relaying,
+                ClientConnectionState::Closed,
+            ),
+            (
+                ClientConnectionState::Closing,
+                ClientConnectionState::Closed,
+            ),
+        ];
+
+        for (from, next) in valid {
+            assert!(is_valid_connection_transition(from, next));
+        }
+    }
+
+    #[test]
+    fn rejects_client_connection_state_regressions() {
+        assert!(!is_valid_connection_transition(
+            ClientConnectionState::Relaying,
+            ClientConnectionState::Opening
+        ));
+        assert!(!is_valid_connection_transition(
+            ClientConnectionState::Closed,
+            ClientConnectionState::Relaying
+        ));
     }
 }
