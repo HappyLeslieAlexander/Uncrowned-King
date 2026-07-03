@@ -1,11 +1,12 @@
 //! Uncrowned King client binary.
 
 use clap::{Parser, Subcommand};
+use tracing_subscriber::EnvFilter;
 use uk_client::{AnyError, check_config, config::ClientConfig, run_handshake, run_socks5_listener};
 
 /// UK client command line.
 #[derive(Debug, Parser)]
-#[command(name = "uk-client", about = "Uncrowned King client")]
+#[command(name = "uk-client", version, about = "Uncrowned King client")]
 struct Args {
     /// Path to client TOML config.
     #[arg(long)]
@@ -32,7 +33,7 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<(), AnyError> {
-    tracing_subscriber::fmt::init();
+    init_tracing();
     let args = Args::parse();
     let config = ClientConfig::load(&args.config)?;
     match args.command {
@@ -49,4 +50,21 @@ async fn main() -> Result<(), AnyError> {
         }
     }
     Ok(())
+}
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    fn command_definition_is_valid() {
+        Args::command().debug_assert();
+    }
 }
