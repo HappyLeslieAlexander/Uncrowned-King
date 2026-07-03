@@ -51,6 +51,8 @@ Set `handshake_timeout_seconds = 0` to disable the TLS/auth handshake timeout.
 
 Client configs may also set `handshake_timeout_seconds = 10` to bound the
 server connection, TLS handshake, authentication exchange, and SETTINGS read.
+When running the SOCKS5 listener, `socks_handshake_timeout_seconds = 10` bounds
+the local SOCKS greeting and CONNECT request.
 
 Validate configs without opening listeners or outbound sessions:
 

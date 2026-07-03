@@ -19,6 +19,8 @@ pub struct ClientConfig {
     pub secret: String,
     /// Optional server connection and authentication timeout in seconds.
     pub handshake_timeout_seconds: Option<u64>,
+    /// Optional SOCKS5 greeting/request timeout in seconds.
+    pub socks_handshake_timeout_seconds: Option<u64>,
 }
 
 impl ClientConfig {
@@ -32,6 +34,11 @@ impl ClientConfig {
     /// Server connection and authentication timeout in seconds. Zero disables it.
     pub fn handshake_timeout_seconds(&self) -> u64 {
         self.handshake_timeout_seconds.unwrap_or(10)
+    }
+
+    /// SOCKS5 greeting/request timeout in seconds. Zero disables it.
+    pub fn socks_handshake_timeout_seconds(&self) -> u64 {
+        self.socks_handshake_timeout_seconds.unwrap_or(10)
     }
 }
 
@@ -47,6 +54,7 @@ mod tests {
             key_id: "client".to_owned(),
             secret: "secret".to_owned(),
             handshake_timeout_seconds: None,
+            socks_handshake_timeout_seconds: None,
         }
     }
 
@@ -70,5 +78,27 @@ handshake_timeout_seconds = 4
         .unwrap();
 
         assert_eq!(config.handshake_timeout_seconds(), 4);
+    }
+
+    #[test]
+    fn defaults_socks_handshake_timeout() {
+        assert_eq!(minimal_config().socks_handshake_timeout_seconds(), 10);
+    }
+
+    #[test]
+    fn parses_socks_handshake_timeout() {
+        let config: ClientConfig = toml::from_str(
+            r#"
+server_addr = "127.0.0.1:443"
+server_name = "localhost"
+ca_cert_path = "ca.pem"
+key_id = "client"
+secret = "secret"
+socks_handshake_timeout_seconds = 5
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.socks_handshake_timeout_seconds(), 5);
     }
 }

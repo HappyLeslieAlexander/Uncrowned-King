@@ -7,6 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use bytes::{Bytes, BytesMut};
@@ -14,6 +15,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
     net::{TcpListener, TcpStream},
     sync::{Mutex, mpsc},
+    time,
 };
 use tokio_rustls::client::TlsStream;
 use tracing::{debug, info, warn};
@@ -72,6 +74,7 @@ pub(crate) async fn run_socks5_listener(
     config: ClientConfig,
     listen: String,
 ) -> Result<(), AnyError> {
+    let socks_handshake_timeout = timeout(config.socks_handshake_timeout_seconds());
     let sessions = Arc::new(ClientSessionManager::new(config));
     let listener = TcpListener::bind(&listen).await?;
     info!(event = "socks5.listen", listen = %listen);
@@ -80,7 +83,9 @@ pub(crate) async fn run_socks5_listener(
         let (local, peer) = listener.accept().await?;
         let sessions = Arc::clone(&sessions);
         tokio::spawn(async move {
-            if let Err(err) = handle_socks_connection(local, sessions).await {
+            if let Err(err) =
+                handle_socks_connection(local, sessions, socks_handshake_timeout).await
+            {
                 warn!(event = "socks5.connection.error", peer = %peer, error = %err);
             }
         });
@@ -354,9 +359,10 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
 async fn handle_socks_connection(
     mut local: TcpStream,
     sessions: Arc<ClientSessionManager>,
+    socks_handshake_timeout: Option<Duration>,
 ) -> Result<(), AnyError> {
     let mut state = ClientConnectionState::NegotiatingSocks;
-    let target = socks5::negotiate_connect(&mut local).await?;
+    let target = negotiate_socks_connect(&mut local, socks_handshake_timeout).await?;
 
     transition(&mut state, ClientConnectionState::Opening);
     let flow = match sessions.open_flow(target).await {
@@ -381,6 +387,20 @@ async fn handle_socks_connection(
     flow_session.flows.lock().await.remove(&flow_id);
     transition(&mut state, ClientConnectionState::Closed);
     relay_result
+}
+
+async fn negotiate_socks_connect(
+    local: &mut TcpStream,
+    socks_handshake_timeout: Option<Duration>,
+) -> Result<Target, AnyError> {
+    if let Some(timeout) = socks_handshake_timeout {
+        match time::timeout(timeout, socks5::negotiate_connect(local)).await {
+            Ok(result) => Ok(result?),
+            Err(_) => Err("socks handshake timeout".into()),
+        }
+    } else {
+        Ok(socks5::negotiate_connect(local).await?)
+    }
 }
 
 async fn relay_tcp(mut local: TcpStream, mut flow: ClientFlow) -> Result<(), AnyError> {
@@ -480,6 +500,10 @@ fn max_streams(settings: &uk_proto::Settings) -> u64 {
     settings
         .get(SettingKey::MaxStreams)
         .unwrap_or(DEFAULT_MAX_STREAMS)
+}
+
+fn timeout(seconds: u64) -> Option<Duration> {
+    (seconds != 0).then(|| Duration::from_secs(seconds))
 }
 
 fn transition(state: &mut ClientConnectionState, next: ClientConnectionState) {
