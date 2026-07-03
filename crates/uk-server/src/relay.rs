@@ -715,7 +715,19 @@ async fn connect_allowed_target(
     policy_set: &PolicySet,
     target_connect_timeout: Option<Duration>,
 ) -> Result<TcpStream, OpenFailure> {
-    let addrs = with_optional_timeout(target_connect_timeout, resolve_target(target)).await?;
+    with_optional_timeout(
+        target_connect_timeout,
+        connect_allowed_target_inner(target, credential, policy_set),
+    )
+    .await
+}
+
+async fn connect_allowed_target_inner(
+    target: &Target,
+    credential: &Credential,
+    policy_set: &PolicySet,
+) -> Result<TcpStream, OpenFailure> {
+    let addrs = resolve_target(target).await?;
     let resolved_ips = resolved_ips(target, &addrs);
     let context = PolicyContext {
         key_id: &credential.key_id,
@@ -726,7 +738,7 @@ async fn connect_allowed_target(
     if policy_set.evaluate(&context) != PolicyDecision::Allow {
         return Err(OpenFailure::PolicyDenied);
     }
-    with_optional_timeout(target_connect_timeout, connect_socket_addrs(&addrs)).await
+    connect_socket_addrs(&addrs).await
 }
 
 async fn resolve_target(target: &Target) -> Result<Vec<SocketAddr>, OpenFailure> {
@@ -912,5 +924,16 @@ mod tests {
         assert!(!flow.target_to_client_open);
         assert!(flow.is_fully_closed());
         assert!(flow.control.is_aborted());
+    }
+
+    #[tokio::test]
+    async fn optional_timeout_maps_elapsed_to_target_timeout() {
+        let result = with_optional_timeout(Some(Duration::from_millis(1)), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(())
+        })
+        .await;
+
+        assert!(matches!(result, Err(OpenFailure::TargetTimeout)));
     }
 }
