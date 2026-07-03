@@ -91,6 +91,11 @@ async fn maps_target_unavailable_to_socks_host_unreachable() -> Result<(), TestE
     tokio::time::timeout(Duration::from_secs(10), run_target_unavailable_e2e()).await?
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relays_domain_socks_target_to_echo_target() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_domain_relay_e2e()).await?
+}
+
 async fn run_tcp_relay_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -116,6 +121,26 @@ async fn run_policy_denied_e2e() -> Result<(), TestError> {
     let denied_target = unused_loopback_addr().await?;
     let (_socks, connect_reply) = open_socks_connect(harness.socks_addr, denied_target).await?;
     assert_eq!(connect_reply[1], SOCKS_REPLY_NOT_ALLOWED);
+    Ok(())
+}
+
+async fn run_domain_relay_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, echo_task) = spawn_localhost_echo_target().await?;
+    let harness =
+        RelayHarness::start(Some(allow_localhost_domain_policy(target_addr.port()))).await?;
+
+    let (mut socks, connect_reply) =
+        open_socks_connect_domain(harness.socks_addr, "localhost", target_addr.port()).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    socks.write_all(b"uncrowned king domain e2e").await?;
+    let mut echoed = vec![0_u8; "uncrowned king domain e2e".len()];
+    socks.read_exact(&mut echoed).await?;
+    assert_eq!(echoed, b"uncrowned king domain e2e");
+
+    echo_task.await??;
     Ok(())
 }
 
@@ -220,6 +245,20 @@ async fn spawn_echo_target()
     Ok((addr, task))
 }
 
+async fn spawn_localhost_echo_target()
+-> Result<(SocketAddr, tokio::task::JoinHandle<Result<(), TestError>>), TestError> {
+    let listener = TcpListener::bind(("localhost", 0)).await?;
+    let addr = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut buf = [0_u8; 1024];
+        let read = stream.read(&mut buf).await?;
+        stream.write_all(&buf[..read]).await?;
+        Ok(())
+    });
+    Ok((addr, task))
+}
+
 async fn wait_for_listener(
     name: &str,
     addr: SocketAddr,
@@ -278,6 +317,27 @@ async fn open_socks_connect(
     Ok((socks, connect_reply))
 }
 
+async fn open_socks_connect_domain(
+    socks_addr: SocketAddr,
+    domain: &str,
+    port: u16,
+) -> Result<(TcpStream, [u8; 10]), TestError> {
+    let domain_len = u8::try_from(domain.len())?;
+    let mut request = vec![0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, domain_len];
+    request.extend_from_slice(domain.as_bytes());
+    request.extend_from_slice(&[(port >> 8) as u8, port as u8]);
+
+    let mut socks = TcpStream::connect(socks_addr).await?;
+    socks.write_all(&request).await?;
+
+    let mut method_response = [0_u8; 2];
+    socks.read_exact(&mut method_response).await?;
+    assert_eq!(method_response, [0x05, 0x00]);
+    let mut connect_reply = [0_u8; 10];
+    socks.read_exact(&mut connect_reply).await?;
+    Ok((socks, connect_reply))
+}
+
 async fn unused_loopback_addr() -> Result<SocketAddr, TestError> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let addr = listener.local_addr()?;
@@ -311,6 +371,18 @@ fn allow_loopback_policy(port: u16) -> String {
         [[rules]]
         action = "allow"
         cidr = "127.0.0.1/32"
+        port_start = {port}
+        port_end = {port}
+        "#
+    )
+}
+
+fn allow_localhost_domain_policy(port: u16) -> String {
+    format!(
+        r#"
+        [[rules]]
+        action = "allow"
+        domain = "localhost"
         port_start = {port}
         port_end = {port}
         "#
