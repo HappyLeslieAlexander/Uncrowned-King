@@ -79,6 +79,7 @@ const HALF_CLOSE_REQUEST: &[u8] = b"uncrowned king half-close request";
 const HALF_CLOSE_RESPONSE: &[u8] = b"uncrowned king half-close response";
 const TARGET_HALF_CLOSE_GREETING: &[u8] = b"uncrowned king target half-close greeting";
 const TARGET_HALF_CLOSE_LATE_REQUEST: &[u8] = b"uncrowned king target half-close late request";
+const LARGE_PAYLOAD_LEN: usize = 128 * 1024 + 123;
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
@@ -118,6 +119,11 @@ async fn maps_stream_limit_to_socks_general_failure() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_stream_limit_e2e()).await?
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relays_large_payload_across_frames() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_large_payload_e2e()).await?
+}
+
 async fn run_tcp_relay_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -143,6 +149,25 @@ async fn run_policy_denied_e2e() -> Result<(), TestError> {
     let denied_target = unused_loopback_addr().await?;
     let (_socks, connect_reply) = open_socks_connect(harness.socks_addr, denied_target).await?;
     assert_eq!(connect_reply[1], SOCKS_REPLY_NOT_ALLOWED);
+    Ok(())
+}
+
+async fn run_large_payload_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let payload = large_payload();
+    let (target_addr, target_task) = spawn_fixed_size_echo_target(payload.len()).await?;
+    let harness = RelayHarness::start(Some(allow_loopback_policy(target_addr.port()))).await?;
+
+    let (mut socks, connect_reply) = open_socks_connect(harness.socks_addr, target_addr).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    socks.write_all(&payload).await?;
+    let mut echoed = vec![0_u8; payload.len()];
+    socks.read_exact(&mut echoed).await?;
+    assert_eq!(echoed, payload);
+
+    target_task.await??;
     Ok(())
 }
 
@@ -346,6 +371,21 @@ async fn spawn_echo_target()
     Ok((addr, task))
 }
 
+async fn spawn_fixed_size_echo_target(
+    expected_len: usize,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<Result<(), TestError>>), TestError> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut buf = vec![0_u8; expected_len];
+        stream.read_exact(&mut buf).await?;
+        stream.write_all(&buf).await?;
+        Ok(())
+    });
+    Ok((addr, task))
+}
+
 async fn spawn_read_to_eof_target() -> Result<
     (
         SocketAddr,
@@ -526,6 +566,12 @@ fn test_limits_with_max_streams(max_streams: u64) -> LimitConfig {
     let mut limits = test_limits();
     limits.max_streams = Some(max_streams);
     limits
+}
+
+fn large_payload() -> Vec<u8> {
+    (0..LARGE_PAYLOAD_LEN)
+        .map(|index| (index % 251) as u8)
+        .collect()
 }
 
 fn create_temp_dir() -> Result<PathBuf, TestError> {
