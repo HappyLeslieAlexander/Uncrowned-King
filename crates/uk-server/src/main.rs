@@ -7,7 +7,7 @@ mod tls;
 use std::{sync::Arc, time::Duration};
 
 use bytes::BytesMut;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokio::{net::TcpListener, sync::Mutex, time};
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tracing::{info, warn};
@@ -25,6 +25,18 @@ struct Args {
     /// Path to server TOML config.
     #[arg(long)]
     config: String,
+    /// Server subcommand.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Server mode.
+#[derive(Debug, Clone, Copy, Subcommand)]
+enum Command {
+    /// Start the UK server listener.
+    Serve,
+    /// Validate config, credentials, policy, and TLS files without listening.
+    ConfigCheck,
 }
 
 #[tokio::main]
@@ -32,7 +44,11 @@ async fn main() -> Result<(), AnyError> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
     let config = ServerConfig::load(&args.config)?;
-    run(config).await
+    match args.command.unwrap_or(Command::Serve) {
+        Command::Serve => run(config).await?,
+        Command::ConfigCheck => check_config(&config)?,
+    }
+    Ok(())
 }
 
 async fn run(config: ServerConfig) -> Result<(), AnyError> {
@@ -62,6 +78,14 @@ async fn run(config: ServerConfig) -> Result<(), AnyError> {
             }
         });
     }
+}
+
+fn check_config(config: &ServerConfig) -> Result<(), AnyError> {
+    let _credentials = config.credentials()?;
+    let _policy_set = config.policy_set()?;
+    let _tls_config = tls::server_config(&config.cert_path, &config.key_path)?;
+    println!("uk-server config ok");
+    Ok(())
 }
 
 async fn handle_connection(

@@ -52,6 +52,13 @@ Set `handshake_timeout_seconds = 0` to disable the TLS/auth handshake timeout.
 Client configs may also set `handshake_timeout_seconds = 10` to bound the
 server connection, TLS handshake, authentication exchange, and SETTINGS read.
 
+Validate configs without opening listeners or outbound sessions:
+
+```sh
+uk-server --config server.toml config-check
+uk-client --config client.toml config-check
+```
+
 ## Repository Layout
 
 ```text
