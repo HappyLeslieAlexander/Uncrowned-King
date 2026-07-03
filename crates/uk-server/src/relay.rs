@@ -24,7 +24,8 @@ use uk_auth::Credential;
 use uk_policy::{PolicyContext, PolicyDecision, PolicySet};
 use uk_proto::{
     ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL,
-    TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, read_frame, write_frame,
+    TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, is_client_initiated_flow_id, read_frame,
+    write_frame,
 };
 
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
@@ -139,15 +140,17 @@ async fn handle_session_frame(
 ) -> Result<(), AnyError> {
     match frame.header.frame_type {
         FrameType::TcpOpen => {
-            if target_writers.len() as u64 >= max_streams {
-                send_resource_limit(carrier_writer, frame.header.id).await?;
-                send_tcp_close(carrier_writer, frame.header.id, TCP_CLOSE_ERROR).await?;
-                return Ok(());
-            }
-            if target_writers.contains_key(&frame.header.id) {
-                send_error(carrier_writer, frame.header.id, ErrorCode::Protocol).await?;
-                send_tcp_close(carrier_writer, frame.header.id, TCP_CLOSE_ERROR).await?;
-                return Ok(());
+            if is_client_initiated_flow_id(frame.header.id) {
+                if target_writers.len() as u64 >= max_streams {
+                    send_resource_limit(carrier_writer, frame.header.id).await?;
+                    send_tcp_close(carrier_writer, frame.header.id, TCP_CLOSE_ERROR).await?;
+                    return Ok(());
+                }
+                if target_writers.contains_key(&frame.header.id) {
+                    send_error(carrier_writer, frame.header.id, ErrorCode::Protocol).await?;
+                    send_tcp_close(carrier_writer, frame.header.id, TCP_CLOSE_ERROR).await?;
+                    return Ok(());
+                }
             }
             if let Some((flow_id, target_writer_tx)) =
                 handle_tcp_open(carrier_writer, event_tx, frame, credential, policy_set).await?
@@ -198,6 +201,12 @@ async fn handle_tcp_open(
     if flow_id == 0 {
         send_error(carrier_writer, flow_id, ErrorCode::Protocol).await?;
         return Err("tcp flow id must be non-zero".into());
+    }
+    if !is_client_initiated_flow_id(flow_id) {
+        send_error(carrier_writer, flow_id, ErrorCode::Protocol).await?;
+        send_tcp_close(carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
+        warn!(event = "tcp.open.reserved_flow_id", flow_id);
+        return Ok(None);
     }
 
     let mut payload = frame.payload;

@@ -1,7 +1,7 @@
 //! SOCKS5-to-UK TCP relay.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     error::Error,
     sync::{
         Arc,
@@ -18,15 +18,14 @@ use tokio::{
 use tokio_rustls::client::TlsStream;
 use tracing::{debug, info, warn};
 use uk_proto::{
-    ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, SettingKey, TCP_CLOSE_NORMAL,
-    TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, frame::DEFAULT_MAX_FRAME_SIZE, read_frame,
-    write_frame,
+    ErrorCode, ErrorPayload, FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, Frame, FrameLimits, FrameType,
+    SettingKey, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen,
+    frame::DEFAULT_MAX_FRAME_SIZE, is_client_initiated_flow_id, read_frame, write_frame,
 };
 
 use crate::{config::ClientConfig, session, socks5};
 
-const FIRST_CLIENT_FLOW_ID: u64 = 1;
-const FLOW_ID_STEP: u64 = 2;
+const FLOW_ID_ALLOCATION_ATTEMPTS: usize = 1024;
 const FLOW_FRAME_QUEUE_CAPACITY: usize = 32;
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
 
@@ -176,9 +175,7 @@ impl ClientSession {
         if self.is_closed() {
             return Err("uk session is closed".into());
         }
-        let flow_id = self.allocate_flow_id();
-        let (sender, frames) = mpsc::channel(FLOW_FRAME_QUEUE_CAPACITY);
-        self.flows.lock().await.insert(flow_id, sender);
+        let (flow_id, frames) = self.reserve_flow().await?;
         if self.is_closed() {
             self.flows.lock().await.remove(&flow_id);
             return Err("uk session is closed".into());
@@ -229,6 +226,24 @@ impl ClientSession {
 
     fn allocate_flow_id(&self) -> u64 {
         self.next_flow_id.fetch_add(FLOW_ID_STEP, Ordering::Relaxed)
+    }
+
+    async fn reserve_flow(&self) -> Result<(u64, mpsc::Receiver<Frame>), AnyError> {
+        for _ in 0..FLOW_ID_ALLOCATION_ATTEMPTS {
+            let flow_id = self.allocate_flow_id();
+            if !is_client_initiated_flow_id(flow_id) {
+                continue;
+            }
+
+            let (sender, frames) = mpsc::channel(FLOW_FRAME_QUEUE_CAPACITY);
+            let mut flows = self.flows.lock().await;
+            if let Entry::Vacant(entry) = flows.entry(flow_id) {
+                entry.insert(sender);
+                return Ok((flow_id, frames));
+            }
+        }
+
+        Err("no available client flow id".into())
     }
 
     async fn send_tcp_open(&self, flow_id: u64, target: Target) -> Result<(), AnyError> {

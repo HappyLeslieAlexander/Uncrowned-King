@@ -88,6 +88,10 @@ Validation:
 
 ## 4. TCP Relay Payloads
 
+TCP relay flow IDs are non-zero. v0.1 requires client-initiated proxy flows to
+use odd IDs. Even non-zero IDs are reserved for future server-initiated flows.
+Connection-scoped frames such as authentication and settings use ID `0`.
+
 `TCP_OPEN` payload:
 
 ```text
