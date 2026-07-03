@@ -3,6 +3,14 @@
 This document turns the whitepaper into the first implementable wire contract.
 It intentionally covers only the pieces required by the initial Rust crates.
 
+## 0. Carrier Requirements
+
+The v0.1 TLS/TCP carrier must negotiate ALPN `uk/1`. Both endpoints must treat
+missing or different ALPN as a connection error before accepting UK frames.
+
+UK frames must only be processed after the transport handshake completes. TLS
+0-RTT data must not be accepted as UK application data.
+
 ## 1. Common Encoding
 
 All fixed-width integers are unsigned and encoded in network byte order
