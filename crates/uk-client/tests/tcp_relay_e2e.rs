@@ -124,6 +124,11 @@ async fn relays_large_payload_across_frames() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_large_payload_e2e()).await?
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconnects_after_server_idle_timeout() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_idle_reconnect_e2e()).await?
+}
+
 async fn run_tcp_relay_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -149,6 +154,27 @@ async fn run_policy_denied_e2e() -> Result<(), TestError> {
     let denied_target = unused_loopback_addr().await?;
     let (_socks, connect_reply) = open_socks_connect(harness.socks_addr, denied_target).await?;
     assert_eq!(connect_reply[1], SOCKS_REPLY_NOT_ALLOWED);
+    Ok(())
+}
+
+async fn run_idle_reconnect_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = RelayHarness::start_with_limits(
+        Some(allow_loopback_any_port_policy()),
+        test_limits_with_idle_timeout(1),
+    )
+    .await?;
+
+    let (first_target_addr, first_echo_task) = spawn_echo_target().await?;
+    assert_echo_roundtrip(harness.socks_addr, first_target_addr, b"first session").await?;
+    first_echo_task.await??;
+
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    let (second_target_addr, second_echo_task) = spawn_echo_target().await?;
+    assert_echo_roundtrip(harness.socks_addr, second_target_addr, b"second session").await?;
+    second_echo_task.await??;
     Ok(())
 }
 
@@ -521,6 +547,21 @@ async fn open_socks_connect(
     Ok((socks, connect_reply))
 }
 
+async fn assert_echo_roundtrip(
+    socks_addr: SocketAddr,
+    target_addr: SocketAddr,
+    payload: &[u8],
+) -> Result<(), TestError> {
+    let (mut socks, connect_reply) = open_socks_connect(socks_addr, target_addr).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    socks.write_all(payload).await?;
+    let mut echoed = vec![0_u8; payload.len()];
+    socks.read_exact(&mut echoed).await?;
+    assert_eq!(echoed, payload);
+    Ok(())
+}
+
 async fn open_socks_connect_domain(
     socks_addr: SocketAddr,
     domain: &str,
@@ -568,6 +609,12 @@ fn test_limits_with_max_streams(max_streams: u64) -> LimitConfig {
     limits
 }
 
+fn test_limits_with_idle_timeout(idle_timeout_seconds: u64) -> LimitConfig {
+    let mut limits = test_limits();
+    limits.idle_timeout_seconds = Some(idle_timeout_seconds);
+    limits
+}
+
 fn large_payload() -> Vec<u8> {
     (0..LARGE_PAYLOAD_LEN)
         .map(|index| (index % 251) as u8)
@@ -592,6 +639,15 @@ fn allow_loopback_policy(port: u16) -> String {
         port_end = {port}
         "#
     )
+}
+
+fn allow_loopback_any_port_policy() -> String {
+    r#"
+        [[rules]]
+        action = "allow"
+        cidr = "127.0.0.1/32"
+        "#
+    .to_owned()
 }
 
 fn allow_localhost_domain_policy(port: u16) -> String {
