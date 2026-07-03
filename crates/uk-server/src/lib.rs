@@ -156,6 +156,16 @@ async fn complete_handshake(
         key_id = %String::from_utf8_lossy(&credential.key_id)
     );
 
+    let settings = server_settings(config);
+    let mut settings_payload = BytesMut::new();
+    settings.encode(&mut settings_payload)?;
+    let settings_frame = Frame::new(FrameType::Settings, 0, 0, settings_payload.freeze())?;
+    write_frame(&mut stream, &settings_frame).await?;
+
+    Ok((stream, credential))
+}
+
+fn server_settings(config: &ServerConfig) -> Settings {
     let mut settings = Settings::default();
     settings.set(SettingKey::ProtocolRevision, 1);
     settings.set(SettingKey::MaxFrameSize, config.max_frame_size());
@@ -164,12 +174,7 @@ async fn complete_handshake(
         SettingKey::IdleTimeoutSeconds,
         config.idle_timeout_seconds(),
     );
-    let mut settings_payload = BytesMut::new();
-    settings.encode(&mut settings_payload)?;
-    let settings_frame = Frame::new(FrameType::Settings, 0, 0, settings_payload.freeze())?;
-    write_frame(&mut stream, &settings_frame).await?;
-
-    Ok((stream, credential))
+    settings
 }
 
 fn idle_timeout(seconds: u64) -> Option<Duration> {
@@ -190,4 +195,53 @@ fn tcp_half_close_timeout(seconds: u64) -> Option<Duration> {
 
 fn usize_limit(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{CredentialConfig, LimitConfig};
+
+    fn minimal_config() -> ServerConfig {
+        ServerConfig {
+            listen: "127.0.0.1:1".to_owned(),
+            cert_path: "cert.pem".to_owned(),
+            key_path: "key.pem".to_owned(),
+            auth_skew_seconds: None,
+            limits: None,
+            policy_path: None,
+            credentials: vec![CredentialConfig {
+                key_id: "client".to_owned(),
+                secret: "0123456789abcdef0123456789abcdef".to_owned(),
+                status: Some("active".to_owned()),
+                not_before: None,
+                not_after: None,
+                policy_group: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn server_settings_include_protocol_and_limits() {
+        let mut config = minimal_config();
+        config.limits = Some(LimitConfig {
+            max_pre_auth_bytes: None,
+            max_frame_size: Some(32_768),
+            max_streams: Some(17),
+            idle_timeout_seconds: Some(42),
+            max_buffered_bytes_per_flow: None,
+            handshake_timeout_seconds: None,
+            target_connect_timeout_seconds: None,
+            tcp_half_close_timeout_seconds: None,
+            replay_cache_window_seconds: None,
+            replay_cache_max_entries: None,
+        });
+
+        let settings = server_settings(&config);
+
+        assert_eq!(settings.get(SettingKey::ProtocolRevision), Some(1));
+        assert_eq!(settings.get(SettingKey::MaxFrameSize), Some(32_768));
+        assert_eq!(settings.get(SettingKey::MaxStreams), Some(17));
+        assert_eq!(settings.get(SettingKey::IdleTimeoutSeconds), Some(42));
+    }
 }
