@@ -54,10 +54,25 @@ Full frame with payload `61 62 63`:
 
 ## 5. Auth Tag
 
-The Rust test suite fixes the secret, exporter, nonces, session id, key id,
-client time, and capabilities, then validates the generated HMAC-SHA256 tag.
-This keeps the source of truth executable while the v0.1 auth payload is still
-settling.
+Input:
+
+```text
+secret = "0123456789abcdef0123456789abcdef"
+exporter_32 = 11 repeated 32 times
+server_nonce = 22 repeated 32 times
+client_nonce = 44 repeated 32 times
+session_id = 33 repeated 16 times
+key_id = "client-a"
+client_time = 1700000001
+client_capabilities = "cap"
+```
+
+Expected HMAC-SHA256 tag:
+
+```text
+3f 8e f7 a9 74 52 1f 15 0d d4 5e 87 92 6e c2 08
+5e 57 19 da a9 35 5d c6 03 16 9b 92 76 3d b0 21
+```
 
 ## 6. Error Frame
 
