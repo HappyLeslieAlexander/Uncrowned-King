@@ -167,9 +167,7 @@ impl PolicyRule {
             return false;
         }
         if self.cidr.as_ref().is_some_and(|cidr| {
-            !target_ips(context.target, context.resolved_ips)
-                .into_iter()
-                .any(|ip| cidr.contains(ip))
+            !cidr_matches(self.action, cidr, context.target, context.resolved_ips)
         }) {
             return false;
         }
@@ -368,6 +366,23 @@ fn target_ips(target: &Target, resolved_ips: &[IpAddr]) -> Vec<IpAddr> {
         Target::Domain(_, _) => resolved_ips.to_vec(),
         Target::Ipv4(ip, _) => vec![IpAddr::V4(*ip)],
         Target::Ipv6(ip, _) => vec![IpAddr::V6(*ip)],
+    }
+}
+
+fn cidr_matches(
+    action: PolicyDecision,
+    cidr: &Cidr,
+    target: &Target,
+    resolved_ips: &[IpAddr],
+) -> bool {
+    let ips = target_ips(target, resolved_ips);
+    if ips.is_empty() {
+        return false;
+    }
+
+    match action {
+        PolicyDecision::Allow => ips.into_iter().all(|ip| cidr.contains(ip)),
+        PolicyDecision::Deny => ips.into_iter().any(|ip| cidr.contains(ip)),
     }
 }
 
@@ -571,6 +586,41 @@ mod tests {
         let mut rule = PolicyRule::new(PolicyDecision::Allow);
         rule.private = Some(false);
         let policy = PolicySet::new(vec![rule]);
+        let target = Target::Domain("mixed.example".to_owned(), 443);
+        let resolved = [
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        ];
+
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &resolved)),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn cidr_allow_requires_all_domain_resolutions_to_match() {
+        let mut rule = PolicyRule::new(PolicyDecision::Allow);
+        rule.cidr = Some("203.0.113.0/24".parse().unwrap());
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Domain("mixed.example".to_owned(), 443);
+        let resolved = [
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        ];
+
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &resolved)),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn cidr_deny_matches_any_domain_resolution() {
+        let mut deny_rule = PolicyRule::new(PolicyDecision::Deny);
+        deny_rule.cidr = Some("10.0.0.0/8".parse().unwrap());
+        let allow_rule = PolicyRule::new(PolicyDecision::Allow);
+        let policy = PolicySet::new(vec![deny_rule, allow_rule]);
         let target = Target::Domain("mixed.example".to_owned(), 443);
         let resolved = [
             IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),

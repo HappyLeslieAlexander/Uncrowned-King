@@ -282,6 +282,8 @@ For private-address predicates, `private=true` matches when any candidate IP is
 private, while `private=false` matches only when every candidate IP is public.
 Private IPs include loopback, IPv4 private/link-local ranges, IPv6 unique-local
 addresses, and IPv6 link-local addresses.
+For CIDR predicates, `deny` matches when any candidate IP is inside the range,
+while `allow` matches only when every candidate IP is inside the range.
 
 Policy actions must be explicit `allow` or `deny`; unknown action strings are
 configuration errors.
