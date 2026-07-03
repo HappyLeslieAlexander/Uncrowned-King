@@ -107,6 +107,11 @@ async fn relays_domain_socks_target_to_echo_target() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn applies_credential_policy_group() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_policy_group_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relays_ipv6_socks_target_to_echo_target() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_ipv6_relay_e2e()).await?
 }
@@ -384,6 +389,27 @@ async fn run_domain_relay_e2e() -> Result<(), TestError> {
     let mut echoed = vec![0_u8; "uncrowned king domain e2e".len()];
     socks.read_exact(&mut echoed).await?;
     assert_eq!(echoed, b"uncrowned king domain e2e");
+
+    echo_task.await??;
+    Ok(())
+}
+
+async fn run_policy_group_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, echo_task) = spawn_echo_target().await?;
+    let harness = RelayHarness::start(Some(allow_default_group_loopback_policy(
+        target_addr.port(),
+    )))
+    .await?;
+
+    let (mut socks, connect_reply) = open_socks_connect(harness.socks_addr, target_addr).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    socks.write_all(b"uncrowned king policy group e2e").await?;
+    let mut echoed = vec![0_u8; "uncrowned king policy group e2e".len()];
+    socks.read_exact(&mut echoed).await?;
+    assert_eq!(echoed, b"uncrowned king policy group e2e");
 
     echo_task.await??;
     Ok(())
@@ -806,6 +832,19 @@ fn allow_ipv6_loopback_policy(port: u16) -> String {
         [[rules]]
         action = "allow"
         cidr = "::1/128"
+        port_start = {port}
+        port_end = {port}
+        "#
+    )
+}
+
+fn allow_default_group_loopback_policy(port: u16) -> String {
+    format!(
+        r#"
+        [[rules]]
+        action = "allow"
+        policy_group = "default"
+        cidr = "127.0.0.1/32"
         port_start = {port}
         port_end = {port}
         "#
