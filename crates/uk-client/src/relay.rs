@@ -27,11 +27,12 @@ use crate::{config::ClientConfig, session, socks5};
 
 const FIRST_CLIENT_FLOW_ID: u64 = 1;
 const FLOW_ID_STEP: u64 = 2;
+const FLOW_FRAME_QUEUE_CAPACITY: usize = 32;
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
 
 type AnyError = Box<dyn Error + Send + Sync>;
 type CarrierWriter = Arc<Mutex<WriteHalf<TlsStream<TcpStream>>>>;
-type FlowTable = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Frame>>>>;
+type FlowTable = Arc<Mutex<HashMap<u64, mpsc::Sender<Frame>>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClientConnectionState {
@@ -52,7 +53,7 @@ struct ClientSession {
 
 struct ClientFlow {
     id: u64,
-    frames: mpsc::UnboundedReceiver<Frame>,
+    frames: mpsc::Receiver<Frame>,
     session: Arc<ClientSession>,
 }
 
@@ -101,7 +102,7 @@ impl ClientSession {
             return Err("uk session is closed".into());
         }
         let flow_id = self.allocate_flow_id();
-        let (sender, frames) = mpsc::unbounded_channel();
+        let (sender, frames) = mpsc::channel(FLOW_FRAME_QUEUE_CAPACITY);
         self.flows.lock().await.insert(flow_id, sender);
         if self.closed.load(Ordering::SeqCst) {
             self.flows.lock().await.remove(&flow_id);
@@ -200,9 +201,12 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
         | FrameType::Error
         | FrameType::PolicyDenied
         | FrameType::ResourceLimit => {
-            let sender = session.flows.lock().await.get(&frame.header.id).cloned();
-            if let Some(sender) = sender {
-                let _ = sender.send(frame);
+            let flow_id = frame.header.id;
+            let sender = session.flows.lock().await.get(&flow_id).cloned();
+            if let Some(sender) = sender
+                && sender.send(frame).await.is_err()
+            {
+                session.flows.lock().await.remove(&flow_id);
             }
             Ok(())
         }
