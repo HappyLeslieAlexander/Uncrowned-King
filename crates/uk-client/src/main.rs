@@ -1,16 +1,7 @@
 //! Uncrowned King client binary.
 
-mod config;
-mod relay;
-mod session;
-mod socks5;
-mod tls;
-
 use clap::{Parser, Subcommand};
-
-use crate::config::ClientConfig;
-
-type AnyError = Box<dyn std::error::Error + Send + Sync>;
+use uk_client::{AnyError, check_config, config::ClientConfig, run_handshake, run_socks5_listener};
 
 /// UK client command line.
 #[derive(Debug, Parser)]
@@ -45,25 +36,17 @@ async fn main() -> Result<(), AnyError> {
     let args = Args::parse();
     let config = ClientConfig::load(&args.config)?;
     match args.command {
-        Command::ConfigCheck => check_config(&config)?,
-        Command::Handshake => run_handshake(config).await?,
+        Command::ConfigCheck => {
+            check_config(&config)?;
+            println!("uk-client config ok");
+        }
+        Command::Handshake => {
+            run_handshake(config).await?;
+            println!("uk-client handshake ok");
+        }
         Command::Socks5 { listen } => {
-            relay::run_socks5_listener(config, listen).await?;
+            run_socks5_listener(config, listen).await?;
         }
     }
-    Ok(())
-}
-
-fn check_config(config: &ClientConfig) -> Result<(), AnyError> {
-    config.validate_auth_material()?;
-    let _connector = tls::connector(&config.ca_cert_path)?;
-    let _server_name = tls::server_name(config.server_name.clone())?;
-    println!("uk-client config ok");
-    Ok(())
-}
-
-async fn run_handshake(config: ClientConfig) -> Result<(), AnyError> {
-    let (_stream, _settings) = session::connect_authenticated(&config).await?;
-    println!("uk-client handshake ok");
     Ok(())
 }
