@@ -1,7 +1,9 @@
 [package]
 name = "uk-client"
+description = "SOCKS5 client and TLS carrier for Uncrowned King."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
