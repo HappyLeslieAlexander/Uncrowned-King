@@ -112,6 +112,11 @@ async fn applies_credential_policy_group() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maps_policy_group_mismatch_to_socks_not_allowed() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_policy_group_mismatch_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relays_ipv6_socks_target_to_echo_target() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_ipv6_relay_e2e()).await?
 }
@@ -412,6 +417,20 @@ async fn run_policy_group_e2e() -> Result<(), TestError> {
     assert_eq!(echoed, b"uncrowned king policy group e2e");
 
     echo_task.await??;
+    Ok(())
+}
+
+async fn run_policy_group_mismatch_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let denied_target = unused_loopback_addr().await?;
+    let harness = RelayHarness::start(Some(allow_admin_group_loopback_policy(
+        denied_target.port(),
+    )))
+    .await?;
+
+    let (_socks, connect_reply) = open_socks_connect(harness.socks_addr, denied_target).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_NOT_ALLOWED);
     Ok(())
 }
 
@@ -839,11 +858,19 @@ fn allow_ipv6_loopback_policy(port: u16) -> String {
 }
 
 fn allow_default_group_loopback_policy(port: u16) -> String {
+    allow_group_loopback_policy("default", port)
+}
+
+fn allow_admin_group_loopback_policy(port: u16) -> String {
+    allow_group_loopback_policy("admins", port)
+}
+
+fn allow_group_loopback_policy(group: &str, port: u16) -> String {
     format!(
         r#"
         [[rules]]
         action = "allow"
-        policy_group = "default"
+        policy_group = "{group}"
         cidr = "127.0.0.1/32"
         port_start = {port}
         port_end = {port}
