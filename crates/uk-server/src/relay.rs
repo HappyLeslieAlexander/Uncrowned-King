@@ -62,8 +62,9 @@ enum OpenFailure {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FlowEvent {
-    TargetClosed(u64),
-    TargetActivity,
+    ReadClosed(u64),
+    WriteClosed(u64),
+    Activity,
 }
 
 enum SessionEvent {
@@ -148,12 +149,18 @@ pub(crate) async fn relay_session(
         };
 
         match event {
-            SessionEvent::Flow(Some(FlowEvent::TargetClosed(flow_id))) => {
-                if target_writers.remove(&flow_id).is_some() {
+            SessionEvent::Flow(Some(FlowEvent::ReadClosed(flow_id))) => {
+                if target_writers.contains_key(&flow_id) {
+                    info!(event = "tcp.target_read_closed", flow_id);
+                }
+            }
+            SessionEvent::Flow(Some(FlowEvent::WriteClosed(flow_id))) => {
+                if let Some(target) = target_writers.remove(&flow_id) {
+                    target.close();
                     info!(event = "tcp.closed", flow_id);
                 }
             }
-            SessionEvent::Flow(Some(FlowEvent::TargetActivity) | None) => {}
+            SessionEvent::Flow(Some(FlowEvent::Activity) | None) => {}
             SessionEvent::Frame(frame) => {
                 if let Err(err) = handle_session_frame(frame, &context, &mut target_writers).await {
                     break Err(err);
@@ -373,7 +380,7 @@ fn spawn_target_reader(
             }
             _ => {}
         }
-        let _ = event_tx.send(FlowEvent::TargetClosed(flow_id));
+        let _ = event_tx.send(FlowEvent::ReadClosed(flow_id));
     });
 }
 
@@ -395,7 +402,7 @@ fn spawn_target_writer(
             }
             _ => {}
         }
-        let _ = event_tx.send(FlowEvent::TargetClosed(flow_id));
+        let _ = event_tx.send(FlowEvent::WriteClosed(flow_id));
     });
 }
 
@@ -569,7 +576,7 @@ async fn relay_target_to_client(
             Bytes::copy_from_slice(&target_buf[..read]),
         )
         .await?;
-        let _ = event_tx.send(FlowEvent::TargetActivity);
+        let _ = event_tx.send(FlowEvent::Activity);
     }
 }
 
