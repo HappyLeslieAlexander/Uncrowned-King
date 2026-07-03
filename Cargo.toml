@@ -11,9 +11,9 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "GPL-3.0-only"
 authors = ["UncrownedKing Contributors"]
-repository = "https://example.invalid/uncrownedking"
+repository = "https://github.com/HappyLeslieAlexander/Uncrowned-King"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
