@@ -25,5 +25,8 @@ uk-auth = { path = "../uk-auth" }
 uk-policy = { path = "../uk-policy" }
 uk-proto = { path = "../uk-proto" }
 
+[dev-dependencies]
+uk-server = { path = "../uk-server" }
+
 [lints]
 workspace = true
