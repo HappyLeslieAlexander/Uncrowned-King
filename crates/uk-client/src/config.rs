@@ -23,6 +23,8 @@ pub struct ClientConfig {
     pub handshake_timeout_seconds: Option<u64>,
     /// Optional SOCKS5 greeting/request timeout in seconds.
     pub socks_handshake_timeout_seconds: Option<u64>,
+    /// Optional timeout for waiting on TCP open acknowledgement in seconds.
+    pub tcp_open_timeout_seconds: Option<u64>,
 }
 
 impl ClientConfig {
@@ -41,6 +43,11 @@ impl ClientConfig {
     /// SOCKS5 greeting/request timeout in seconds. Zero disables it.
     pub fn socks_handshake_timeout_seconds(&self) -> u64 {
         self.socks_handshake_timeout_seconds.unwrap_or(10)
+    }
+
+    /// TCP open acknowledgement timeout in seconds. Zero disables it.
+    pub fn tcp_open_timeout_seconds(&self) -> u64 {
+        self.tcp_open_timeout_seconds.unwrap_or(10)
     }
 
     /// Validates local authentication material before opening a network session.
@@ -63,6 +70,7 @@ mod tests {
             secret: "0123456789abcdef0123456789abcdef".to_owned(),
             handshake_timeout_seconds: None,
             socks_handshake_timeout_seconds: None,
+            tcp_open_timeout_seconds: None,
         }
     }
 
@@ -108,6 +116,28 @@ socks_handshake_timeout_seconds = 5
         .unwrap();
 
         assert_eq!(config.socks_handshake_timeout_seconds(), 5);
+    }
+
+    #[test]
+    fn defaults_tcp_open_timeout() {
+        assert_eq!(minimal_config().tcp_open_timeout_seconds(), 10);
+    }
+
+    #[test]
+    fn parses_tcp_open_timeout() {
+        let config: ClientConfig = toml::from_str(
+            r#"
+server_addr = "127.0.0.1:443"
+server_name = "localhost"
+ca_cert_path = "ca.pem"
+key_id = "client"
+secret = "secret"
+tcp_open_timeout_seconds = 6
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.tcp_open_timeout_seconds(), 6);
     }
 
     #[test]

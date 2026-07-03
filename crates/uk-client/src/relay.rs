@@ -50,6 +50,7 @@ struct ClientSession {
     flows: FlowTable,
     limits: FrameLimits,
     max_streams: u64,
+    open_timeout: Option<Duration>,
     closed: AtomicBool,
     next_flow_id: AtomicU64,
 }
@@ -158,6 +159,7 @@ impl ClientSession {
             flows: Arc::new(Mutex::new(HashMap::new())),
             limits,
             max_streams: max_streams(&settings),
+            open_timeout: timeout(config.tcp_open_timeout_seconds()),
             closed: AtomicBool::new(false),
             next_flow_id: AtomicU64::new(FIRST_CLIENT_FLOW_ID),
         });
@@ -202,11 +204,23 @@ impl ClientSession {
             frames,
             session: Arc::clone(self),
         };
-        let frame = flow
-            .frames
-            .recv()
-            .await
-            .ok_or("uk session closed while opening flow")?;
+        let frame = if let Some(timeout) = self.open_timeout {
+            match time::timeout(timeout, flow.frames.recv()).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => return Err("uk session closed while opening flow".into()),
+                Err(_) => {
+                    warn!(event = "client.flow.open.timeout", flow_id);
+                    self.flows.lock().await.remove(&flow_id);
+                    self.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await?;
+                    return Ok(OpenOutcome::Rejected(socks5::Reply::GeneralFailure));
+                }
+            }
+        } else {
+            flow.frames
+                .recv()
+                .await
+                .ok_or("uk session closed while opening flow")?
+        };
         match frame.header.frame_type {
             FrameType::TcpData if frame.payload.is_empty() => Ok(OpenOutcome::Open(flow)),
             FrameType::PolicyDenied => {
