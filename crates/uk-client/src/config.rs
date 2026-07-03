@@ -58,11 +58,15 @@ impl ClientConfig {
 
     /// Validates configured network endpoints without resolving DNS.
     pub fn validate_network_endpoints(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        validate_host_port("server_addr", &self.server_addr)
+        validate_endpoint("server_addr", &self.server_addr)
     }
 }
 
-fn validate_host_port(name: &'static str, value: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+/// Validates one `host:port` endpoint without resolving DNS.
+pub fn validate_endpoint(
+    name: &'static str,
+    value: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     if let Ok(addr) = value.parse::<SocketAddr>() {
         return validate_port(name, addr.port());
     }

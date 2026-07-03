@@ -25,7 +25,10 @@ use uk_proto::{
     frame::DEFAULT_MAX_FRAME_SIZE, is_client_initiated_flow_id, read_frame, write_frame,
 };
 
-use crate::{config::ClientConfig, session, socks5};
+use crate::{
+    config::{ClientConfig, validate_endpoint},
+    session, socks5,
+};
 
 const FLOW_ID_ALLOCATION_ATTEMPTS: usize = 1024;
 const FLOW_FRAME_QUEUE_CAPACITY: usize = 32;
@@ -81,6 +84,7 @@ pub(crate) async fn run_socks5_listener(
     config: ClientConfig,
     listen: String,
 ) -> Result<(), AnyError> {
+    validate_endpoint("socks listen", &listen)?;
     let socks_handshake_timeout = timeout(config.socks_handshake_timeout_seconds());
     let sessions = Arc::new(ClientSessionManager::new(config));
     let listener = TcpListener::bind(&listen).await?;
@@ -690,5 +694,12 @@ mod tests {
         let frame = Frame::new(FrameType::Ping, 0, FLOW_ID, Bytes::new()).unwrap();
 
         assert!(decode_open_response(frame).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_socks_listen_endpoint() {
+        assert!(validate_endpoint("socks listen", "127.0.0.1").is_err());
+        assert!(validate_endpoint("socks listen", "127.0.0.1:0").is_err());
+        assert!(validate_endpoint("socks listen", "::1:1080").is_err());
     }
 }
