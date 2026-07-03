@@ -93,6 +93,20 @@ struct TargetFlow {
     control: TargetFlowControl,
 }
 
+#[derive(Debug, Clone)]
+struct SessionShutdown {
+    closed: Arc<AtomicBool>,
+}
+
+struct RelaySessionContext<'a> {
+    credential: &'a Credential,
+    policy_set: &'a PolicySet,
+    carrier_writer: &'a CarrierWriter,
+    event_tx: &'a mpsc::UnboundedSender<FlowEvent>,
+    limits: RelayLimits,
+    shutdown: SessionShutdown,
+}
+
 pub(crate) async fn relay_session(
     carrier: TlsStream<TcpStream>,
     credential: Credential,
@@ -107,16 +121,30 @@ pub(crate) async fn relay_session(
     let carrier_writer = Arc::new(Mutex::new(carrier_writer));
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let mut target_writers = FlowTable::new();
+    let shutdown = SessionShutdown::default();
+    let context = RelaySessionContext {
+        credential: &credential,
+        policy_set: &policy_set,
+        carrier_writer: &carrier_writer,
+        event_tx: &event_tx,
+        limits,
+        shutdown: shutdown.clone(),
+    };
 
-    loop {
-        match next_session_event(
+    let result = loop {
+        let event = match next_session_event(
             &mut carrier_reader,
             &mut event_rx,
             limits.frame,
             idle_timeout,
         )
-        .await?
+        .await
         {
+            Ok(event) => event,
+            Err(err) => break Err(err),
+        };
+
+        match event {
             SessionEvent::Flow(Some(FlowEvent::TargetClosed(flow_id))) => {
                 if target_writers.remove(&flow_id).is_some() {
                     info!(event = "tcp.closed", flow_id);
@@ -124,23 +152,21 @@ pub(crate) async fn relay_session(
             }
             SessionEvent::Flow(Some(FlowEvent::TargetActivity) | None) => {}
             SessionEvent::Frame(frame) => {
-                handle_session_frame(
-                    frame,
-                    &credential,
-                    &policy_set,
-                    &carrier_writer,
-                    &event_tx,
-                    &mut target_writers,
-                    limits,
-                )
-                .await?;
+                if let Err(err) = handle_session_frame(frame, &context, &mut target_writers).await {
+                    break Err(err);
+                }
             }
             SessionEvent::IdleTimeout => {
                 info!(event = "server.session.idle_timeout");
-                return Ok(());
+                break Ok(());
             }
         }
-    }
+    };
+
+    shutdown.close();
+    close_target_flows(&mut target_writers);
+    shutdown_carrier_writer(&carrier_writer).await;
+    result
 }
 
 async fn next_session_event(
@@ -165,30 +191,27 @@ async fn next_session_event(
 
 async fn handle_session_frame(
     frame: Frame,
-    credential: &Credential,
-    policy_set: &PolicySet,
-    carrier_writer: &CarrierWriter,
-    event_tx: &mpsc::UnboundedSender<FlowEvent>,
+    context: &RelaySessionContext<'_>,
     target_writers: &mut FlowTable,
-    limits: RelayLimits,
 ) -> Result<(), AnyError> {
     match frame.header.frame_type {
         FrameType::TcpOpen => {
             if is_client_initiated_flow_id(frame.header.id) {
-                if target_writers.len() as u64 >= limits.max_streams {
-                    send_resource_limit(carrier_writer, frame.header.id).await?;
-                    send_tcp_close(carrier_writer, frame.header.id, TCP_CLOSE_ERROR).await?;
+                if target_writers.len() as u64 >= context.limits.max_streams {
+                    send_resource_limit(context.carrier_writer, frame.header.id).await?;
+                    send_tcp_close(context.carrier_writer, frame.header.id, TCP_CLOSE_ERROR)
+                        .await?;
                     return Ok(());
                 }
                 if target_writers.contains_key(&frame.header.id) {
-                    send_error(carrier_writer, frame.header.id, ErrorCode::Protocol).await?;
-                    send_tcp_close(carrier_writer, frame.header.id, TCP_CLOSE_ERROR).await?;
+                    send_error(context.carrier_writer, frame.header.id, ErrorCode::Protocol)
+                        .await?;
+                    send_tcp_close(context.carrier_writer, frame.header.id, TCP_CLOSE_ERROR)
+                        .await?;
                     return Ok(());
                 }
             }
-            if let Some((flow_id, target_writer_tx)) =
-                handle_tcp_open(carrier_writer, event_tx, frame, credential, policy_set).await?
-            {
+            if let Some((flow_id, target_writer_tx)) = handle_tcp_open(context, frame).await? {
                 target_writers.insert(flow_id, target_writer_tx);
             }
             Ok(())
@@ -197,19 +220,22 @@ async fn handle_session_frame(
             if !frame.payload.is_empty() {
                 let flow_id = frame.header.id;
                 if let Some(target) = target_writers.get(&flow_id) {
-                    match target.enqueue_data(frame.payload, limits.max_buffered_bytes_per_flow) {
+                    match target
+                        .enqueue_data(frame.payload, context.limits.max_buffered_bytes_per_flow)
+                    {
                         Ok(()) => {}
                         Err(EnqueueError::Closed) => {
                             target_writers.remove(&flow_id);
                         }
                         Err(EnqueueError::ResourceLimit) => {
-                            send_resource_limit(carrier_writer, flow_id).await?;
-                            send_tcp_close(carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
+                            send_resource_limit(context.carrier_writer, flow_id).await?;
+                            send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR)
+                                .await?;
                             target_writers.remove(&flow_id);
                         }
                     }
                 } else {
-                    send_error(carrier_writer, flow_id, ErrorCode::Protocol).await?;
+                    send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
                 }
             }
             Ok(())
@@ -222,27 +248,24 @@ async fn handle_session_frame(
             }
             Ok(())
         }
-        FrameType::Ping => write_pong(carrier_writer, &frame).await,
+        FrameType::Ping => write_pong(context.carrier_writer, &frame).await,
         FrameType::Pong => Ok(()),
         _ => Err("unexpected frame while relaying session".into()),
     }
 }
 
 async fn handle_tcp_open(
-    carrier_writer: &CarrierWriter,
-    event_tx: &mpsc::UnboundedSender<FlowEvent>,
+    context: &RelaySessionContext<'_>,
     frame: Frame,
-    credential: &Credential,
-    policy_set: &PolicySet,
 ) -> Result<Option<(u64, TargetFlow)>, AnyError> {
     let flow_id = frame.header.id;
     if flow_id == 0 {
-        send_error(carrier_writer, flow_id, ErrorCode::Protocol).await?;
+        send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
         return Err("tcp flow id must be non-zero".into());
     }
     if !is_client_initiated_flow_id(flow_id) {
-        send_error(carrier_writer, flow_id, ErrorCode::Protocol).await?;
-        send_tcp_close(carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
+        send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+        send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
         warn!(event = "tcp.open.reserved_flow_id", flow_id);
         return Ok(None);
     }
@@ -251,53 +274,61 @@ async fn handle_tcp_open(
     let open = match TcpOpen::decode(&mut payload) {
         Ok(open) => open,
         Err(err) => {
-            send_error(carrier_writer, flow_id, ErrorCode::InvalidTarget).await?;
-            send_tcp_close(carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
+            send_error(context.carrier_writer, flow_id, ErrorCode::InvalidTarget).await?;
+            send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
             warn!(event = "tcp.open.invalid", flow_id, error = %err);
             return Ok(None);
         }
     };
     if open.open_flags != TCP_OPEN_FLAGS_NONE {
-        send_error(carrier_writer, flow_id, ErrorCode::Protocol).await?;
-        send_tcp_close(carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
+        send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+        send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
         return Ok(None);
     }
 
     let target = open.target;
-    let target_stream = match connect_allowed_target(&target, credential, policy_set).await {
-        Ok(stream) => stream,
-        Err(OpenFailure::PolicyDenied) => {
-            warn!(event = "policy.denied", flow_id, target = ?target);
-            send_policy_denied(carrier_writer, flow_id).await?;
-            send_tcp_close(carrier_writer, flow_id, TCP_CLOSE_NORMAL).await?;
-            return Ok(None);
-        }
-        Err(OpenFailure::TargetUnavailable(err)) => {
-            warn!(event = "target.unavailable", flow_id, target = ?target, error = %err);
-            send_error(carrier_writer, flow_id, ErrorCode::TargetUnavailable).await?;
-            send_tcp_close(carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
-            return Ok(None);
-        }
-    };
+    let target_stream =
+        match connect_allowed_target(&target, context.credential, context.policy_set).await {
+            Ok(stream) => stream,
+            Err(OpenFailure::PolicyDenied) => {
+                warn!(event = "policy.denied", flow_id, target = ?target);
+                send_policy_denied(context.carrier_writer, flow_id).await?;
+                send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_NORMAL).await?;
+                return Ok(None);
+            }
+            Err(OpenFailure::TargetUnavailable(err)) => {
+                warn!(event = "target.unavailable", flow_id, target = ?target, error = %err);
+                send_error(
+                    context.carrier_writer,
+                    flow_id,
+                    ErrorCode::TargetUnavailable,
+                )
+                .await?;
+                send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
+                return Ok(None);
+            }
+        };
 
     let (target_reader, target_writer) = target_stream.into_split();
     let (target_writer_tx, target_writer_rx) = mpsc::channel(TARGET_WRITE_QUEUE_CAPACITY);
     let flow_control = TargetFlowControl::default();
     let target_flow = TargetFlow::new(target_writer_tx, flow_control.clone());
-    send_tcp_data(carrier_writer, flow_id, Bytes::new()).await?;
+    send_tcp_data(context.carrier_writer, flow_id, Bytes::new()).await?;
     spawn_target_reader(
         flow_id,
         target_reader,
-        Arc::clone(carrier_writer),
-        event_tx.clone(),
+        Arc::clone(context.carrier_writer),
+        context.event_tx.clone(),
+        context.shutdown.clone(),
     );
     spawn_target_writer(
         flow_id,
         target_writer,
         target_writer_rx,
         flow_control,
-        Arc::clone(carrier_writer),
-        event_tx.clone(),
+        Arc::clone(context.carrier_writer),
+        context.event_tx.clone(),
+        context.shutdown.clone(),
     );
     info!(event = "tcp.open", flow_id, target = ?target);
     Ok(Some((flow_id, target_flow)))
@@ -308,14 +339,24 @@ fn spawn_target_reader(
     target_reader: OwnedReadHalf,
     carrier_writer: CarrierWriter,
     event_tx: mpsc::UnboundedSender<FlowEvent>,
+    shutdown: SessionShutdown,
 ) {
     tokio::spawn(async move {
-        if let Err(err) =
-            relay_target_to_client(flow_id, target_reader, &carrier_writer, &event_tx).await
+        match relay_target_to_client(
+            flow_id,
+            target_reader,
+            &carrier_writer,
+            &event_tx,
+            &shutdown,
+        )
+        .await
         {
-            warn!(event = "tcp.target.read.error", flow_id, error = %err);
-            let _ = send_error(&carrier_writer, flow_id, ErrorCode::TargetUnavailable).await;
-            let _ = send_tcp_close(&carrier_writer, flow_id, TCP_CLOSE_ERROR).await;
+            Err(err) if !shutdown.is_closed() => {
+                warn!(event = "tcp.target.read.error", flow_id, error = %err);
+                let _ = send_error(&carrier_writer, flow_id, ErrorCode::TargetUnavailable).await;
+                let _ = send_tcp_close(&carrier_writer, flow_id, TCP_CLOSE_ERROR).await;
+            }
+            _ => {}
         }
         let _ = event_tx.send(FlowEvent::TargetClosed(flow_id));
     });
@@ -328,12 +369,16 @@ fn spawn_target_writer(
     flow_control: TargetFlowControl,
     carrier_writer: CarrierWriter,
     event_tx: mpsc::UnboundedSender<FlowEvent>,
+    shutdown: SessionShutdown,
 ) {
     tokio::spawn(async move {
-        if let Err(err) = relay_client_to_target(target_writer, commands, flow_control).await {
-            warn!(event = "tcp.target.write.error", flow_id, error = %err);
-            let _ = send_error(&carrier_writer, flow_id, ErrorCode::TargetUnavailable).await;
-            let _ = send_tcp_close(&carrier_writer, flow_id, TCP_CLOSE_ERROR).await;
+        match relay_client_to_target(target_writer, commands, flow_control, &shutdown).await {
+            Err(err) if !shutdown.is_closed() => {
+                warn!(event = "tcp.target.write.error", flow_id, error = %err);
+                let _ = send_error(&carrier_writer, flow_id, ErrorCode::TargetUnavailable).await;
+                let _ = send_tcp_close(&carrier_writer, flow_id, TCP_CLOSE_ERROR).await;
+            }
+            _ => {}
         }
         let _ = event_tx.send(FlowEvent::TargetClosed(flow_id));
     });
@@ -343,12 +388,13 @@ async fn relay_client_to_target(
     mut target_writer: OwnedWriteHalf,
     mut commands: mpsc::Receiver<TargetCommand>,
     flow_control: TargetFlowControl,
+    shutdown: &SessionShutdown,
 ) -> Result<(), AnyError> {
     while let Some(command) = commands.recv().await {
         match command {
             TargetCommand::Data(payload) => {
                 let payload_len = payload.len();
-                if flow_control.is_closed() {
+                if flow_control.is_closed() || shutdown.is_closed() {
                     flow_control.release_bytes(payload_len);
                     return Ok(());
                 }
@@ -378,6 +424,24 @@ impl RelayLimits {
             max_streams,
             max_buffered_bytes_per_flow,
         }
+    }
+}
+
+impl Default for SessionShutdown {
+    fn default() -> Self {
+        Self {
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl SessionShutdown {
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 }
 
@@ -467,10 +531,17 @@ async fn relay_target_to_client(
     mut target_reader: OwnedReadHalf,
     carrier_writer: &CarrierWriter,
     event_tx: &mpsc::UnboundedSender<FlowEvent>,
+    shutdown: &SessionShutdown,
 ) -> Result<(), AnyError> {
     let mut target_buf = Box::new([0_u8; RELAY_BUFFER_SIZE]);
     loop {
+        if shutdown.is_closed() {
+            return Ok(());
+        }
         let read = target_reader.read(target_buf.as_mut()).await?;
+        if shutdown.is_closed() {
+            return Ok(());
+        }
         if read == 0 {
             send_tcp_close(carrier_writer, flow_id, TCP_CLOSE_NORMAL).await?;
             return Ok(());
@@ -482,6 +553,19 @@ async fn relay_target_to_client(
         )
         .await?;
         let _ = event_tx.send(FlowEvent::TargetActivity);
+    }
+}
+
+fn close_target_flows(target_writers: &mut FlowTable) {
+    for target in target_writers.drain().map(|(_, target)| target) {
+        target.close();
+    }
+}
+
+async fn shutdown_carrier_writer(carrier_writer: &CarrierWriter) {
+    let mut writer = carrier_writer.lock().await;
+    if let Err(err) = writer.shutdown().await {
+        debug!(event = "server.session.shutdown.error", error = %err);
     }
 }
 
