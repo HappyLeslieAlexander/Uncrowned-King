@@ -21,3 +21,6 @@ uk-client --config examples/client.toml config-check
 
 Replace the example shared secret before using these configs anywhere outside a
 local throwaway environment.
+
+The example policy denies private resolved addresses before allowing
+`example.com` traffic. Keep deny rules before broad allow rules when adapting it.

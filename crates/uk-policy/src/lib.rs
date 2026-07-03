@@ -693,6 +693,13 @@ mod tests {
     }
 
     #[test]
+    fn parses_example_policy() {
+        let policy = PolicySet::from_toml(include_str!("../../../examples/policy.toml")).unwrap();
+
+        assert_eq!(policy.rules.len(), 3);
+    }
+
+    #[test]
     fn rejects_unknown_policy_fields() {
         let err = PolicySet::from_toml(
             r#"

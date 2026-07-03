@@ -23,15 +23,22 @@ SOCKS5 client -> UK over TLS/TCP -> UK server -> TCP target
 ```
 
 Server policy is deny-all unless `policy_path` is set in the server config. A
-minimal allow policy looks like:
+minimal public-domain policy should deny private resolved addresses before
+allowing external domains:
 
 ```toml
+[[rules]]
+action = "deny"
+private = true
+
 [[rules]]
 action = "allow"
 domain_suffix = ".example.com"
 port_start = 443
 port_end = 443
 ```
+
+Rules are evaluated in order; the first matching rule wins.
 
 Server limits can advertise and enforce the maximum frame size and concurrent
 TCP streams per authenticated session, plus the authenticated session idle

@@ -1,4 +1,8 @@
-# Example allow policy for local development.
+# Example allow policy for local development. Rules are evaluated in order.
+
+[[rules]]
+action = "deny"
+private = true
 
 [[rules]]
 action = "allow"
