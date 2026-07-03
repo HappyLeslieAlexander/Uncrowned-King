@@ -57,6 +57,7 @@ enum ServerSessionState {
 enum OpenFailure {
     PolicyDenied,
     TargetUnavailable(io::Error),
+    TargetTimeout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,6 +313,12 @@ async fn handle_tcp_open(
                 ErrorCode::TargetUnavailable,
             )
             .await?;
+            send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
+            return Ok(None);
+        }
+        Err(OpenFailure::TargetTimeout) => {
+            warn!(event = "target.timeout", flow_id, target = ?target);
+            send_error(context.carrier_writer, flow_id, ErrorCode::TargetTimeout).await?;
             send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
             return Ok(None);
         }
@@ -649,14 +656,10 @@ where
     if let Some(duration) = duration {
         tokio::time::timeout(duration, future)
             .await
-            .map_err(|_| OpenFailure::TargetUnavailable(timeout_error()))?
+            .map_err(|_| OpenFailure::TargetTimeout)?
     } else {
         future.await
     }
-}
-
-fn timeout_error() -> io::Error {
-    io::Error::new(io::ErrorKind::TimedOut, "target connect timeout")
 }
 
 async fn send_tcp_data(

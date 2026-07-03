@@ -28,6 +28,8 @@ pub enum ErrorCode {
     Protocol = 9,
     /// Target could not be reached or connected.
     TargetUnavailable = 10,
+    /// Target DNS resolution or TCP connect timed out.
+    TargetTimeout = 11,
 }
 
 impl TryFrom<u64> for ErrorCode {
@@ -45,6 +47,7 @@ impl TryFrom<u64> for ErrorCode {
             8 => Ok(Self::ResourceLimit),
             9 => Ok(Self::Protocol),
             10 => Ok(Self::TargetUnavailable),
+            11 => Ok(Self::TargetTimeout),
             _ => Err(ProtocolError::InvalidErrorPayload("unknown error code")),
         }
     }
@@ -102,6 +105,15 @@ mod tests {
         payload.encode(&mut out).unwrap();
         let mut bytes = Bytes::from(out);
         assert_eq!(ErrorPayload::decode(&mut bytes).unwrap(), payload);
+    }
+
+    #[test]
+    fn encodes_target_timeout_vector() {
+        let mut out = Vec::new();
+        ErrorPayload::new(ErrorCode::TargetTimeout)
+            .encode(&mut out)
+            .unwrap();
+        assert_eq!(out, [0x0b]);
     }
 
     #[test]

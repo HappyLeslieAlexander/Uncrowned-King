@@ -211,3 +211,4 @@ varint error_code
 | `8` | `ERROR_RESOURCE_LIMIT` |
 | `9` | `ERROR_PROTOCOL` |
 | `10` | `ERROR_TARGET_UNAVAILABLE` |
+| `11` | `ERROR_TARGET_TIMEOUT` |

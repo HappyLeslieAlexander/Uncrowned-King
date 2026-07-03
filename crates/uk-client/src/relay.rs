@@ -469,7 +469,9 @@ fn expect_error_payload(mut payload: Bytes, code: ErrorCode) -> Result<(), AnyEr
 fn map_error_payload(mut payload: Bytes) -> Result<socks5::Reply, AnyError> {
     let status = ErrorPayload::decode(&mut payload)?;
     let reply = match status.code {
-        ErrorCode::InvalidTarget | ErrorCode::TargetUnavailable => socks5::Reply::HostUnreachable,
+        ErrorCode::InvalidTarget | ErrorCode::TargetUnavailable | ErrorCode::TargetTimeout => {
+            socks5::Reply::HostUnreachable
+        }
         ErrorCode::PolicyDenied => socks5::Reply::NotAllowed,
         ErrorCode::ResourceLimit
         | ErrorCode::Protocol

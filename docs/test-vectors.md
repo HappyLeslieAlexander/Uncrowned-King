@@ -73,6 +73,12 @@ settling.
 0a
 ```
 
+`ERROR_TARGET_TIMEOUT` payload:
+
+```text
+0b
+```
+
 An unknown required flag example:
 
 ```text
