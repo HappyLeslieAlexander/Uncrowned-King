@@ -17,8 +17,8 @@ use tracing::{debug, info, warn};
 use uk_auth::Credential;
 use uk_policy::{PolicyContext, PolicyDecision, PolicySet};
 use uk_proto::{
-    Frame, FrameLimits, FrameType, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target,
-    TcpClose, TcpOpen, read_frame, write_frame,
+    ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL,
+    TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, read_frame, write_frame,
 };
 
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
@@ -72,14 +72,14 @@ async fn handle_tcp_open(
 ) -> Result<(), AnyError> {
     let flow_id = frame.header.id;
     if flow_id == 0 {
-        send_error(carrier, flow_id).await?;
+        send_error(carrier, flow_id, ErrorCode::Protocol).await?;
         return Err("tcp flow id must be non-zero".into());
     }
 
     let mut payload = frame.payload;
     let open = TcpOpen::decode(&mut payload)?;
     if open.open_flags != TCP_OPEN_FLAGS_NONE {
-        send_error(carrier, flow_id).await?;
+        send_error(carrier, flow_id, ErrorCode::Protocol).await?;
         send_tcp_close(carrier, flow_id, TCP_CLOSE_ERROR).await?;
         return Ok(());
     }
@@ -95,7 +95,7 @@ async fn handle_tcp_open(
         }
         Err(OpenFailure::TargetUnavailable(err)) => {
             warn!(event = "target.unavailable", flow_id, target = ?target, error = %err);
-            send_error(carrier, flow_id).await?;
+            send_error(carrier, flow_id, ErrorCode::TargetUnavailable).await?;
             send_tcp_close(carrier, flow_id, TCP_CLOSE_ERROR).await?;
             return Ok(());
         }
@@ -237,16 +237,34 @@ async fn send_policy_denied<W>(writer: &mut W, flow_id: u64) -> Result<(), AnyEr
 where
     W: AsyncWrite + Unpin,
 {
-    let frame = Frame::new(FrameType::PolicyDenied, 0, flow_id, Bytes::new())?;
-    write_frame(writer, &frame).await?;
-    Ok(())
+    send_status_frame(
+        writer,
+        FrameType::PolicyDenied,
+        flow_id,
+        ErrorCode::PolicyDenied,
+    )
+    .await
 }
 
-async fn send_error<W>(writer: &mut W, flow_id: u64) -> Result<(), AnyError>
+async fn send_error<W>(writer: &mut W, flow_id: u64, code: ErrorCode) -> Result<(), AnyError>
 where
     W: AsyncWrite + Unpin,
 {
-    let frame = Frame::new(FrameType::Error, 0, flow_id, Bytes::new())?;
+    send_status_frame(writer, FrameType::Error, flow_id, code).await
+}
+
+async fn send_status_frame<W>(
+    writer: &mut W,
+    frame_type: FrameType,
+    flow_id: u64,
+    code: ErrorCode,
+) -> Result<(), AnyError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut payload = BytesMut::new();
+    ErrorPayload::new(code).encode(&mut payload)?;
+    let frame = Frame::new(frame_type, 0, flow_id, payload.freeze())?;
     write_frame(writer, &frame).await?;
     Ok(())
 }

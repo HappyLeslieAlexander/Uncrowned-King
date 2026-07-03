@@ -76,9 +76,11 @@ impl Settings {
         let count = usize::try_from(count).map_err(|_| ProtocolError::InvalidVarint)?;
         let mut settings = Self::default();
         for _ in 0..count {
-            let key = SettingKey::try_from(varint::decode(src)?)?;
+            let key = varint::decode(src)?;
             let value = varint::decode(src)?;
-            settings.set(key, value);
+            if let Ok(key) = SettingKey::try_from(key) {
+                settings.set(key, value);
+            }
         }
         Ok(settings)
     }
@@ -100,5 +102,12 @@ mod tests {
         settings.encode(&mut out).unwrap();
         let mut bytes = Bytes::from(out);
         assert_eq!(Settings::decode(&mut bytes).unwrap(), settings);
+    }
+
+    #[test]
+    fn ignores_unknown_optional_settings() {
+        let mut bytes = Bytes::from_static(&[0x02, 0x01, 0x40, 0x80, 0x3f, 0x01]);
+        let settings = Settings::decode(&mut bytes).unwrap();
+        assert_eq!(settings.get(SettingKey::MaxFrameSize), Some(128));
     }
 }

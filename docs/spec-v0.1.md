@@ -189,6 +189,12 @@ added after v0.1.
 
 ## 7. Error Codes
 
+`ERROR`, `POLICY_DENIED`, and `RESOURCE_LIMIT` payloads carry one coarse code:
+
+```text
+varint error_code
+```
+
 | Code | Name |
 | ---: | --- |
 | `1` | `ERROR_UNSUPPORTED_VERSION` |
@@ -200,3 +206,4 @@ added after v0.1.
 | `7` | `ERROR_POLICY_DENIED` |
 | `8` | `ERROR_RESOURCE_LIMIT` |
 | `9` | `ERROR_PROTOCOL` |
+| `10` | `ERROR_TARGET_UNAVAILABLE` |

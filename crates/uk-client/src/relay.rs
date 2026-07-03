@@ -10,8 +10,8 @@ use tokio::{
 use tokio_rustls::client::TlsStream;
 use tracing::{debug, info, warn};
 use uk_proto::{
-    Frame, FrameLimits, FrameType, SettingKey, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, TcpClose,
-    TcpOpen, frame::DEFAULT_MAX_FRAME_SIZE, read_frame, write_frame,
+    ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, SettingKey, TCP_CLOSE_NORMAL,
+    TCP_OPEN_FLAGS_NONE, TcpClose, TcpOpen, frame::DEFAULT_MAX_FRAME_SIZE, read_frame, write_frame,
 };
 
 use crate::{config::ClientConfig, session, socks5};
@@ -106,13 +106,15 @@ async fn open_flow(
                 return Ok(socks5::Reply::Succeeded);
             }
             FrameType::PolicyDenied if frame.header.id == CLIENT_FLOW_ID => {
+                expect_error_payload(frame.payload, ErrorCode::PolicyDenied)?;
                 return Ok(socks5::Reply::NotAllowed);
             }
             FrameType::ResourceLimit if frame.header.id == CLIENT_FLOW_ID => {
+                expect_error_payload(frame.payload, ErrorCode::ResourceLimit)?;
                 return Ok(socks5::Reply::GeneralFailure);
             }
             FrameType::Error if frame.header.id == CLIENT_FLOW_ID => {
-                return Ok(socks5::Reply::HostUnreachable);
+                return map_error_payload(frame.payload);
             }
             FrameType::TcpClose if frame.header.id == CLIENT_FLOW_ID => {
                 return Ok(socks5::Reply::ConnectionRefused);
@@ -161,6 +163,8 @@ async fn relay_tcp(
                     FrameType::Error | FrameType::PolicyDenied | FrameType::ResourceLimit
                         if frame.header.id == CLIENT_FLOW_ID =>
                     {
+                        let mut payload = frame.payload;
+                        let _status = ErrorPayload::decode(&mut payload)?;
                         local.shutdown().await?;
                         remote_to_local_open = false;
                     }
@@ -173,6 +177,31 @@ async fn relay_tcp(
     }
 
     Ok(())
+}
+
+fn expect_error_payload(mut payload: Bytes, code: ErrorCode) -> Result<(), AnyError> {
+    let status = ErrorPayload::decode(&mut payload)?;
+    if status.code == code {
+        Ok(())
+    } else {
+        Err("unexpected error payload code".into())
+    }
+}
+
+fn map_error_payload(mut payload: Bytes) -> Result<socks5::Reply, AnyError> {
+    let status = ErrorPayload::decode(&mut payload)?;
+    let reply = match status.code {
+        ErrorCode::InvalidTarget | ErrorCode::TargetUnavailable => socks5::Reply::HostUnreachable,
+        ErrorCode::PolicyDenied => socks5::Reply::NotAllowed,
+        ErrorCode::ResourceLimit
+        | ErrorCode::Protocol
+        | ErrorCode::UnsupportedVersion
+        | ErrorCode::UnsupportedFlag
+        | ErrorCode::OversizedFrame
+        | ErrorCode::TruncatedFrame
+        | ErrorCode::AuthFailed => socks5::Reply::GeneralFailure,
+    };
+    Ok(reply)
 }
 
 async fn send_tcp_data<W>(writer: &mut W, flow_id: u64, payload: Bytes) -> Result<(), AnyError>

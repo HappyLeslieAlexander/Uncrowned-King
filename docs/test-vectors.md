@@ -61,6 +61,18 @@ settling.
 
 ## 6. Error Frame
 
+`POLICY_DENIED` payload:
+
+```text
+07
+```
+
+`ERROR_TARGET_UNAVAILABLE` payload:
+
+```text
+0a
+```
+
 An unknown required flag example:
 
 ```text

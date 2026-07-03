@@ -40,4 +40,7 @@ pub enum ProtocolError {
     /// A TCP relay payload was malformed.
     #[error("invalid tcp payload: {0}")]
     InvalidTcpPayload(&'static str),
+    /// An error frame payload was malformed.
+    #[error("invalid error payload: {0}")]
+    InvalidErrorPayload(&'static str),
 }
