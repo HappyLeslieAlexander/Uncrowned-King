@@ -164,10 +164,10 @@ pub(crate) async fn relay_session(
                 if let Some(target) = target_writers.get_mut(&flow_id) {
                     target.mark_target_to_client_closed();
                     info!(event = "tcp.target_read_closed", flow_id);
-                    if target.client_to_target_open
-                        && let Some(timeout) = context.limits.tcp_half_close_timeout
-                    {
-                        spawn_half_close_timer(flow_id, timeout, context.event_tx.clone());
+                    if target.client_to_target_open {
+                        if let Some(timeout) = context.limits.tcp_half_close_timeout {
+                            spawn_half_close_timer(flow_id, timeout, context.event_tx.clone());
+                        }
                     }
                     if target.is_fully_closed() {
                         target_writers.remove(&flow_id);

@@ -130,10 +130,10 @@ impl ClientSessionManager {
 
     async fn current_session(&self) -> Result<Arc<ClientSession>, AnyError> {
         let mut current = self.current.lock().await;
-        if let Some(session) = current.as_ref()
-            && !session.is_closed()
-        {
-            return Ok(Arc::clone(session));
+        if let Some(session) = current.as_ref() {
+            if !session.is_closed() {
+                return Ok(Arc::clone(session));
+            }
         }
 
         *current = None;
