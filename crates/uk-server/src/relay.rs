@@ -62,6 +62,12 @@ enum OpenFailure {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenSlotRejection {
+    DuplicateFlowId,
+    ResourceLimit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FlowEvent {
     ReadClosed(u64),
     ReadDrainExpired(u64),
@@ -244,16 +250,17 @@ async fn handle_session_frame(
 ) -> Result<(), AnyError> {
     match frame.header.frame_type {
         FrameType::TcpOpen => {
-            if is_client_initiated_flow_id(frame.header.id) {
-                if target_writers.len() as u64 >= context.limits.max_streams {
-                    send_resource_limit(context.carrier_writer, frame.header.id).await?;
+            match check_tcp_open_slot(frame.header.id, target_writers, context.limits.max_streams) {
+                Ok(()) => {}
+                Err(OpenSlotRejection::DuplicateFlowId) => {
+                    send_error(context.carrier_writer, frame.header.id, ErrorCode::Protocol)
+                        .await?;
                     send_tcp_close(context.carrier_writer, frame.header.id, TCP_CLOSE_ERROR)
                         .await?;
                     return Ok(());
                 }
-                if target_writers.contains_key(&frame.header.id) {
-                    send_error(context.carrier_writer, frame.header.id, ErrorCode::Protocol)
-                        .await?;
+                Err(OpenSlotRejection::ResourceLimit) => {
+                    send_resource_limit(context.carrier_writer, frame.header.id).await?;
                     send_tcp_close(context.carrier_writer, frame.header.id, TCP_CLOSE_ERROR)
                         .await?;
                     return Ok(());
@@ -319,6 +326,23 @@ async fn handle_session_frame(
         FrameType::Pong => Ok(()),
         _ => Err("unexpected frame while relaying session".into()),
     }
+}
+
+fn check_tcp_open_slot(
+    flow_id: u64,
+    target_writers: &FlowTable,
+    max_streams: u64,
+) -> Result<(), OpenSlotRejection> {
+    if !is_client_initiated_flow_id(flow_id) {
+        return Ok(());
+    }
+    if target_writers.contains_key(&flow_id) {
+        return Err(OpenSlotRejection::DuplicateFlowId);
+    }
+    if target_writers.len() as u64 >= max_streams {
+        return Err(OpenSlotRejection::ResourceLimit);
+    }
+    Ok(())
 }
 
 async fn handle_tcp_open(
@@ -924,6 +948,36 @@ mod tests {
         assert!(!flow.target_to_client_open);
         assert!(flow.is_fully_closed());
         assert!(flow.control.is_aborted());
+    }
+
+    #[test]
+    fn duplicate_open_slot_is_protocol_error_before_stream_limit() {
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(1, test_target_flow());
+
+        assert_eq!(
+            check_tcp_open_slot(1, &target_writers, 1),
+            Err(OpenSlotRejection::DuplicateFlowId)
+        );
+    }
+
+    #[test]
+    fn new_open_slot_rejects_resource_limit() {
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(1, test_target_flow());
+
+        assert_eq!(
+            check_tcp_open_slot(3, &target_writers, 1),
+            Err(OpenSlotRejection::ResourceLimit)
+        );
+    }
+
+    #[test]
+    fn reserved_open_slot_is_left_for_protocol_validation() {
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(1, test_target_flow());
+
+        assert_eq!(check_tcp_open_slot(2, &target_writers, 1), Ok(()));
     }
 
     #[tokio::test]
