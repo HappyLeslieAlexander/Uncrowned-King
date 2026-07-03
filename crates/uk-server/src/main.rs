@@ -1,4 +1,4 @@
-//! UncrownedKing server binary.
+//! Uncrowned King server binary.
 
 mod config;
 mod relay;
@@ -20,7 +20,7 @@ type AnyError = Box<dyn std::error::Error + Send + Sync>;
 
 /// UK server command line.
 #[derive(Debug, Parser)]
-#[command(name = "uk-server", about = "UncrownedKing server")]
+#[command(name = "uk-server", about = "Uncrowned King server")]
 struct Args {
     /// Path to server TOML config.
     #[arg(long)]

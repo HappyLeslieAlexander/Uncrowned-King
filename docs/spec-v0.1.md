@@ -1,4 +1,4 @@
-# UncrownedKing Protocol Specification v0.1
+# Uncrowned King Protocol Specification v0.1
 
 This document turns the whitepaper into the first implementable wire contract.
 It intentionally covers only the pieces required by the initial Rust crates.

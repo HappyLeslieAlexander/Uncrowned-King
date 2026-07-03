@@ -1,4 +1,4 @@
-# Example uk-client configuration.
+# Example UK client configuration.
 
 server_addr = "127.0.0.1:9443"
 server_name = "localhost"

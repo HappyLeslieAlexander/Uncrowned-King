@@ -1,4 +1,4 @@
-# UncrownedKing v0.1 Test Vectors
+# Uncrowned King v0.1 Test Vectors
 
 All bytes are hexadecimal.
 

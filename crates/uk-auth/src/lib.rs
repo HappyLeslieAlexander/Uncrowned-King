@@ -1,4 +1,4 @@
-//! Challenge-response authentication for UncrownedKing.
+//! Challenge-response authentication for Uncrowned King.
 
 use std::{
     collections::HashMap,

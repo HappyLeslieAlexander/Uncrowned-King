@@ -1,4 +1,4 @@
-# Example uk-server configuration.
+# Example UK server configuration.
 
 listen = "127.0.0.1:9443"
 cert_path = "examples/server-cert.pem"

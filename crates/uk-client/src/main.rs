@@ -1,4 +1,4 @@
-//! UncrownedKing client binary.
+//! Uncrowned King client binary.
 
 mod config;
 mod relay;
@@ -14,7 +14,7 @@ type AnyError = Box<dyn std::error::Error + Send + Sync>;
 
 /// UK client command line.
 #[derive(Debug, Parser)]
-#[command(name = "uk-client", about = "UncrownedKing client")]
+#[command(name = "uk-client", about = "Uncrowned King client")]
 struct Args {
     /// Path to client TOML config.
     #[arg(long)]

@@ -1,6 +1,6 @@
-# UncrownedKing
+# Uncrowned King
 
-UncrownedKing, abbreviated as UK, is a practical secure proxy protocol built on
+Uncrowned King, abbreviated as UK, is a practical secure proxy protocol built on
 standard encrypted transports. The Rust implementation in this repository is
 being developed in small, testable increments.
 

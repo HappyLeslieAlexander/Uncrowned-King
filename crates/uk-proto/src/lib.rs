@@ -1,4 +1,4 @@
-//! Core UncrownedKing wire encoding.
+//! Core Uncrowned King wire encoding.
 
 pub mod error;
 pub mod flow;

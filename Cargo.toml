@@ -12,7 +12,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
-authors = ["UncrownedKing Contributors"]
+authors = ["Uncrowned King Contributors"]
 repository = "https://github.com/HappyLeslieAlexander/Uncrowned-King"
 
 [workspace.lints.rust]

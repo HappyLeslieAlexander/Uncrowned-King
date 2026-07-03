@@ -1,4 +1,4 @@
-//! Minimal policy engine for UncrownedKing.
+//! Minimal policy engine for Uncrowned King.
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},

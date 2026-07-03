@@ -1,8 +1,8 @@
-# UncrownedKing: A Practical Secure Proxy Protocol
+# Uncrowned King: A Practical Secure Proxy Protocol
 
 ## Abstract
 
-UncrownedKing, abbreviated as UK, is a secure proxy protocol designed for high-performance TCP and UDP forwarding over standard encrypted transports. UK runs over TLS 1.3, QUIC, HTTP/2, or WebSocket-compatible streams, and provides authenticated session establishment, multiplexed TCP streams, UDP flow forwarding, policy enforcement, resource control, and structured observability.
+Uncrowned King, abbreviated as UK, is a secure proxy protocol designed for high-performance TCP and UDP forwarding over standard encrypted transports. UK runs over TLS 1.3, QUIC, HTTP/2, or WebSocket-compatible streams, and provides authenticated session establishment, multiplexed TCP streams, UDP flow forwarding, policy enforcement, resource control, and structured observability.
 
 UK does not attempt to invent new cryptography. It uses existing transport security and adds a compact authenticated proxy layer above it. The goal is a protocol that is simple enough to implement correctly, fast enough for production traffic, and strict enough to survive hostile input and unreliable networks.
 
@@ -591,6 +591,6 @@ Fuzz targets:
 
 ## 21. Conclusion
 
-UncrownedKing is a practical secure proxy protocol built on standard encrypted transports. Its design is intentionally conservative: simple frames, strict parsing, authenticated sessions, explicit policy, bounded resources, and measurable behavior.
+Uncrowned King is a practical secure proxy protocol built on standard encrypted transports. Its design is intentionally conservative: simple frames, strict parsing, authenticated sessions, explicit policy, bounded resources, and measurable behavior.
 
 The protocol succeeds if an implementation can be reviewed, tested, deployed, and operated without hidden assumptions. UK should be fast, but not vague; flexible, but not loose; powerful, but not careless.
