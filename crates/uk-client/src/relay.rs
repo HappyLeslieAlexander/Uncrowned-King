@@ -443,9 +443,10 @@ async fn relay_tcp(mut local: TcpStream, mut flow: ClientFlow) -> Result<(), Any
                     FrameType::TcpClose => {
                         let mut payload = frame.payload;
                         let close = TcpClose::decode(&mut payload)?;
+                        let was_remote_to_local_open = remote_to_local_open;
                         local.shutdown().await?;
                         remote_to_local_open = false;
-                        if close.close_code != TCP_CLOSE_NORMAL {
+                        if close.close_code != TCP_CLOSE_NORMAL || !was_remote_to_local_open {
                             local_to_remote_open = false;
                         }
                     }

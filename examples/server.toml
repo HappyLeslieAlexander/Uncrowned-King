@@ -14,6 +14,7 @@ idle_timeout_seconds = 300
 max_buffered_bytes_per_flow = 2097152
 handshake_timeout_seconds = 10
 target_connect_timeout_seconds = 10
+tcp_half_close_timeout_seconds = 30
 
 [[credentials]]
 key_id = "local-dev"

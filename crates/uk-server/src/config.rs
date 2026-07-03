@@ -106,6 +106,14 @@ impl ServerConfig {
             .and_then(|limits| limits.target_connect_timeout_seconds)
             .unwrap_or(10)
     }
+
+    /// TCP half-close drain timeout in seconds. Zero disables it.
+    pub fn tcp_half_close_timeout_seconds(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.tcp_half_close_timeout_seconds)
+            .unwrap_or(30)
+    }
 }
 
 /// Server resource limits.
@@ -127,6 +135,8 @@ pub struct LimitConfig {
     pub handshake_timeout_seconds: Option<u64>,
     /// DNS resolution and TCP dial timeout for target opens.
     pub target_connect_timeout_seconds: Option<u64>,
+    /// TCP half-close drain timeout in seconds.
+    pub tcp_half_close_timeout_seconds: Option<u64>,
 }
 
 /// One configured credential.
@@ -272,6 +282,29 @@ target_connect_timeout_seconds = 7
         .unwrap();
 
         assert_eq!(config.target_connect_timeout_seconds(), 7);
+    }
+
+    #[test]
+    fn defaults_tcp_half_close_timeout() {
+        assert_eq!(minimal_config().tcp_half_close_timeout_seconds(), 30);
+    }
+
+    #[test]
+    fn parses_tcp_half_close_timeout() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+tcp_half_close_timeout_seconds = 11
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.tcp_half_close_timeout_seconds(), 11);
     }
 
     #[test]

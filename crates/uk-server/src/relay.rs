@@ -45,6 +45,7 @@ pub(crate) struct RelayLimits {
     max_streams: u64,
     max_buffered_bytes_per_flow: usize,
     target_connect_timeout: Option<Duration>,
+    tcp_half_close_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +64,7 @@ enum OpenFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FlowEvent {
     ReadClosed(u64),
+    ReadDrainExpired(u64),
     WriteClosed(u64),
     Activity,
 }
@@ -152,6 +154,16 @@ pub(crate) async fn relay_session(
             SessionEvent::Flow(Some(FlowEvent::ReadClosed(flow_id))) => {
                 if target_writers.contains_key(&flow_id) {
                     info!(event = "tcp.target_read_closed", flow_id);
+                    if let Some(timeout) = context.limits.tcp_half_close_timeout {
+                        spawn_half_close_timer(flow_id, timeout, context.event_tx.clone());
+                    }
+                }
+            }
+            SessionEvent::Flow(Some(FlowEvent::ReadDrainExpired(flow_id))) => {
+                if let Some(target) = target_writers.remove(&flow_id) {
+                    target.close();
+                    send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_NORMAL).await?;
+                    info!(event = "tcp.half_close_timeout", flow_id);
                 }
             }
             SessionEvent::Flow(Some(FlowEvent::WriteClosed(flow_id))) => {
@@ -406,6 +418,17 @@ fn spawn_target_writer(
     });
 }
 
+fn spawn_half_close_timer(
+    flow_id: u64,
+    timeout: Duration,
+    event_tx: mpsc::UnboundedSender<FlowEvent>,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        let _ = event_tx.send(FlowEvent::ReadDrainExpired(flow_id));
+    });
+}
+
 async fn relay_client_to_target(
     mut target_writer: OwnedWriteHalf,
     mut commands: mpsc::Receiver<TargetCommand>,
@@ -441,12 +464,14 @@ impl RelayLimits {
         max_streams: u64,
         max_buffered_bytes_per_flow: usize,
         target_connect_timeout: Option<Duration>,
+        tcp_half_close_timeout: Option<Duration>,
     ) -> Self {
         Self {
             frame,
             max_streams,
             max_buffered_bytes_per_flow,
             target_connect_timeout,
+            tcp_half_close_timeout,
         }
     }
 }

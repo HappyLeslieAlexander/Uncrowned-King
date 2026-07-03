@@ -113,6 +113,10 @@ uses `POLICY_DENIED`, `RESOURCE_LIMIT`, or `ERROR`, followed by `TCP_CLOSE`.
 u16 close_code
 ```
 
+`TCP_CLOSE` closes the sending direction for that flow. A peer that receives a
+normal `TCP_CLOSE` may continue sending data until it also sends `TCP_CLOSE` or
+the receiver's configured half-close drain window expires.
+
 Known close codes:
 
 | Code | Name |

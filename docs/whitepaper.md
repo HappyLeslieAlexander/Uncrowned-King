@@ -305,7 +305,7 @@ TCP_CLOSE {
 }
 ```
 
-TCP half-close should be supported. After one side closes, the other side receives a configurable drain window, default `30s`.
+TCP half-close should be supported. After one side closes, the other side receives a configurable drain window, default `30s` (`tcp_half_close_timeout_seconds`).
 
 ## 10. UDP Relay
 
