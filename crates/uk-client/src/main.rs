@@ -9,8 +9,8 @@ use uk_client::{AnyError, check_config, config::ClientConfig, run_handshake, run
 #[command(name = "uk-client", version, about = "Uncrowned King client")]
 struct Args {
     /// Path to client TOML config.
-    #[arg(long)]
-    config: String,
+    #[arg(long, global = true)]
+    config: Option<String>,
     /// Client subcommand.
     #[command(subcommand)]
     command: Command,
@@ -35,7 +35,7 @@ enum Command {
 async fn main() -> Result<(), AnyError> {
     init_tracing();
     let args = Args::parse();
-    let config = ClientConfig::load(&args.config)?;
+    let config = ClientConfig::load(config_path(&args)?)?;
     match args.command {
         Command::ConfigCheck => {
             check_config(&config)?;
@@ -52,6 +52,12 @@ async fn main() -> Result<(), AnyError> {
     Ok(())
 }
 
+fn config_path(args: &Args) -> Result<&str, AnyError> {
+    args.config
+        .as_deref()
+        .ok_or_else(|| "--config is required".into())
+}
+
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
@@ -66,5 +72,30 @@ mod tests {
     #[test]
     fn command_definition_is_valid() {
         Args::command().debug_assert();
+    }
+
+    #[test]
+    fn parses_config_before_subcommand() {
+        let args =
+            Args::try_parse_from(["uk-client", "--config", "client.toml", "config-check"]).unwrap();
+
+        assert_eq!(args.config.as_deref(), Some("client.toml"));
+        assert!(matches!(args.command, Command::ConfigCheck));
+    }
+
+    #[test]
+    fn parses_config_after_subcommand() {
+        let args =
+            Args::try_parse_from(["uk-client", "config-check", "--config", "client.toml"]).unwrap();
+
+        assert_eq!(args.config.as_deref(), Some("client.toml"));
+        assert!(matches!(args.command, Command::ConfigCheck));
+    }
+
+    #[test]
+    fn rejects_missing_config_path() {
+        let args = Args::try_parse_from(["uk-client", "config-check"]).unwrap();
+
+        assert!(config_path(&args).is_err());
     }
 }
