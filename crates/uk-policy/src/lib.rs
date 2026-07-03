@@ -93,6 +93,8 @@ pub struct PolicyRule {
     pub key_id: Option<Vec<u8>>,
     /// Optional exact policy group match.
     pub policy_group: Option<String>,
+    /// Optional exact domain match.
+    pub domain: Option<String>,
     /// Optional domain suffix match.
     pub domain_suffix: Option<String>,
     /// Optional CIDR match against literal or resolved IPs.
@@ -110,6 +112,7 @@ impl PolicyRule {
             action,
             key_id: None,
             policy_group: None,
+            domain: None,
             domain_suffix: None,
             cidr: None,
             ports: None,
@@ -130,6 +133,13 @@ impl PolicyRule {
                 .policy_group
                 .is_none_or(|context_group| context_group != group)
         }) {
+            return false;
+        }
+        if self
+            .domain
+            .as_deref()
+            .is_some_and(|want| target_domain(context.target) != Some(want))
+        {
             return false;
         }
         if self.domain_suffix.as_deref().is_some_and(|suffix| {
@@ -219,6 +229,7 @@ struct RawPolicyRule {
     action: String,
     key_id: Option<String>,
     policy_group: Option<String>,
+    domain: Option<String>,
     domain_suffix: Option<String>,
     cidr: Option<String>,
     port_start: Option<u16>,
@@ -256,6 +267,7 @@ impl TryFrom<RawPolicyRule> for PolicyRule {
             action,
             key_id: raw.key_id.map(String::into_bytes),
             policy_group: raw.policy_group,
+            domain: raw.domain,
             domain_suffix: raw.domain_suffix,
             cidr: raw.cidr.as_deref().map(Cidr::from_str).transpose()?,
             ports,
@@ -340,6 +352,25 @@ mod tests {
     }
 
     #[test]
+    fn allows_exact_domain_only() {
+        let mut rule = PolicyRule::new(PolicyDecision::Allow);
+        rule.domain = Some("example.com".to_owned());
+        rule.ports = Some(443..=443);
+        let policy = PolicySet::new(vec![rule]);
+        let exact = Target::Domain("example.com".to_owned(), 443);
+        let subdomain = Target::Domain("api.example.com".to_owned(), 443);
+
+        assert_eq!(
+            policy.evaluate(&context(&exact, Some("default"), &[])),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            policy.evaluate(&context(&subdomain, Some("default"), &[])),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
     fn denies_private_ip_by_rule() {
         let mut rule = PolicyRule::new(PolicyDecision::Deny);
         rule.private = Some(true);
@@ -391,15 +422,21 @@ mod tests {
             [[rules]]
             action = "allow"
             policy_group = "ops"
+            domain = "bastion.example.com"
             cidr = "10.20.0.0/16"
             port_start = 22
             port_end = 22
             "#,
         )
         .unwrap();
-        let target = Target::Ipv4(Ipv4Addr::new(10, 20, 1, 2), 22);
+        let target = Target::Domain("bastion.example.com".to_owned(), 22);
+        let resolved = [IpAddr::V4(Ipv4Addr::new(10, 20, 1, 2))];
         assert_eq!(
-            policy.evaluate(&context(&target, Some("ops"), &[])),
+            policy.rules[0].domain.as_deref(),
+            Some("bastion.example.com")
+        );
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("ops"), &resolved)),
             PolicyDecision::Allow
         );
     }
