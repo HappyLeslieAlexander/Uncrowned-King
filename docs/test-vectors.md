@@ -24,6 +24,12 @@ IPv4 target `127.0.0.1:8080`:
 02 04 7f 00 00 01 1f 90
 ```
 
+IPv6 target `[::1]:5353`:
+
+```text
+03 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01 14 e9
+```
+
 ## 3. Frame Header
 
 Frame header for `TCP_DATA`, id `1`, payload length `3`:

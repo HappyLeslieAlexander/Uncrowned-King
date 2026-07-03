@@ -149,6 +149,20 @@ mod tests {
     }
 
     #[test]
+    fn encodes_ipv6_vector() {
+        let target = Target::Ipv6(Ipv6Addr::LOCALHOST, 5353);
+        let mut out = Vec::new();
+        target.encode(&mut out).unwrap();
+        assert_eq!(
+            out,
+            [
+                0x03, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x01, 0x14, 0xe9,
+            ]
+        );
+    }
+
+    #[test]
     fn roundtrips_ipv6() {
         let target = Target::Ipv6(Ipv6Addr::LOCALHOST, 5353);
         let mut out = Vec::new();
