@@ -55,6 +55,7 @@ async fn main() -> Result<(), AnyError> {
 }
 
 fn check_config(config: &ClientConfig) -> Result<(), AnyError> {
+    config.validate_auth_material()?;
     let _connector = tls::connector(&config.ca_cert_path)?;
     let _server_name = tls::server_name(config.server_name.clone())?;
     println!("uk-client config ok");

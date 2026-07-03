@@ -323,4 +323,55 @@ policy_grop = "default"
 
         assert!(result.is_err());
     }
+
+    #[test]
+    fn rejects_empty_credential_key_id() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+
+[[credentials]]
+key_id = ""
+secret = "0123456789abcdef0123456789abcdef"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.credentials(), Err(AuthError::InvalidKeyIdLength));
+    }
+
+    #[test]
+    fn rejects_long_credential_key_id() {
+        let mut config = minimal_config();
+        config.credentials.push(CredentialConfig {
+            key_id: "k".repeat(65),
+            secret: "0123456789abcdef0123456789abcdef".to_owned(),
+            status: None,
+            not_before: None,
+            not_after: None,
+            policy_group: None,
+        });
+
+        assert_eq!(config.credentials(), Err(AuthError::InvalidKeyIdLength));
+    }
+
+    #[test]
+    fn rejects_short_credential_secret() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+
+[[credentials]]
+key_id = "client"
+secret = "too-short"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.credentials(), Err(AuthError::SecretTooShort));
+    }
 }

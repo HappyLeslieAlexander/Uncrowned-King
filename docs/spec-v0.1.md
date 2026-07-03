@@ -149,6 +149,9 @@ bytes     client_capabilities
 bytes[32] tag
 ```
 
+`key_id_len` must be `1..=64`. Shared secrets are local configuration, never
+sent on the wire, and must contain at least 32 bytes of secret material.
+
 `tag` is:
 
 ```text

@@ -19,6 +19,8 @@ const AUTH_LABEL: &[u8] = b"UK-AUTH-v1";
 pub const EXPORTER_LABEL: &[u8] = b"EXPORTER-UK-v1";
 /// Maximum accepted key id length.
 pub const MAX_KEY_ID_LEN: usize = 64;
+/// Minimum accepted shared secret length in bytes.
+pub const MIN_SECRET_LEN: usize = 32;
 
 /// Authentication result alias.
 pub type AuthResult<T> = Result<T, AuthError>;
@@ -44,6 +46,9 @@ pub enum AuthError {
     /// Secret material is too short.
     #[error("secret must be at least 32 bytes")]
     SecretTooShort,
+    /// Key id length is outside the protocol bounds.
+    #[error("key id length must be 1..=64 bytes")]
+    InvalidKeyIdLength,
     /// Authentication payload is malformed.
     #[error("invalid auth payload: {0}")]
     InvalidPayload(&'static str),
@@ -91,16 +96,13 @@ impl Credential {
             not_after: None,
             policy_group: None,
         };
-        credential.validate_secret()?;
+        credential.validate_auth_material()?;
         Ok(credential)
     }
 
-    fn validate_secret(&self) -> AuthResult<()> {
-        if self.secret.len() < 32 {
-            Err(AuthError::SecretTooShort)
-        } else {
-            Ok(())
-        }
+    fn validate_auth_material(&self) -> AuthResult<()> {
+        validate_key_id(&self.key_id)?;
+        validate_shared_secret(&self.secret)
     }
 
     fn is_active_at(&self, now: u64) -> bool {
@@ -211,9 +213,8 @@ impl AuthResponse {
         client_capabilities: Vec<u8>,
     ) -> AuthResult<Self> {
         let key_id = key_id.into();
-        if key_id.is_empty() || key_id.len() > MAX_KEY_ID_LEN {
-            return Err(AuthError::InvalidPayload("invalid key id length"));
-        }
+        validate_key_id(&key_id)?;
+        validate_shared_secret(secret)?;
         let mut client_nonce = [0_u8; 32];
         rand::thread_rng().fill_bytes(&mut client_nonce);
         let tag = compute_auth_tag(
@@ -236,9 +237,7 @@ impl AuthResponse {
 
     /// Encodes this response as an `AUTH_RESPONSE` payload.
     pub fn encode(&self, dst: &mut impl BufMut) -> AuthResult<()> {
-        if self.key_id.len() > MAX_KEY_ID_LEN {
-            return Err(AuthError::InvalidPayload("key id is too long"));
-        }
+        validate_key_id(&self.key_id)?;
         varint::encode(self.key_id.len() as u64, dst)?;
         dst.put_slice(&self.key_id);
         dst.put_slice(&self.client_nonce);
@@ -252,9 +251,7 @@ impl AuthResponse {
     /// Decodes an `AUTH_RESPONSE` payload.
     pub fn decode(src: &mut impl Buf) -> AuthResult<Self> {
         let key_id = read_varbytes(src, "key id")?;
-        if key_id.is_empty() || key_id.len() > MAX_KEY_ID_LEN {
-            return Err(AuthError::InvalidPayload("invalid key id length"));
-        }
+        validate_key_id(&key_id)?;
         if src.remaining() < 72 {
             return Err(AuthError::InvalidPayload("response is truncated"));
         }
@@ -368,7 +365,7 @@ pub fn verify_auth_response(
         .iter()
         .find(|credential| credential.key_id == response.key_id)
         .ok_or(AuthError::UnknownKey)?;
-    credential.validate_secret()?;
+    credential.validate_auth_material()?;
 
     if !credential.is_active_at(now) {
         return Err(AuthError::CredentialNotActive);
@@ -404,9 +401,7 @@ fn auth_mac(
     client_time: u64,
     client_capabilities: &[u8],
 ) -> AuthResult<HmacSha256> {
-    if secret.len() < 32 {
-        return Err(AuthError::SecretTooShort);
-    }
+    validate_shared_secret(secret)?;
     let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| AuthError::SecretTooShort)?;
     mac.update(AUTH_LABEL);
     mac.update(exporter_32);
@@ -417,6 +412,24 @@ fn auth_mac(
     mac.update(&client_time.to_be_bytes());
     mac.update(client_capabilities);
     Ok(mac)
+}
+
+/// Validates that a key id can be represented on the wire.
+pub fn validate_key_id(key_id: &[u8]) -> AuthResult<()> {
+    if key_id.is_empty() || key_id.len() > MAX_KEY_ID_LEN {
+        Err(AuthError::InvalidKeyIdLength)
+    } else {
+        Ok(())
+    }
+}
+
+/// Validates shared secret material before using it for HMAC authentication.
+pub fn validate_shared_secret(secret: &[u8]) -> AuthResult<()> {
+    if secret.len() < MIN_SECRET_LEN {
+        Err(AuthError::SecretTooShort)
+    } else {
+        Ok(())
+    }
 }
 
 fn read_varbytes(src: &mut impl Buf, name: &'static str) -> AuthResult<Vec<u8>> {
@@ -475,6 +488,47 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_credential_key_id() {
+        assert_eq!(
+            Credential::active(Vec::new(), vec![0; MIN_SECRET_LEN]),
+            Err(AuthError::InvalidKeyIdLength)
+        );
+    }
+
+    #[test]
+    fn rejects_long_credential_key_id() {
+        assert_eq!(
+            Credential::active(vec![0; MAX_KEY_ID_LEN + 1], vec![0; MIN_SECRET_LEN]),
+            Err(AuthError::InvalidKeyIdLength)
+        );
+    }
+
+    #[test]
+    fn rejects_short_credential_secret() {
+        assert_eq!(
+            Credential::active(b"client-a".to_vec(), b"too-short".to_vec()),
+            Err(AuthError::SecretTooShort)
+        );
+    }
+
+    #[test]
+    fn rejects_short_response_secret() {
+        let (_, exporter, challenge, _) = fixture();
+
+        assert_eq!(
+            AuthResponse::for_challenge(
+                b"client-a".to_vec(),
+                b"too-short",
+                &exporter,
+                &challenge,
+                1_700_000_001,
+                Vec::new()
+            ),
+            Err(AuthError::SecretTooShort)
+        );
+    }
+
+    #[test]
     fn roundtrips_challenge_payload() {
         let (_, _, challenge, _) = fixture();
         let mut out = Vec::new();
@@ -490,6 +544,18 @@ mod tests {
         response.encode(&mut out).unwrap();
         let mut bytes = bytes::Bytes::from(out);
         assert_eq!(AuthResponse::decode(&mut bytes).unwrap(), response);
+    }
+
+    #[test]
+    fn rejects_encoding_empty_response_key_id() {
+        let (_, _, _, mut response) = fixture();
+        response.key_id.clear();
+        let mut out = Vec::new();
+
+        assert_eq!(
+            response.encode(&mut out),
+            Err(AuthError::InvalidKeyIdLength)
+        );
     }
 
     #[test]

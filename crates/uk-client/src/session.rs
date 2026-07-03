@@ -17,6 +17,7 @@ type AnyError = Box<dyn Error + Send + Sync>;
 pub async fn connect_authenticated(
     config: &ClientConfig,
 ) -> Result<(TlsStream<TcpStream>, Settings), AnyError> {
+    config.validate_auth_material()?;
     if let Some(timeout) = handshake_timeout(config.handshake_timeout_seconds()) {
         match time::timeout(timeout, connect_authenticated_inner(config)).await {
             Ok(result) => result,

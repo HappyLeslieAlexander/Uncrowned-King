@@ -99,7 +99,7 @@ UK uses challenge-response authentication with TLS exporter binding.
 Each credential has:
 
 ```text
-key_id: opaque identifier
+key_id: opaque identifier, 1..=64 bytes
 secret: 32 bytes or longer random secret
 status: active | disabled | retired
 not_before: optional timestamp

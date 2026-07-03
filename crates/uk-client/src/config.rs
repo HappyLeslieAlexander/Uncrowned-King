@@ -3,6 +3,7 @@
 use std::{fs, path::Path};
 
 use serde::Deserialize;
+use uk_auth::{AuthError, validate_key_id, validate_shared_secret};
 
 /// Client TOML configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -41,6 +42,12 @@ impl ClientConfig {
     pub fn socks_handshake_timeout_seconds(&self) -> u64 {
         self.socks_handshake_timeout_seconds.unwrap_or(10)
     }
+
+    /// Validates local authentication material before opening a network session.
+    pub fn validate_auth_material(&self) -> Result<(), AuthError> {
+        validate_key_id(self.key_id.as_bytes())?;
+        validate_shared_secret(self.secret.as_bytes())
+    }
 }
 
 #[cfg(test)]
@@ -53,7 +60,7 @@ mod tests {
             server_name: "localhost".to_owned(),
             ca_cert_path: "ca.pem".to_owned(),
             key_id: "client".to_owned(),
-            secret: "secret".to_owned(),
+            secret: "0123456789abcdef0123456789abcdef".to_owned(),
             handshake_timeout_seconds: None,
             socks_handshake_timeout_seconds: None,
         }
@@ -117,5 +124,43 @@ handshake_timeout_secondz = 4
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn accepts_valid_auth_material() {
+        assert!(minimal_config().validate_auth_material().is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_key_id_auth_material() {
+        let mut config = minimal_config();
+        config.key_id.clear();
+
+        assert_eq!(
+            config.validate_auth_material(),
+            Err(AuthError::InvalidKeyIdLength)
+        );
+    }
+
+    #[test]
+    fn rejects_long_key_id_auth_material() {
+        let mut config = minimal_config();
+        config.key_id = "k".repeat(65);
+
+        assert_eq!(
+            config.validate_auth_material(),
+            Err(AuthError::InvalidKeyIdLength)
+        );
+    }
+
+    #[test]
+    fn rejects_short_secret_auth_material() {
+        let mut config = minimal_config();
+        config.secret = "too-short".to_owned();
+
+        assert_eq!(
+            config.validate_auth_material(),
+            Err(AuthError::SecretTooShort)
+        );
     }
 }
