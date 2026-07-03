@@ -267,6 +267,10 @@ A server policy may match:
 - connection count
 - traffic direction
 
+Domain suffix matches are DNS label-boundary matches. For example,
+`example.com` matches `example.com` and `api.example.com`, but not
+`badexample.com`.
+
 Example policy:
 
 ```text

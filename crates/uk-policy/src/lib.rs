@@ -135,15 +135,14 @@ impl PolicyRule {
         }) {
             return false;
         }
-        if self
-            .domain
-            .as_deref()
-            .is_some_and(|want| target_domain(context.target) != Some(want))
-        {
+        if self.domain.as_deref().is_some_and(|want| {
+            target_domain(context.target).is_none_or(|domain| !domain_matches_exact(domain, want))
+        }) {
             return false;
         }
         if self.domain_suffix.as_deref().is_some_and(|suffix| {
-            target_domain(context.target).is_none_or(|domain| !domain.ends_with(suffix))
+            target_domain(context.target)
+                .is_none_or(|domain| !domain_matches_suffix(domain, suffix))
         }) {
             return false;
         }
@@ -285,6 +284,31 @@ fn target_domain(target: &Target) -> Option<&str> {
     }
 }
 
+fn domain_matches_exact(domain: &str, want: &str) -> bool {
+    let domain = normalize_domain(domain);
+    let want = normalize_domain(want);
+    !want.is_empty() && domain == want
+}
+
+fn domain_matches_suffix(domain: &str, suffix: &str) -> bool {
+    let domain = normalize_domain(domain);
+    let suffix = normalize_domain(suffix);
+    if suffix.is_empty() {
+        return false;
+    }
+    if let Some(stripped) = suffix.strip_prefix('.') {
+        return !stripped.is_empty() && domain.len() > stripped.len() && domain.ends_with(&suffix);
+    }
+    domain == suffix
+        || domain
+            .strip_suffix(&suffix)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn normalize_domain(domain: &str) -> String {
+    domain.trim_end_matches('.').to_ascii_lowercase()
+}
+
 fn target_ips(target: &Target, resolved_ips: &[IpAddr]) -> Vec<IpAddr> {
     match target {
         Target::Domain(_, _) => resolved_ips.to_vec(),
@@ -354,6 +378,48 @@ mod tests {
     }
 
     #[test]
+    fn keeps_domain_suffix_on_label_boundary() {
+        let mut rule = PolicyRule::new(PolicyDecision::Allow);
+        rule.domain_suffix = Some("example.com".to_owned());
+        rule.ports = Some(443..=443);
+        let policy = PolicySet::new(vec![rule]);
+        let exact = Target::Domain("example.com".to_owned(), 443);
+        let subdomain = Target::Domain("api.example.com".to_owned(), 443);
+        let false_suffix = Target::Domain("badexample.com".to_owned(), 443);
+
+        assert_eq!(
+            policy.evaluate(&context(&exact, Some("default"), &[])),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            policy.evaluate(&context(&subdomain, Some("default"), &[])),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            policy.evaluate(&context(&false_suffix, Some("default"), &[])),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn leading_dot_domain_suffix_matches_subdomains_only() {
+        let mut rule = PolicyRule::new(PolicyDecision::Allow);
+        rule.domain_suffix = Some(".example.com".to_owned());
+        let policy = PolicySet::new(vec![rule]);
+        let exact = Target::Domain("example.com".to_owned(), 443);
+        let subdomain = Target::Domain("api.example.com".to_owned(), 443);
+
+        assert_eq!(
+            policy.evaluate(&context(&exact, Some("default"), &[])),
+            PolicyDecision::Deny
+        );
+        assert_eq!(
+            policy.evaluate(&context(&subdomain, Some("default"), &[])),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
     fn allows_exact_domain_only() {
         let mut rule = PolicyRule::new(PolicyDecision::Allow);
         rule.domain = Some("example.com".to_owned());
@@ -369,6 +435,20 @@ mod tests {
         assert_eq!(
             policy.evaluate(&context(&subdomain, Some("default"), &[])),
             PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn matches_domains_case_insensitively() {
+        let mut rule = PolicyRule::new(PolicyDecision::Allow);
+        rule.domain = Some("Example.COM".to_owned());
+        rule.ports = Some(443..=443);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Domain("example.com".to_owned(), 443);
+
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &[])),
+            PolicyDecision::Allow
         );
     }
 
