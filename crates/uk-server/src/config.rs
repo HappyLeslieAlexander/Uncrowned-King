@@ -360,6 +360,31 @@ tcp_half_close_timeout_seconds = 11
     }
 
     #[test]
+    fn accepts_zero_timeout_limits() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+idle_timeout_seconds = 0
+handshake_timeout_seconds = 0
+target_connect_timeout_seconds = 0
+tcp_half_close_timeout_seconds = 0
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.idle_timeout_seconds(), 0);
+        assert_eq!(config.handshake_timeout_seconds(), 0);
+        assert_eq!(config.target_connect_timeout_seconds(), 0);
+        assert_eq!(config.tcp_half_close_timeout_seconds(), 0);
+        assert!(config.validate_limits().is_ok());
+    }
+
+    #[test]
     fn defaults_replay_cache_limits() {
         assert_eq!(minimal_config().replay_cache_window_seconds(), 300);
         assert_eq!(

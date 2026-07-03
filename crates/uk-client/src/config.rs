@@ -141,6 +141,27 @@ tcp_open_timeout_seconds = 6
     }
 
     #[test]
+    fn parses_zero_timeout_values() {
+        let config: ClientConfig = toml::from_str(
+            r#"
+server_addr = "127.0.0.1:443"
+server_name = "localhost"
+ca_cert_path = "ca.pem"
+key_id = "client"
+secret = "secret"
+handshake_timeout_seconds = 0
+socks_handshake_timeout_seconds = 0
+tcp_open_timeout_seconds = 0
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.handshake_timeout_seconds(), 0);
+        assert_eq!(config.socks_handshake_timeout_seconds(), 0);
+        assert_eq!(config.tcp_open_timeout_seconds(), 0);
+    }
+
+    #[test]
     fn rejects_unknown_client_config_fields() {
         let result = toml::from_str::<ClientConfig>(
             r#"
