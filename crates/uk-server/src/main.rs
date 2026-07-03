@@ -115,6 +115,7 @@ async fn handle_connection(
     let mut settings = Settings::default();
     settings.set(SettingKey::ProtocolRevision, 1);
     settings.set(SettingKey::MaxFrameSize, config.max_frame_size());
+    settings.set(SettingKey::MaxStreams, config.max_streams());
     let mut settings_payload = BytesMut::new();
     settings.encode(&mut settings_payload)?;
     let settings_frame = Frame::new(FrameType::Settings, 0, 0, settings_payload.freeze())?;
@@ -127,6 +128,7 @@ async fn handle_connection(
         FrameLimits {
             max_frame_size: config.max_frame_size(),
         },
+        config.max_streams(),
     )
     .await
 }

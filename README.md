@@ -33,6 +33,15 @@ port_start = 443
 port_end = 443
 ```
 
+Server limits can advertise and enforce the maximum frame size and concurrent
+TCP streams per authenticated session:
+
+```toml
+[limits]
+max_frame_size = 65536
+max_streams = 64
+```
+
 ## Repository Layout
 
 ```text

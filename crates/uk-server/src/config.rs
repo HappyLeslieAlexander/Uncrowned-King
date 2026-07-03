@@ -65,15 +65,26 @@ impl ServerConfig {
             .and_then(|limits| limits.max_frame_size)
             .unwrap_or(65_536)
     }
+
+    /// Configured maximum concurrent TCP streams per authenticated session.
+    pub fn max_streams(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.max_streams)
+            .unwrap_or(64)
+    }
 }
 
 /// Server resource limits.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(clippy::struct_field_names)]
 pub struct LimitConfig {
     /// Maximum pre-authentication frame payload.
     pub max_pre_auth_bytes: Option<u64>,
     /// Maximum post-authentication frame payload.
     pub max_frame_size: Option<u64>,
+    /// Maximum concurrent TCP streams per authenticated session.
+    pub max_streams: Option<u64>,
 }
 
 /// One configured credential.
