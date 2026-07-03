@@ -97,6 +97,8 @@ struct TargetFlowControl {
 struct TargetFlow {
     commands: mpsc::Sender<TargetCommand>,
     control: TargetFlowControl,
+    target_to_client_open: bool,
+    client_to_target_open: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -152,24 +154,47 @@ pub(crate) async fn relay_session(
 
         match event {
             SessionEvent::Flow(Some(FlowEvent::ReadClosed(flow_id))) => {
-                if target_writers.contains_key(&flow_id) {
+                if let Some(target) = target_writers.get_mut(&flow_id) {
+                    target.mark_target_to_client_closed();
                     info!(event = "tcp.target_read_closed", flow_id);
-                    if let Some(timeout) = context.limits.tcp_half_close_timeout {
+                    if target.client_to_target_open
+                        && let Some(timeout) = context.limits.tcp_half_close_timeout
+                    {
                         spawn_half_close_timer(flow_id, timeout, context.event_tx.clone());
+                    }
+                    if target.is_fully_closed() {
+                        target_writers.remove(&flow_id);
+                        info!(event = "tcp.closed", flow_id);
                     }
                 }
             }
             SessionEvent::Flow(Some(FlowEvent::ReadDrainExpired(flow_id))) => {
-                if let Some(target) = target_writers.remove(&flow_id) {
-                    target.close();
+                let (should_remove, should_close_peer) =
+                    if let Some(target) = target_writers.get_mut(&flow_id) {
+                        let should_close_peer =
+                            !target.target_to_client_open && target.client_to_target_open;
+                        if should_close_peer {
+                            target.close_client_to_target();
+                        }
+                        (target.is_fully_closed(), should_close_peer)
+                    } else {
+                        (false, false)
+                    };
+                if should_close_peer {
                     send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_NORMAL).await?;
+                }
+                if should_remove {
+                    target_writers.remove(&flow_id);
                     info!(event = "tcp.half_close_timeout", flow_id);
                 }
             }
             SessionEvent::Flow(Some(FlowEvent::WriteClosed(flow_id))) => {
-                if let Some(target) = target_writers.remove(&flow_id) {
-                    target.close();
-                    info!(event = "tcp.closed", flow_id);
+                if let Some(target) = target_writers.get_mut(&flow_id) {
+                    target.mark_client_to_target_closed();
+                    if target.is_fully_closed() {
+                        target_writers.remove(&flow_id);
+                        info!(event = "tcp.closed", flow_id);
+                    }
                 }
             }
             SessionEvent::Flow(Some(FlowEvent::Activity) | None) => {}
@@ -265,8 +290,14 @@ async fn handle_session_frame(
         FrameType::TcpClose => {
             let mut payload = frame.payload;
             let _close = TcpClose::decode(&mut payload)?;
-            if let Some(target) = target_writers.remove(&frame.header.id) {
-                target.close();
+            let should_remove = if let Some(target) = target_writers.get_mut(&frame.header.id) {
+                target.close_client_to_target();
+                target.is_fully_closed()
+            } else {
+                false
+            };
+            if should_remove {
+                target_writers.remove(&frame.header.id);
             }
             Ok(())
         }
@@ -541,7 +572,12 @@ impl TargetFlowControl {
 
 impl TargetFlow {
     fn new(commands: mpsc::Sender<TargetCommand>, control: TargetFlowControl) -> Self {
-        Self { commands, control }
+        Self {
+            commands,
+            control,
+            target_to_client_open: true,
+            client_to_target_open: true,
+        }
     }
 
     fn enqueue_data(&self, payload: Bytes, byte_limit: usize) -> Result<(), EnqueueError> {
@@ -551,7 +587,7 @@ impl TargetFlow {
 
         let payload_len = payload.len();
         if !self.control.reserve_bytes(payload_len, byte_limit) {
-            self.close();
+            self.close_client_to_target_queue();
             return Err(EnqueueError::ResourceLimit);
         }
 
@@ -563,15 +599,35 @@ impl TargetFlow {
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.control.release_bytes(payload_len);
-                self.close();
+                self.close_client_to_target_queue();
                 Err(EnqueueError::ResourceLimit)
             }
         }
     }
 
-    fn close(&self) {
+    fn close_client_to_target(&mut self) {
+        if self.client_to_target_open {
+            self.client_to_target_open = false;
+            self.close_client_to_target_queue();
+        }
+    }
+
+    fn close_client_to_target_queue(&self) {
         self.control.close();
         let _ = self.commands.try_send(TargetCommand::Close);
+    }
+
+    fn mark_target_to_client_closed(&mut self) {
+        self.target_to_client_open = false;
+    }
+
+    fn mark_client_to_target_closed(&mut self) {
+        self.client_to_target_open = false;
+        self.control.close();
+    }
+
+    const fn is_fully_closed(&self) -> bool {
+        !self.target_to_client_open && !self.client_to_target_open
     }
 }
 
@@ -606,8 +662,8 @@ async fn relay_target_to_client(
 }
 
 fn close_target_flows(target_writers: &mut FlowTable) {
-    for target in target_writers.drain().map(|(_, target)| target) {
-        target.close();
+    for mut target in target_writers.drain().map(|(_, target)| target) {
+        target.close_client_to_target();
     }
 }
 
@@ -769,4 +825,44 @@ async fn write_frame_locked(writer: &CarrierWriter, frame: &Frame) -> Result<(),
 fn transition(state: &mut ServerSessionState, next: ServerSessionState) {
     debug!(event = "server.session.state", from = ?*state, to = ?next);
     *state = next;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_target_flow() -> TargetFlow {
+        let (commands, _commands_rx) = mpsc::channel(1);
+        TargetFlow::new(commands, TargetFlowControl::default())
+    }
+
+    #[test]
+    fn client_half_close_keeps_flow_reserved_until_target_read_closes() {
+        let mut flow = test_target_flow();
+
+        flow.close_client_to_target();
+
+        assert!(!flow.client_to_target_open);
+        assert!(flow.target_to_client_open);
+        assert!(!flow.is_fully_closed());
+
+        flow.mark_target_to_client_closed();
+
+        assert!(flow.is_fully_closed());
+    }
+
+    #[test]
+    fn target_read_close_keeps_flow_reserved_until_client_write_closes() {
+        let mut flow = test_target_flow();
+
+        flow.mark_target_to_client_closed();
+
+        assert!(flow.client_to_target_open);
+        assert!(!flow.target_to_client_open);
+        assert!(!flow.is_fully_closed());
+
+        flow.close_client_to_target();
+
+        assert!(flow.is_fully_closed());
+    }
 }
