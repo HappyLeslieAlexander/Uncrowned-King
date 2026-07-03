@@ -564,6 +564,16 @@ mod tests {
         payload.freeze()
     }
 
+    fn error_frame(code: ErrorCode) -> Frame {
+        Frame::new(FrameType::Error, 0, FLOW_ID, status_payload(code)).unwrap()
+    }
+
+    fn close_frame(close_code: u16) -> Frame {
+        let mut payload = BytesMut::new();
+        TcpClose::new(close_code).encode(&mut payload).unwrap();
+        Frame::new(FrameType::TcpClose, 0, FLOW_ID, payload.freeze()).unwrap()
+    }
+
     #[test]
     fn decodes_open_ack() {
         let frame = Frame::new(FrameType::TcpData, 0, FLOW_ID, Bytes::new()).unwrap();
@@ -588,6 +598,81 @@ mod tests {
     }
 
     #[test]
+    fn decodes_resource_limit_open_response() {
+        let frame = Frame::new(
+            FrameType::ResourceLimit,
+            0,
+            FLOW_ID,
+            status_payload(ErrorCode::ResourceLimit),
+        )
+        .unwrap();
+
+        assert_eq!(
+            decode_open_response(frame).unwrap(),
+            OpenResponse::Rejected(socks5::Reply::GeneralFailure)
+        );
+    }
+
+    #[test]
+    fn maps_error_open_response_codes_to_socks_replies() {
+        let cases = [
+            (ErrorCode::UnsupportedVersion, socks5::Reply::GeneralFailure),
+            (ErrorCode::UnsupportedFlag, socks5::Reply::GeneralFailure),
+            (ErrorCode::OversizedFrame, socks5::Reply::GeneralFailure),
+            (ErrorCode::TruncatedFrame, socks5::Reply::GeneralFailure),
+            (ErrorCode::InvalidTarget, socks5::Reply::HostUnreachable),
+            (ErrorCode::AuthFailed, socks5::Reply::GeneralFailure),
+            (ErrorCode::PolicyDenied, socks5::Reply::NotAllowed),
+            (ErrorCode::ResourceLimit, socks5::Reply::GeneralFailure),
+            (ErrorCode::Protocol, socks5::Reply::GeneralFailure),
+            (ErrorCode::TargetUnavailable, socks5::Reply::HostUnreachable),
+            (ErrorCode::TargetTimeout, socks5::Reply::HostUnreachable),
+        ];
+
+        for (code, expected_reply) in cases {
+            assert_eq!(
+                decode_open_response(error_frame(code)).unwrap(),
+                OpenResponse::Rejected(expected_reply),
+                "error code {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_tcp_close_open_response_as_connection_refused() {
+        assert_eq!(
+            decode_open_response(close_frame(TCP_CLOSE_NORMAL)).unwrap(),
+            OpenResponse::Rejected(socks5::Reply::ConnectionRefused)
+        );
+    }
+
+    #[test]
+    fn rejects_policy_denied_with_wrong_error_code() {
+        let frame = Frame::new(
+            FrameType::PolicyDenied,
+            0,
+            FLOW_ID,
+            status_payload(ErrorCode::Protocol),
+        )
+        .unwrap();
+
+        assert!(decode_open_response(frame).is_err());
+    }
+
+    #[test]
+    fn rejects_resource_limit_with_wrong_error_code() {
+        let frame = Frame::new(
+            FrameType::ResourceLimit,
+            0,
+            FLOW_ID,
+            status_payload(ErrorCode::PolicyDenied),
+        )
+        .unwrap();
+
+        assert!(decode_open_response(frame).is_err());
+    }
+
+    #[test]
     fn rejects_non_empty_tcp_data_as_open_ack() {
         let frame = Frame::new(
             FrameType::TcpData,
@@ -596,6 +681,13 @@ mod tests {
             Bytes::from_static(b"early data"),
         )
         .unwrap();
+
+        assert!(decode_open_response(frame).is_err());
+    }
+
+    #[test]
+    fn rejects_unexpected_open_response_frame() {
+        let frame = Frame::new(FrameType::Ping, 0, FLOW_ID, Bytes::new()).unwrap();
 
         assert!(decode_open_response(frame).is_err());
     }
