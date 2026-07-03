@@ -79,6 +79,9 @@ impl Settings {
             let key = varint::decode(src)?;
             let value = varint::decode(src)?;
             if let Ok(key) = SettingKey::try_from(key) {
+                if settings.get(key).is_some() {
+                    return Err(ProtocolError::InvalidSettings("duplicate setting key"));
+                }
                 settings.set(key, value);
             }
         }
@@ -120,6 +123,15 @@ mod tests {
         assert_eq!(
             Settings::decode(&mut bytes),
             Err(ProtocolError::InvalidSettings("trailing settings bytes"))
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_known_setting_keys() {
+        let mut bytes = Bytes::from_static(&[0x02, 0x01, 0x40, 0x80, 0x01, 0x40, 0x81]);
+        assert_eq!(
+            Settings::decode(&mut bytes),
+            Err(ProtocolError::InvalidSettings("duplicate setting key"))
         );
     }
 }
