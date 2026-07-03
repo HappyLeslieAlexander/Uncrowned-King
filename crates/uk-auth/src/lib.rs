@@ -60,6 +60,9 @@ pub enum AuthError {
     /// Two configured credentials use the same key id.
     #[error("duplicate credential key id")]
     DuplicateCredentialKeyId,
+    /// A configured credential has an invalid policy group.
+    #[error("credential policy group must be non-empty and printable")]
+    InvalidCredentialPolicyGroup,
     /// Authentication payload is malformed.
     #[error("invalid auth payload: {0}")]
     InvalidPayload(&'static str),

@@ -244,6 +244,13 @@ impl CredentialConfig {
             "retired" => CredentialStatus::Retired,
             _ => return Err(AuthError::InvalidCredentialStatus),
         };
+        if self
+            .policy_group
+            .as_deref()
+            .is_some_and(invalid_policy_group)
+        {
+            return Err(AuthError::InvalidCredentialPolicyGroup);
+        }
         let mut credential = Credential::active(self.key_id.as_bytes(), self.secret.as_bytes())?;
         credential.status = status;
         credential.not_before = self.not_before;
@@ -251,6 +258,10 @@ impl CredentialConfig {
         credential.policy_group.clone_from(&self.policy_group);
         Ok(credential)
     }
+}
+
+fn invalid_policy_group(group: &str) -> bool {
+    group.is_empty() || group.bytes().any(|byte| byte.is_ascii_control())
 }
 
 #[cfg(test)]
@@ -774,6 +785,50 @@ secret = "abcdef0123456789abcdef0123456789"
         assert_eq!(
             config.credentials(),
             Err(AuthError::DuplicateCredentialKeyId)
+        );
+    }
+
+    #[test]
+    fn rejects_empty_credential_policy_group() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+
+[[credentials]]
+key_id = "client"
+secret = "0123456789abcdef0123456789abcdef"
+policy_group = ""
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.credentials(),
+            Err(AuthError::InvalidCredentialPolicyGroup)
+        );
+    }
+
+    #[test]
+    fn rejects_control_character_credential_policy_group() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+
+[[credentials]]
+key_id = "client"
+secret = "0123456789abcdef0123456789abcdef"
+policy_group = "bad\ngroup"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.credentials(),
+            Err(AuthError::InvalidCredentialPolicyGroup)
         );
     }
 }
