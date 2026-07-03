@@ -1,9 +1,9 @@
 //! Client-side UK session setup.
 
-use std::error::Error;
+use std::{error::Error, time::Duration};
 
 use bytes::BytesMut;
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, time};
 use tokio_rustls::client::TlsStream;
 use tracing::info;
 use uk_auth::{AuthChallenge, AuthResponse, unix_now};
@@ -15,6 +15,19 @@ type AnyError = Box<dyn Error + Send + Sync>;
 
 /// Connects to the configured server and completes UK authentication.
 pub async fn connect_authenticated(
+    config: &ClientConfig,
+) -> Result<(TlsStream<TcpStream>, Settings), AnyError> {
+    if let Some(timeout) = handshake_timeout(config.handshake_timeout_seconds()) {
+        match time::timeout(timeout, connect_authenticated_inner(config)).await {
+            Ok(result) => result,
+            Err(_) => Err("client handshake timeout".into()),
+        }
+    } else {
+        connect_authenticated_inner(config).await
+    }
+}
+
+async fn connect_authenticated_inner(
     config: &ClientConfig,
 ) -> Result<(TlsStream<TcpStream>, Settings), AnyError> {
     let connector = tls::connector(&config.ca_cert_path)?;
@@ -54,4 +67,8 @@ pub async fn connect_authenticated(
         max_frame_size = ?settings.get(uk_proto::SettingKey::MaxFrameSize)
     );
     Ok((stream, settings))
+}
+
+fn handshake_timeout(seconds: u64) -> Option<Duration> {
+    (seconds != 0).then(|| Duration::from_secs(seconds))
 }

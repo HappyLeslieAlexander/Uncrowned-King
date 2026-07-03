@@ -17,6 +17,8 @@ pub struct ClientConfig {
     pub key_id: String,
     /// Shared secret. v0.1 treats this as UTF-8 bytes.
     pub secret: String,
+    /// Optional server connection and authentication timeout in seconds.
+    pub handshake_timeout_seconds: Option<u64>,
 }
 
 impl ClientConfig {
@@ -25,5 +27,48 @@ impl ClientConfig {
         let text = fs::read_to_string(path)?;
         let config = toml::from_str(&text)?;
         Ok(config)
+    }
+
+    /// Server connection and authentication timeout in seconds. Zero disables it.
+    pub fn handshake_timeout_seconds(&self) -> u64 {
+        self.handshake_timeout_seconds.unwrap_or(10)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_config() -> ClientConfig {
+        ClientConfig {
+            server_addr: "127.0.0.1:443".to_owned(),
+            server_name: "localhost".to_owned(),
+            ca_cert_path: "ca.pem".to_owned(),
+            key_id: "client".to_owned(),
+            secret: "secret".to_owned(),
+            handshake_timeout_seconds: None,
+        }
+    }
+
+    #[test]
+    fn defaults_handshake_timeout() {
+        assert_eq!(minimal_config().handshake_timeout_seconds(), 10);
+    }
+
+    #[test]
+    fn parses_handshake_timeout() {
+        let config: ClientConfig = toml::from_str(
+            r#"
+server_addr = "127.0.0.1:443"
+server_name = "localhost"
+ca_cert_path = "ca.pem"
+key_id = "client"
+secret = "secret"
+handshake_timeout_seconds = 4
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.handshake_timeout_seconds(), 4);
     }
 }
