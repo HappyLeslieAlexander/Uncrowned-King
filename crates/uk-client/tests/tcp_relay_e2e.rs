@@ -79,6 +79,8 @@ const HALF_CLOSE_REQUEST: &[u8] = b"uncrowned king half-close request";
 const HALF_CLOSE_RESPONSE: &[u8] = b"uncrowned king half-close response";
 const TARGET_HALF_CLOSE_GREETING: &[u8] = b"uncrowned king target half-close greeting";
 const TARGET_HALF_CLOSE_LATE_REQUEST: &[u8] = b"uncrowned king target half-close late request";
+const TARGET_HALF_CLOSE_TIMEOUT_GREETING: &[u8] =
+    b"uncrowned king target half-close timeout greeting";
 const LARGE_PAYLOAD_LEN: usize = 128 * 1024 + 123;
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -117,6 +119,11 @@ async fn preserves_client_half_close_until_target_response() -> Result<(), TestE
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preserves_client_writes_after_target_half_close() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_target_half_close_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closes_target_after_half_close_drain_timeout() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_half_close_timeout_e2e()).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -307,6 +314,31 @@ async fn run_target_half_close_e2e() -> Result<(), TestError> {
 
     let target_received = target_task.await??;
     assert_eq!(target_received, TARGET_HALF_CLOSE_LATE_REQUEST);
+    Ok(())
+}
+
+async fn run_half_close_timeout_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, target_task) =
+        spawn_write_shutdown_then_read_target(TARGET_HALF_CLOSE_TIMEOUT_GREETING).await?;
+    let harness = RelayHarness::start_with_limits(
+        Some(allow_loopback_policy(target_addr.port())),
+        test_limits_with_half_close_timeout(1),
+    )
+    .await?;
+
+    let (mut socks, connect_reply) = open_socks_connect(harness.socks_addr, target_addr).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    let mut greeting = vec![0_u8; TARGET_HALF_CLOSE_TIMEOUT_GREETING.len()];
+    socks.read_exact(&mut greeting).await?;
+    assert_eq!(greeting, TARGET_HALF_CLOSE_TIMEOUT_GREETING);
+    let mut eof = [0_u8; 1];
+    assert_eq!(socks.read(&mut eof).await?, 0);
+
+    let target_received = target_task.await??;
+    assert!(target_received.is_empty());
     Ok(())
 }
 
@@ -700,6 +732,12 @@ fn test_limits_with_max_streams(max_streams: u64) -> LimitConfig {
 fn test_limits_with_idle_timeout(idle_timeout_seconds: u64) -> LimitConfig {
     let mut limits = test_limits();
     limits.idle_timeout_seconds = Some(idle_timeout_seconds);
+    limits
+}
+
+fn test_limits_with_half_close_timeout(tcp_half_close_timeout_seconds: u64) -> LimitConfig {
+    let mut limits = test_limits();
+    limits.tcp_half_close_timeout_seconds = Some(tcp_half_close_timeout_seconds);
     limits
 }
 
