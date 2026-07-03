@@ -1,0 +1,9 @@
+# Example uk-client configuration.
+
+server_addr = "127.0.0.1:9443"
+server_name = "localhost"
+ca_cert_path = "examples/server-cert.pem"
+key_id = "local-dev"
+secret = "replace-with-a-long-random-shared-secret"
+handshake_timeout_seconds = 10
+socks_handshake_timeout_seconds = 10

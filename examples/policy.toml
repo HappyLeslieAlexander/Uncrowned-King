@@ -1,0 +1,13 @@
+# Example allow policy for local development.
+
+[[rules]]
+action = "allow"
+domain_suffix = ".example.com"
+port_start = 443
+port_end = 443
+
+[[rules]]
+action = "allow"
+domain = "example.com"
+port_start = 443
+port_end = 443

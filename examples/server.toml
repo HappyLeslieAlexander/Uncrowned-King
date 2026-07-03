@@ -1,0 +1,21 @@
+# Example uk-server configuration.
+
+listen = "127.0.0.1:9443"
+cert_path = "examples/server-cert.pem"
+key_path = "examples/server-key.pem"
+policy_path = "examples/policy.toml"
+auth_skew_seconds = 30
+
+[limits]
+max_pre_auth_bytes = 4096
+max_frame_size = 65536
+max_streams = 64
+idle_timeout_seconds = 300
+max_buffered_bytes_per_flow = 2097152
+handshake_timeout_seconds = 10
+
+[[credentials]]
+key_id = "local-dev"
+secret = "replace-with-a-long-random-shared-secret"
+status = "active"
+policy_group = "default"
