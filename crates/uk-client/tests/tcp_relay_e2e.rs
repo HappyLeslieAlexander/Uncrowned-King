@@ -73,6 +73,8 @@ const SECRET: &str = "0123456789abcdef0123456789abcdef";
 const SOCKS_REPLY_SUCCEEDED: u8 = 0x00;
 const SOCKS_REPLY_NOT_ALLOWED: u8 = 0x02;
 const SOCKS_REPLY_HOST_UNREACHABLE: u8 = 0x04;
+const HALF_CLOSE_REQUEST: &[u8] = b"uncrowned king half-close request";
+const HALF_CLOSE_RESPONSE: &[u8] = b"uncrowned king half-close response";
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -94,6 +96,11 @@ async fn maps_target_unavailable_to_socks_host_unreachable() -> Result<(), TestE
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relays_domain_socks_target_to_echo_target() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_domain_relay_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preserves_client_half_close_until_target_response() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_half_close_e2e()).await?
 }
 
 async fn run_tcp_relay_e2e() -> Result<(), TestError> {
@@ -121,6 +128,30 @@ async fn run_policy_denied_e2e() -> Result<(), TestError> {
     let denied_target = unused_loopback_addr().await?;
     let (_socks, connect_reply) = open_socks_connect(harness.socks_addr, denied_target).await?;
     assert_eq!(connect_reply[1], SOCKS_REPLY_NOT_ALLOWED);
+    Ok(())
+}
+
+async fn run_half_close_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, target_task) =
+        spawn_read_to_eof_then_respond_target(HALF_CLOSE_RESPONSE).await?;
+    let harness = RelayHarness::start(Some(allow_loopback_policy(target_addr.port()))).await?;
+
+    let (mut socks, connect_reply) = open_socks_connect(harness.socks_addr, target_addr).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    socks.write_all(HALF_CLOSE_REQUEST).await?;
+    socks.shutdown().await?;
+
+    let mut response = vec![0_u8; HALF_CLOSE_RESPONSE.len()];
+    socks.read_exact(&mut response).await?;
+    assert_eq!(response, HALF_CLOSE_RESPONSE);
+    let mut eof = [0_u8; 1];
+    assert_eq!(socks.read(&mut eof).await?, 0);
+
+    let target_received = target_task.await??;
+    assert_eq!(target_received, HALF_CLOSE_REQUEST);
     Ok(())
 }
 
@@ -241,6 +272,28 @@ async fn spawn_echo_target()
         let read = stream.read(&mut buf).await?;
         stream.write_all(&buf[..read]).await?;
         Ok(())
+    });
+    Ok((addr, task))
+}
+
+async fn spawn_read_to_eof_then_respond_target(
+    response: &'static [u8],
+) -> Result<
+    (
+        SocketAddr,
+        tokio::task::JoinHandle<Result<Vec<u8>, TestError>>,
+    ),
+    TestError,
+> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await?;
+        stream.write_all(response).await?;
+        stream.shutdown().await?;
+        Ok(received)
     });
     Ok((addr, task))
 }

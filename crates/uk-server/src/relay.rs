@@ -487,7 +487,7 @@ async fn relay_client_to_target(
         match command {
             TargetCommand::Data(payload) => {
                 let payload_len = payload.len();
-                if flow_control.is_closed() || shutdown.is_closed() {
+                if flow_control.is_aborted() || shutdown.is_closed() {
                     flow_control.release_bytes(payload_len);
                     return Ok(());
                 }
