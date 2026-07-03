@@ -97,6 +97,14 @@ impl ServerConfig {
             .and_then(|limits| limits.handshake_timeout_seconds)
             .unwrap_or(10)
     }
+
+    /// DNS resolution and TCP dial timeout for target opens. Zero disables it.
+    pub fn target_connect_timeout_seconds(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.target_connect_timeout_seconds)
+            .unwrap_or(10)
+    }
 }
 
 /// Server resource limits.
@@ -115,6 +123,8 @@ pub struct LimitConfig {
     pub max_buffered_bytes_per_flow: Option<u64>,
     /// TLS and authentication handshake timeout in seconds.
     pub handshake_timeout_seconds: Option<u64>,
+    /// DNS resolution and TCP dial timeout for target opens.
+    pub target_connect_timeout_seconds: Option<u64>,
 }
 
 /// One configured credential.
@@ -236,5 +246,28 @@ handshake_timeout_seconds = 3
         .unwrap();
 
         assert_eq!(config.handshake_timeout_seconds(), 3);
+    }
+
+    #[test]
+    fn defaults_target_connect_timeout() {
+        assert_eq!(minimal_config().target_connect_timeout_seconds(), 10);
+    }
+
+    #[test]
+    fn parses_target_connect_timeout() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+target_connect_timeout_seconds = 7
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.target_connect_timeout_seconds(), 7);
     }
 }

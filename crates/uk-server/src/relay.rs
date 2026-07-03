@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     error::Error,
+    future::Future,
     io,
     net::{IpAddr, SocketAddr},
     sync::{
@@ -43,6 +44,7 @@ pub(crate) struct RelayLimits {
     frame: FrameLimits,
     max_streams: u64,
     max_buffered_bytes_per_flow: usize,
+    target_connect_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,27 +289,33 @@ async fn handle_tcp_open(
     }
 
     let target = open.target;
-    let target_stream =
-        match connect_allowed_target(&target, context.credential, context.policy_set).await {
-            Ok(stream) => stream,
-            Err(OpenFailure::PolicyDenied) => {
-                warn!(event = "policy.denied", flow_id, target = ?target);
-                send_policy_denied(context.carrier_writer, flow_id).await?;
-                send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_NORMAL).await?;
-                return Ok(None);
-            }
-            Err(OpenFailure::TargetUnavailable(err)) => {
-                warn!(event = "target.unavailable", flow_id, target = ?target, error = %err);
-                send_error(
-                    context.carrier_writer,
-                    flow_id,
-                    ErrorCode::TargetUnavailable,
-                )
-                .await?;
-                send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
-                return Ok(None);
-            }
-        };
+    let target_stream = match connect_allowed_target(
+        &target,
+        context.credential,
+        context.policy_set,
+        context.limits.target_connect_timeout,
+    )
+    .await
+    {
+        Ok(stream) => stream,
+        Err(OpenFailure::PolicyDenied) => {
+            warn!(event = "policy.denied", flow_id, target = ?target);
+            send_policy_denied(context.carrier_writer, flow_id).await?;
+            send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_NORMAL).await?;
+            return Ok(None);
+        }
+        Err(OpenFailure::TargetUnavailable(err)) => {
+            warn!(event = "target.unavailable", flow_id, target = ?target, error = %err);
+            send_error(
+                context.carrier_writer,
+                flow_id,
+                ErrorCode::TargetUnavailable,
+            )
+            .await?;
+            send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
+            return Ok(None);
+        }
+    };
 
     let (target_reader, target_writer) = target_stream.into_split();
     let (target_writer_tx, target_writer_rx) = mpsc::channel(TARGET_WRITE_QUEUE_CAPACITY);
@@ -418,11 +426,13 @@ impl RelayLimits {
         frame: FrameLimits,
         max_streams: u64,
         max_buffered_bytes_per_flow: usize,
+        target_connect_timeout: Option<Duration>,
     ) -> Self {
         Self {
             frame,
             max_streams,
             max_buffered_bytes_per_flow,
+            target_connect_timeout,
         }
     }
 }
@@ -573,8 +583,9 @@ async fn connect_allowed_target(
     target: &Target,
     credential: &Credential,
     policy_set: &PolicySet,
+    target_connect_timeout: Option<Duration>,
 ) -> Result<TcpStream, OpenFailure> {
-    let addrs = resolve_target(target).await?;
+    let addrs = with_optional_timeout(target_connect_timeout, resolve_target(target)).await?;
     let resolved_ips = resolved_ips(target, &addrs);
     let context = PolicyContext {
         key_id: &credential.key_id,
@@ -585,7 +596,7 @@ async fn connect_allowed_target(
     if policy_set.evaluate(&context) != PolicyDecision::Allow {
         return Err(OpenFailure::PolicyDenied);
     }
-    connect_socket_addrs(&addrs).await
+    with_optional_timeout(target_connect_timeout, connect_socket_addrs(&addrs)).await
 }
 
 async fn resolve_target(target: &Target) -> Result<Vec<SocketAddr>, OpenFailure> {
@@ -626,6 +637,26 @@ async fn connect_socket_addrs(addrs: &[SocketAddr]) -> Result<TcpStream, OpenFai
     Err(OpenFailure::TargetUnavailable(last_error.unwrap_or_else(
         || io::Error::new(io::ErrorKind::NotFound, "target has no socket addresses"),
     )))
+}
+
+async fn with_optional_timeout<T, F>(
+    duration: Option<Duration>,
+    future: F,
+) -> Result<T, OpenFailure>
+where
+    F: Future<Output = Result<T, OpenFailure>>,
+{
+    if let Some(duration) = duration {
+        tokio::time::timeout(duration, future)
+            .await
+            .map_err(|_| OpenFailure::TargetUnavailable(timeout_error()))?
+    } else {
+        future.await
+    }
+}
+
+fn timeout_error() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "target connect timeout")
 }
 
 async fn send_tcp_data(

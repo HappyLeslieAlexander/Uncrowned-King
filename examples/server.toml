@@ -13,6 +13,7 @@ max_streams = 64
 idle_timeout_seconds = 300
 max_buffered_bytes_per_flow = 2097152
 handshake_timeout_seconds = 10
+target_connect_timeout_seconds = 10
 
 [[credentials]]
 key_id = "local-dev"

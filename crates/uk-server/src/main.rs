@@ -121,6 +121,7 @@ async fn handle_connection(
             },
             config.max_streams(),
             usize_limit(config.max_buffered_bytes_per_flow()),
+            target_connect_timeout(config.target_connect_timeout_seconds()),
         ),
         idle_timeout(config.idle_timeout_seconds()),
     )
@@ -197,6 +198,10 @@ fn idle_timeout(seconds: u64) -> Option<Duration> {
 }
 
 fn handshake_timeout(seconds: u64) -> Option<Duration> {
+    (seconds != 0).then(|| Duration::from_secs(seconds))
+}
+
+fn target_connect_timeout(seconds: u64) -> Option<Duration> {
     (seconds != 0).then(|| Duration::from_secs(seconds))
 }
 
