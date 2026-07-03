@@ -392,8 +392,14 @@ fn private_matches(context: &PolicyContext<'_>, want_private: bool) -> bool {
 fn is_private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
-        IpAddr::V6(ip) => ip.is_unique_local() || ip.is_loopback(),
+        IpAddr::V6(ip) => {
+            ip.is_unique_local() || ip.is_loopback() || is_ipv6_unicast_link_local(ip)
+        }
     }
+}
+
+fn is_ipv6_unicast_link_local(ip: Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfe80
 }
 
 fn ipv4_mask(prefix: u8) -> u32 {
@@ -524,6 +530,19 @@ mod tests {
         rule.private = Some(true);
         let policy = PolicySet::new(vec![rule]);
         let target = Target::Ipv4(Ipv4Addr::new(10, 0, 0, 1), 22);
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &[])),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn denies_ipv6_link_local_by_private_rule() {
+        let mut rule = PolicyRule::new(PolicyDecision::Deny);
+        rule.private = Some(true);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Ipv6("fe80::1".parse().unwrap(), 443);
+
         assert_eq!(
             policy.evaluate(&context(&target, Some("default"), &[])),
             PolicyDecision::Deny

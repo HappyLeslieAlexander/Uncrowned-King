@@ -278,6 +278,8 @@ key identifiers. Policy group predicates must not be empty or contain ASCII
 control characters.
 For private-address predicates, `private=true` matches when any candidate IP is
 private, while `private=false` matches only when every candidate IP is public.
+Private IPs include loopback, IPv4 private/link-local ranges, IPv6 unique-local
+addresses, and IPv6 link-local addresses.
 
 Policy actions must be explicit `allow` or `deny`; unknown action strings are
 configuration errors.
