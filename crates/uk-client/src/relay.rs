@@ -19,7 +19,7 @@ use tokio_rustls::client::TlsStream;
 use tracing::{debug, info, warn};
 use uk_proto::{
     ErrorCode, ErrorPayload, FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, Frame, FrameLimits, FrameType,
-    SettingKey, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen,
+    SettingKey, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen,
     frame::DEFAULT_MAX_FRAME_SIZE, is_client_initiated_flow_id, read_frame, write_frame,
 };
 
@@ -322,10 +322,18 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
         | FrameType::ResourceLimit => {
             let flow_id = frame.header.id;
             let sender = session.flows.lock().await.get(&flow_id).cloned();
-            if let Some(sender) = sender
-                && sender.send(frame).await.is_err()
-            {
-                session.flows.lock().await.remove(&flow_id);
+            if let Some(sender) = sender {
+                match sender.try_send(frame) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        session.flows.lock().await.remove(&flow_id);
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!(event = "client.flow.queue_full", flow_id);
+                        session.flows.lock().await.remove(&flow_id);
+                        session.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await?;
+                    }
+                }
             }
             Ok(())
         }
