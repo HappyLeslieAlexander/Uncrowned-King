@@ -198,6 +198,9 @@ impl Cidr {
                 let mask = ipv4_mask(*prefix);
                 u32::from(*network) & mask == u32::from(ip) & mask
             }
+            (Self::V4(_, _), IpAddr::V6(ip)) => {
+                ipv4_mapped(ip).is_some_and(|mapped_ip| self.contains(IpAddr::V4(mapped_ip)))
+            }
             (Self::V6(network, prefix), IpAddr::V6(ip)) => {
                 let mask = ipv6_mask(*prefix);
                 u128::from(*network) & mask == u128::from(ip) & mask
@@ -400,7 +403,10 @@ fn is_metadata_service_ip(ip: IpAddr) -> bool {
         IpAddr::V4(ip) => {
             ip == Ipv4Addr::new(169, 254, 169, 254) || ip == Ipv4Addr::new(100, 100, 100, 200)
         }
-        IpAddr::V6(ip) => ip == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254),
+        IpAddr::V6(ip) => {
+            ipv4_mapped(ip).is_some_and(|ip| is_metadata_service_ip(IpAddr::V4(ip)))
+                || ip == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)
+        }
     }
 }
 
@@ -420,13 +426,27 @@ fn is_private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
         IpAddr::V6(ip) => {
-            ip.is_unique_local() || ip.is_loopback() || is_ipv6_unicast_link_local(ip)
+            ipv4_mapped(ip).is_some_and(|ip| is_private(IpAddr::V4(ip)))
+                || ip.is_unique_local()
+                || ip.is_loopback()
+                || is_ipv6_unicast_link_local(ip)
         }
     }
 }
 
 fn is_ipv6_unicast_link_local(ip: Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xffc0) == 0xfe80
+}
+
+fn ipv4_mapped(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let segments = ip.segments();
+    if segments[..5] == [0, 0, 0, 0, 0] && segments[5] == 0xffff {
+        let high = segments[6].to_be_bytes();
+        let low = segments[7].to_be_bytes();
+        Some(Ipv4Addr::new(high[0], high[1], low[0], low[1]))
+    } else {
+        None
+    }
 }
 
 fn ipv4_mask(prefix: u8) -> u32 {
@@ -577,6 +597,19 @@ mod tests {
     }
 
     #[test]
+    fn denies_ipv4_mapped_loopback_by_private_rule() {
+        let mut rule = PolicyRule::new(PolicyDecision::Deny);
+        rule.private = Some(true);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Ipv6("::ffff:127.0.0.1".parse().unwrap(), 443);
+
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &[])),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
     fn private_true_matches_any_private_resolution() {
         let mut rule = PolicyRule::new(PolicyDecision::Deny);
         rule.private = Some(true);
@@ -603,6 +636,20 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         ];
+
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &resolved)),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn private_false_rejects_ipv4_mapped_private_resolution() {
+        let mut rule = PolicyRule::new(PolicyDecision::Allow);
+        rule.private = Some(false);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Domain("mapped.example".to_owned(), 443);
+        let resolved = [IpAddr::V6("::ffff:10.0.0.1".parse().unwrap())];
 
         assert_eq!(
             policy.evaluate(&context(&target, Some("default"), &resolved)),
@@ -646,10 +693,36 @@ mod tests {
     }
 
     #[test]
+    fn cidr_deny_matches_ipv4_mapped_resolution() {
+        let mut deny_rule = PolicyRule::new(PolicyDecision::Deny);
+        deny_rule.cidr = Some("10.0.0.0/8".parse().unwrap());
+        let allow_rule = PolicyRule::new(PolicyDecision::Allow);
+        let policy = PolicySet::new(vec![deny_rule, allow_rule]);
+        let target = Target::Domain("mapped.example".to_owned(), 443);
+        let resolved = [IpAddr::V6("::ffff:10.0.0.1".parse().unwrap())];
+
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &resolved)),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
     fn denies_metadata_ip_even_when_allow_rule_matches() {
         let rule = PolicyRule::new(PolicyDecision::Allow);
         let policy = PolicySet::new(vec![rule]);
         let target = Target::Ipv4(Ipv4Addr::new(169, 254, 169, 254), 80);
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &[])),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn denies_ipv4_mapped_metadata_ip_even_when_allow_rule_matches() {
+        let rule = PolicyRule::new(PolicyDecision::Allow);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Ipv6("::ffff:169.254.169.254".parse().unwrap(), 80);
         assert_eq!(
             policy.evaluate(&context(&target, Some("default"), &[])),
             PolicyDecision::Deny
@@ -662,6 +735,18 @@ mod tests {
         let policy = PolicySet::new(vec![rule]);
         let target = Target::Domain("metadata.example".to_owned(), 80);
         let resolved = [IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))];
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &resolved)),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn denies_domain_resolving_to_ipv4_mapped_metadata_ip() {
+        let rule = PolicyRule::new(PolicyDecision::Allow);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Domain("metadata.example".to_owned(), 80);
+        let resolved = [IpAddr::V6("::ffff:169.254.169.254".parse().unwrap())];
         assert_eq!(
             policy.evaluate(&context(&target, Some("default"), &resolved)),
             PolicyDecision::Deny
