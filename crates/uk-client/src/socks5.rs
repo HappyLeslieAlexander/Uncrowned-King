@@ -66,7 +66,14 @@ where
     if version != VERSION {
         return Err(protocol_error("unsupported socks version"));
     }
-    let method_count = stream.read_u8().await?;
+    let method_count = match stream.read_u8().await {
+        Ok(method_count) => method_count,
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+            let _ = send_method_selection(stream, METHOD_NO_ACCEPTABLE).await;
+            return Err(protocol_error("truncated socks greeting"));
+        }
+        Err(err) => return Err(err),
+    };
     if method_count == 0 {
         send_method_selection(stream, METHOD_NO_ACCEPTABLE).await?;
         return Err(protocol_error("socks greeting has no methods"));
@@ -327,6 +334,20 @@ mod tests {
         let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
 
         client.write_all(&[0x05, 0x02, 0x00]).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut method_response = [0_u8; 2];
+        client.read_exact(&mut method_response).await.unwrap();
+        assert_eq!(method_response, [0x05, 0xff]);
+        assert!(server_task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_truncated_greeting_head_with_no_acceptable_method() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
+
+        client.write_all(&[0x05]).await.unwrap();
         client.shutdown().await.unwrap();
 
         let mut method_response = [0_u8; 2];
