@@ -72,6 +72,10 @@ Frame types:
 | `0x31` | `POLICY_DENIED` |
 | `0x32` | `RESOURCE_LIMIT` |
 
+Frame types that are not valid in the current protocol phase are protocol
+errors. Receivers should send `ERROR(Protocol)` before closing the session when
+the carrier is still writable.
+
 ## 3. Target Encoding
 
 ```text

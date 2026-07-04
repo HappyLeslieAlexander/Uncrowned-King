@@ -341,8 +341,16 @@ async fn handle_session_frame(
             validate_or_report_session_control_frame(&frame, context, FrameType::Pong).await?;
             Ok(())
         }
-        _ => Err("unexpected frame while relaying session".into()),
+        _ => reject_unexpected_session_frame(&frame, context).await,
     }
+}
+
+async fn reject_unexpected_session_frame(
+    frame: &Frame,
+    context: &RelaySessionContext<'_>,
+) -> Result<(), AnyError> {
+    send_error(context.carrier_writer, frame.header.id, ErrorCode::Protocol).await?;
+    Err("unexpected frame while relaying session".into())
 }
 
 async fn validate_or_report_session_control_frame(
