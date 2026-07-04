@@ -256,6 +256,13 @@ impl CredentialConfig {
         {
             return Err(AuthError::InvalidCredentialPolicyGroup);
         }
+        if self
+            .not_before
+            .zip(self.not_after)
+            .is_some_and(|(not_before, not_after)| not_before > not_after)
+        {
+            return Err(AuthError::InvalidCredentialValidityWindow);
+        }
         let mut credential = Credential::active(self.key_id.as_bytes(), self.secret.as_bytes())?;
         credential.status = status;
         credential.not_before = self.not_before;
@@ -742,6 +749,29 @@ secret = "too-short"
         .unwrap();
 
         assert_eq!(config.credentials(), Err(AuthError::SecretTooShort));
+    }
+
+    #[test]
+    fn rejects_reversed_credential_validity_window() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+
+[[credentials]]
+key_id = "client"
+secret = "0123456789abcdef0123456789abcdef"
+not_before = 20
+not_after = 10
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.credentials(),
+            Err(AuthError::InvalidCredentialValidityWindow)
+        );
     }
 
     #[test]

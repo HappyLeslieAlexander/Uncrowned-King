@@ -65,6 +65,9 @@ pub enum AuthError {
     /// A configured credential has an invalid policy group.
     #[error("credential policy group must be non-empty and printable")]
     InvalidCredentialPolicyGroup,
+    /// A configured credential validity window is impossible.
+    #[error("credential not_before must be less than or equal to not_after")]
+    InvalidCredentialValidityWindow,
     /// Authentication payload is malformed.
     #[error("invalid auth payload: {0}")]
     InvalidPayload(&'static str),
