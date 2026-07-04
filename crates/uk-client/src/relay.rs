@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
     error::Error,
+    io,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -109,10 +110,21 @@ pub(crate) async fn run_socks5_listener(
             if let Err(err) =
                 handle_socks_connection(local, sessions, socks_handshake_timeout).await
             {
-                warn!(event = "socks5.connection.error", peer = %peer, error = %err);
+                if is_clean_socks_disconnect(&err) {
+                    debug!(event = "socks5.connection.closed", peer = %peer);
+                } else {
+                    warn!(event = "socks5.connection.error", peer = %peer, error = %err);
+                }
             }
         });
     }
+}
+
+fn is_clean_socks_disconnect(error: &AnyError) -> bool {
+    error
+        .as_ref()
+        .downcast_ref::<io::Error>()
+        .is_some_and(|error| error.kind() == io::ErrorKind::UnexpectedEof)
 }
 
 impl ClientSessionManager {
@@ -723,6 +735,10 @@ mod tests {
         }
     }
 
+    fn boxed_io_error(kind: io::ErrorKind) -> AnyError {
+        io::Error::new(kind, "test error").into()
+    }
+
     fn status_payload(code: ErrorCode) -> Bytes {
         let mut payload = BytesMut::new();
         ErrorPayload::new(code).encode(&mut payload).unwrap();
@@ -1042,6 +1058,16 @@ mod tests {
         assert!(validate_endpoint("socks listen", "127.0.0.1").is_err());
         assert!(validate_endpoint("socks listen", "127.0.0.1:0").is_err());
         assert!(validate_endpoint("socks listen", "::1:1080").is_err());
+    }
+
+    #[test]
+    fn classifies_clean_socks_disconnects() {
+        assert!(is_clean_socks_disconnect(&boxed_io_error(
+            io::ErrorKind::UnexpectedEof
+        )));
+        assert!(!is_clean_socks_disconnect(&boxed_io_error(
+            io::ErrorKind::InvalidData
+        )));
     }
 
     #[tokio::test]
