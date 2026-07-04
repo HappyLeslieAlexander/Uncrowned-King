@@ -3,9 +3,7 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
     error::Error,
-    future::Future,
     io,
-    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -36,6 +34,7 @@ use crate::{
 
 const FLOW_ID_ALLOCATION_ATTEMPTS: usize = 1024;
 const FLOW_FRAME_QUEUE_CAPACITY: usize = 32;
+const PENDING_OPEN_BUFFER_LIMIT: usize = 64 * 1024;
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const DEFAULT_MAX_STREAMS: u64 = 64;
 
@@ -72,6 +71,7 @@ struct ClientFlow {
     id: u64,
     frames: mpsc::Receiver<Frame>,
     session: Arc<ClientSession>,
+    pending_local_data: Vec<Bytes>,
 }
 
 enum OpenOutcome {
@@ -83,6 +83,13 @@ enum OpenOutcome {
 enum OpenWaitOutcome {
     Frame(Frame),
     Cancelled,
+    LocalResourceLimit,
+}
+
+enum PendingOpenLocalRead {
+    Buffered,
+    Closed,
+    ResourceLimit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,15 +158,19 @@ impl ClientSessionManager {
         }
     }
 
-    async fn open_flow<C>(&self, target: Target, cancel: C) -> Result<OpenOutcome, AnyError>
-    where
-        C: Future<Output = ()>,
-    {
-        tokio::pin!(cancel);
+    async fn open_flow(
+        &self,
+        target: Target,
+        local: &mut TcpStream,
+    ) -> Result<OpenOutcome, AnyError> {
+        let mut pending_local_data = PendingOpenLocalData::default();
         let mut last_error = None;
         for attempt in 0..2 {
             let session = self.current_session().await?;
-            match session.open_flow(target.clone(), cancel.as_mut()).await {
+            match session
+                .open_flow(target.clone(), local, &mut pending_local_data)
+                .await
+            {
                 Ok(outcome) => return Ok(outcome),
                 Err(err) => {
                     warn!(
@@ -243,14 +254,12 @@ impl ClientSession {
         }
     }
 
-    async fn open_flow<C>(
+    async fn open_flow(
         self: &Arc<Self>,
         target: Target,
-        cancel: Pin<&mut C>,
-    ) -> Result<OpenOutcome, AnyError>
-    where
-        C: Future<Output = ()>,
-    {
+        local: &mut TcpStream,
+        pending_local_data: &mut PendingOpenLocalData,
+    ) -> Result<OpenOutcome, AnyError> {
         if self.is_closed() {
             return Err("uk session is closed".into());
         }
@@ -272,16 +281,23 @@ impl ClientSession {
             id: flow_id,
             frames,
             session: Arc::clone(self),
+            pending_local_data: Vec::new(),
         };
         let frame = match self
-            .wait_for_open_frame(flow_id, &mut flow.frames, cancel)
+            .wait_for_open_frame(flow_id, &mut flow.frames, local, pending_local_data)
             .await?
         {
             OpenWaitOutcome::Frame(frame) => frame,
             OpenWaitOutcome::Cancelled => return Ok(OpenOutcome::Cancelled),
+            OpenWaitOutcome::LocalResourceLimit => {
+                return Ok(OpenOutcome::Rejected(socks5::Reply::GeneralFailure));
+            }
         };
         match decode_open_response(frame) {
-            Ok(OpenResponse::Accepted) => Ok(OpenOutcome::Open(flow)),
+            Ok(OpenResponse::Accepted) => {
+                flow.pending_local_data = pending_local_data.take_chunks();
+                Ok(OpenOutcome::Open(flow))
+            }
             Ok(OpenResponse::Rejected(reply)) => {
                 self.flows.lock().await.remove(&flow_id);
                 Ok(OpenOutcome::Rejected(reply))
@@ -293,51 +309,72 @@ impl ClientSession {
         }
     }
 
-    async fn wait_for_open_frame<C>(
+    async fn wait_for_open_frame(
         &self,
         flow_id: u64,
         frames: &mut mpsc::Receiver<Frame>,
-        mut cancel: Pin<&mut C>,
-    ) -> Result<OpenWaitOutcome, AnyError>
-    where
-        C: Future<Output = ()>,
-    {
+        local: &mut TcpStream,
+        pending_local_data: &mut PendingOpenLocalData,
+    ) -> Result<OpenWaitOutcome, AnyError> {
         if let Some(timeout) = self.open_timeout {
+            if let Ok(result) = time::timeout(
+                timeout,
+                self.wait_for_open_frame_inner(flow_id, frames, local, pending_local_data),
+            )
+            .await
+            {
+                result
+            } else {
+                warn!(event = "client.flow.open.timeout", flow_id);
+                self.cancel_pending_open(flow_id).await;
+                Ok(OpenWaitOutcome::Cancelled)
+            }
+        } else {
+            self.wait_for_open_frame_inner(flow_id, frames, local, pending_local_data)
+                .await
+        }
+    }
+
+    async fn wait_for_open_frame_inner(
+        &self,
+        flow_id: u64,
+        frames: &mut mpsc::Receiver<Frame>,
+        local: &mut TcpStream,
+        pending_local_data: &mut PendingOpenLocalData,
+    ) -> Result<OpenWaitOutcome, AnyError> {
+        loop {
             tokio::select! {
-                frame = time::timeout(timeout, frames.recv()) => {
-                    match frame {
-                        Ok(Some(frame)) => Ok(OpenWaitOutcome::Frame(frame)),
-                        Ok(None) => Err("uk session closed while opening flow".into()),
-                        Err(_) => {
-                            warn!(event = "client.flow.open.timeout", flow_id);
-                            self.flows.lock().await.remove(&flow_id);
-                            self.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await?;
-                            Ok(OpenWaitOutcome::Cancelled)
+                frame = frames.recv() => {
+                    return frame
+                        .map(OpenWaitOutcome::Frame)
+                        .ok_or_else(|| "uk session closed while opening flow".into());
+                }
+                read = pending_local_data.read_from(local, self.data_frame_size) => {
+                    match read {
+                        PendingOpenLocalRead::Buffered => {}
+                        PendingOpenLocalRead::Closed => {
+                            debug!(event = "client.flow.open.cancelled", flow_id);
+                            self.cancel_pending_open(flow_id).await;
+                            return Ok(OpenWaitOutcome::Cancelled);
+                        }
+                        PendingOpenLocalRead::ResourceLimit => {
+                            warn!(
+                                event = "client.flow.open.local_buffer_limit",
+                                flow_id,
+                                buffered_bytes = pending_local_data.queued_bytes()
+                            );
+                            self.cancel_pending_open(flow_id).await;
+                            return Ok(OpenWaitOutcome::LocalResourceLimit);
                         }
                     }
                 }
-                () = cancel.as_mut() => {
-                    debug!(event = "client.flow.open.cancelled", flow_id);
-                    self.flows.lock().await.remove(&flow_id);
-                    let _ = self.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await;
-                    Ok(OpenWaitOutcome::Cancelled)
-                }
-            }
-        } else {
-            tokio::select! {
-                frame = frames.recv() => {
-                    frame
-                        .map(OpenWaitOutcome::Frame)
-                        .ok_or_else(|| "uk session closed while opening flow".into())
-                }
-                () = cancel.as_mut() => {
-                    debug!(event = "client.flow.open.cancelled", flow_id);
-                    self.flows.lock().await.remove(&flow_id);
-                    let _ = self.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await;
-                    Ok(OpenWaitOutcome::Cancelled)
-                }
             }
         }
+    }
+
+    async fn cancel_pending_open(&self, flow_id: u64) {
+        self.flows.lock().await.remove(&flow_id);
+        let _ = self.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await;
     }
 
     async fn reserve_flow(&self) -> Result<Option<(u64, mpsc::Receiver<Frame>)>, AnyError> {
@@ -423,6 +460,58 @@ impl ClientSession {
             self.close().await;
         }
         result
+    }
+}
+
+#[derive(Default)]
+struct PendingOpenLocalData {
+    chunks: Vec<Bytes>,
+    queued_bytes: usize,
+    scratch: Vec<u8>,
+}
+
+impl PendingOpenLocalData {
+    fn queued_bytes(&self) -> usize {
+        self.queued_bytes
+    }
+
+    fn take_chunks(&mut self) -> Vec<Bytes> {
+        self.queued_bytes = 0;
+        std::mem::take(&mut self.chunks)
+    }
+
+    async fn read_from(
+        &mut self,
+        local: &mut TcpStream,
+        data_frame_size: usize,
+    ) -> PendingOpenLocalRead {
+        let remaining = PENDING_OPEN_BUFFER_LIMIT.saturating_sub(self.queued_bytes);
+        if remaining == 0 {
+            return peek_when_pending_buffer_full(local).await;
+        }
+
+        let read_len = data_frame_size.max(1).min(remaining);
+        if self.scratch.len() < read_len {
+            self.scratch.resize(read_len, 0);
+        }
+
+        match local.read(&mut self.scratch[..read_len]).await {
+            Ok(0) | Err(_) => PendingOpenLocalRead::Closed,
+            Ok(read) => {
+                self.queued_bytes += read;
+                self.chunks
+                    .push(Bytes::copy_from_slice(&self.scratch[..read]));
+                PendingOpenLocalRead::Buffered
+            }
+        }
+    }
+}
+
+async fn peek_when_pending_buffer_full(local: &TcpStream) -> PendingOpenLocalRead {
+    let mut byte = [0_u8; 1];
+    match local.peek(&mut byte).await {
+        Ok(0) | Err(_) => PendingOpenLocalRead::Closed,
+        Ok(_) => PendingOpenLocalRead::ResourceLimit,
     }
 }
 
@@ -613,10 +702,7 @@ async fn handle_socks_connection(
     let target = negotiate_socks_connect(&mut local, socks_handshake_timeout).await?;
 
     transition(&mut state, ClientConnectionState::Opening);
-    let flow = match sessions
-        .open_flow(target, wait_for_socks_disconnect(&local))
-        .await
-    {
+    let flow = match sessions.open_flow(target, &mut local).await {
         Ok(OpenOutcome::Open(flow)) => flow,
         Ok(OpenOutcome::Rejected(reply)) => {
             socks5::send_reply(&mut local, reply).await?;
@@ -649,14 +735,6 @@ async fn handle_socks_connection(
     relay_result
 }
 
-async fn wait_for_socks_disconnect(local: &TcpStream) {
-    let mut byte = [0_u8; 1];
-    match local.peek(&mut byte).await {
-        Ok(0) | Err(_) => {}
-        Ok(_) => std::future::pending::<()>().await,
-    }
-}
-
 async fn negotiate_socks_connect(
     local: &mut TcpStream,
     socks_handshake_timeout: Option<Duration>,
@@ -676,6 +754,8 @@ async fn relay_tcp(mut local: TcpStream, mut flow: ClientFlow) -> Result<(), Any
     let mut remote_to_local_open = true;
     let data_frame_size = flow.session.data_frame_size;
     let mut local_buf = vec![0_u8; data_frame_size].into_boxed_slice();
+
+    flush_pending_local_data(&mut flow).await?;
 
     while local_to_remote_open || remote_to_local_open {
         tokio::select! {
@@ -731,6 +811,23 @@ async fn relay_tcp(mut local: TcpStream, mut flow: ClientFlow) -> Result<(), Any
         }
     }
 
+    Ok(())
+}
+
+async fn flush_pending_local_data(flow: &mut ClientFlow) -> Result<(), AnyError> {
+    let data_frame_size = flow.session.data_frame_size.max(1);
+    for payload in flow.pending_local_data.drain(..) {
+        if payload.len() <= data_frame_size {
+            flow.session.send_tcp_data(flow.id, payload).await?;
+            continue;
+        }
+
+        for chunk in payload.chunks(data_frame_size) {
+            flow.session
+                .send_tcp_data(flow.id, Bytes::copy_from_slice(chunk))
+                .await?;
+        }
+    }
     Ok(())
 }
 

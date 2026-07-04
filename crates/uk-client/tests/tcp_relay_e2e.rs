@@ -119,6 +119,11 @@ async fn relays_tcp_through_socks5_to_echo_target() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relays_data_sent_before_socks_success_reply() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_early_socks_data_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn maps_policy_denied_to_socks_not_allowed() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_policy_denied_e2e()).await?
 }
@@ -269,6 +274,15 @@ async fn cancels_pending_open_when_socks_client_disconnects() -> Result<(), Test
     .await?
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancels_pending_open_after_buffering_early_socks_data() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_pending_open_cancel_after_early_socks_data_e2e(),
+    )
+    .await?
+}
+
 async fn run_tcp_relay_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -282,6 +296,33 @@ async fn run_tcp_relay_e2e() -> Result<(), TestError> {
     let mut echoed = vec![0_u8; "uncrowned king e2e".len()];
     socks.read_exact(&mut echoed).await?;
     assert_eq!(echoed, b"uncrowned king e2e");
+
+    echo_task.await??;
+    Ok(())
+}
+
+async fn run_early_socks_data_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let early_payload = b"uncrowned king early socks data";
+    let (target_addr, echo_task) = spawn_echo_target().await?;
+    let harness = RelayHarness::start(Some(allow_loopback_policy(target_addr.port()))).await?;
+
+    let mut socks = TcpStream::connect(harness.socks_addr).await?;
+    let mut request = socks_connect_request(target_addr);
+    request.extend_from_slice(early_payload);
+    socks.write_all(&request).await?;
+
+    let mut method_response = [0_u8; 2];
+    socks.read_exact(&mut method_response).await?;
+    assert_eq!(method_response, [0x05, 0x00]);
+    let mut connect_reply = [0_u8; 10];
+    socks.read_exact(&mut connect_reply).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    let mut echoed = vec![0_u8; early_payload.len()];
+    socks.read_exact(&mut echoed).await?;
+    assert_eq!(echoed, early_payload);
 
     echo_task.await??;
     Ok(())
@@ -329,6 +370,24 @@ async fn run_pending_open_cancel_on_socks_disconnect_e2e() -> Result<(), TestErr
     let mut harness = PendingOpenCancelServerHarness::start().await?;
     let mut socks = TcpStream::connect(harness.socks_addr).await?;
     let request = socks_connect_request(SocketAddr::from((Ipv4Addr::LOCALHOST, 80)));
+    socks.write_all(&request).await?;
+
+    let mut method_response = [0_u8; 2];
+    socks.read_exact(&mut method_response).await?;
+    assert_eq!(method_response, [0x05, 0x00]);
+    drop(socks);
+
+    assert_eq!(harness.received_close_code().await?, TCP_CLOSE_ERROR);
+    Ok(())
+}
+
+async fn run_pending_open_cancel_after_early_socks_data_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let mut harness = PendingOpenCancelServerHarness::start().await?;
+    let mut socks = TcpStream::connect(harness.socks_addr).await?;
+    let mut request = socks_connect_request(SocketAddr::from((Ipv4Addr::LOCALHOST, 80)));
+    request.extend_from_slice(b"uncrowned king early data before open ack");
     socks.write_all(&request).await?;
 
     let mut method_response = [0_u8; 2];
