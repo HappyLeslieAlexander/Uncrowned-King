@@ -5,13 +5,17 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::Barrier,
     task::JoinHandle,
 };
 use uk_client::{config::ClientConfig, run_socks5_listener};
@@ -140,6 +144,11 @@ async fn closes_target_after_half_close_drain_timeout() -> Result<(), TestError>
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn maps_stream_limit_to_socks_general_failure() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_stream_limit_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relays_concurrent_socks_flows_over_one_session() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_concurrent_multiplex_e2e()).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -334,6 +343,51 @@ async fn run_stream_limit_e2e() -> Result<(), TestError> {
     first_socks.shutdown().await?;
     let target_received = target_task.await??;
     assert_eq!(target_received, b"x");
+    Ok(())
+}
+
+async fn run_concurrent_multiplex_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let first_payload = patterned_payload(4097);
+    let mut second_payload = patterned_payload(7003);
+    second_payload.reverse();
+    let barrier = Arc::new(Barrier::new(2));
+    let (first_target_addr, first_target_task) =
+        spawn_barrier_echo_target(first_payload.len(), Arc::clone(&barrier)).await?;
+    let (second_target_addr, second_target_task) =
+        spawn_barrier_echo_target(second_payload.len(), Arc::clone(&barrier)).await?;
+    let harness = RelayHarness::start_with_limits(
+        Some(allow_loopback_any_port_policy()),
+        test_limits_with_max_streams(2),
+    )
+    .await?;
+
+    let first_open = open_socks_connect(harness.socks_addr, first_target_addr);
+    let second_open = open_socks_connect(harness.socks_addr, second_target_addr);
+    let ((mut first_socks, first_reply), (mut second_socks, second_reply)) =
+        tokio::try_join!(first_open, second_open)?;
+    assert_eq!(first_reply[1], SOCKS_REPLY_SUCCEEDED);
+    assert_eq!(second_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    tokio::try_join!(
+        first_socks.write_all(&first_payload),
+        second_socks.write_all(&second_payload)
+    )?;
+
+    let mut first_echo = vec![0_u8; first_payload.len()];
+    let mut second_echo = vec![0_u8; second_payload.len()];
+    tokio::try_join!(
+        first_socks.read_exact(&mut first_echo),
+        second_socks.read_exact(&mut second_echo)
+    )?;
+    assert_eq!(first_echo, first_payload);
+    assert_eq!(second_echo, second_payload);
+
+    first_socks.shutdown().await?;
+    second_socks.shutdown().await?;
+    assert_eq!(first_target_task.await??, first_payload);
+    assert_eq!(second_target_task.await??, second_payload);
     Ok(())
 }
 
@@ -620,6 +674,29 @@ async fn spawn_fixed_size_echo_target(
         stream.read_exact(&mut buf).await?;
         stream.write_all(&buf).await?;
         Ok(())
+    });
+    Ok((addr, task))
+}
+
+async fn spawn_barrier_echo_target(
+    expected_len: usize,
+    barrier: Arc<Barrier>,
+) -> Result<
+    (
+        SocketAddr,
+        tokio::task::JoinHandle<Result<Vec<u8>, TestError>>,
+    ),
+    TestError,
+> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut received = vec![0_u8; expected_len];
+        stream.read_exact(&mut received).await?;
+        barrier.wait().await;
+        stream.write_all(&received).await?;
+        Ok(received)
     });
     Ok((addr, task))
 }
