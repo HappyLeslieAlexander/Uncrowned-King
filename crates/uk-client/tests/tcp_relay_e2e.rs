@@ -37,8 +37,8 @@ use uk_client::{
 };
 use uk_proto::{
     ALPN_PROTOCOL, ErrorCode, ErrorPayload, Frame, FrameIoError, FrameLimits, FrameType,
-    SettingKey, Settings, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TcpClose, TcpOpen, read_frame,
-    validate_connection_frame, write_frame,
+    SettingKey, Settings, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose,
+    TcpOpen, read_frame, validate_connection_frame, write_frame,
 };
 use uk_server::config::{CredentialConfig, LimitConfig, ServerConfig};
 
@@ -233,6 +233,15 @@ async fn relays_concurrent_socks_flows_over_one_session() -> Result<(), TestErro
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closes_flow_when_buffered_byte_limit_is_exceeded() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_buffered_limit_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keeps_server_session_after_client_flow_resource_limit() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_client_flow_resource_limit_keeps_session_e2e(),
+    )
+    .await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -637,6 +646,47 @@ async fn run_buffered_limit_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+async fn run_client_flow_resource_limit_keeps_session_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (first_target_addr, first_target_task) = spawn_read_to_eof_target().await?;
+    let (second_target_addr, second_target_task) = spawn_echo_target().await?;
+    let harness =
+        ServerHarness::start_with_policy(test_limits(), Some(allow_loopback_any_port_policy()))
+            .await?;
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(harness.client_config(SECRET)).await?;
+
+    write_frame(&mut carrier, &tcp_open_frame(1, first_target_addr)?).await?;
+    read_open_ack(&mut carrier, 1).await?;
+    write_frame(
+        &mut carrier,
+        &flow_status_frame(FrameType::ResourceLimit, 1, ErrorCode::ResourceLimit)?,
+    )
+    .await?;
+    write_frame(&mut carrier, &tcp_close_frame(1, TCP_CLOSE_ERROR)?).await?;
+    assert!(first_target_task.await??.is_empty());
+
+    write_frame(&mut carrier, &tcp_open_frame(3, second_target_addr)?).await?;
+    read_open_ack(&mut carrier, 3).await?;
+    let payload = Bytes::from_static(b"session survived client resource limit");
+    let data = Frame::new(FrameType::TcpData, 0, 3, payload.clone())?;
+    write_frame(&mut carrier, &data).await?;
+
+    let echoed = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(echoed.header.frame_type, FrameType::TcpData);
+    assert_eq!(echoed.header.id, 3);
+    assert_eq!(echoed.payload, payload);
+
+    write_frame(&mut carrier, &tcp_close_frame(3, TCP_CLOSE_NORMAL)?).await?;
+    second_target_task.await??;
+    Ok(())
+}
+
 async fn run_target_half_close_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -966,11 +1016,25 @@ struct ServerHarness {
 
 impl ServerHarness {
     async fn start(limits: LimitConfig) -> Result<Self, TestError> {
+        Self::start_with_policy(limits, None).await
+    }
+
+    async fn start_with_policy(
+        limits: LimitConfig,
+        policy_toml: Option<String>,
+    ) -> Result<Self, TestError> {
         let temp_dir = create_temp_dir()?;
         let cert_path = temp_dir.join("server-cert.pem");
         let key_path = temp_dir.join("server-key.pem");
         fs::write(&cert_path, CERT_PEM)?;
         fs::write(&key_path, KEY_PEM)?;
+        let policy_path = if let Some(policy_toml) = policy_toml {
+            let policy_path = temp_dir.join("policy.toml");
+            fs::write(&policy_path, policy_toml)?;
+            Some(policy_path)
+        } else {
+            None
+        };
         let server_addr = unused_loopback_addr().await?;
         let mut server_task = tokio::spawn(uk_server::run(ServerConfig {
             listen: server_addr.to_string(),
@@ -978,7 +1042,7 @@ impl ServerHarness {
             key_path: path_string(&key_path),
             auth_skew_seconds: Some(30),
             limits: Some(limits),
-            policy_path: None,
+            policy_path: policy_path.as_deref().map(path_string),
             credentials: vec![CredentialConfig {
                 key_id: KEY_ID.to_owned(),
                 secret: SECRET.to_owned(),
@@ -1733,6 +1797,61 @@ async fn open_socks_connect(
     let mut connect_reply = [0_u8; 10];
     socks.read_exact(&mut connect_reply).await?;
     Ok((socks, connect_reply))
+}
+
+fn tcp_open_frame(flow_id: u64, target_addr: SocketAddr) -> Result<Frame, TestError> {
+    let open = TcpOpen::new(target_from_socket_addr(target_addr), TCP_OPEN_FLAGS_NONE);
+    let mut payload = BytesMut::new();
+    open.encode(&mut payload)?;
+    Ok(Frame::new(
+        FrameType::TcpOpen,
+        0,
+        flow_id,
+        payload.freeze(),
+    )?)
+}
+
+fn tcp_close_frame(flow_id: u64, close_code: u16) -> Result<Frame, TestError> {
+    let mut payload = BytesMut::new();
+    TcpClose::new(close_code).encode(&mut payload)?;
+    Ok(Frame::new(
+        FrameType::TcpClose,
+        0,
+        flow_id,
+        payload.freeze(),
+    )?)
+}
+
+fn flow_status_frame(
+    frame_type: FrameType,
+    flow_id: u64,
+    code: ErrorCode,
+) -> Result<Frame, TestError> {
+    let mut payload = BytesMut::new();
+    ErrorPayload::new(code).encode(&mut payload)?;
+    Ok(Frame::new(frame_type, 0, flow_id, payload.freeze())?)
+}
+
+async fn read_open_ack(
+    carrier: &mut ClientTlsStream<TcpStream>,
+    flow_id: u64,
+) -> Result<(), TestError> {
+    let frame = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(frame.header.frame_type, FrameType::TcpData);
+    assert_eq!(frame.header.id, flow_id);
+    assert!(frame.payload.is_empty());
+    Ok(())
+}
+
+fn target_from_socket_addr(target_addr: SocketAddr) -> Target {
+    match target_addr {
+        SocketAddr::V4(addr) => Target::Ipv4(*addr.ip(), addr.port()),
+        SocketAddr::V6(addr) => Target::Ipv6(*addr.ip(), addr.port()),
+    }
 }
 
 fn socks_connect_request(target_addr: SocketAddr) -> Vec<u8> {
