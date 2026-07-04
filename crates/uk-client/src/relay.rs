@@ -62,7 +62,8 @@ struct ClientSession {
     open_timeout: Option<Duration>,
     closed: AtomicBool,
     next_flow_id: AtomicU64,
-    pong_epoch: AtomicU64,
+    next_ping_nonce: AtomicU64,
+    last_pong_nonce: AtomicU64,
     pong_notify: Notify,
 }
 
@@ -318,7 +319,8 @@ impl ClientSession {
             open_timeout: timeout(config.tcp_open_timeout_seconds()),
             closed: AtomicBool::new(false),
             next_flow_id: AtomicU64::new(FIRST_CLIENT_FLOW_ID),
-            pong_epoch: AtomicU64::new(0),
+            next_ping_nonce: AtomicU64::new(0),
+            last_pong_nonce: AtomicU64::new(0),
             pong_notify: Notify::new(),
         });
         spawn_carrier_reader(carrier_reader, Arc::clone(&session));
@@ -543,27 +545,36 @@ impl ClientSession {
         self.write_frame(&pong_frame).await
     }
 
-    async fn write_ping(&self) -> Result<(), AnyError> {
-        let frame = Frame::new(FrameType::Ping, 0, 0, Bytes::new())?;
-        self.write_frame(&frame).await
+    async fn write_ping(&self) -> Result<u64, AnyError> {
+        let nonce = next_keepalive_nonce(&self.next_ping_nonce);
+        let frame = Frame::new(FrameType::Ping, 0, 0, keepalive_nonce_payload(nonce))?;
+        self.write_frame(&frame).await?;
+        Ok(nonce)
     }
 
-    fn observed_pong_epoch(&self) -> u64 {
-        self.pong_epoch.load(Ordering::SeqCst)
+    fn observed_pong_nonce(&self) -> u64 {
+        self.last_pong_nonce.load(Ordering::SeqCst)
     }
 
-    fn record_pong(&self) {
-        self.pong_epoch.fetch_add(1, Ordering::SeqCst);
-        self.pong_notify.notify_one();
+    fn record_pong(&self, payload: &Bytes) {
+        let Some(nonce) = decode_keepalive_nonce(payload) else {
+            debug!(
+                event = "client.session.keepalive.pong_ignored",
+                payload_len = payload.len()
+            );
+            return;
+        };
+        self.last_pong_nonce.store(nonce, Ordering::SeqCst);
+        self.pong_notify.notify_waiters();
     }
 
-    async fn wait_for_pong_after(&self, observed_epoch: u64) -> bool {
+    async fn wait_for_pong(&self, nonce: u64) -> bool {
         loop {
             if self.is_closed() {
                 return false;
             }
             let notified = self.pong_notify.notified();
-            if self.observed_pong_epoch() != observed_epoch {
+            if self.observed_pong_nonce() == nonce {
                 return true;
             }
             notified.await;
@@ -650,6 +661,26 @@ fn allocate_client_flow_id(next_flow_id: &AtomicU64) -> Option<u64> {
     }
 }
 
+fn next_keepalive_nonce(counter: &AtomicU64) -> u64 {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = if current == u64::MAX { 1 } else { current + 1 };
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn keepalive_nonce_payload(nonce: u64) -> Bytes {
+    Bytes::copy_from_slice(&nonce.to_be_bytes())
+}
+
+fn decode_keepalive_nonce(payload: &Bytes) -> Option<u64> {
+    let bytes: [u8; 8] = payload.as_ref().try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
+}
+
 fn spawn_carrier_reader(
     mut carrier_reader: ReadHalf<TlsStream<TcpStream>>,
     session: Arc<ClientSession>,
@@ -687,12 +718,14 @@ fn spawn_keepalive(session: Arc<ClientSession>, interval: Duration) {
             if !session.has_open_flows().await {
                 continue;
             }
-            let observed_pong_epoch = session.observed_pong_epoch();
-            if let Err(err) = session.write_ping().await {
-                debug!(event = "client.session.keepalive.error", error = %err);
-                return;
-            }
-            match time::timeout(interval, session.wait_for_pong_after(observed_pong_epoch)).await {
+            let nonce = match session.write_ping().await {
+                Ok(nonce) => nonce,
+                Err(err) => {
+                    debug!(event = "client.session.keepalive.error", error = %err);
+                    return;
+                }
+            };
+            match time::timeout(interval, session.wait_for_pong(nonce)).await {
                 Ok(true) => {}
                 Ok(false) => return,
                 Err(_) => {
@@ -757,7 +790,7 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
                 report_protocol_error(session).await;
                 return Err(err);
             }
-            session.record_pong();
+            session.record_pong(&frame.payload);
             Ok(())
         }
         _ => {
@@ -1641,6 +1674,33 @@ mod tests {
         );
         assert_eq!(allocate_client_flow_id(&next_flow_id), Some(MAX_VARINT));
         assert_eq!(allocate_client_flow_id(&next_flow_id), None);
+    }
+
+    #[test]
+    fn allocates_nonzero_keepalive_nonces() {
+        let counter = AtomicU64::new(0);
+
+        assert_eq!(next_keepalive_nonce(&counter), 1);
+        assert_eq!(next_keepalive_nonce(&counter), 2);
+    }
+
+    #[test]
+    fn keepalive_nonce_wrap_skips_zero() {
+        let counter = AtomicU64::new(u64::MAX);
+
+        assert_eq!(next_keepalive_nonce(&counter), 1);
+    }
+
+    #[test]
+    fn decodes_keepalive_nonce_payloads() {
+        let payload = keepalive_nonce_payload(42);
+
+        assert_eq!(decode_keepalive_nonce(&payload), Some(42));
+        assert_eq!(decode_keepalive_nonce(&Bytes::new()), None);
+        assert_eq!(
+            decode_keepalive_nonce(&Bytes::from_static(b"too long!")),
+            None
+        );
     }
 
     #[test]
