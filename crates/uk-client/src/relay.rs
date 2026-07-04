@@ -36,7 +36,6 @@ use crate::{
 
 const FLOW_ID_ALLOCATION_ATTEMPTS: usize = 1024;
 const FLOW_FRAME_QUEUE_CAPACITY: usize = 32;
-const PENDING_OPEN_BUFFER_LIMIT: usize = 64 * 1024;
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const DEFAULT_MAX_STREAMS: u64 = 64;
 
@@ -59,6 +58,7 @@ struct ClientSession {
     limits: FrameLimits,
     data_frame_size: usize,
     max_streams: u64,
+    max_pending_open_bytes: usize,
     max_buffered_bytes_per_session: usize,
     session_buffer: ClientSessionBufferControl,
     open_timeout: Option<Duration>,
@@ -446,6 +446,7 @@ impl ClientSession {
             limits,
             data_frame_size: tcp_data_frame_size(limits),
             max_streams: max_streams(&settings),
+            max_pending_open_bytes: usize_limit(config.max_pending_open_bytes())?,
             max_buffered_bytes_per_session: usize_limit(config.max_buffered_bytes_per_session())?,
             session_buffer,
             open_timeout: timeout(config.tcp_open_timeout_seconds()),
@@ -578,7 +579,11 @@ impl ClientSession {
                         .map(OpenWaitOutcome::Frame)
                         .ok_or_else(|| "uk session closed while opening flow".into());
                 }
-                read = pending_local_data.read_from(local, self.data_frame_size) => {
+                read = pending_local_data.read_from(
+                    local,
+                    self.data_frame_size,
+                    self.max_pending_open_bytes,
+                ) => {
                     match read {
                         PendingOpenLocalRead::Buffered => {}
                         PendingOpenLocalRead::Closed => {
@@ -746,8 +751,9 @@ impl PendingOpenLocalData {
         &mut self,
         local: &mut TcpStream,
         data_frame_size: usize,
+        byte_limit: usize,
     ) -> PendingOpenLocalRead {
-        let remaining = PENDING_OPEN_BUFFER_LIMIT.saturating_sub(self.queued_bytes);
+        let remaining = byte_limit.saturating_sub(self.queued_bytes);
         if remaining == 0 {
             return peek_when_pending_buffer_full(local).await;
         }
@@ -1430,6 +1436,7 @@ mod tests {
             handshake_timeout_seconds: None,
             socks_handshake_timeout_seconds: None,
             tcp_open_timeout_seconds: None,
+            max_pending_open_bytes: None,
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
         }

@@ -28,6 +28,8 @@ pub struct ClientConfig {
     pub socks_handshake_timeout_seconds: Option<u64>,
     /// Optional timeout for waiting on TCP open acknowledgement in seconds.
     pub tcp_open_timeout_seconds: Option<u64>,
+    /// Optional maximum local bytes buffered while waiting for TCP open ack.
+    pub max_pending_open_bytes: Option<u64>,
     /// Optional maximum concurrent local SOCKS5 connections.
     pub max_socks_connections: Option<u64>,
     /// Optional maximum queued server-to-local bytes across one UK session.
@@ -55,6 +57,11 @@ impl ClientConfig {
     /// TCP open acknowledgement timeout in seconds. Zero disables it.
     pub fn tcp_open_timeout_seconds(&self) -> u64 {
         self.tcp_open_timeout_seconds.unwrap_or(10)
+    }
+
+    /// Maximum local bytes buffered while waiting for TCP open ack.
+    pub fn max_pending_open_bytes(&self) -> u64 {
+        self.max_pending_open_bytes.unwrap_or(65_536)
     }
 
     /// Maximum concurrent local SOCKS5 connections.
@@ -105,6 +112,15 @@ impl ClientConfig {
         }
         usize::try_from(max_socks_connections)
             .map_err(|_| "max_socks_connections is too large for this platform")?;
+        let max_pending_open_bytes = self.max_pending_open_bytes();
+        if max_pending_open_bytes == 0 {
+            return Err("max_pending_open_bytes must be greater than zero".into());
+        }
+        if max_pending_open_bytes > MAX_FRAME_PAYLOAD_SIZE {
+            return Err(
+                format!("max_pending_open_bytes must be at most {MAX_FRAME_PAYLOAD_SIZE}").into(),
+            );
+        }
         let max_buffered_bytes_per_session = self.max_buffered_bytes_per_session();
         if max_buffered_bytes_per_session == 0 {
             return Err("max_buffered_bytes_per_session must be greater than zero".into());
@@ -143,6 +159,7 @@ mod tests {
             handshake_timeout_seconds: None,
             socks_handshake_timeout_seconds: None,
             tcp_open_timeout_seconds: None,
+            max_pending_open_bytes: None,
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
         }
@@ -217,6 +234,44 @@ tcp_open_timeout_seconds = 6
     #[test]
     fn defaults_max_socks_connections() {
         assert_eq!(minimal_config().max_socks_connections(), 1024);
+    }
+
+    #[test]
+    fn defaults_pending_open_buffer_limit() {
+        assert_eq!(minimal_config().max_pending_open_bytes(), 65_536);
+    }
+
+    #[test]
+    fn parses_pending_open_buffer_limit() {
+        let config: ClientConfig = toml::from_str(
+            r#"
+server_addr = "127.0.0.1:443"
+server_name = "localhost"
+ca_cert_path = "ca.pem"
+key_id = "client"
+secret = "secret"
+max_pending_open_bytes = 2048
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.max_pending_open_bytes(), 2048);
+    }
+
+    #[test]
+    fn rejects_zero_pending_open_buffer_limit() {
+        let mut config = minimal_config();
+        config.max_pending_open_bytes = Some(0);
+
+        assert!(config.validate_resource_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_too_large_pending_open_buffer_limit() {
+        let mut config = minimal_config();
+        config.max_pending_open_bytes = Some(MAX_FRAME_PAYLOAD_SIZE + 1);
+
+        assert!(config.validate_resource_limits().is_err());
     }
 
     #[test]
@@ -297,6 +352,7 @@ secret = "secret"
 handshake_timeout_seconds = 0
 socks_handshake_timeout_seconds = 0
 tcp_open_timeout_seconds = 0
+max_pending_open_bytes = 1024
 max_socks_connections = 1
 max_buffered_bytes_per_session = 1024
 "#,
@@ -306,6 +362,7 @@ max_buffered_bytes_per_session = 1024
         assert_eq!(config.handshake_timeout_seconds(), 0);
         assert_eq!(config.socks_handshake_timeout_seconds(), 0);
         assert_eq!(config.tcp_open_timeout_seconds(), 0);
+        assert_eq!(config.max_pending_open_bytes(), 1024);
         assert_eq!(config.max_socks_connections(), 1);
         assert_eq!(config.max_buffered_bytes_per_session(), 1024);
     }

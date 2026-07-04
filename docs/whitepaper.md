@@ -427,6 +427,7 @@ Recommended client behavior:
 Maintain 1 warm control connection.
 Maintain up to N active carrier connections.
 Bound concurrent local SOCKS listener connections.
+Bound local bytes buffered while a TCP open is pending.
 Bound queued server-to-local bytes per client session.
 Try configured fallback server endpoints before surfacing connect failure.
 Prefer QUIC when RTT and loss are acceptable.
