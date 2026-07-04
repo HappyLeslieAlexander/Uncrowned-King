@@ -81,6 +81,14 @@ enum OpenResponse {
     Rejected(socks5::Reply),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlowFrameRoute {
+    UnknownFlow,
+    Enqueued,
+    FlowClosed,
+    FlowQueueFull,
+}
+
 pub(crate) async fn run_socks5_listener(
     config: ClientConfig,
     listen: String,
@@ -346,20 +354,13 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
         | FrameType::Error
         | FrameType::PolicyDenied
         | FrameType::ResourceLimit => {
-            let flow_id = frame.header.id;
-            let sender = session.flows.lock().await.get(&flow_id).cloned();
-            if let Some(sender) = sender {
-                match sender.try_send(frame) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        session.flows.lock().await.remove(&flow_id);
-                    }
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        warn!(event = "client.flow.queue_full", flow_id);
-                        session.flows.lock().await.remove(&flow_id);
-                        session.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await?;
-                    }
-                }
+            let (flow_id, route) = {
+                let mut flows = session.flows.lock().await;
+                route_flow_frame(frame, &mut flows)
+            };
+            if route == FlowFrameRoute::FlowQueueFull {
+                warn!(event = "client.flow.queue_full", flow_id);
+                session.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await?;
             }
             Ok(())
         }
@@ -367,6 +368,29 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
         FrameType::Pong => Ok(()),
         _ => Err("unexpected frame on client session".into()),
     }
+}
+
+fn route_flow_frame(
+    frame: Frame,
+    flows: &mut HashMap<u64, mpsc::Sender<Frame>>,
+) -> (u64, FlowFrameRoute) {
+    let flow_id = frame.header.id;
+    let Some(sender) = flows.get(&flow_id) else {
+        return (flow_id, FlowFrameRoute::UnknownFlow);
+    };
+
+    let route = match sender.try_send(frame) {
+        Ok(()) => FlowFrameRoute::Enqueued,
+        Err(mpsc::error::TrySendError::Closed(_)) => FlowFrameRoute::FlowClosed,
+        Err(mpsc::error::TrySendError::Full(_)) => FlowFrameRoute::FlowQueueFull,
+    };
+    if matches!(
+        route,
+        FlowFrameRoute::FlowClosed | FlowFrameRoute::FlowQueueFull
+    ) {
+        flows.remove(&flow_id);
+    }
+    (flow_id, route)
 }
 
 async fn handle_socks_connection(
@@ -626,10 +650,82 @@ mod tests {
         Frame::new(FrameType::Error, 0, FLOW_ID, status_payload(code)).unwrap()
     }
 
+    fn data_frame(flow_id: u64, payload: Bytes) -> Frame {
+        Frame::new(FrameType::TcpData, 0, flow_id, payload).unwrap()
+    }
+
     fn close_frame(close_code: u16) -> Frame {
         let mut payload = BytesMut::new();
         TcpClose::new(close_code).encode(&mut payload).unwrap();
         Frame::new(FrameType::TcpClose, 0, FLOW_ID, payload.freeze()).unwrap()
+    }
+
+    #[test]
+    fn routes_carrier_frame_to_existing_flow() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut flows = HashMap::new();
+        flows.insert(FLOW_ID, sender);
+
+        assert_eq!(
+            route_flow_frame(
+                data_frame(FLOW_ID, Bytes::from_static(b"hello")),
+                &mut flows
+            ),
+            (FLOW_ID, FlowFrameRoute::Enqueued)
+        );
+
+        let frame = receiver.try_recv().unwrap();
+        assert_eq!(frame.header.id, FLOW_ID);
+        assert_eq!(frame.payload, Bytes::from_static(b"hello"));
+        assert!(flows.contains_key(&FLOW_ID));
+    }
+
+    #[test]
+    fn ignores_carrier_frame_for_unknown_flow() {
+        let mut flows = HashMap::new();
+
+        assert_eq!(
+            route_flow_frame(data_frame(99, Bytes::from_static(b"late")), &mut flows),
+            (99, FlowFrameRoute::UnknownFlow)
+        );
+        assert!(flows.is_empty());
+    }
+
+    #[test]
+    fn removes_closed_flow_sender() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let mut flows = HashMap::new();
+        flows.insert(FLOW_ID, sender);
+
+        assert_eq!(
+            route_flow_frame(data_frame(FLOW_ID, Bytes::from_static(b"late")), &mut flows),
+            (FLOW_ID, FlowFrameRoute::FlowClosed)
+        );
+        assert!(!flows.contains_key(&FLOW_ID));
+    }
+
+    #[test]
+    fn removes_full_flow_sender() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender
+            .try_send(data_frame(FLOW_ID, Bytes::from_static(b"queued")))
+            .unwrap();
+        let mut flows = HashMap::new();
+        flows.insert(FLOW_ID, sender);
+
+        assert_eq!(
+            route_flow_frame(
+                data_frame(FLOW_ID, Bytes::from_static(b"overflow")),
+                &mut flows
+            ),
+            (FLOW_ID, FlowFrameRoute::FlowQueueFull)
+        );
+        assert!(!flows.contains_key(&FLOW_ID));
+        assert_eq!(
+            receiver.try_recv().unwrap().payload,
+            Bytes::from_static(b"queued")
+        );
     }
 
     #[test]
