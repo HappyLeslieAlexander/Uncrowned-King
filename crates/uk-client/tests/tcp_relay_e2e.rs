@@ -292,6 +292,11 @@ async fn closes_target_after_half_close_drain_timeout() -> Result<(), TestError>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closes_client_after_half_close_drain_timeout() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_client_half_close_timeout_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn maps_stream_limit_to_socks_general_failure() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_stream_limit_e2e()).await?
 }
@@ -960,6 +965,33 @@ async fn run_half_close_timeout_e2e() -> Result<(), TestError> {
 
     let target_received = target_task.await??;
     assert!(target_received.is_empty());
+    Ok(())
+}
+
+async fn run_client_half_close_timeout_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, release_target, target_task) =
+        spawn_read_to_eof_until_released_target().await?;
+    let harness = RelayHarness::start_with_limits(
+        Some(allow_loopback_policy(target_addr.port())),
+        test_limits_with_half_close_timeout(1),
+    )
+    .await?;
+
+    let (mut socks, connect_reply) = open_socks_connect(harness.socks_addr, target_addr).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    socks.write_all(HALF_CLOSE_REQUEST).await?;
+    socks.shutdown().await?;
+
+    let mut byte = [0_u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(3), socks.read(&mut byte)).await??;
+    assert_eq!(read, 0);
+
+    let _ = release_target.send(());
+    let target_received = target_task.await??;
+    assert_eq!(target_received, HALF_CLOSE_REQUEST);
     Ok(())
 }
 
@@ -2501,6 +2533,27 @@ async fn spawn_read_to_eof_target() -> Result<
         Ok(received)
     });
     Ok((addr, task))
+}
+
+async fn spawn_read_to_eof_until_released_target() -> Result<
+    (
+        SocketAddr,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<Vec<u8>, TestError>>,
+    ),
+    TestError,
+> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = listener.local_addr()?;
+    let (release_tx, release_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await?;
+        let _ = release_rx.await;
+        Ok(received)
+    });
+    Ok((addr, release_tx, task))
 }
 
 async fn spawn_write_shutdown_then_read_target(

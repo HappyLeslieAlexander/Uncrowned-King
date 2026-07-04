@@ -107,9 +107,18 @@ enum FlowEvent {
         result: Result<TcpStream, OpenFailure>,
     },
     ReadClosed(u64),
-    ReadDrainExpired(u64),
+    HalfCloseDrainExpired {
+        flow_id: u64,
+        closed_side: HalfCloseSide,
+    },
     WriteClosed(u64),
     Activity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HalfCloseSide {
+    TargetToClient,
+    ClientToTarget,
 }
 
 enum SessionEvent {
@@ -314,8 +323,11 @@ async fn handle_flow_event(
         Some(FlowEvent::ReadClosed(flow_id)) => {
             handle_target_read_closed(flow_id, context, target_writers);
         }
-        Some(FlowEvent::ReadDrainExpired(flow_id)) => {
-            handle_read_drain_expired(flow_id, context, target_writers).await?;
+        Some(FlowEvent::HalfCloseDrainExpired {
+            flow_id,
+            closed_side,
+        }) => {
+            handle_half_close_drain_expired(flow_id, closed_side, context, target_writers).await?;
         }
         Some(FlowEvent::WriteClosed(flow_id)) => {
             handle_target_write_closed(flow_id, target_writers);
@@ -335,7 +347,12 @@ fn handle_target_read_closed(
         info!(event = "tcp.target_read_closed", flow_id);
         if target.client_to_target_open {
             if let Some(timeout) = context.limits.tcp_half_close_timeout {
-                spawn_half_close_timer(flow_id, timeout, context.event_tx.clone());
+                spawn_half_close_timer(
+                    flow_id,
+                    HalfCloseSide::TargetToClient,
+                    timeout,
+                    context.event_tx.clone(),
+                );
             }
         }
         if target.is_fully_closed() {
@@ -345,17 +362,29 @@ fn handle_target_read_closed(
     }
 }
 
-async fn handle_read_drain_expired(
+async fn handle_half_close_drain_expired(
     flow_id: u64,
+    closed_side: HalfCloseSide,
     context: &RelaySessionContext<'_>,
     target_writers: &mut FlowTable,
 ) -> Result<(), AnyError> {
     let (should_remove, should_close_peer) =
         if let Some(target) = open_target_flow_mut(target_writers, flow_id) {
-            let should_close_peer = !target.target_to_client_open && target.client_to_target_open;
-            if should_close_peer {
-                target.close_client_to_target();
-            }
+            let should_close_peer = match closed_side {
+                HalfCloseSide::TargetToClient
+                    if !target.target_to_client_open && target.client_to_target_open =>
+                {
+                    target.close_client_to_target();
+                    true
+                }
+                HalfCloseSide::ClientToTarget
+                    if !target.client_to_target_open && target.target_to_client_open =>
+                {
+                    target.abort();
+                    true
+                }
+                _ => false,
+            };
             (target.is_fully_closed(), should_close_peer)
         } else {
             (false, false)
@@ -365,7 +394,7 @@ async fn handle_read_drain_expired(
     }
     if should_remove {
         remove_flow_slot(target_writers, flow_id);
-        info!(event = "tcp.half_close_timeout", flow_id);
+        info!(event = "tcp.half_close_timeout", flow_id, side = ?closed_side);
     }
     Ok(())
 }
@@ -574,7 +603,18 @@ async fn handle_tcp_close_frame(
         Some(FlowSlot::Opening(_)) => true,
         Some(FlowSlot::Open(target)) => {
             if close.close_code == TCP_CLOSE_NORMAL {
+                let should_start_drain_timer = target.target_to_client_open;
                 target.close_client_to_target();
+                if should_start_drain_timer {
+                    if let Some(timeout) = context.limits.tcp_half_close_timeout {
+                        spawn_half_close_timer(
+                            flow_id,
+                            HalfCloseSide::ClientToTarget,
+                            timeout,
+                            context.event_tx.clone(),
+                        );
+                    }
+                }
             } else {
                 target.abort();
             }
@@ -948,12 +988,16 @@ fn spawn_target_writer(
 
 fn spawn_half_close_timer(
     flow_id: u64,
+    closed_side: HalfCloseSide,
     timeout: Duration,
     event_tx: mpsc::UnboundedSender<FlowEvent>,
 ) {
     tokio::spawn(async move {
         tokio::time::sleep(timeout).await;
-        let _ = event_tx.send(FlowEvent::ReadDrainExpired(flow_id));
+        let _ = event_tx.send(FlowEvent::HalfCloseDrainExpired {
+            flow_id,
+            closed_side,
+        });
     });
 }
 
