@@ -23,7 +23,7 @@ use uk_proto::{
     ErrorCode, ErrorPayload, FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, Frame, FrameIoError, FrameLimits,
     FrameType, SettingKey, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target,
     TcpClose, TcpOpen, frame::DEFAULT_MAX_FRAME_SIZE, is_client_initiated_flow_id, read_frame,
-    write_frame,
+    validate_connection_frame, write_frame,
 };
 
 use crate::{
@@ -406,10 +406,21 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
             }
             Ok(())
         }
-        FrameType::Ping => session.write_pong(&frame).await,
-        FrameType::Pong => Ok(()),
+        FrameType::Ping => {
+            validate_session_control_frame(&frame, FrameType::Ping)?;
+            session.write_pong(&frame).await
+        }
+        FrameType::Pong => {
+            validate_session_control_frame(&frame, FrameType::Pong)?;
+            Ok(())
+        }
         _ => Err("unexpected frame on client session".into()),
     }
+}
+
+fn validate_session_control_frame(frame: &Frame, expected_type: FrameType) -> Result<(), AnyError> {
+    validate_connection_frame(frame, expected_type)?;
+    Ok(())
 }
 
 fn route_flow_frame(
@@ -732,6 +743,10 @@ mod tests {
         Frame::new(FrameType::TcpClose, 0, FLOW_ID, payload.freeze()).unwrap()
     }
 
+    fn control_frame(frame_type: FrameType, flow_id: u64) -> Frame {
+        Frame::new(frame_type, 0, flow_id, Bytes::new()).unwrap()
+    }
+
     #[test]
     fn routes_carrier_frame_to_existing_flow() {
         let (sender, mut receiver) = mpsc::channel(1);
@@ -990,6 +1005,36 @@ mod tests {
         let frame = Frame::new(FrameType::Ping, 0, FLOW_ID, Bytes::new()).unwrap();
 
         assert!(decode_open_response(frame).is_err());
+    }
+
+    #[test]
+    fn accepts_zero_id_session_control_frame() {
+        assert!(
+            validate_session_control_frame(&control_frame(FrameType::Ping, 0), FrameType::Ping)
+                .is_ok()
+        );
+        assert!(
+            validate_session_control_frame(&control_frame(FrameType::Pong, 0), FrameType::Pong)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_nonzero_id_session_control_frame() {
+        assert!(
+            validate_session_control_frame(
+                &control_frame(FrameType::Ping, FLOW_ID),
+                FrameType::Ping
+            )
+            .is_err()
+        );
+        assert!(
+            validate_session_control_frame(
+                &control_frame(FrameType::Pong, FLOW_ID),
+                FrameType::Pong
+            )
+            .is_err()
+        );
     }
 
     #[test]

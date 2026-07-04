@@ -29,7 +29,7 @@ use uk_policy::{PolicyContext, PolicyDecision, PolicySet};
 use uk_proto::{
     ErrorCode, ErrorPayload, Frame, FrameIoError, FrameLimits, FrameType, TCP_CLOSE_ERROR,
     TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, is_client_initiated_flow_id,
-    read_frame, write_frame,
+    read_frame, validate_connection_frame, write_frame,
 };
 
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
@@ -304,10 +304,21 @@ async fn handle_session_frame(
         }
         FrameType::TcpData => handle_tcp_data_frame(frame, context, target_writers).await,
         FrameType::TcpClose => handle_tcp_close_frame(frame, context, target_writers).await,
-        FrameType::Ping => write_pong(context.carrier_writer, &frame).await,
-        FrameType::Pong => Ok(()),
+        FrameType::Ping => {
+            validate_session_control_frame(&frame, FrameType::Ping)?;
+            write_pong(context.carrier_writer, &frame).await
+        }
+        FrameType::Pong => {
+            validate_session_control_frame(&frame, FrameType::Pong)?;
+            Ok(())
+        }
         _ => Err("unexpected frame while relaying session".into()),
     }
+}
+
+fn validate_session_control_frame(frame: &Frame, expected_type: FrameType) -> Result<(), AnyError> {
+    validate_connection_frame(frame, expected_type)?;
+    Ok(())
 }
 
 async fn handle_tcp_data_frame(
@@ -1091,6 +1102,10 @@ mod tests {
         TargetFlow::new(commands, TargetFlowControl::default())
     }
 
+    fn control_frame(frame_type: FrameType, flow_id: u64) -> Frame {
+        Frame::new(frame_type, 0, flow_id, Bytes::new()).unwrap()
+    }
+
     #[test]
     fn client_half_close_keeps_flow_reserved_until_target_read_closes() {
         let mut flow = test_target_flow();
@@ -1242,6 +1257,30 @@ mod tests {
             map_frame_event(Err(FrameIoError::Closed)).unwrap(),
             SessionEvent::PeerClosed
         ));
+    }
+
+    #[test]
+    fn accepts_zero_id_session_control_frame() {
+        assert!(
+            validate_session_control_frame(&control_frame(FrameType::Ping, 0), FrameType::Ping)
+                .is_ok()
+        );
+        assert!(
+            validate_session_control_frame(&control_frame(FrameType::Pong, 0), FrameType::Pong)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_nonzero_id_session_control_frame() {
+        assert!(
+            validate_session_control_frame(&control_frame(FrameType::Ping, 1), FrameType::Ping)
+                .is_err()
+        );
+        assert!(
+            validate_session_control_frame(&control_frame(FrameType::Pong, 1), FrameType::Pong)
+                .is_err()
+        );
     }
 
     #[test]
