@@ -37,7 +37,8 @@ use uk_client::{
 };
 use uk_proto::{
     ALPN_PROTOCOL, ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, SettingKey, Settings,
-    TCP_CLOSE_NORMAL, TcpClose, TcpOpen, read_frame, validate_connection_frame, write_frame,
+    TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TcpClose, TcpOpen, read_frame, validate_connection_frame,
+    write_frame,
 };
 use uk_server::config::{CredentialConfig, LimitConfig, ServerConfig};
 
@@ -259,6 +260,15 @@ async fn closes_idle_socks_handshake_after_timeout() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_socks_handshake_timeout_e2e()).await?
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancels_pending_open_when_socks_client_disconnects() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_pending_open_cancel_on_socks_disconnect_e2e(),
+    )
+    .await?
+}
+
 async fn run_tcp_relay_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -310,6 +320,23 @@ async fn run_socks_handshake_timeout_e2e() -> Result<(), TestError> {
     let mut byte = [0_u8; 1];
 
     assert_eq!(socks.read(&mut byte).await?, 0);
+    Ok(())
+}
+
+async fn run_pending_open_cancel_on_socks_disconnect_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let mut harness = PendingOpenCancelServerHarness::start().await?;
+    let mut socks = TcpStream::connect(harness.socks_addr).await?;
+    let request = socks_connect_request(SocketAddr::from((Ipv4Addr::LOCALHOST, 80)));
+    socks.write_all(&request).await?;
+
+    let mut method_response = [0_u8; 2];
+    socks.read_exact(&mut method_response).await?;
+    assert_eq!(method_response, [0x05, 0x00]);
+    drop(socks);
+
+    assert_eq!(harness.received_close_code().await?, TCP_CLOSE_ERROR);
     Ok(())
 }
 
@@ -1002,11 +1029,128 @@ impl Drop for MalformedFrameServerHarness {
     }
 }
 
+struct PendingOpenCancelServerHarness {
+    temp_dir: PathBuf,
+    socks_addr: SocketAddr,
+    server_task: Option<JoinHandle<Result<u16, TestError>>>,
+    client_task: JoinHandle<Result<(), TestError>>,
+}
+
+impl PendingOpenCancelServerHarness {
+    async fn start() -> Result<Self, TestError> {
+        let temp_dir = create_temp_dir()?;
+        let cert_path = temp_dir.join("server-cert.pem");
+        let key_path = temp_dir.join("server-key.pem");
+        fs::write(&cert_path, CERT_PEM)?;
+        fs::write(&key_path, KEY_PEM)?;
+
+        let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let server_addr = server_listener.local_addr()?;
+        let socks_addr = unused_loopback_addr().await?;
+        let server_task = tokio::spawn(run_pending_open_cancel_server(
+            server_listener,
+            cert_path.clone(),
+            key_path,
+        ));
+        let mut client_task = tokio::spawn(run_socks5_listener(
+            ClientConfig {
+                server_addr: server_addr.to_string(),
+                server_name: "localhost".to_owned(),
+                ca_cert_path: path_string(&cert_path),
+                key_id: KEY_ID.to_owned(),
+                secret: SECRET.to_owned(),
+                handshake_timeout_seconds: Some(3),
+                socks_handshake_timeout_seconds: Some(3),
+                tcp_open_timeout_seconds: Some(30),
+            },
+            socks_addr.to_string(),
+        ));
+        wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+
+        Ok(Self {
+            temp_dir,
+            socks_addr,
+            server_task: Some(server_task),
+            client_task,
+        })
+    }
+
+    async fn received_close_code(&mut self) -> Result<u16, TestError> {
+        let task = self
+            .server_task
+            .take()
+            .ok_or("pending open cancel server task was already awaited")?;
+        tokio::time::timeout(Duration::from_secs(3), task).await??
+    }
+}
+
+impl Drop for PendingOpenCancelServerHarness {
+    fn drop(&mut self) {
+        self.client_task.abort();
+        if let Some(task) = self.server_task.take() {
+            task.abort();
+        }
+        let _ = fs::remove_dir_all(&self.temp_dir);
+    }
+}
+
 async fn run_malformed_frame_server(
     listener: TcpListener,
     cert_path: PathBuf,
     key_path: PathBuf,
 ) -> Result<ErrorCode, TestError> {
+    let mut stream = accept_fake_server_session(listener, cert_path, key_path).await?;
+    let open_frame = read_frame(&mut stream, FrameLimits::default()).await?;
+    assert_eq!(open_frame.header.frame_type, FrameType::TcpOpen);
+    let flow_id = open_frame.header.id;
+    let mut open_payload = open_frame.payload;
+    TcpOpen::decode(&mut open_payload)?;
+
+    let ack = Frame::new(FrameType::TcpData, 0, flow_id, Bytes::new())?;
+    write_frame(&mut stream, &ack).await?;
+
+    let malformed_close = Frame::new(FrameType::TcpClose, 0, flow_id, Bytes::new())?;
+    write_frame(&mut stream, &malformed_close).await?;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut stream, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(response.header.frame_type, FrameType::Error);
+    assert_eq!(response.header.id, 0);
+    let mut payload = response.payload;
+    Ok(ErrorPayload::decode(&mut payload)?.code)
+}
+
+async fn run_pending_open_cancel_server(
+    listener: TcpListener,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+) -> Result<u16, TestError> {
+    let mut stream = accept_fake_server_session(listener, cert_path, key_path).await?;
+    let open_frame = read_frame(&mut stream, FrameLimits::default()).await?;
+    assert_eq!(open_frame.header.frame_type, FrameType::TcpOpen);
+    let flow_id = open_frame.header.id;
+    let mut open_payload = open_frame.payload;
+    TcpOpen::decode(&mut open_payload)?;
+
+    let close_frame = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut stream, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(close_frame.header.frame_type, FrameType::TcpClose);
+    assert_eq!(close_frame.header.id, flow_id);
+    let mut payload = close_frame.payload;
+    Ok(TcpClose::decode(&mut payload)?.close_code)
+}
+
+async fn accept_fake_server_session(
+    listener: TcpListener,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+) -> Result<ServerTlsStream<TcpStream>, TestError> {
     let (tcp, _) = listener.accept().await?;
     tcp.set_nodelay(true)?;
     let acceptor = TlsAcceptor::from(Arc::new(server_tls_config(&cert_path, &key_path)?));
@@ -1046,28 +1190,7 @@ async fn run_malformed_frame_server(
     settings.encode(&mut settings_payload)?;
     let settings_frame = Frame::new(FrameType::Settings, 0, 0, settings_payload.freeze())?;
     write_frame(&mut stream, &settings_frame).await?;
-
-    let open_frame = read_frame(&mut stream, FrameLimits::default()).await?;
-    assert_eq!(open_frame.header.frame_type, FrameType::TcpOpen);
-    let flow_id = open_frame.header.id;
-    let mut open_payload = open_frame.payload;
-    TcpOpen::decode(&mut open_payload)?;
-
-    let ack = Frame::new(FrameType::TcpData, 0, flow_id, Bytes::new())?;
-    write_frame(&mut stream, &ack).await?;
-
-    let malformed_close = Frame::new(FrameType::TcpClose, 0, flow_id, Bytes::new())?;
-    write_frame(&mut stream, &malformed_close).await?;
-
-    let response = tokio::time::timeout(
-        Duration::from_secs(3),
-        read_frame(&mut stream, FrameLimits::default()),
-    )
-    .await??;
-    assert_eq!(response.header.frame_type, FrameType::Error);
-    assert_eq!(response.header.id, 0);
-    let mut payload = response.payload;
-    Ok(ErrorPayload::decode(&mut payload)?.code)
+    Ok(stream)
 }
 
 fn server_tls_config(cert_path: &Path, key_path: &Path) -> Result<RustlsServerConfig, TestError> {
@@ -1395,6 +1518,20 @@ async fn open_socks_connect(
     socks_addr: SocketAddr,
     target_addr: SocketAddr,
 ) -> Result<(TcpStream, [u8; 10]), TestError> {
+    let request = socks_connect_request(target_addr);
+
+    let mut socks = TcpStream::connect(socks_addr).await?;
+    socks.write_all(&request).await?;
+
+    let mut method_response = [0_u8; 2];
+    socks.read_exact(&mut method_response).await?;
+    assert_eq!(method_response, [0x05, 0x00]);
+    let mut connect_reply = [0_u8; 10];
+    socks.read_exact(&mut connect_reply).await?;
+    Ok((socks, connect_reply))
+}
+
+fn socks_connect_request(target_addr: SocketAddr) -> Vec<u8> {
     let port = target_addr.port();
     let mut request = vec![0x05, 0x01, 0x00, 0x05, 0x01, 0x00];
     match target_addr {
@@ -1408,16 +1545,7 @@ async fn open_socks_connect(
         }
     }
     request.extend_from_slice(&port.to_be_bytes());
-
-    let mut socks = TcpStream::connect(socks_addr).await?;
-    socks.write_all(&request).await?;
-
-    let mut method_response = [0_u8; 2];
-    socks.read_exact(&mut method_response).await?;
-    assert_eq!(method_response, [0x05, 0x00]);
-    let mut connect_reply = [0_u8; 10];
-    socks.read_exact(&mut connect_reply).await?;
-    Ok((socks, connect_reply))
+    request
 }
 
 async fn assert_echo_roundtrip(

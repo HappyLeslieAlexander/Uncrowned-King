@@ -3,7 +3,9 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
     error::Error,
+    future::Future,
     io,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -75,6 +77,12 @@ struct ClientFlow {
 enum OpenOutcome {
     Open(ClientFlow),
     Rejected(socks5::Reply),
+    Cancelled,
+}
+
+enum OpenWaitOutcome {
+    Frame(Frame),
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,11 +151,15 @@ impl ClientSessionManager {
         }
     }
 
-    async fn open_flow(&self, target: Target) -> Result<OpenOutcome, AnyError> {
+    async fn open_flow<C>(&self, target: Target, cancel: C) -> Result<OpenOutcome, AnyError>
+    where
+        C: Future<Output = ()>,
+    {
+        tokio::pin!(cancel);
         let mut last_error = None;
         for attempt in 0..2 {
             let session = self.current_session().await?;
-            match session.open_flow(target.clone()).await {
+            match session.open_flow(target.clone(), cancel.as_mut()).await {
                 Ok(outcome) => return Ok(outcome),
                 Err(err) => {
                     warn!(
@@ -231,7 +243,14 @@ impl ClientSession {
         }
     }
 
-    async fn open_flow(self: &Arc<Self>, target: Target) -> Result<OpenOutcome, AnyError> {
+    async fn open_flow<C>(
+        self: &Arc<Self>,
+        target: Target,
+        cancel: Pin<&mut C>,
+    ) -> Result<OpenOutcome, AnyError>
+    where
+        C: Future<Output = ()>,
+    {
         if self.is_closed() {
             return Err("uk session is closed".into());
         }
@@ -254,22 +273,12 @@ impl ClientSession {
             frames,
             session: Arc::clone(self),
         };
-        let frame = if let Some(timeout) = self.open_timeout {
-            match time::timeout(timeout, flow.frames.recv()).await {
-                Ok(Some(frame)) => frame,
-                Ok(None) => return Err("uk session closed while opening flow".into()),
-                Err(_) => {
-                    warn!(event = "client.flow.open.timeout", flow_id);
-                    self.flows.lock().await.remove(&flow_id);
-                    self.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await?;
-                    return Ok(OpenOutcome::Rejected(socks5::Reply::GeneralFailure));
-                }
-            }
-        } else {
-            flow.frames
-                .recv()
-                .await
-                .ok_or("uk session closed while opening flow")?
+        let frame = match self
+            .wait_for_open_frame(flow_id, &mut flow.frames, cancel)
+            .await?
+        {
+            OpenWaitOutcome::Frame(frame) => frame,
+            OpenWaitOutcome::Cancelled => return Ok(OpenOutcome::Cancelled),
         };
         match decode_open_response(frame) {
             Ok(OpenResponse::Accepted) => Ok(OpenOutcome::Open(flow)),
@@ -280,6 +289,53 @@ impl ClientSession {
             Err(err) => {
                 self.flows.lock().await.remove(&flow_id);
                 Err(err)
+            }
+        }
+    }
+
+    async fn wait_for_open_frame<C>(
+        &self,
+        flow_id: u64,
+        frames: &mut mpsc::Receiver<Frame>,
+        mut cancel: Pin<&mut C>,
+    ) -> Result<OpenWaitOutcome, AnyError>
+    where
+        C: Future<Output = ()>,
+    {
+        if let Some(timeout) = self.open_timeout {
+            tokio::select! {
+                frame = time::timeout(timeout, frames.recv()) => {
+                    match frame {
+                        Ok(Some(frame)) => Ok(OpenWaitOutcome::Frame(frame)),
+                        Ok(None) => Err("uk session closed while opening flow".into()),
+                        Err(_) => {
+                            warn!(event = "client.flow.open.timeout", flow_id);
+                            self.flows.lock().await.remove(&flow_id);
+                            self.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await?;
+                            Ok(OpenWaitOutcome::Cancelled)
+                        }
+                    }
+                }
+                () = cancel.as_mut() => {
+                    debug!(event = "client.flow.open.cancelled", flow_id);
+                    self.flows.lock().await.remove(&flow_id);
+                    let _ = self.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await;
+                    Ok(OpenWaitOutcome::Cancelled)
+                }
+            }
+        } else {
+            tokio::select! {
+                frame = frames.recv() => {
+                    frame
+                        .map(OpenWaitOutcome::Frame)
+                        .ok_or_else(|| "uk session closed while opening flow".into())
+                }
+                () = cancel.as_mut() => {
+                    debug!(event = "client.flow.open.cancelled", flow_id);
+                    self.flows.lock().await.remove(&flow_id);
+                    let _ = self.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await;
+                    Ok(OpenWaitOutcome::Cancelled)
+                }
             }
         }
     }
@@ -557,10 +613,17 @@ async fn handle_socks_connection(
     let target = negotiate_socks_connect(&mut local, socks_handshake_timeout).await?;
 
     transition(&mut state, ClientConnectionState::Opening);
-    let flow = match sessions.open_flow(target).await {
+    let flow = match sessions
+        .open_flow(target, wait_for_socks_disconnect(&local))
+        .await
+    {
         Ok(OpenOutcome::Open(flow)) => flow,
         Ok(OpenOutcome::Rejected(reply)) => {
             socks5::send_reply(&mut local, reply).await?;
+            transition(&mut state, ClientConnectionState::Closed);
+            return Ok(());
+        }
+        Ok(OpenOutcome::Cancelled) => {
             transition(&mut state, ClientConnectionState::Closed);
             return Ok(());
         }
@@ -584,6 +647,14 @@ async fn handle_socks_connection(
     flow_session.flows.lock().await.remove(&flow_id);
     transition(&mut state, ClientConnectionState::Closed);
     relay_result
+}
+
+async fn wait_for_socks_disconnect(local: &TcpStream) {
+    let mut byte = [0_u8; 1];
+    match local.peek(&mut byte).await {
+        Ok(0) | Err(_) => {}
+        Ok(_) => std::future::pending::<()>().await,
+    }
 }
 
 async fn negotiate_socks_connect(
