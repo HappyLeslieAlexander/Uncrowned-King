@@ -24,3 +24,5 @@ local throwaway environment.
 
 The example policy denies private resolved addresses before allowing
 `example.com` traffic. Keep deny rules before broad allow rules when adapting it.
+Known cloud metadata service IPs are hard-denied by the policy engine before
+those ordered rules are evaluated.

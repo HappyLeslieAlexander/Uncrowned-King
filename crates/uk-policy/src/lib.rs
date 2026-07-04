@@ -83,7 +83,7 @@ impl PolicySet {
 
     /// Evaluates the target. Unmatched requests are denied.
     pub fn evaluate(&self, context: &PolicyContext<'_>) -> PolicyDecision {
-        if target_or_resolution_contains_metadata_ip(context.target, context.resolved_ips) {
+        if target_or_resolution_contains_metadata_service_ip(context.target, context.resolved_ips) {
             return PolicyDecision::Deny;
         }
 
@@ -386,10 +386,22 @@ fn cidr_matches(
     }
 }
 
-fn target_or_resolution_contains_metadata_ip(target: &Target, resolved_ips: &[IpAddr]) -> bool {
+fn target_or_resolution_contains_metadata_service_ip(
+    target: &Target,
+    resolved_ips: &[IpAddr],
+) -> bool {
     target_ips(target, resolved_ips)
         .into_iter()
-        .any(|ip| ip == IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)))
+        .any(is_metadata_service_ip)
+}
+
+fn is_metadata_service_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip == Ipv4Addr::new(169, 254, 169, 254) || ip == Ipv4Addr::new(100, 100, 100, 200)
+        }
+        IpAddr::V6(ip) => ip == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254),
+    }
 }
 
 fn private_matches(context: &PolicyContext<'_>, want_private: bool) -> bool {
@@ -650,6 +662,52 @@ mod tests {
         let policy = PolicySet::new(vec![rule]);
         let target = Target::Domain("metadata.example".to_owned(), 80);
         let resolved = [IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))];
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &resolved)),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn denies_aws_ipv6_metadata_ip_even_when_allow_rule_matches() {
+        let rule = PolicyRule::new(PolicyDecision::Allow);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Ipv6("fd00:ec2::254".parse().unwrap(), 80);
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &[])),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn denies_alibaba_metadata_ip_even_when_allow_rule_matches() {
+        let rule = PolicyRule::new(PolicyDecision::Allow);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Ipv4(Ipv4Addr::new(100, 100, 100, 200), 80);
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &[])),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn denies_domain_resolving_to_aws_ipv6_metadata_ip() {
+        let rule = PolicyRule::new(PolicyDecision::Allow);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Domain("metadata.example".to_owned(), 80);
+        let resolved = [IpAddr::V6("fd00:ec2::254".parse().unwrap())];
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &resolved)),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn denies_domain_resolving_to_alibaba_metadata_ip() {
+        let rule = PolicyRule::new(PolicyDecision::Allow);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Domain("metadata.example".to_owned(), 80);
+        let resolved = [IpAddr::V4(Ipv4Addr::new(100, 100, 100, 200))];
         assert_eq!(
             policy.evaluate(&context(&target, Some("default"), &resolved)),
             PolicyDecision::Deny

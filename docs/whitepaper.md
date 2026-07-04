@@ -286,6 +286,9 @@ Private IPs include loopback, IPv4 private/link-local ranges, IPv6 unique-local
 addresses, and IPv6 link-local addresses.
 For CIDR predicates, `deny` matches when any candidate IP is inside the range,
 while `allow` matches only when every candidate IP is inside the range.
+Known cloud metadata service IPs are denied before ordered policy rules are
+evaluated. This includes `169.254.169.254`, `100.100.100.200`, and
+`fd00:ec2::254`.
 
 Policy actions must be explicit `allow` or `deny`; unknown action strings are
 configuration errors.
@@ -295,7 +298,6 @@ Example policy:
 ```text
 allow group=default domain_suffix=.example.com ports=443,8443
 allow group=ops cidr=10.20.0.0/16 ports=22,5432
-deny  ip=169.254.169.254
 deny  private=true unless group=internal
 ```
 
