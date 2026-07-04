@@ -250,6 +250,7 @@ impl ClientSession {
 
     async fn close(&self) {
         if !self.closed.swap(true, Ordering::SeqCst) {
+            self.pong_notify.notify_waiters();
             self.flows.lock().await.clear();
             let mut writer = self.writer.lock().await;
             if let Err(err) = writer.shutdown().await {
@@ -468,11 +469,14 @@ impl ClientSession {
         self.pong_notify.notify_one();
     }
 
-    async fn wait_for_pong_after(&self, observed_epoch: u64) {
+    async fn wait_for_pong_after(&self, observed_epoch: u64) -> bool {
         loop {
+            if self.is_closed() {
+                return false;
+            }
             let notified = self.pong_notify.notified();
             if self.observed_pong_epoch() != observed_epoch {
-                return;
+                return true;
             }
             notified.await;
         }
@@ -600,15 +604,16 @@ fn spawn_keepalive(session: Arc<ClientSession>, interval: Duration) {
                 debug!(event = "client.session.keepalive.error", error = %err);
                 return;
             }
-            if time::timeout(interval, session.wait_for_pong_after(observed_pong_epoch))
-                .await
-                .is_err()
-            {
-                if !session.is_closed() {
-                    warn!(event = "client.session.keepalive.timeout");
-                    session.close().await;
+            match time::timeout(interval, session.wait_for_pong_after(observed_pong_epoch)).await {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(_) => {
+                    if !session.is_closed() {
+                        warn!(event = "client.session.keepalive.timeout");
+                        session.close().await;
+                    }
+                    return;
                 }
-                return;
             }
         }
     });
