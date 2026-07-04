@@ -71,6 +71,12 @@ enum OpenSlotRejection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlowIdRejection {
+    Zero,
+    Reserved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FlowEvent {
     ReadClosed(u64),
     ReadDrainExpired(u64),
@@ -283,66 +289,121 @@ async fn handle_session_frame(
             }
             Ok(())
         }
-        FrameType::TcpData => {
-            let flow_id = frame.header.id;
-            match tcp_data_disposition(flow_id, &frame.payload, target_writers) {
-                TcpDataDisposition::UnknownFlow => {
-                    send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
-                }
-                TcpDataDisposition::EmptyPayload => {}
-                TcpDataDisposition::ForwardPayload => {
-                    let mut should_remove = false;
-                    let mut should_send_resource_limit = false;
-                    let Some(target) = target_writers.get_mut(&flow_id) else {
-                        send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
-                        return Ok(());
-                    };
-                    match target
-                        .enqueue_data(frame.payload, context.limits.max_buffered_bytes_per_flow)
-                    {
-                        Ok(()) => {}
-                        Err(EnqueueError::Closed) => {
-                            target.mark_client_to_target_closed();
-                            should_remove = target.is_fully_closed();
-                        }
-                        Err(EnqueueError::ResourceLimit) => {
-                            target.abort();
-                            should_remove = true;
-                            should_send_resource_limit = true;
-                        }
-                    }
-                    if should_send_resource_limit {
-                        send_resource_limit(context.carrier_writer, flow_id).await?;
-                        send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
-                    }
-                    if should_remove {
-                        target_writers.remove(&flow_id);
-                    }
-                }
-            }
-            Ok(())
-        }
-        FrameType::TcpClose => {
-            let mut payload = frame.payload;
-            let close = TcpClose::decode(&mut payload)?;
-            let should_remove = if let Some(target) = target_writers.get_mut(&frame.header.id) {
-                if close.close_code == TCP_CLOSE_NORMAL {
-                    target.close_client_to_target();
-                } else {
-                    target.abort();
-                }
-                target.is_fully_closed()
-            } else {
-                false
-            };
-            if should_remove {
-                target_writers.remove(&frame.header.id);
-            }
-            Ok(())
-        }
+        FrameType::TcpData => handle_tcp_data_frame(frame, context, target_writers).await,
+        FrameType::TcpClose => handle_tcp_close_frame(frame, context, target_writers).await,
         FrameType::Ping => write_pong(context.carrier_writer, &frame).await,
         FrameType::Pong => Ok(()),
         _ => Err("unexpected frame while relaying session".into()),
+    }
+}
+
+async fn handle_tcp_data_frame(
+    frame: Frame,
+    context: &RelaySessionContext<'_>,
+    target_writers: &mut FlowTable,
+) -> Result<(), AnyError> {
+    let flow_id = frame.header.id;
+    if let Err(rejection) = validate_client_relay_flow_id(flow_id) {
+        return reject_invalid_client_relay_flow_id(
+            context,
+            flow_id,
+            rejection,
+            "tcp data flow id must be non-zero",
+        )
+        .await;
+    }
+    match tcp_data_disposition(flow_id, &frame.payload, target_writers) {
+        TcpDataDisposition::UnknownFlow => {
+            send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+        }
+        TcpDataDisposition::EmptyPayload => {}
+        TcpDataDisposition::ForwardPayload => {
+            forward_tcp_data_frame(flow_id, frame.payload, context, target_writers).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn forward_tcp_data_frame(
+    flow_id: u64,
+    payload: Bytes,
+    context: &RelaySessionContext<'_>,
+    target_writers: &mut FlowTable,
+) -> Result<(), AnyError> {
+    let mut should_remove = false;
+    let mut should_send_resource_limit = false;
+    let Some(target) = target_writers.get_mut(&flow_id) else {
+        send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+        return Ok(());
+    };
+    match target.enqueue_data(payload, context.limits.max_buffered_bytes_per_flow) {
+        Ok(()) => {}
+        Err(EnqueueError::Closed) => {
+            target.mark_client_to_target_closed();
+            should_remove = target.is_fully_closed();
+        }
+        Err(EnqueueError::ResourceLimit) => {
+            target.abort();
+            should_remove = true;
+            should_send_resource_limit = true;
+        }
+    }
+    if should_send_resource_limit {
+        send_resource_limit(context.carrier_writer, flow_id).await?;
+        send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
+    }
+    if should_remove {
+        target_writers.remove(&flow_id);
+    }
+    Ok(())
+}
+
+async fn handle_tcp_close_frame(
+    frame: Frame,
+    context: &RelaySessionContext<'_>,
+    target_writers: &mut FlowTable,
+) -> Result<(), AnyError> {
+    let flow_id = frame.header.id;
+    if let Err(rejection) = validate_client_relay_flow_id(flow_id) {
+        return reject_invalid_client_relay_flow_id(
+            context,
+            flow_id,
+            rejection,
+            "tcp close flow id must be non-zero",
+        )
+        .await;
+    }
+    let mut payload = frame.payload;
+    let close = TcpClose::decode(&mut payload)?;
+    let should_remove = if let Some(target) = target_writers.get_mut(&flow_id) {
+        if close.close_code == TCP_CLOSE_NORMAL {
+            target.close_client_to_target();
+        } else {
+            target.abort();
+        }
+        target.is_fully_closed()
+    } else {
+        false
+    };
+    if should_remove {
+        target_writers.remove(&flow_id);
+    }
+    Ok(())
+}
+
+async fn reject_invalid_client_relay_flow_id(
+    context: &RelaySessionContext<'_>,
+    flow_id: u64,
+    rejection: FlowIdRejection,
+    zero_id_error: &'static str,
+) -> Result<(), AnyError> {
+    send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+    match rejection {
+        FlowIdRejection::Zero => Err(zero_id_error.into()),
+        FlowIdRejection::Reserved => {
+            send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
+            Ok(())
+        }
     }
 }
 
@@ -361,6 +422,16 @@ fn check_tcp_open_slot(
         return Err(OpenSlotRejection::ResourceLimit);
     }
     Ok(())
+}
+
+fn validate_client_relay_flow_id(flow_id: u64) -> Result<(), FlowIdRejection> {
+    if flow_id == 0 {
+        Err(FlowIdRejection::Zero)
+    } else if !is_client_initiated_flow_id(flow_id) {
+        Err(FlowIdRejection::Reserved)
+    } else {
+        Ok(())
+    }
 }
 
 fn tcp_data_disposition(
@@ -1140,6 +1211,16 @@ mod tests {
         target_writers.insert(1, test_target_flow());
 
         assert_eq!(check_tcp_open_slot(2, &target_writers, 1), Ok(()));
+    }
+
+    #[test]
+    fn validates_client_relay_flow_ids() {
+        assert_eq!(validate_client_relay_flow_id(0), Err(FlowIdRejection::Zero));
+        assert_eq!(
+            validate_client_relay_flow_id(2),
+            Err(FlowIdRejection::Reserved)
+        );
+        assert_eq!(validate_client_relay_flow_id(1), Ok(()));
     }
 
     #[test]

@@ -23,8 +23,21 @@ pub fn check_config(config: &ClientConfig) -> Result<(), AnyError> {
 
 /// Connects to the server and completes UK authentication.
 pub async fn run_handshake(config: ClientConfig) -> Result<(), AnyError> {
-    let (_stream, _settings) = session::connect_authenticated(&config).await?;
+    let (_stream, _settings) = connect_authenticated_carrier(config).await?;
     Ok(())
+}
+
+/// Connects to the server, authenticates, and returns the live UK carrier.
+pub async fn connect_authenticated_carrier(
+    config: ClientConfig,
+) -> Result<
+    (
+        tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+        uk_proto::Settings,
+    ),
+    AnyError,
+> {
+    session::connect_authenticated(&config).await
 }
 
 /// Starts a local SOCKS5 listener backed by UK TCP relay.

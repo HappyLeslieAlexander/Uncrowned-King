@@ -12,13 +12,20 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use bytes::BytesMut;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Barrier,
     task::JoinHandle,
 };
-use uk_client::{config::ClientConfig, run_handshake, run_socks5_listener};
+use uk_client::{
+    config::ClientConfig, connect_authenticated_carrier, run_handshake, run_socks5_listener,
+};
+use uk_proto::{
+    ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, TCP_CLOSE_NORMAL, TcpClose, read_frame,
+    write_frame,
+};
 use uk_server::config::{CredentialConfig, LimitConfig, ServerConfig};
 
 const CERT_PEM: &str = r"-----BEGIN CERTIFICATE-----
@@ -110,6 +117,11 @@ async fn maps_target_unavailable_to_socks_host_unreachable() -> Result<(), TestE
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reports_auth_failure_during_handshake() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_auth_failure_error_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reports_protocol_error_for_zero_id_tcp_close() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_zero_id_tcp_close_error_e2e()).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -556,50 +568,105 @@ async fn run_target_unavailable_e2e() -> Result<(), TestError> {
 async fn run_auth_failure_error_e2e() -> Result<(), TestError> {
     init_tracing();
 
-    let temp_dir = create_temp_dir()?;
-    let cert_path = temp_dir.join("server-cert.pem");
-    let key_path = temp_dir.join("server-key.pem");
-    fs::write(&cert_path, CERT_PEM)?;
-    fs::write(&key_path, KEY_PEM)?;
-    let server_addr = unused_loopback_addr().await?;
-    let mut server_task = tokio::spawn(uk_server::run(ServerConfig {
-        listen: server_addr.to_string(),
-        cert_path: path_string(&cert_path),
-        key_path: path_string(&key_path),
-        auth_skew_seconds: Some(30),
-        limits: Some(test_limits()),
-        policy_path: None,
-        credentials: vec![CredentialConfig {
-            key_id: KEY_ID.to_owned(),
-            secret: SECRET.to_owned(),
-            status: Some("active".to_owned()),
-            not_before: None,
-            not_after: None,
-            policy_group: Some("default".to_owned()),
-        }],
-    }));
-    wait_for_listener("uk-server", server_addr, &mut server_task).await?;
+    let harness = ServerHarness::start(test_limits()).await?;
+    let result = run_handshake(harness.client_config(WRONG_SECRET)).await;
 
-    let result = run_handshake(ClientConfig {
-        server_addr: server_addr.to_string(),
-        server_name: "localhost".to_owned(),
-        ca_cert_path: path_string(&cert_path),
-        key_id: KEY_ID.to_owned(),
-        secret: WRONG_SECRET.to_owned(),
-        handshake_timeout_seconds: Some(3),
-        socks_handshake_timeout_seconds: Some(3),
-        tcp_open_timeout_seconds: Some(3),
-    })
-    .await;
-
-    server_task.abort();
-    fs::remove_dir_all(&temp_dir)?;
     let error = result.expect_err("wrong secret must fail authentication");
     assert!(
         error.to_string().contains("authentication failed"),
         "unexpected auth failure error: {error}"
     );
     Ok(())
+}
+
+async fn run_zero_id_tcp_close_error_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = ServerHarness::start(test_limits()).await?;
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(harness.client_config(SECRET)).await?;
+
+    let mut payload = BytesMut::new();
+    TcpClose::new(TCP_CLOSE_NORMAL).encode(&mut payload)?;
+    let frame = Frame::new(FrameType::TcpClose, 0, 0, payload.freeze())?;
+    write_frame(&mut carrier, &frame).await?;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(response.header.frame_type, FrameType::Error);
+    assert_eq!(response.header.id, 0);
+
+    let mut payload = response.payload;
+    assert_eq!(
+        ErrorPayload::decode(&mut payload)?.code,
+        ErrorCode::Protocol
+    );
+    Ok(())
+}
+
+struct ServerHarness {
+    temp_dir: PathBuf,
+    server_addr: SocketAddr,
+    cert_path: PathBuf,
+    server_task: JoinHandle<Result<(), TestError>>,
+}
+
+impl ServerHarness {
+    async fn start(limits: LimitConfig) -> Result<Self, TestError> {
+        let temp_dir = create_temp_dir()?;
+        let cert_path = temp_dir.join("server-cert.pem");
+        let key_path = temp_dir.join("server-key.pem");
+        fs::write(&cert_path, CERT_PEM)?;
+        fs::write(&key_path, KEY_PEM)?;
+        let server_addr = unused_loopback_addr().await?;
+        let mut server_task = tokio::spawn(uk_server::run(ServerConfig {
+            listen: server_addr.to_string(),
+            cert_path: path_string(&cert_path),
+            key_path: path_string(&key_path),
+            auth_skew_seconds: Some(30),
+            limits: Some(limits),
+            policy_path: None,
+            credentials: vec![CredentialConfig {
+                key_id: KEY_ID.to_owned(),
+                secret: SECRET.to_owned(),
+                status: Some("active".to_owned()),
+                not_before: None,
+                not_after: None,
+                policy_group: Some("default".to_owned()),
+            }],
+        }));
+        wait_for_listener("uk-server", server_addr, &mut server_task).await?;
+
+        Ok(Self {
+            temp_dir,
+            server_addr,
+            cert_path,
+            server_task,
+        })
+    }
+
+    fn client_config(&self, secret: &str) -> ClientConfig {
+        ClientConfig {
+            server_addr: self.server_addr.to_string(),
+            server_name: "localhost".to_owned(),
+            ca_cert_path: path_string(&self.cert_path),
+            key_id: KEY_ID.to_owned(),
+            secret: secret.to_owned(),
+            handshake_timeout_seconds: Some(3),
+            socks_handshake_timeout_seconds: Some(3),
+            tcp_open_timeout_seconds: Some(3),
+        }
+    }
+}
+
+impl Drop for ServerHarness {
+    fn drop(&mut self) {
+        self.server_task.abort();
+        let _ = fs::remove_dir_all(&self.temp_dir);
+    }
 }
 
 struct RelayHarness {
