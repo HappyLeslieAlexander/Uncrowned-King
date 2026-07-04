@@ -229,6 +229,15 @@ async fn socks_listener_stops_on_shutdown_signal() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn socks_listener_stops_while_server_connect_is_pending() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_socks_listener_shutdown_during_connect_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relays_domain_socks_target_to_echo_target() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_domain_relay_e2e()).await?
 }
@@ -1237,6 +1246,59 @@ async fn run_socks_listener_shutdown_e2e() -> Result<(), TestError> {
         .send(())
         .map_err(|()| "client shutdown receiver dropped")?;
     tokio::time::timeout(Duration::from_secs(3), client_task).await???;
+    Ok(())
+}
+
+async fn run_socks_listener_shutdown_during_connect_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    fs::write(&cert_path, CERT_PEM)?;
+
+    let carrier_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let server_addr = carrier_listener.local_addr()?;
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let silent_server = tokio::spawn(async move {
+        let (_stream, _) = carrier_listener.accept().await?;
+        let _ = accepted_tx.send(());
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        Ok::<(), TestError>(())
+    });
+
+    let socks_addr = unused_loopback_addr().await?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut client_task = tokio::spawn(run_socks5_listener_until_shutdown(
+        ClientConfig {
+            server_addr: server_addr.to_string(),
+            server_name: "localhost".to_owned(),
+            ca_cert_path: path_string(&cert_path),
+            key_id: KEY_ID.to_owned(),
+            secret: SECRET.to_owned(),
+            handshake_timeout_seconds: Some(30),
+            socks_handshake_timeout_seconds: Some(3),
+            tcp_open_timeout_seconds: Some(30),
+        },
+        socks_addr.to_string(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+    wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+
+    let mut socks = TcpStream::connect(socks_addr).await?;
+    let request = socks_connect_request(SocketAddr::from((Ipv4Addr::LOCALHOST, 80)));
+    socks.write_all(&request).await?;
+    let mut method_response = [0_u8; 2];
+    socks.read_exact(&mut method_response).await?;
+    assert_eq!(method_response, [0x05, 0x00]);
+    tokio::time::timeout(Duration::from_secs(3), accepted_rx).await??;
+
+    shutdown_tx
+        .send(())
+        .map_err(|()| "client shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(3), client_task).await???;
+    silent_server.abort();
     Ok(())
 }
 

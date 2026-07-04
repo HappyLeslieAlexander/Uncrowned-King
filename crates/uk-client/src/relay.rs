@@ -69,6 +69,8 @@ struct ClientSession {
 struct ClientSessionManager {
     config: ClientConfig,
     current: Mutex<Option<Arc<ClientSession>>>,
+    connect_lock: Mutex<()>,
+    closed: AtomicBool,
 }
 
 struct ClientFlow {
@@ -200,6 +202,8 @@ impl ClientSessionManager {
         Self {
             config,
             current: Mutex::new(None),
+            connect_lock: Mutex::new(()),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -233,18 +237,47 @@ impl ClientSessionManager {
     }
 
     async fn current_session(&self) -> Result<Arc<ClientSession>, AnyError> {
+        if self.is_closed() {
+            return Err("client session manager is shutting down".into());
+        }
+        if let Some(session) = self.current_session_if_live().await {
+            return Ok(session);
+        }
+
+        let _connect_guard = self.connect_lock.lock().await;
+        if self.is_closed() {
+            return Err("client session manager is shutting down".into());
+        }
+        if let Some(session) = self.current_session_if_live().await {
+            return Ok(session);
+        }
+
+        info!(event = "client.session.connect");
+        let session = ClientSession::connect(&self.config).await?;
+        if self.is_closed() {
+            session.close().await;
+            return Err("client session manager is shutting down".into());
+        }
+        let mut current = self.current.lock().await;
+        if self.is_closed() {
+            drop(current);
+            session.close().await;
+            return Err("client session manager is shutting down".into());
+        }
+        *current = Some(Arc::clone(&session));
+        Ok(session)
+    }
+
+    async fn current_session_if_live(&self) -> Option<Arc<ClientSession>> {
         let mut current = self.current.lock().await;
         if let Some(session) = current.as_ref() {
             if !session.is_closed() {
-                return Ok(Arc::clone(session));
+                return Some(Arc::clone(session));
             }
         }
 
         *current = None;
-        info!(event = "client.session.connect");
-        let session = ClientSession::connect(&self.config).await?;
-        *current = Some(Arc::clone(&session));
-        Ok(session)
+        None
     }
 
     async fn invalidate(&self, session: &Arc<ClientSession>) {
@@ -259,10 +292,15 @@ impl ClientSessionManager {
     }
 
     async fn shutdown(&self) {
+        self.closed.store(true, Ordering::SeqCst);
         let session = { self.current.lock().await.take() };
         if let Some(session) = session {
             session.close().await;
         }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 }
 
