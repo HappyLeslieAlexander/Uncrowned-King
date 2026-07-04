@@ -40,6 +40,9 @@ impl ServerConfig {
 
     /// Converts static credential config into auth records.
     pub fn credentials(&self) -> Result<Vec<Credential>, AuthError> {
+        if self.credentials.is_empty() {
+            return Err(AuthError::NoCredentials);
+        }
         let mut seen_key_ids = HashSet::new();
         let mut credentials = Vec::with_capacity(self.credentials.len());
         for credential_config in &self.credentials {
@@ -698,6 +701,13 @@ policy_grop = "default"
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_empty_credential_list() {
+        let config = minimal_config();
+
+        assert_eq!(config.credentials(), Err(AuthError::NoCredentials));
     }
 
     #[test]

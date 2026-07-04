@@ -62,6 +62,9 @@ pub enum AuthError {
     /// Two configured credentials use the same key id.
     #[error("duplicate credential key id")]
     DuplicateCredentialKeyId,
+    /// No credentials were configured.
+    #[error("at least one credential is required")]
+    NoCredentials,
     /// A configured credential has an invalid policy group.
     #[error("credential policy group must be non-empty and printable")]
     InvalidCredentialPolicyGroup,
