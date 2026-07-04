@@ -12,7 +12,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -122,6 +122,11 @@ async fn reports_auth_failure_during_handshake() -> Result<(), TestError> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reports_protocol_error_for_zero_id_tcp_close() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_zero_id_tcp_close_error_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn responds_to_authenticated_ping() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_authenticated_ping_pong_e2e()).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -604,6 +609,28 @@ async fn run_zero_id_tcp_close_error_e2e() -> Result<(), TestError> {
         ErrorPayload::decode(&mut payload)?.code,
         ErrorCode::Protocol
     );
+    Ok(())
+}
+
+async fn run_authenticated_ping_pong_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = ServerHarness::start(test_limits()).await?;
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(harness.client_config(SECRET)).await?;
+
+    let payload = Bytes::from_static(b"authenticated-ping");
+    let frame = Frame::new(FrameType::Ping, 0, 0, payload.clone())?;
+    write_frame(&mut carrier, &frame).await?;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(response.header.frame_type, FrameType::Pong);
+    assert_eq!(response.header.id, 0);
+    assert_eq!(response.payload, payload);
     Ok(())
 }
 
