@@ -17,7 +17,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, WriteHalf},
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, WriteHalf},
     net::{
         TcpStream, lookup_host,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -40,11 +40,25 @@ const TARGET_CONNECT_PARALLELISM: usize = 4;
 const TARGET_WRITE_QUEUE_CAPACITY: usize = 32;
 
 type AnyError = Box<dyn Error + Send + Sync>;
-type CarrierWriter = Arc<Mutex<WriteHalf<TlsStream<TcpStream>>>>;
 type FlowTable = HashMap<u64, FlowSlot>;
 type BoxedConnectFuture<T> =
     Pin<Box<dyn Future<Output = (SocketAddr, io::Result<T>)> + Send + 'static>>;
 type TargetConnector<T> = Arc<dyn Fn(SocketAddr) -> BoxedConnectFuture<T> + Send + Sync + 'static>;
+
+#[derive(Clone)]
+struct CarrierWriter {
+    inner: Arc<Mutex<WriteHalf<TlsStream<TcpStream>>>>,
+    shutdown: SessionShutdown,
+}
+
+impl CarrierWriter {
+    fn new(inner: WriteHalf<TlsStream<TcpStream>>, shutdown: SessionShutdown) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+            shutdown,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RelayLimits {
@@ -191,10 +205,10 @@ pub(crate) async fn relay_session(
     transition(&mut state, ServerSessionState::Relaying);
 
     let (mut carrier_reader, carrier_writer) = tokio::io::split(carrier);
-    let carrier_writer = Arc::new(Mutex::new(carrier_writer));
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let mut target_writers = FlowTable::new();
     let shutdown = SessionShutdown::default();
+    let carrier_writer = CarrierWriter::new(carrier_writer, shutdown.clone());
     let context = RelaySessionContext {
         credential,
         policy_set,
@@ -785,7 +799,7 @@ async fn accept_open_target(
         flow_id,
         target_reader,
         flow_control.clone(),
-        Arc::clone(context.carrier_writer),
+        context.carrier_writer.clone(),
         context.event_tx.clone(),
         context.shutdown.clone(),
         context.limits.data_frame_size,
@@ -795,7 +809,7 @@ async fn accept_open_target(
         target_writer,
         target_writer_rx,
         flow_control,
-        Arc::clone(context.carrier_writer),
+        context.carrier_writer.clone(),
         context.event_tx.clone(),
         context.shutdown.clone(),
     );
@@ -1272,7 +1286,7 @@ fn close_target_flows(target_writers: &mut FlowTable) {
 }
 
 async fn shutdown_carrier_writer(carrier_writer: &CarrierWriter) {
-    let mut writer = carrier_writer.lock().await;
+    let mut writer = carrier_writer.inner.lock().await;
     if let Err(err) = writer.shutdown().await {
         debug!(event = "server.session.shutdown.error", error = %err);
     }
@@ -1489,9 +1503,31 @@ async fn write_pong(writer: &CarrierWriter, request_frame: &Frame) -> Result<(),
 }
 
 async fn write_frame_locked(writer: &CarrierWriter, frame: &Frame) -> Result<(), AnyError> {
-    let mut writer = writer.lock().await;
-    write_frame(&mut *writer, frame).await?;
+    let mut guard = tokio::select! {
+        writer = writer.inner.lock() => writer,
+        () = writer.shutdown.closed() => return Err(session_shutdown_error().into()),
+    };
+    write_frame_or_shutdown(&mut *guard, frame, &writer.shutdown).await?;
     Ok(())
+}
+
+async fn write_frame_or_shutdown<W>(
+    writer: &mut W,
+    frame: &Frame,
+    shutdown: &SessionShutdown,
+) -> Result<(), AnyError>
+where
+    W: AsyncWrite + Unpin,
+{
+    tokio::select! {
+        result = write_frame(writer, frame) => result?,
+        () = shutdown.closed() => return Err(session_shutdown_error().into()),
+    }
+    Ok(())
+}
+
+fn session_shutdown_error() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "session shutdown")
 }
 
 fn transition(state: &mut ServerSessionState, next: ServerSessionState) {
@@ -1633,6 +1669,31 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn carrier_write_exits_when_session_shutdown_notifies() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let shutdown = SessionShutdown::default();
+        let shutdown_handle = shutdown.clone();
+        let frame = Frame::new(FrameType::TcpData, 0, 1, Bytes::from(vec![0xaa; 1024])).unwrap();
+
+        let write_task =
+            tokio::spawn(
+                async move { write_frame_or_shutdown(&mut writer, &frame, &shutdown).await },
+            );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!write_task.is_finished());
+
+        shutdown_handle.close();
+
+        let err = tokio::time::timeout(Duration::from_secs(1), write_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        let io_error = err.downcast_ref::<io::Error>().unwrap();
+        assert_eq!(io_error.kind(), io::ErrorKind::Interrupted);
     }
 
     #[tokio::test]
