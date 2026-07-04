@@ -91,6 +91,10 @@ impl ServerConfig {
         reject_zero_limit("max_sessions", self.max_sessions())?;
         reject_zero_limit("max_streams", self.max_streams())?;
         reject_zero_limit(
+            "max_outbound_dials_per_session",
+            self.max_outbound_dials_per_session(),
+        )?;
+        reject_zero_limit(
             "max_buffered_bytes_per_session",
             self.max_buffered_bytes_per_session(),
         )?;
@@ -152,6 +156,14 @@ impl ServerConfig {
             .as_ref()
             .and_then(|limits| limits.max_streams)
             .unwrap_or(64)
+    }
+
+    /// Configured maximum in-flight target dials per authenticated session.
+    pub fn max_outbound_dials_per_session(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.max_outbound_dials_per_session)
+            .unwrap_or(16)
     }
 
     /// Maximum queued client-to-target bytes across one authenticated session.
@@ -264,6 +276,8 @@ pub struct LimitConfig {
     pub max_sessions: Option<u64>,
     /// Maximum concurrent TCP streams per authenticated session.
     pub max_streams: Option<u64>,
+    /// Maximum in-flight target dials per authenticated session.
+    pub max_outbound_dials_per_session: Option<u64>,
     /// Maximum queued client-to-target bytes across one authenticated session.
     pub max_buffered_bytes_per_session: Option<u64>,
     /// Idle timeout for authenticated relay sessions in seconds.
@@ -490,6 +504,29 @@ max_sessions = 128
         .unwrap();
 
         assert_eq!(config.max_sessions(), 128);
+    }
+
+    #[test]
+    fn defaults_outbound_dials_limit() {
+        assert_eq!(minimal_config().max_outbound_dials_per_session(), 16);
+    }
+
+    #[test]
+    fn parses_outbound_dials_limit() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_outbound_dials_per_session = 4
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.max_outbound_dials_per_session(), 4);
     }
 
     #[test]
@@ -786,6 +823,24 @@ credentials = []
 
 [limits]
 max_sessions = 0
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_outbound_dials_limit() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_outbound_dials_per_session = 0
 "#,
         )
         .unwrap();

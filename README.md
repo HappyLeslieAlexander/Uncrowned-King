@@ -45,9 +45,9 @@ Known cloud metadata service IPs are denied before ordered rules are evaluated,
 including `169.254.169.254`, `100.100.100.200`, and `fd00:ec2::254`.
 
 Server limits can advertise and enforce the maximum frame size, concurrent
-carrier sessions, concurrent TCP streams per authenticated session, queued
-client-to-target bytes per session and per flow, plus the authenticated session
-idle timeout:
+carrier sessions, concurrent TCP streams per authenticated session, in-flight
+target dials per session, queued client-to-target bytes per session and per
+flow, plus the authenticated session idle timeout:
 
 ```toml
 [limits]
@@ -55,6 +55,7 @@ max_pre_auth_bytes = 4096
 max_frame_size = 65536
 max_sessions = 1024
 max_streams = 64
+max_outbound_dials_per_session = 16
 max_buffered_bytes_per_session = 16777216
 idle_timeout_seconds = 300
 max_buffered_bytes_per_flow = 2097152

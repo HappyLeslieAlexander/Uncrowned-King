@@ -2585,6 +2585,7 @@ fn test_limits() -> LimitConfig {
         max_frame_size: Some(65_536),
         max_sessions: Some(32),
         max_streams: Some(8),
+        max_outbound_dials_per_session: Some(8),
         max_buffered_bytes_per_session: Some(4 * 1024 * 1024),
         idle_timeout_seconds: Some(30),
         max_buffered_bytes_per_flow: Some(1024 * 1024),

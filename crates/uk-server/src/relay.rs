@@ -22,7 +22,7 @@ use tokio::{
         TcpStream, lookup_host,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
-    sync::{Mutex, Notify, mpsc, watch},
+    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
     task::JoinSet,
 };
 use tokio_rustls::server::TlsStream;
@@ -64,6 +64,7 @@ impl CarrierWriter {
 pub(crate) struct RelayLimits {
     frame: FrameLimits,
     max_streams: u64,
+    max_outbound_dials_per_session: usize,
     data_frame_size: usize,
     max_buffered_bytes_per_session: usize,
     max_buffered_bytes_per_flow: usize,
@@ -162,6 +163,16 @@ struct TargetFlowControl {
 }
 
 #[derive(Debug, Clone)]
+struct OpenDialLimiter {
+    semaphore: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+struct OpenDialPermit {
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+
+#[derive(Debug, Clone)]
 enum FlowSlot {
     Opening(OpenFlowCancel),
     Open(TargetFlow),
@@ -171,6 +182,7 @@ enum FlowSlot {
 struct OpenFlowCancel {
     cancelled: Arc<AtomicBool>,
     notify: Arc<Notify>,
+    dial_permit: Option<OpenDialPermit>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +207,7 @@ struct RelaySessionContext<'a> {
     limits: RelayLimits,
     shutdown: SessionShutdown,
     session_buffer: SessionBufferControl,
+    open_dial_limiter: OpenDialLimiter,
 }
 
 struct TargetOpenTask {
@@ -224,6 +237,7 @@ pub(crate) async fn relay_session(
     let mut target_writers = FlowTable::new();
     let shutdown = SessionShutdown::default();
     let session_buffer = SessionBufferControl::default();
+    let open_dial_limiter = OpenDialLimiter::new(limits.max_outbound_dials_per_session);
     let carrier_writer = CarrierWriter::new(carrier_writer, shutdown.clone());
     let context = RelaySessionContext {
         credential,
@@ -233,6 +247,7 @@ pub(crate) async fn relay_session(
         limits,
         shutdown: shutdown.clone(),
         session_buffer,
+        open_dial_limiter,
     };
 
     let result = loop {
@@ -708,7 +723,13 @@ async fn handle_tcp_open_frame(
     }
 
     if let Some((flow_id, target)) = validate_tcp_open_request(context, frame).await? {
-        let cancel = OpenFlowCancel::default();
+        let Some(dial_permit) = context.open_dial_limiter.try_acquire() else {
+            warn!(event = "tcp.open.dial_limit", flow_id, target = ?target);
+            send_resource_limit(context.carrier_writer, flow_id).await?;
+            send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
+            return Ok(());
+        };
+        let cancel = OpenFlowCancel::with_dial_permit(dial_permit);
         target_writers.insert(flow_id, FlowSlot::Opening(cancel.clone()));
         spawn_target_open(TargetOpenTask {
             flow_id,
@@ -983,6 +1004,7 @@ impl RelayLimits {
     pub(crate) fn new(
         frame: FrameLimits,
         max_streams: u64,
+        max_outbound_dials_per_session: usize,
         max_buffered_bytes_per_session: usize,
         max_buffered_bytes_per_flow: usize,
         target_connect_timeout: Option<Duration>,
@@ -991,6 +1013,7 @@ impl RelayLimits {
         Self {
             frame,
             max_streams,
+            max_outbound_dials_per_session,
             data_frame_size: tcp_data_frame_size(frame),
             max_buffered_bytes_per_session,
             max_buffered_bytes_per_flow,
@@ -1031,11 +1054,48 @@ impl SessionShutdown {
     }
 }
 
+impl OpenDialLimiter {
+    fn new(limit: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(limit)),
+        }
+    }
+
+    fn try_acquire(&self) -> Option<OpenDialPermit> {
+        Arc::clone(&self.semaphore)
+            .try_acquire_owned()
+            .ok()
+            .map(OpenDialPermit::new)
+    }
+
+    #[cfg(test)]
+    fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+}
+
+impl OpenDialPermit {
+    fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            _permit: Arc::new(permit),
+        }
+    }
+}
+
+impl fmt::Debug for OpenDialPermit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenDialPermit")
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for OpenFlowCancel {
     fn default() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
+            dial_permit: None,
         }
     }
 }
@@ -1045,11 +1105,19 @@ impl fmt::Debug for OpenFlowCancel {
         formatter
             .debug_struct("OpenFlowCancel")
             .field("cancelled", &self.is_cancelled())
+            .field("has_dial_permit", &self.dial_permit.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl OpenFlowCancel {
+    fn with_dial_permit(dial_permit: OpenDialPermit) -> Self {
+        Self {
+            dial_permit: Some(dial_permit),
+            ..Self::default()
+        }
+    }
+
     fn cancel(&self) {
         if !self.cancelled.swap(true, Ordering::SeqCst) {
             self.notify.notify_waiters();
@@ -2042,6 +2110,21 @@ mod tests {
 
         assert!(target_writers.is_empty());
         assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn open_dial_permit_lives_until_all_cancel_handles_drop() {
+        let limiter = OpenDialLimiter::new(1);
+        let permit = limiter.try_acquire().expect("first permit");
+        let cancel = OpenFlowCancel::with_dial_permit(permit);
+        let task_cancel = cancel.clone();
+
+        assert_eq!(limiter.available_permits(), 0);
+        assert!(limiter.try_acquire().is_none());
+        drop(cancel);
+        assert_eq!(limiter.available_permits(), 0);
+        drop(task_cancel);
+        assert_eq!(limiter.available_permits(), 1);
     }
 
     #[test]
