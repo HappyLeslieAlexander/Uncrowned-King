@@ -319,10 +319,22 @@ impl ClientSession {
         self.write_frame(&frame).await
     }
 
+    async fn send_resource_limit(&self, flow_id: u64) -> Result<(), AnyError> {
+        self.send_status_frame(FrameType::ResourceLimit, flow_id, ErrorCode::ResourceLimit)
+            .await
+    }
+
     async fn send_connection_error(&self, code: ErrorCode) -> Result<(), AnyError> {
-        let mut payload = BytesMut::new();
-        ErrorPayload::new(code).encode(&mut payload)?;
-        let frame = Frame::new(FrameType::Error, 0, 0, payload.freeze())?;
+        self.send_status_frame(FrameType::Error, 0, code).await
+    }
+
+    async fn send_status_frame(
+        &self,
+        frame_type: FrameType,
+        flow_id: u64,
+        code: ErrorCode,
+    ) -> Result<(), AnyError> {
+        let frame = status_frame(frame_type, flow_id, code)?;
         self.write_frame(&frame).await
     }
 
@@ -442,6 +454,7 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
                 }
                 FlowFrameRoute::FlowQueueFull => {
                     warn!(event = "client.flow.queue_full", flow_id);
+                    session.send_resource_limit(flow_id).await?;
                     session.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await?;
                 }
                 FlowFrameRoute::UnknownFlow
@@ -653,6 +666,12 @@ fn validate_flow_status(frame_type: FrameType, payload: Bytes) -> Result<(), Any
         FrameType::ResourceLimit => expect_error_payload(payload, ErrorCode::ResourceLimit),
         _ => Err("unexpected flow status frame".into()),
     }
+}
+
+fn status_frame(frame_type: FrameType, flow_id: u64, code: ErrorCode) -> Result<Frame, AnyError> {
+    let mut payload = BytesMut::new();
+    ErrorPayload::new(code).encode(&mut payload)?;
+    Ok(Frame::new(frame_type, 0, flow_id, payload.freeze())?)
 }
 
 fn decode_open_response(frame: Frame) -> Result<OpenResponse, AnyError> {
@@ -1003,6 +1022,33 @@ mod tests {
                 status_payload(ErrorCode::ResourceLimit)
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn status_frame_encodes_flow_resource_limit() {
+        let frame =
+            status_frame(FrameType::ResourceLimit, FLOW_ID, ErrorCode::ResourceLimit).unwrap();
+
+        assert_eq!(frame.header.frame_type, FrameType::ResourceLimit);
+        assert_eq!(frame.header.id, FLOW_ID);
+        let mut payload = frame.payload;
+        assert_eq!(
+            ErrorPayload::decode(&mut payload).unwrap().code,
+            ErrorCode::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn status_frame_encodes_connection_error() {
+        let frame = status_frame(FrameType::Error, 0, ErrorCode::Protocol).unwrap();
+
+        assert_eq!(frame.header.frame_type, FrameType::Error);
+        assert_eq!(frame.header.id, 0);
+        let mut payload = frame.payload;
+        assert_eq!(
+            ErrorPayload::decode(&mut payload).unwrap().code,
+            ErrorCode::Protocol
         );
     }
 
