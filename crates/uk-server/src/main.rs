@@ -1,8 +1,9 @@
 //! Uncrowned King server binary.
 
 use clap::{Parser, Subcommand};
+use tracing::warn;
 use tracing_subscriber::EnvFilter;
-use uk_server::{AnyError, check_config, config::ServerConfig, run};
+use uk_server::{AnyError, check_config, config::ServerConfig, run_until_shutdown};
 
 /// UK server command line.
 #[derive(Debug, Parser)]
@@ -31,7 +32,7 @@ async fn main() -> Result<(), AnyError> {
     let args = Args::parse();
     let config = ServerConfig::load(config_path(&args)?)?;
     match args.command.unwrap_or(Command::Serve) {
-        Command::Serve => run(config).await?,
+        Command::Serve => run_until_shutdown(config, shutdown_signal()).await?,
         Command::ConfigCheck => {
             check_config(&config)?;
             println!("uk-server config ok");
@@ -49,6 +50,33 @@ fn config_path(args: &Args) -> Result<&str, AnyError> {
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    () = wait_for_ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(err) => {
+                warn!(event = "server.signal.install_error", error = %err);
+                wait_for_ctrl_c().await;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    wait_for_ctrl_c().await;
+}
+
+async fn wait_for_ctrl_c() {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        warn!(event = "server.signal.ctrl_c_error", error = %err);
+    }
 }
 
 #[cfg(test)]

@@ -1,8 +1,11 @@
 //! Uncrowned King client binary.
 
 use clap::{Parser, Subcommand};
+use tracing::warn;
 use tracing_subscriber::EnvFilter;
-use uk_client::{AnyError, check_config, config::ClientConfig, run_handshake, run_socks5_listener};
+use uk_client::{
+    AnyError, check_config, config::ClientConfig, run_handshake, run_socks5_listener_until_shutdown,
+};
 
 /// UK client command line.
 #[derive(Debug, Parser)]
@@ -46,7 +49,7 @@ async fn main() -> Result<(), AnyError> {
             println!("uk-client handshake ok");
         }
         Command::Socks5 { listen } => {
-            run_socks5_listener(config, listen).await?;
+            run_socks5_listener_until_shutdown(config, listen, shutdown_signal()).await?;
         }
     }
     Ok(())
@@ -61,6 +64,33 @@ fn config_path(args: &Args) -> Result<&str, AnyError> {
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    () = wait_for_ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(err) => {
+                warn!(event = "client.signal.install_error", error = %err);
+                wait_for_ctrl_c().await;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    wait_for_ctrl_c().await;
+}
+
+async fn wait_for_ctrl_c() {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        warn!(event = "client.signal.ctrl_c_error", error = %err);
+    }
 }
 
 #[cfg(test)]

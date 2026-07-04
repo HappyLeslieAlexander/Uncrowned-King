@@ -7,6 +7,8 @@ mod session;
 mod socks5;
 mod tls;
 
+use std::{future, future::Future};
+
 use crate::config::ClientConfig;
 
 /// Client error type.
@@ -42,5 +44,17 @@ pub async fn connect_authenticated_carrier(
 
 /// Starts a local SOCKS5 listener backed by UK TCP relay.
 pub async fn run_socks5_listener(config: ClientConfig, listen: String) -> Result<(), AnyError> {
-    relay::run_socks5_listener(config, listen).await
+    run_socks5_listener_until_shutdown(config, listen, future::pending()).await
+}
+
+/// Starts a local SOCKS5 listener until `shutdown` resolves.
+pub async fn run_socks5_listener_until_shutdown<F>(
+    config: ClientConfig,
+    listen: String,
+    shutdown: F,
+) -> Result<(), AnyError>
+where
+    F: Future<Output = ()> + Send,
+{
+    relay::run_socks5_listener_until_shutdown(config, listen, shutdown).await
 }

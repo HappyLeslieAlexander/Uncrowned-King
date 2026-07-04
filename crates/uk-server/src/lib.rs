@@ -5,10 +5,15 @@ pub mod config;
 mod relay;
 mod tls;
 
-use std::{io, sync::Arc, time::Duration};
+use std::{future, future::Future, io, sync::Arc, time::Duration};
 
 use bytes::BytesMut;
-use tokio::{net::TcpListener, sync::Mutex, time};
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex, watch},
+    task::JoinSet,
+    time,
+};
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tracing::{debug, info, warn};
 use uk_auth::{AuthChallenge, AuthResponse, ReplayCache, unix_now, verify_auth_response};
@@ -24,6 +29,14 @@ pub type AnyError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Runs the UK server listener until the task is cancelled or the listener fails.
 pub async fn run(config: ServerConfig) -> Result<(), AnyError> {
+    run_until_shutdown(config, future::pending()).await
+}
+
+/// Runs the UK server listener until `shutdown` resolves or the listener fails.
+pub async fn run_until_shutdown<F>(config: ServerConfig, shutdown: F) -> Result<(), AnyError>
+where
+    F: Future<Output = ()> + Send,
+{
     config.validate_network_endpoints()?;
     config.validate_limits()?;
     let credentials = Arc::new(config.credentials()?);
@@ -38,37 +51,64 @@ pub async fn run(config: ServerConfig) -> Result<(), AnyError> {
 
     info!(event = "server.listen", listen = %config.listen);
 
-    loop {
-        let (tcp, peer) = listener.accept().await?;
-        let acceptor = acceptor.clone();
-        let credentials = Arc::clone(&credentials);
-        let policy_set = Arc::clone(&policy_set);
-        let replay_cache = Arc::clone(&replay_cache);
-        let config = config.clone();
+    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+    let mut connections = JoinSet::new();
+    tokio::pin!(shutdown);
 
-        tokio::spawn(async move {
-            if let Err(err) =
-                handle_connection(acceptor, tcp, credentials, policy_set, replay_cache, config)
-                    .await
-            {
-                if is_clean_tls_handshake_disconnect(&err) {
-                    debug!(event = "tls.handshake.closed", peer = %peer);
-                } else {
-                    warn!(event = "protocol.error", peer = %peer, error = %err);
-                }
+    loop {
+        tokio::select! {
+            () = &mut shutdown => {
+                info!(event = "server.shutdown");
+                let _ = shutdown_tx.send(true);
+                break;
             }
-        });
+            accepted = listener.accept() => {
+                let (tcp, peer) = accepted?;
+                let acceptor = acceptor.clone();
+                let credentials = Arc::clone(&credentials);
+                let policy_set = Arc::clone(&policy_set);
+                let replay_cache = Arc::clone(&replay_cache);
+                let config = config.clone();
+                let shutdown_rx = shutdown_tx.subscribe();
+
+                connections.spawn(async move {
+                    if let Err(err) =
+                        handle_connection(
+                            acceptor,
+                            tcp,
+                            credentials,
+                            policy_set,
+                            replay_cache,
+                            config,
+                            shutdown_rx,
+                        )
+                        .await
+                    {
+                        if is_clean_tls_handshake_disconnect(&err) {
+                            debug!(event = "tls.handshake.closed", peer = %peer);
+                        } else {
+                            warn!(event = "protocol.error", peer = %peer, error = %err);
+                        }
+                    }
+                });
+            }
+            joined = connections.join_next(), if !connections.is_empty() => {
+                log_connection_task_result(joined);
+            }
+        }
     }
+
+    while let Some(joined) = connections.join_next().await {
+        log_connection_task_result(Some(joined));
+    }
+
+    Ok(())
 }
 
-/// Validates server config, credentials, policy, and TLS material.
-pub fn check_config(config: &ServerConfig) -> Result<(), AnyError> {
-    config.validate_network_endpoints()?;
-    config.validate_limits()?;
-    let _credentials = config.credentials()?;
-    let _policy_set = config.policy_set()?;
-    let _tls_config = tls::server_config(&config.cert_path, &config.key_path)?;
-    Ok(())
+fn log_connection_task_result(result: Option<Result<(), tokio::task::JoinError>>) {
+    if let Some(Err(err)) = result {
+        warn!(event = "server.connection.task_error", error = %err);
+    }
 }
 
 async fn handle_connection(
@@ -78,9 +118,14 @@ async fn handle_connection(
     policy_set: Arc<uk_policy::PolicySet>,
     replay_cache: Arc<Mutex<ReplayCache>>,
     config: ServerConfig,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AnyError> {
     tcp.set_nodelay(true)?;
-    let (stream, credential) =
+    if *shutdown_rx.borrow() {
+        return Ok(());
+    }
+
+    let handshake = async {
         if let Some(timeout) = handshake_timeout(config.handshake_timeout_seconds()) {
             match time::timeout(
                 timeout,
@@ -88,12 +133,24 @@ async fn handle_connection(
             )
             .await
             {
-                Ok(result) => result?,
-                Err(_) => return Err("handshake timeout".into()),
+                Ok(result) => result,
+                Err(_) => Err("handshake timeout".into()),
             }
         } else {
-            complete_handshake(acceptor, tcp, credentials, replay_cache, &config).await?
-        };
+            complete_handshake(acceptor, tcp, credentials, replay_cache, &config).await
+        }
+    };
+
+    let (stream, credential) = tokio::select! {
+        result = handshake => result?,
+        changed = shutdown_rx.changed() => {
+            let _ = changed;
+            return Ok(());
+        }
+    };
+    if *shutdown_rx.borrow() {
+        return Ok(());
+    }
 
     relay::relay_session(
         stream,
@@ -109,8 +166,19 @@ async fn handle_connection(
             tcp_half_close_timeout(config.tcp_half_close_timeout_seconds()),
         ),
         idle_timeout(config.idle_timeout_seconds()),
+        shutdown_rx,
     )
     .await
+}
+
+/// Validates server config, credentials, policy, and TLS material.
+pub fn check_config(config: &ServerConfig) -> Result<(), AnyError> {
+    config.validate_network_endpoints()?;
+    config.validate_limits()?;
+    let _credentials = config.credentials()?;
+    let _policy_set = config.policy_set()?;
+    let _tls_config = tls::server_config(&config.cert_path, &config.key_path)?;
+    Ok(())
 }
 
 async fn complete_handshake(

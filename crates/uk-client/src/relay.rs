@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
     error::Error,
+    future::Future,
     io,
     sync::{
         Arc,
@@ -15,7 +16,8 @@ use bytes::{Bytes, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, Notify, mpsc},
+    sync::{Mutex, Notify, mpsc, watch},
+    task::JoinSet,
     time,
 };
 use tokio_rustls::client::TlsStream;
@@ -110,10 +112,14 @@ enum FlowFrameRoute {
     FlowQueueFull,
 }
 
-pub(crate) async fn run_socks5_listener(
+pub(crate) async fn run_socks5_listener_until_shutdown<F>(
     config: ClientConfig,
     listen: String,
-) -> Result<(), AnyError> {
+    shutdown: F,
+) -> Result<(), AnyError>
+where
+    F: Future<Output = ()> + Send,
+{
     crate::check_config(&config)?;
     validate_endpoint("socks listen", &listen)?;
     let socks_handshake_timeout = timeout(config.socks_handshake_timeout_seconds());
@@ -121,20 +127,56 @@ pub(crate) async fn run_socks5_listener(
     let listener = TcpListener::bind(&listen).await?;
     info!(event = "socks5.listen", listen = %listen);
 
+    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+    let mut connections = JoinSet::new();
+    tokio::pin!(shutdown);
+
     loop {
-        let (local, peer) = listener.accept().await?;
-        let sessions = Arc::clone(&sessions);
-        tokio::spawn(async move {
-            if let Err(err) =
-                handle_socks_connection(local, sessions, socks_handshake_timeout).await
-            {
-                if is_clean_socks_disconnect(&err) {
-                    debug!(event = "socks5.connection.closed", peer = %peer);
-                } else {
-                    warn!(event = "socks5.connection.error", peer = %peer, error = %err);
-                }
+        tokio::select! {
+            () = &mut shutdown => {
+                info!(event = "socks5.shutdown");
+                sessions.shutdown().await;
+                let _ = shutdown_tx.send(true);
+                break;
             }
-        });
+            accepted = listener.accept() => {
+                let (local, peer) = accepted?;
+                let sessions = Arc::clone(&sessions);
+                let shutdown_rx = shutdown_tx.subscribe();
+                connections.spawn(async move {
+                    if let Err(err) =
+                        handle_socks_connection(
+                            local,
+                            sessions,
+                            socks_handshake_timeout,
+                            shutdown_rx,
+                        )
+                        .await
+                    {
+                        if is_clean_socks_disconnect(&err) {
+                            debug!(event = "socks5.connection.closed", peer = %peer);
+                        } else {
+                            warn!(event = "socks5.connection.error", peer = %peer, error = %err);
+                        }
+                    }
+                });
+            }
+            joined = connections.join_next(), if !connections.is_empty() => {
+                log_socks_task_result(joined);
+            }
+        }
+    }
+
+    while let Some(joined) = connections.join_next().await {
+        log_socks_task_result(Some(joined));
+    }
+
+    Ok(())
+}
+
+fn log_socks_task_result(result: Option<Result<(), tokio::task::JoinError>>) {
+    if let Some(Err(err)) = result {
+        warn!(event = "socks5.connection.task_error", error = %err);
     }
 }
 
@@ -213,6 +255,13 @@ impl ClientSessionManager {
             .is_some_and(|current| Arc::ptr_eq(current, session))
         {
             *current = None;
+        }
+    }
+
+    async fn shutdown(&self) {
+        let session = { self.current.lock().await.take() };
+        if let Some(session) = session {
+            session.close().await;
         }
     }
 }
@@ -747,13 +796,32 @@ async fn handle_socks_connection(
     mut local: TcpStream,
     sessions: Arc<ClientSessionManager>,
     socks_handshake_timeout: Option<Duration>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AnyError> {
     local.set_nodelay(true)?;
+    if *shutdown_rx.borrow() {
+        return Ok(());
+    }
     let mut state = ClientConnectionState::NegotiatingSocks;
-    let target = negotiate_socks_connect(&mut local, socks_handshake_timeout).await?;
+    let target = tokio::select! {
+        result = negotiate_socks_connect(&mut local, socks_handshake_timeout) => result?,
+        changed = shutdown_rx.changed() => {
+            let _ = changed;
+            transition(&mut state, ClientConnectionState::Closed);
+            return Ok(());
+        }
+    };
 
     transition(&mut state, ClientConnectionState::Opening);
-    let flow = match sessions.open_flow(target, &mut local).await {
+    let open_result = tokio::select! {
+        result = sessions.open_flow(target, &mut local) => result,
+        changed = shutdown_rx.changed() => {
+            let _ = changed;
+            transition(&mut state, ClientConnectionState::Closed);
+            return Ok(());
+        }
+    };
+    let flow = match open_result {
         Ok(OpenOutcome::Open(flow)) => flow,
         Ok(OpenOutcome::Rejected(reply)) => {
             socks5::send_reply(&mut local, reply).await?;
@@ -776,7 +844,7 @@ async fn handle_socks_connection(
     transition(&mut state, ClientConnectionState::Relaying);
     let flow_id = flow.id;
     let flow_session = Arc::clone(&flow.session);
-    let relay_result = relay_tcp(local, flow).await;
+    let relay_result = relay_tcp(local, flow, shutdown_rx).await;
     if relay_result.is_err() {
         transition(&mut state, ClientConnectionState::Closing);
         let _ = flow_session.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await;
@@ -800,7 +868,11 @@ async fn negotiate_socks_connect(
     }
 }
 
-async fn relay_tcp(mut local: TcpStream, mut flow: ClientFlow) -> Result<(), AnyError> {
+async fn relay_tcp(
+    mut local: TcpStream,
+    mut flow: ClientFlow,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), AnyError> {
     let mut local_to_remote_open = true;
     let mut remote_to_local_open = true;
     let data_frame_size = flow.session.data_frame_size;
@@ -810,6 +882,12 @@ async fn relay_tcp(mut local: TcpStream, mut flow: ClientFlow) -> Result<(), Any
 
     while local_to_remote_open || remote_to_local_open {
         tokio::select! {
+            changed = shutdown_rx.changed() => {
+                let _ = changed;
+                local.shutdown().await?;
+                local_to_remote_open = false;
+                remote_to_local_open = false;
+            }
             read = local.read(local_buf.as_mut()), if local_to_remote_open => {
                 let read = read?;
                 if read == 0 {
@@ -1492,7 +1570,12 @@ mod tests {
 
     #[tokio::test]
     async fn socks_listener_rejects_invalid_backing_config_before_bind() {
-        let result = run_socks5_listener(minimal_config(), "127.0.0.1:1".to_owned()).await;
+        let result = run_socks5_listener_until_shutdown(
+            minimal_config(),
+            "127.0.0.1:1".to_owned(),
+            std::future::pending(),
+        )
+        .await;
 
         assert!(result.is_err());
     }

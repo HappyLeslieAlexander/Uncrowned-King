@@ -22,7 +22,7 @@ use tokio::{
         TcpStream, lookup_host,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
-    sync::{Mutex, Notify, mpsc},
+    sync::{Mutex, Notify, mpsc, watch},
     task::JoinSet,
 };
 use tokio_rustls::server::TlsStream;
@@ -102,6 +102,7 @@ enum SessionEvent {
     FrameReadError(FrameIoError),
     IdleTimeout,
     PeerClosed,
+    Shutdown,
 }
 
 #[derive(Debug)]
@@ -184,6 +185,7 @@ pub(crate) async fn relay_session(
     policy_set: Arc<PolicySet>,
     limits: RelayLimits,
     idle_timeout: Option<Duration>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AnyError> {
     let mut state = ServerSessionState::Authenticated;
     transition(&mut state, ServerSessionState::Relaying);
@@ -208,6 +210,7 @@ pub(crate) async fn relay_session(
             &mut event_rx,
             limits.frame,
             idle_timeout,
+            &mut shutdown_rx,
         )
         .await
         {
@@ -234,6 +237,10 @@ pub(crate) async fn relay_session(
             }
             SessionEvent::PeerClosed => {
                 info!(event = "server.session.peer_closed");
+                break Ok(());
+            }
+            SessionEvent::Shutdown => {
+                info!(event = "server.session.shutdown");
                 break Ok(());
             }
         }
@@ -332,17 +339,30 @@ async fn next_session_event(
     event_rx: &mut mpsc::UnboundedReceiver<FlowEvent>,
     limits: FrameLimits,
     idle_timeout: Option<Duration>,
+    shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<SessionEvent, AnyError> {
+    if *shutdown_rx.borrow() {
+        return Ok(SessionEvent::Shutdown);
+    }
+
     if let Some(idle_timeout) = idle_timeout {
         tokio::select! {
             event = event_rx.recv() => Ok(SessionEvent::Flow(event)),
             frame = read_frame(carrier_reader, limits) => Ok(map_frame_event(frame)),
+            changed = shutdown_rx.changed() => {
+                let _ = changed;
+                Ok(SessionEvent::Shutdown)
+            }
             () = tokio::time::sleep(idle_timeout) => Ok(SessionEvent::IdleTimeout),
         }
     } else {
         tokio::select! {
             event = event_rx.recv() => Ok(SessionEvent::Flow(event)),
             frame = read_frame(carrier_reader, limits) => Ok(map_frame_event(frame)),
+            changed = shutdown_rx.changed() => {
+                let _ = changed;
+                Ok(SessionEvent::Shutdown)
+            }
         }
     }
 }

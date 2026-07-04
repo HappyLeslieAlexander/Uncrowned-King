@@ -39,7 +39,7 @@ rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = "0.26"
 toml = "0.8"
 tracing = "0.1"
