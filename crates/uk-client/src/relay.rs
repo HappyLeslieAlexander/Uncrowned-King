@@ -14,7 +14,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
     net::{TcpListener, TcpStream},
     sync::{Mutex, Notify, mpsc, watch},
     task::JoinSet,
@@ -952,8 +952,12 @@ async fn relay_tcp(
                         if !remote_to_local_open {
                             return Err("tcp data received after remote close".into());
                         }
-                        if !frame.payload.is_empty() {
-                            local.write_all(&frame.payload).await?;
+                        let local_write_open = frame.payload.is_empty()
+                            || write_all_or_shutdown(&mut local, &frame.payload, &mut shutdown_rx)
+                                .await?;
+                        if !local_write_open {
+                            local_to_remote_open = false;
+                            remote_to_local_open = false;
                         }
                     }
                     FrameType::TcpClose => {
@@ -979,6 +983,27 @@ async fn relay_tcp(
     }
 
     Ok(())
+}
+
+async fn write_all_or_shutdown<W>(
+    writer: &mut W,
+    payload: &[u8],
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Result<bool, AnyError>
+where
+    W: AsyncWrite + Unpin,
+{
+    tokio::select! {
+        result = writer.write_all(payload) => {
+            result?;
+            Ok(true)
+        }
+        changed = shutdown_rx.changed() => {
+            let _ = changed;
+            writer.shutdown().await?;
+            Ok(false)
+        }
+    }
 }
 
 async fn flush_pending_local_data(flow: &mut ClientFlow) -> Result<(), AnyError> {
@@ -1585,6 +1610,25 @@ mod tests {
         assert!(!is_clean_socks_disconnect(&boxed_io_error(
             io::ErrorKind::InvalidData
         )));
+    }
+
+    #[tokio::test]
+    async fn local_write_exits_when_shutdown_notifies() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let payload = vec![0x42; 1024];
+        let task = tokio::spawn(async move {
+            write_all_or_shutdown(&mut writer, &payload, &mut shutdown_rx).await
+        });
+
+        shutdown_tx.send(true).unwrap();
+        let wrote_payload = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert!(!wrote_payload);
     }
 
     #[test]
