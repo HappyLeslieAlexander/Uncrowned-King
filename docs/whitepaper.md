@@ -571,7 +571,8 @@ protocol_revision
 Peers must fail the session when `protocol_revision` is missing or unsupported.
 Advertised `max_frame_size` and `max_streams` values must be greater than zero.
 TCP relay peers must reject `max_frame_size < 262`, so a complete v0.1
-`TCP_OPEN` control payload always fits in one frame.
+`TCP_OPEN` control payload always fits in one frame. Peers must reject
+`max_frame_size > 16777216`.
 
 ## 19. Minimum Viable Implementation
 

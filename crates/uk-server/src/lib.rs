@@ -138,7 +138,10 @@ async fn complete_handshake(
     )
     .await?;
 
-    validate_connection_frame(&response_frame, FrameType::AuthResponse)?;
+    if let Err(err) = validate_connection_frame(&response_frame, FrameType::AuthResponse) {
+        let _ = write_connection_error(&mut stream, ErrorCode::Protocol).await;
+        return Err(err.into());
+    }
 
     let mut response_payload = response_frame.payload;
     let response = match AuthResponse::decode(&mut response_payload) {

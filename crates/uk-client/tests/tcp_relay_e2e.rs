@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    io::BufReader,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process,
@@ -13,18 +14,23 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
+use rustls::{
+    ClientConfig as RustlsClientConfig, RootCertStore,
+    pki_types::{CertificateDer, ServerName},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Barrier,
     task::JoinHandle,
 };
+use tokio_rustls::{TlsConnector, client::TlsStream};
 use uk_client::{
     config::ClientConfig, connect_authenticated_carrier, run_handshake, run_socks5_listener,
 };
 use uk_proto::{
-    ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, TCP_CLOSE_NORMAL, TcpClose, read_frame,
-    write_frame,
+    ALPN_PROTOCOL, ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, TCP_CLOSE_NORMAL,
+    TcpClose, read_frame, write_frame,
 };
 use uk_server::config::{CredentialConfig, LimitConfig, ServerConfig};
 
@@ -117,6 +123,15 @@ async fn maps_target_unavailable_to_socks_host_unreachable() -> Result<(), TestE
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reports_auth_failure_during_handshake() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_auth_failure_error_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reports_protocol_error_for_unexpected_auth_response_frame() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_unexpected_auth_response_frame_error_e2e(),
+    )
+    .await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -639,6 +654,35 @@ async fn run_auth_failure_error_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+async fn run_unexpected_auth_response_frame_error_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = ServerHarness::start(test_limits()).await?;
+    let mut carrier = connect_tls_carrier(&harness).await?;
+
+    let challenge = read_frame(&mut carrier, FrameLimits::default()).await?;
+    assert_eq!(challenge.header.frame_type, FrameType::AuthChallenge);
+    assert_eq!(challenge.header.id, 0);
+
+    let frame = Frame::new(FrameType::Settings, 0, 0, Bytes::new())?;
+    write_frame(&mut carrier, &frame).await?;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(response.header.frame_type, FrameType::Error);
+    assert_eq!(response.header.id, 0);
+
+    let mut payload = response.payload;
+    assert_eq!(
+        ErrorPayload::decode(&mut payload)?.code,
+        ErrorCode::Protocol
+    );
+    Ok(())
+}
+
 async fn run_zero_id_tcp_close_error_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -819,6 +863,37 @@ impl ServerHarness {
             socks_handshake_timeout_seconds: Some(3),
             tcp_open_timeout_seconds: Some(3),
         }
+    }
+}
+
+async fn connect_tls_carrier(harness: &ServerHarness) -> Result<TlsStream<TcpStream>, TestError> {
+    let mut roots = RootCertStore::empty();
+    for cert in load_certs(&harness.cert_path)? {
+        roots.add(cert)?;
+    }
+    let mut config = RustlsClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+    config.enable_early_data = false;
+
+    let connector = TlsConnector::from(Arc::new(config));
+    let server_name = ServerName::try_from("localhost".to_owned())?;
+    let tcp = TcpStream::connect(harness.server_addr).await?;
+    let stream = connector.connect(server_name, tcp).await?;
+    if stream.get_ref().1.alpn_protocol() != Some(ALPN_PROTOCOL) {
+        return Err("UK ALPN protocol was not negotiated".into());
+    }
+    Ok(stream)
+}
+
+fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TestError> {
+    let mut reader = BufReader::new(fs::File::open(path)?);
+    let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+    if certs.is_empty() {
+        Err("missing certificate".into())
+    } else {
+        Ok(certs)
     }
 }
 
