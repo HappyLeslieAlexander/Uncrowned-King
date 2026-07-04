@@ -85,6 +85,7 @@ pub(crate) async fn run_socks5_listener(
     config: ClientConfig,
     listen: String,
 ) -> Result<(), AnyError> {
+    crate::check_config(&config)?;
     validate_endpoint("socks listen", &listen)?;
     let socks_handshake_timeout = timeout(config.socks_handshake_timeout_seconds());
     let sessions = Arc::new(ClientSessionManager::new(config));
@@ -602,6 +603,19 @@ mod tests {
 
     const FLOW_ID: u64 = 1;
 
+    fn minimal_config() -> ClientConfig {
+        ClientConfig {
+            server_addr: "127.0.0.1:443".to_owned(),
+            server_name: "localhost".to_owned(),
+            ca_cert_path: "missing-ca.pem".to_owned(),
+            key_id: "client".to_owned(),
+            secret: "0123456789abcdef0123456789abcdef".to_owned(),
+            handshake_timeout_seconds: None,
+            socks_handshake_timeout_seconds: None,
+            tcp_open_timeout_seconds: None,
+        }
+    }
+
     fn status_payload(code: ErrorCode) -> Bytes {
         let mut payload = BytesMut::new();
         ErrorPayload::new(code).encode(&mut payload).unwrap();
@@ -741,6 +755,13 @@ mod tests {
         assert!(validate_endpoint("socks listen", "127.0.0.1").is_err());
         assert!(validate_endpoint("socks listen", "127.0.0.1:0").is_err());
         assert!(validate_endpoint("socks listen", "::1:1080").is_err());
+    }
+
+    #[tokio::test]
+    async fn socks_listener_rejects_invalid_backing_config_before_bind() {
+        let result = run_socks5_listener(minimal_config(), "127.0.0.1:1".to_owned()).await;
+
+        assert!(result.is_err());
     }
 
     #[test]
