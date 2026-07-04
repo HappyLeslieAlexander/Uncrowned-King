@@ -72,8 +72,11 @@ Input:
 secret = "0123456789abcdef0123456789abcdef"
 exporter_32 = 11 repeated 32 times
 server_nonce = 22 repeated 32 times
-client_nonce = 44 repeated 32 times
+server_time = 1700000000
 session_id = 33 repeated 16 times
+server_capabilities = 01 02 03
+limits = 04 05 06
+client_nonce = 44 repeated 32 times
 key_id = "client-a"
 client_time = 1700000001
 client_capabilities = "cap"
@@ -82,8 +85,8 @@ client_capabilities = "cap"
 Expected HMAC-SHA256 tag:
 
 ```text
-3f 8e f7 a9 74 52 1f 15 0d d4 5e 87 92 6e c2 08
-5e 57 19 da a9 35 5d c6 03 16 9b 92 76 3d b0 21
+52 9e d7 26 b1 af ea 54 cf ca ac 09 2b 73 e3 17
+1f eb b7 e0 06 59 c1 0b b8 9c f6 86 e7 d5 3c 71
 ```
 
 ## 6. Settings

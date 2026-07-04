@@ -193,14 +193,20 @@ HMAC-SHA256(
   secret,
   "UK-AUTH-v1" ||
   exporter_32 ||
-  server_nonce ||
-  client_nonce ||
-  session_id ||
+  auth_challenge_payload ||
+  varint(key_id_len) ||
   key_id ||
+  client_nonce ||
   client_time_be ||
+  varint(client_capabilities_len) ||
   client_capabilities
 )
 ```
+
+`auth_challenge_payload` is the canonical `AUTH_CHALLENGE` payload exactly as
+encoded above, including `server_time`, `server_capabilities_len`, and
+`limits_len`. Servers must reject responses when either `server_time` or
+`client_time` is outside the configured authentication skew window.
 
 ## 6. SETTINGS Payload
 

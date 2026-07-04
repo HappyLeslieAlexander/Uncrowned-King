@@ -5,7 +5,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, BytesMut};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
@@ -44,8 +44,8 @@ pub enum AuthError {
     /// The supplied tag does not match.
     #[error("invalid hmac tag")]
     InvalidTag,
-    /// The client timestamp is outside the allowed skew.
-    #[error("client timestamp outside allowed skew")]
+    /// An authentication timestamp is outside the allowed skew.
+    #[error("authentication timestamp outside allowed skew")]
     ClockSkew,
     /// The nonce pair has already been accepted.
     #[error("replayed nonce")]
@@ -419,8 +419,9 @@ pub fn verify_auth_response(
         return Err(AuthError::CredentialNotActive);
     }
 
-    let skew = now.abs_diff(response.client_time);
-    if skew > allowed_skew.as_secs() {
+    if !timestamp_within_skew(challenge.server_time, now, allowed_skew)
+        || !timestamp_within_skew(response.client_time, now, allowed_skew)
+    {
         return Err(AuthError::ClockSkew);
     }
 
@@ -450,16 +451,44 @@ fn auth_mac(
     client_capabilities: &[u8],
 ) -> AuthResult<HmacSha256> {
     validate_shared_secret(secret)?;
+    validate_key_id(key_id)?;
     let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| AuthError::SecretTooShort)?;
     mac.update(AUTH_LABEL);
     mac.update(exporter_32);
-    mac.update(&challenge.server_nonce);
-    mac.update(client_nonce);
-    mac.update(&challenge.session_id);
-    mac.update(key_id);
-    mac.update(&client_time.to_be_bytes());
-    mac.update(client_capabilities);
+    mac.update(&encoded_challenge_payload(challenge)?);
+    mac.update(&encoded_response_prefix(
+        key_id,
+        client_nonce,
+        client_time,
+        client_capabilities,
+    )?);
     Ok(mac)
+}
+
+fn timestamp_within_skew(timestamp: u64, now: u64, allowed_skew: Duration) -> bool {
+    now.abs_diff(timestamp) <= allowed_skew.as_secs()
+}
+
+fn encoded_challenge_payload(challenge: &AuthChallenge) -> AuthResult<BytesMut> {
+    let mut payload = BytesMut::new();
+    challenge.encode(&mut payload)?;
+    Ok(payload)
+}
+
+fn encoded_response_prefix(
+    key_id: &[u8],
+    client_nonce: &[u8; 32],
+    client_time: u64,
+    client_capabilities: &[u8],
+) -> AuthResult<BytesMut> {
+    let mut payload = BytesMut::new();
+    varint::encode(key_id.len() as u64, &mut payload)?;
+    payload.put_slice(key_id);
+    payload.put_slice(client_nonce);
+    payload.put_u64(client_time);
+    varint::encode(client_capabilities.len() as u64, &mut payload)?;
+    payload.put_slice(client_capabilities);
+    Ok(payload)
 }
 
 /// Validates that a key id can be represented on the wire.
@@ -583,11 +612,38 @@ mod tests {
         assert_eq!(
             response.tag,
             [
-                0x3f, 0x8e, 0xf7, 0xa9, 0x74, 0x52, 0x1f, 0x15, 0x0d, 0xd4, 0x5e, 0x87, 0x92, 0x6e,
-                0xc2, 0x08, 0x5e, 0x57, 0x19, 0xda, 0xa9, 0x35, 0x5d, 0xc6, 0x03, 0x16, 0x9b, 0x92,
-                0x76, 0x3d, 0xb0, 0x21,
+                0x52, 0x9e, 0xd7, 0x26, 0xb1, 0xaf, 0xea, 0x54, 0xcf, 0xca, 0xac, 0x09, 0x2b, 0x73,
+                0xe3, 0x17, 0x1f, 0xeb, 0xb7, 0xe0, 0x06, 0x59, 0xc1, 0x0b, 0xb8, 0x9c, 0xf6, 0x86,
+                0xe7, 0xd5, 0x3c, 0x71,
             ]
         );
+    }
+
+    #[test]
+    fn auth_tag_covers_challenge_metadata() {
+        let (credential, exporter, challenge, response) = fixture();
+        let mut changed_time = challenge.clone();
+        changed_time.server_time += 1;
+        let mut changed_capabilities = challenge.clone();
+        changed_capabilities.server_capabilities.push(0xff);
+        let mut changed_limits = challenge.clone();
+        changed_limits.limits.push(0xee);
+
+        for changed_challenge in [changed_time, changed_capabilities, changed_limits] {
+            assert_ne!(
+                compute_auth_tag(
+                    &credential.secret,
+                    &exporter,
+                    &changed_challenge,
+                    &response.key_id,
+                    &response.client_nonce,
+                    response.client_time,
+                    &response.client_capabilities,
+                )
+                .unwrap(),
+                response.tag
+            );
+        }
     }
 
     #[test]
@@ -746,6 +802,36 @@ mod tests {
         )
         .unwrap();
         let mut replay_cache = ReplayCache::default();
+        assert_eq!(
+            verify_auth_response(
+                &[credential],
+                &exporter,
+                &challenge,
+                &response,
+                1_700_000_001,
+                Duration::from_secs(30),
+                &mut replay_cache
+            ),
+            Err(AuthError::ClockSkew)
+        );
+    }
+
+    #[test]
+    fn rejects_expired_challenge_timestamp() {
+        let (credential, exporter, mut challenge, mut response) = fixture();
+        challenge.server_time = 1_600_000_000;
+        response.tag = compute_auth_tag(
+            &credential.secret,
+            &exporter,
+            &challenge,
+            &response.key_id,
+            &response.client_nonce,
+            response.client_time,
+            &response.client_capabilities,
+        )
+        .unwrap();
+        let mut replay_cache = ReplayCache::default();
+
         assert_eq!(
             verify_auth_response(
                 &[credential],
