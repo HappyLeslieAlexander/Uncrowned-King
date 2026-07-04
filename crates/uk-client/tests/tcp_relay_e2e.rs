@@ -1447,6 +1447,7 @@ async fn run_server_active_session_shutdown_e2e() -> Result<(), TestError> {
         max_pending_open_bytes: None,
         max_socks_connections: None,
         max_buffered_bytes_per_session: None,
+        max_buffered_bytes_per_flow: None,
     })
     .await?
     .0;
@@ -1487,6 +1488,7 @@ async fn run_socks_listener_shutdown_e2e() -> Result<(), TestError> {
             max_pending_open_bytes: None,
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
+            max_buffered_bytes_per_flow: None,
         },
         socks_addr.to_string(),
         async {
@@ -1535,6 +1537,7 @@ async fn run_socks_listener_shutdown_during_connect_e2e() -> Result<(), TestErro
             max_pending_open_bytes: None,
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
+            max_buffered_bytes_per_flow: None,
         },
         socks_addr.to_string(),
         async {
@@ -1636,6 +1639,7 @@ impl ServerHarness {
             max_pending_open_bytes: None,
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
+            max_buffered_bytes_per_flow: None,
         }
     }
 }
@@ -1762,6 +1766,7 @@ impl MalformedFrameServerHarness {
                 max_pending_open_bytes: None,
                 max_socks_connections: None,
                 max_buffered_bytes_per_session: None,
+                max_buffered_bytes_per_flow: None,
             },
             socks_addr.to_string(),
         ));
@@ -1835,6 +1840,7 @@ impl PendingOpenCancelServerHarness {
                 max_pending_open_bytes: None,
                 max_socks_connections: None,
                 max_buffered_bytes_per_session: None,
+                max_buffered_bytes_per_flow: None,
             },
             socks_addr.to_string(),
         ));
@@ -1919,6 +1925,7 @@ impl MissingPongServerHarness {
                 max_pending_open_bytes: None,
                 max_socks_connections: None,
                 max_buffered_bytes_per_session: None,
+                max_buffered_bytes_per_flow: None,
             },
             socks_addr.to_string(),
         ));
@@ -2252,6 +2259,7 @@ impl RelayHarness {
                 max_pending_open_bytes: None,
                 max_socks_connections,
                 max_buffered_bytes_per_session: None,
+                max_buffered_bytes_per_flow: None,
             },
             socks_addr.to_string(),
         ));

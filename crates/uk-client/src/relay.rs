@@ -41,7 +41,7 @@ const DEFAULT_MAX_STREAMS: u64 = 64;
 
 type AnyError = Box<dyn Error + Send + Sync>;
 type CarrierWriter = Arc<Mutex<WriteHalf<TlsStream<TcpStream>>>>;
-type FlowTable = Arc<Mutex<HashMap<u64, mpsc::Sender<BufferedFlowFrame>>>>;
+type FlowTable = Arc<Mutex<HashMap<u64, ClientFlowRoute>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClientConnectionState {
@@ -60,6 +60,7 @@ struct ClientSession {
     max_streams: u64,
     max_pending_open_bytes: usize,
     max_buffered_bytes_per_session: usize,
+    max_buffered_bytes_per_flow: usize,
     session_buffer: ClientSessionBufferControl,
     open_timeout: Option<Duration>,
     shutdown: ClientSessionShutdown,
@@ -119,7 +120,18 @@ enum FlowFrameRoute {
 }
 
 #[derive(Debug, Clone)]
+struct ClientFlowRoute {
+    sender: mpsc::Sender<BufferedFlowFrame>,
+    flow_buffer: ClientFlowBufferControl,
+}
+
+#[derive(Debug, Clone)]
 struct ClientSessionBufferControl {
+    buffered_bytes: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Clone)]
+struct ClientFlowBufferControl {
     buffered_bytes: Arc<AtomicUsize>,
 }
 
@@ -127,7 +139,14 @@ struct ClientSessionBufferControl {
 struct BufferedFlowFrame {
     frame: Option<Frame>,
     payload_len: usize,
-    control: ClientSessionBufferControl,
+    flow_control: ClientFlowBufferControl,
+    session_control: ClientSessionBufferControl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BufferReserveError {
+    FlowLimit,
+    SessionLimit,
 }
 
 #[derive(Clone)]
@@ -193,18 +212,60 @@ impl ClientSessionBufferControl {
     }
 }
 
-impl BufferedFlowFrame {
-    fn new(frame: Frame, control: ClientSessionBufferControl, byte_limit: usize) -> Option<Self> {
-        let payload_len = frame.payload.len();
-        if control.reserve_bytes(payload_len, byte_limit) {
-            Some(Self {
-                frame: Some(frame),
-                payload_len,
-                control,
-            })
-        } else {
-            None
+impl Default for ClientFlowBufferControl {
+    fn default() -> Self {
+        Self {
+            buffered_bytes: Arc::new(AtomicUsize::new(0)),
         }
+    }
+}
+
+impl ClientFlowBufferControl {
+    fn reserve_bytes(&self, amount: usize, limit: usize) -> bool {
+        reserve_bytes(&self.buffered_bytes, amount, limit)
+    }
+
+    fn release_bytes(&self, amount: usize) {
+        release_bytes(&self.buffered_bytes, amount);
+    }
+
+    #[cfg(test)]
+    fn buffered_bytes(&self) -> usize {
+        self.buffered_bytes.load(Ordering::SeqCst)
+    }
+}
+
+impl ClientFlowRoute {
+    fn new(sender: mpsc::Sender<BufferedFlowFrame>) -> Self {
+        Self {
+            sender,
+            flow_buffer: ClientFlowBufferControl::default(),
+        }
+    }
+}
+
+impl BufferedFlowFrame {
+    fn new(
+        frame: Frame,
+        flow_control: ClientFlowBufferControl,
+        session_control: ClientSessionBufferControl,
+        flow_byte_limit: usize,
+        session_byte_limit: usize,
+    ) -> Result<Self, BufferReserveError> {
+        let payload_len = frame.payload.len();
+        if !flow_control.reserve_bytes(payload_len, flow_byte_limit) {
+            return Err(BufferReserveError::FlowLimit);
+        }
+        if !session_control.reserve_bytes(payload_len, session_byte_limit) {
+            flow_control.release_bytes(payload_len);
+            return Err(BufferReserveError::SessionLimit);
+        }
+        Ok(Self {
+            frame: Some(frame),
+            payload_len,
+            flow_control,
+            session_control,
+        })
     }
 
     fn into_frame(mut self) -> Frame {
@@ -214,7 +275,8 @@ impl BufferedFlowFrame {
 
     fn release(&mut self) {
         if self.payload_len > 0 {
-            self.control.release_bytes(self.payload_len);
+            self.flow_control.release_bytes(self.payload_len);
+            self.session_control.release_bytes(self.payload_len);
             self.payload_len = 0;
         }
     }
@@ -448,6 +510,7 @@ impl ClientSession {
             max_streams: max_streams(&settings),
             max_pending_open_bytes: usize_limit(config.max_pending_open_bytes())?,
             max_buffered_bytes_per_session: usize_limit(config.max_buffered_bytes_per_session())?,
+            max_buffered_bytes_per_flow: usize_limit(config.max_buffered_bytes_per_flow())?,
             session_buffer,
             open_timeout: timeout(config.tcp_open_timeout_seconds()),
             shutdown: ClientSessionShutdown::default(),
@@ -628,7 +691,7 @@ impl ClientSession {
                 return Ok(None);
             }
             if let Entry::Vacant(entry) = flows.entry(flow_id) {
-                entry.insert(sender);
+                entry.insert(ClientFlowRoute::new(sender));
                 return Ok(Some((flow_id, frames)));
             }
         }
@@ -905,6 +968,7 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
                     frame,
                     &mut flows,
                     session.session_buffer.clone(),
+                    session.max_buffered_bytes_per_flow,
                     session.max_buffered_bytes_per_session,
                 )
             };
@@ -989,8 +1053,9 @@ fn is_connection_error_frame(frame: &Frame) -> bool {
 
 fn route_flow_frame(
     frame: Frame,
-    flows: &mut HashMap<u64, mpsc::Sender<BufferedFlowFrame>>,
+    flows: &mut HashMap<u64, ClientFlowRoute>,
     session_buffer: ClientSessionBufferControl,
+    flow_byte_limit: usize,
     session_byte_limit: usize,
 ) -> (u64, FlowFrameRoute) {
     let flow_id = frame.header.id;
@@ -998,14 +1063,28 @@ fn route_flow_frame(
         return (flow_id, FlowFrameRoute::InvalidFlowId);
     }
 
-    let Some(sender) = flows.get(&flow_id) else {
+    let Some(route) = flows.get(&flow_id) else {
         return (flow_id, FlowFrameRoute::UnknownFlow);
     };
+    let sender = route.sender.clone();
+    let flow_buffer = route.flow_buffer.clone();
 
-    let Some(buffered_frame) = BufferedFlowFrame::new(frame, session_buffer, session_byte_limit)
-    else {
-        flows.remove(&flow_id);
-        return (flow_id, FlowFrameRoute::SessionQueueFull);
+    let buffered_frame = match BufferedFlowFrame::new(
+        frame,
+        flow_buffer,
+        session_buffer,
+        flow_byte_limit,
+        session_byte_limit,
+    ) {
+        Ok(frame) => frame,
+        Err(BufferReserveError::FlowLimit) => {
+            flows.remove(&flow_id);
+            return (flow_id, FlowFrameRoute::FlowQueueFull);
+        }
+        Err(BufferReserveError::SessionLimit) => {
+            flows.remove(&flow_id);
+            return (flow_id, FlowFrameRoute::SessionQueueFull);
+        }
     };
 
     let route = match sender.try_send(buffered_frame) {
@@ -1439,6 +1518,7 @@ mod tests {
             max_pending_open_bytes: None,
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
+            max_buffered_bytes_per_flow: None,
         }
     }
 
@@ -1476,25 +1556,33 @@ mod tests {
 
     fn route_test_flow_frame(
         frame: Frame,
-        flows: &mut HashMap<u64, mpsc::Sender<BufferedFlowFrame>>,
+        flows: &mut HashMap<u64, ClientFlowRoute>,
     ) -> (u64, FlowFrameRoute) {
         route_flow_frame(
             frame,
             flows,
             ClientSessionBufferControl::default(),
             usize::MAX,
+            usize::MAX,
         )
     }
 
     fn buffered_flow_frame(frame: Frame) -> BufferedFlowFrame {
-        BufferedFlowFrame::new(frame, ClientSessionBufferControl::default(), usize::MAX).unwrap()
+        BufferedFlowFrame::new(
+            frame,
+            ClientFlowBufferControl::default(),
+            ClientSessionBufferControl::default(),
+            usize::MAX,
+            usize::MAX,
+        )
+        .unwrap()
     }
 
     #[test]
     fn routes_carrier_frame_to_existing_flow() {
         let (sender, mut receiver) = mpsc::channel(1);
         let mut flows = HashMap::new();
-        flows.insert(FLOW_ID, sender);
+        flows.insert(FLOW_ID, ClientFlowRoute::new(sender));
 
         assert_eq!(
             route_test_flow_frame(
@@ -1548,7 +1636,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
         let mut flows = HashMap::new();
-        flows.insert(FLOW_ID, sender);
+        flows.insert(FLOW_ID, ClientFlowRoute::new(sender));
 
         assert_eq!(
             route_test_flow_frame(data_frame(FLOW_ID, Bytes::from_static(b"late")), &mut flows),
@@ -1567,7 +1655,7 @@ mod tests {
             )))
             .unwrap();
         let mut flows = HashMap::new();
-        flows.insert(FLOW_ID, sender);
+        flows.insert(FLOW_ID, ClientFlowRoute::new(sender));
 
         assert_eq!(
             route_test_flow_frame(
@@ -1584,10 +1672,10 @@ mod tests {
     }
 
     #[test]
-    fn removes_flow_when_session_buffer_limit_is_exceeded() {
+    fn removes_flow_when_flow_buffer_limit_is_exceeded() {
         let (sender, _receiver) = mpsc::channel(1);
         let mut flows = HashMap::new();
-        flows.insert(FLOW_ID, sender);
+        flows.insert(FLOW_ID, ClientFlowRoute::new(sender));
         let session_buffer = ClientSessionBufferControl::default();
 
         assert_eq!(
@@ -1595,6 +1683,29 @@ mod tests {
                 data_frame(FLOW_ID, Bytes::from_static(b"overflow")),
                 &mut flows,
                 session_buffer.clone(),
+                4,
+                usize::MAX,
+            ),
+            (FLOW_ID, FlowFrameRoute::FlowQueueFull)
+        );
+
+        assert!(!flows.contains_key(&FLOW_ID));
+        assert_eq!(session_buffer.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn removes_flow_when_session_buffer_limit_is_exceeded() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut flows = HashMap::new();
+        flows.insert(FLOW_ID, ClientFlowRoute::new(sender));
+        let session_buffer = ClientSessionBufferControl::default();
+
+        assert_eq!(
+            route_flow_frame(
+                data_frame(FLOW_ID, Bytes::from_static(b"overflow")),
+                &mut flows,
+                session_buffer.clone(),
+                usize::MAX,
                 4,
             ),
             (FLOW_ID, FlowFrameRoute::SessionQueueFull)
@@ -1606,25 +1717,33 @@ mod tests {
 
     #[test]
     fn buffered_flow_frame_releases_session_bytes_on_drop() {
+        let flow_buffer = ClientFlowBufferControl::default();
         let session_buffer = ClientSessionBufferControl::default();
         let buffered = BufferedFlowFrame::new(
             data_frame(FLOW_ID, Bytes::from_static(b"queued")),
+            flow_buffer.clone(),
             session_buffer.clone(),
+            16,
             16,
         )
         .unwrap();
 
+        assert_eq!(flow_buffer.buffered_bytes(), 6);
         assert_eq!(session_buffer.buffered_bytes(), 6);
         drop(buffered);
+        assert_eq!(flow_buffer.buffered_bytes(), 0);
         assert_eq!(session_buffer.buffered_bytes(), 0);
     }
 
     #[test]
     fn buffered_flow_frame_releases_session_bytes_on_into_frame() {
+        let flow_buffer = ClientFlowBufferControl::default();
         let session_buffer = ClientSessionBufferControl::default();
         let buffered = BufferedFlowFrame::new(
             data_frame(FLOW_ID, Bytes::from_static(b"queued")),
+            flow_buffer.clone(),
             session_buffer.clone(),
+            16,
             16,
         )
         .unwrap();
@@ -1632,6 +1751,7 @@ mod tests {
         let frame = buffered.into_frame();
 
         assert_eq!(frame.payload, Bytes::from_static(b"queued"));
+        assert_eq!(flow_buffer.buffered_bytes(), 0);
         assert_eq!(session_buffer.buffered_bytes(), 0);
     }
 

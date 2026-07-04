@@ -34,6 +34,8 @@ pub struct ClientConfig {
     pub max_socks_connections: Option<u64>,
     /// Optional maximum queued server-to-local bytes across one UK session.
     pub max_buffered_bytes_per_session: Option<u64>,
+    /// Optional maximum queued server-to-local bytes per TCP flow.
+    pub max_buffered_bytes_per_flow: Option<u64>,
 }
 
 impl ClientConfig {
@@ -73,6 +75,11 @@ impl ClientConfig {
     pub fn max_buffered_bytes_per_session(&self) -> u64 {
         self.max_buffered_bytes_per_session
             .unwrap_or(MAX_FRAME_PAYLOAD_SIZE)
+    }
+
+    /// Maximum queued server-to-local bytes per TCP flow.
+    pub fn max_buffered_bytes_per_flow(&self) -> u64 {
+        self.max_buffered_bytes_per_flow.unwrap_or(2_097_152)
     }
 
     /// Validates local authentication material before opening a network session.
@@ -131,6 +138,16 @@ impl ClientConfig {
             )
             .into());
         }
+        let max_buffered_bytes_per_flow = self.max_buffered_bytes_per_flow();
+        if max_buffered_bytes_per_flow == 0 {
+            return Err("max_buffered_bytes_per_flow must be greater than zero".into());
+        }
+        if max_buffered_bytes_per_flow > MAX_FRAME_PAYLOAD_SIZE {
+            return Err(format!(
+                "max_buffered_bytes_per_flow must be at most {MAX_FRAME_PAYLOAD_SIZE}"
+            )
+            .into());
+        }
         Ok(())
     }
 }
@@ -162,6 +179,7 @@ mod tests {
             max_pending_open_bytes: None,
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
+            max_buffered_bytes_per_flow: None,
         }
     }
 
@@ -308,6 +326,11 @@ max_socks_connections = 7
     }
 
     #[test]
+    fn defaults_buffered_bytes_per_flow_limit() {
+        assert_eq!(minimal_config().max_buffered_bytes_per_flow(), 2_097_152);
+    }
+
+    #[test]
     fn parses_buffered_bytes_per_session_limit() {
         let config: ClientConfig = toml::from_str(
             r#"
@@ -341,6 +364,39 @@ max_buffered_bytes_per_session = 8192
     }
 
     #[test]
+    fn parses_buffered_bytes_per_flow_limit() {
+        let config: ClientConfig = toml::from_str(
+            r#"
+server_addr = "127.0.0.1:443"
+server_name = "localhost"
+ca_cert_path = "ca.pem"
+key_id = "client"
+secret = "secret"
+max_buffered_bytes_per_flow = 4096
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.max_buffered_bytes_per_flow(), 4096);
+    }
+
+    #[test]
+    fn rejects_zero_buffered_bytes_per_flow_limit() {
+        let mut config = minimal_config();
+        config.max_buffered_bytes_per_flow = Some(0);
+
+        assert!(config.validate_resource_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_too_large_buffered_bytes_per_flow_limit() {
+        let mut config = minimal_config();
+        config.max_buffered_bytes_per_flow = Some(MAX_FRAME_PAYLOAD_SIZE + 1);
+
+        assert!(config.validate_resource_limits().is_err());
+    }
+
+    #[test]
     fn parses_zero_timeout_values() {
         let config: ClientConfig = toml::from_str(
             r#"
@@ -355,6 +411,7 @@ tcp_open_timeout_seconds = 0
 max_pending_open_bytes = 1024
 max_socks_connections = 1
 max_buffered_bytes_per_session = 1024
+max_buffered_bytes_per_flow = 1024
 "#,
         )
         .unwrap();
@@ -365,6 +422,7 @@ max_buffered_bytes_per_session = 1024
         assert_eq!(config.max_pending_open_bytes(), 1024);
         assert_eq!(config.max_socks_connections(), 1);
         assert_eq!(config.max_buffered_bytes_per_session(), 1024);
+        assert_eq!(config.max_buffered_bytes_per_flow(), 1024);
     }
 
     #[test]

@@ -87,8 +87,9 @@ bounds waiting for a UK TCP open response from the server.
 `max_pending_open_bytes = 65536` bounds local bytes buffered before that open
 response arrives.
 `max_socks_connections = 1024` bounds concurrent local SOCKS connections before
-and during relay. `max_buffered_bytes_per_session = 16777216` bounds queued
-server-to-local relay bytes per UK session.
+and during relay. `max_buffered_bytes_per_session = 16777216` and
+`max_buffered_bytes_per_flow = 2097152` bound queued server-to-local relay bytes
+per UK session and per flow.
 
 Example configs live under `examples/`; see `examples/README.md` for local
 certificate generation. Validate configs without opening listeners or outbound

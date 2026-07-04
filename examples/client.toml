@@ -12,3 +12,4 @@ tcp_open_timeout_seconds = 10
 max_pending_open_bytes = 65536
 max_socks_connections = 1024
 max_buffered_bytes_per_session = 16777216
+max_buffered_bytes_per_flow = 2097152
