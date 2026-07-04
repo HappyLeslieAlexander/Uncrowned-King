@@ -17,6 +17,12 @@ const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestHead {
+    command: u8,
+    addr_type: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reply {
     Succeeded = 0x00,
     GeneralFailure = 0x01,
@@ -83,34 +89,25 @@ async fn read_connect_request<S>(stream: &mut S) -> io::Result<Target>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let version = stream.read_u8().await?;
-    if version != VERSION {
-        send_reply(stream, Reply::GeneralFailure).await?;
-        return Err(protocol_error("unsupported socks request version"));
-    }
-    let command = stream.read_u8().await?;
-    let reserved = stream.read_u8().await?;
-    if reserved != 0 {
-        send_reply(stream, Reply::GeneralFailure).await?;
-        return Err(protocol_error("invalid socks reserved byte"));
-    }
-    let addr_type = stream.read_u8().await?;
-    if command != CMD_CONNECT {
+    let head = read_request_head(stream).await?;
+
+    if head.command != CMD_CONNECT {
         send_reply(stream, Reply::CommandNotSupported).await?;
         return Err(protocol_error("only socks CONNECT is supported"));
     }
 
-    let target = match addr_type {
+    let target = match head.addr_type {
         ATYP_IPV4 => {
             let mut octets = [0_u8; 4];
-            stream.read_exact(&mut octets).await?;
+            read_request_exact(stream, &mut octets).await?;
             let port = read_port(stream).await?;
             Target::Ipv4(Ipv4Addr::from(octets), port)
         }
         ATYP_DOMAIN => {
-            let len = stream.read_u8().await?;
-            let mut domain = vec![0_u8; usize::from(len)];
-            stream.read_exact(&mut domain).await?;
+            let mut len = [0_u8; 1];
+            read_request_exact(stream, &mut len).await?;
+            let mut domain = vec![0_u8; usize::from(len[0])];
+            read_request_exact(stream, &mut domain).await?;
             let port = read_port(stream).await?;
             let Ok(domain) = String::from_utf8(domain) else {
                 send_reply(stream, Reply::HostUnreachable).await?;
@@ -120,7 +117,7 @@ where
         }
         ATYP_IPV6 => {
             let mut octets = [0_u8; 16];
-            stream.read_exact(&mut octets).await?;
+            read_request_exact(stream, &mut octets).await?;
             let port = read_port(stream).await?;
             Target::Ipv6(Ipv6Addr::from(octets), port)
         }
@@ -137,13 +134,46 @@ where
     Ok(target)
 }
 
+async fn read_request_head<S>(stream: &mut S) -> io::Result<RequestHead>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut head = [0_u8; 4];
+    read_request_exact(stream, &mut head).await?;
+
+    let [version, command, reserved, addr_type] = head;
+    if version != VERSION {
+        send_reply(stream, Reply::GeneralFailure).await?;
+        return Err(protocol_error("unsupported socks request version"));
+    }
+    if reserved != 0 {
+        send_reply(stream, Reply::GeneralFailure).await?;
+        return Err(protocol_error("invalid socks reserved byte"));
+    }
+    Ok(RequestHead { command, addr_type })
+}
+
 async fn read_port<S>(stream: &mut S) -> io::Result<u16>
 where
-    S: AsyncRead + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut port = [0_u8; 2];
-    stream.read_exact(&mut port).await?;
+    read_request_exact(stream, &mut port).await?;
     Ok(u16::from_be_bytes(port))
+}
+
+async fn read_request_exact<S>(stream: &mut S, buf: &mut [u8]) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match stream.read_exact(buf).await {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+            let _ = send_reply(stream, Reply::GeneralFailure).await;
+            Err(protocol_error("truncated socks request"))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn validate_target(target: &Target) -> io::Result<()> {
@@ -199,6 +229,34 @@ mod tests {
 
         let target = server_task.await.unwrap().unwrap();
         assert_eq!(target, Target::Ipv6(Ipv6Addr::LOCALHOST, 443));
+    }
+
+    #[tokio::test]
+    async fn negotiates_domain_connect() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
+        let domain = b"example.com";
+        let mut request = vec![
+            0x05,
+            0x01,
+            0x00,
+            0x05,
+            0x01,
+            0x00,
+            0x03,
+            u8::try_from(domain.len()).unwrap(),
+        ];
+        request.extend_from_slice(domain);
+        request.extend_from_slice(&443_u16.to_be_bytes());
+
+        client.write_all(&request).await.unwrap();
+
+        let mut method_response = [0_u8; 2];
+        client.read_exact(&mut method_response).await.unwrap();
+        assert_eq!(method_response, [0x05, 0x00]);
+
+        let target = server_task.await.unwrap().unwrap();
+        assert_eq!(target, Target::Domain("example.com".to_owned(), 443));
     }
 
     #[tokio::test]
@@ -280,6 +338,27 @@ mod tests {
             ])
             .await
             .unwrap();
+
+        let mut method_response = [0_u8; 2];
+        client.read_exact(&mut method_response).await.unwrap();
+        assert_eq!(method_response, [0x05, 0x00]);
+
+        let mut reply = [0_u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], Reply::GeneralFailure.code());
+        assert!(server_task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_truncated_ipv4_request_with_failure_reply() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
+
+        client
+            .write_all(&[0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x01, 127])
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
 
         let mut method_response = [0_u8; 2];
         client.read_exact(&mut method_response).await.unwrap();
