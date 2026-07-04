@@ -96,6 +96,13 @@ enum EnqueueError {
     ResourceLimit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpDataDisposition {
+    UnknownFlow,
+    EmptyPayload,
+    ForwardPayload,
+}
+
 #[derive(Debug, Clone)]
 struct TargetFlowControl {
     buffered_bytes: Arc<AtomicUsize>,
@@ -277,11 +284,18 @@ async fn handle_session_frame(
             Ok(())
         }
         FrameType::TcpData => {
-            if !frame.payload.is_empty() {
-                let flow_id = frame.header.id;
-                let mut should_remove = false;
-                let mut should_send_resource_limit = false;
-                if let Some(target) = target_writers.get_mut(&flow_id) {
+            let flow_id = frame.header.id;
+            match tcp_data_disposition(flow_id, &frame.payload, target_writers) {
+                TcpDataDisposition::UnknownFlow => {
+                    send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+                }
+                TcpDataDisposition::EmptyPayload => {}
+                TcpDataDisposition::ForwardPayload => {
+                    let mut should_remove = false;
+                    let mut should_send_resource_limit = false;
+                    let target = target_writers
+                        .get_mut(&flow_id)
+                        .expect("tcp data disposition checked flow presence");
                     match target
                         .enqueue_data(frame.payload, context.limits.max_buffered_bytes_per_flow)
                     {
@@ -296,15 +310,13 @@ async fn handle_session_frame(
                             should_send_resource_limit = true;
                         }
                     }
-                } else {
-                    send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
-                }
-                if should_send_resource_limit {
-                    send_resource_limit(context.carrier_writer, flow_id).await?;
-                    send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
-                }
-                if should_remove {
-                    target_writers.remove(&flow_id);
+                    if should_send_resource_limit {
+                        send_resource_limit(context.carrier_writer, flow_id).await?;
+                        send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
+                    }
+                    if should_remove {
+                        target_writers.remove(&flow_id);
+                    }
                 }
             }
             Ok(())
@@ -348,6 +360,20 @@ fn check_tcp_open_slot(
         return Err(OpenSlotRejection::ResourceLimit);
     }
     Ok(())
+}
+
+fn tcp_data_disposition(
+    flow_id: u64,
+    payload: &Bytes,
+    target_writers: &FlowTable,
+) -> TcpDataDisposition {
+    if !target_writers.contains_key(&flow_id) {
+        TcpDataDisposition::UnknownFlow
+    } else if payload.is_empty() {
+        TcpDataDisposition::EmptyPayload
+    } else {
+        TcpDataDisposition::ForwardPayload
+    }
 }
 
 async fn handle_tcp_open(
@@ -1070,6 +1096,25 @@ mod tests {
         target_writers.insert(1, test_target_flow());
 
         assert_eq!(check_tcp_open_slot(2, &target_writers, 1), Ok(()));
+    }
+
+    #[test]
+    fn classifies_tcp_data_for_known_and_unknown_flows() {
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(1, test_target_flow());
+
+        assert_eq!(
+            tcp_data_disposition(3, &Bytes::from_static(b"data"), &target_writers),
+            TcpDataDisposition::UnknownFlow
+        );
+        assert_eq!(
+            tcp_data_disposition(1, &Bytes::new(), &target_writers),
+            TcpDataDisposition::EmptyPayload
+        );
+        assert_eq!(
+            tcp_data_disposition(1, &Bytes::from_static(b"data"), &target_writers),
+            TcpDataDisposition::ForwardPayload
+        );
     }
 
     #[tokio::test]
