@@ -13,8 +13,8 @@ use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tracing::{debug, info, warn};
 use uk_auth::{AuthChallenge, AuthResponse, ReplayCache, unix_now, verify_auth_response};
 use uk_proto::{
-    ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, SettingKey, Settings, read_frame,
-    validate_connection_frame, write_frame,
+    ErrorCode, ErrorPayload, Frame, FrameIoError, FrameLimits, FrameType, SettingKey, Settings,
+    read_frame, validate_connection_frame, write_frame,
 };
 
 use crate::config::ServerConfig;
@@ -130,13 +130,20 @@ async fn complete_handshake(
     let challenge_frame = Frame::new(FrameType::AuthChallenge, 0, 0, payload.freeze())?;
     write_frame(&mut stream, &challenge_frame).await?;
 
-    let response_frame = read_frame(
+    let response_frame = match read_frame(
         &mut stream,
         FrameLimits {
             max_frame_size: config.max_pre_auth_bytes(),
         },
     )
-    .await?;
+    .await
+    {
+        Ok(frame) => frame,
+        Err(err) => {
+            report_handshake_frame_io_error(&mut stream, &err).await;
+            return Err(err.into());
+        }
+    };
 
     if let Err(err) = validate_connection_frame(&response_frame, FrameType::AuthResponse) {
         let _ = write_connection_error(&mut stream, ErrorCode::Protocol).await;
@@ -193,6 +200,15 @@ async fn write_connection_error(
     let frame = connection_error_frame(code)?;
     write_frame(stream, &frame).await?;
     Ok(())
+}
+
+async fn report_handshake_frame_io_error(
+    stream: &mut TlsStream<tokio::net::TcpStream>,
+    error: &FrameIoError,
+) {
+    if let FrameIoError::Protocol(error) = error {
+        let _ = write_connection_error(stream, ErrorCode::from_protocol_error(error)).await;
+    }
 }
 
 fn connection_error_frame(code: ErrorCode) -> Result<Frame, AnyError> {

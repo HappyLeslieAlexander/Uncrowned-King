@@ -139,6 +139,15 @@ async fn reports_auth_failure_during_handshake() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reports_oversized_auth_response_during_handshake() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_oversized_auth_response_error_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reports_protocol_error_for_unexpected_auth_response_frame() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -854,6 +863,40 @@ async fn run_auth_failure_error_e2e() -> Result<(), TestError> {
     assert!(
         error.to_string().contains("authentication failed"),
         "unexpected auth failure error: {error}"
+    );
+    Ok(())
+}
+
+async fn run_oversized_auth_response_error_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = ServerHarness::start(test_limits()).await?;
+    let mut carrier = connect_tls_carrier(&harness).await?;
+
+    let challenge = read_frame(&mut carrier, FrameLimits::default()).await?;
+    assert_eq!(challenge.header.frame_type, FrameType::AuthChallenge);
+    assert_eq!(challenge.header.id, 0);
+
+    write_oversized_frame_header(
+        &mut carrier,
+        FrameType::AuthResponse,
+        0,
+        test_limits().max_pre_auth_bytes.unwrap(),
+    )
+    .await?;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(response.header.frame_type, FrameType::Error);
+    assert_eq!(response.header.id, 0);
+
+    let mut payload = response.payload;
+    assert_eq!(
+        ErrorPayload::decode(&mut payload)?.code,
+        ErrorCode::OversizedFrame
     );
     Ok(())
 }
@@ -1954,12 +1997,25 @@ async fn write_oversized_tcp_data_header<W>(writer: &mut W, flow_id: u64) -> Res
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let header = FrameHeader::new(
+    write_oversized_frame_header(
+        writer,
         FrameType::TcpData,
-        0,
         flow_id,
-        FrameLimits::default().max_frame_size + 1,
-    )?;
+        FrameLimits::default().max_frame_size,
+    )
+    .await
+}
+
+async fn write_oversized_frame_header<W>(
+    writer: &mut W,
+    frame_type: FrameType,
+    id: u64,
+    limit: u64,
+) -> Result<(), TestError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let header = FrameHeader::new(frame_type, 0, id, limit + 1)?;
     let mut encoded = BytesMut::new();
     header.encode(&mut encoded)?;
     writer.write_all(&encoded).await?;
