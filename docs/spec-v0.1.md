@@ -132,6 +132,8 @@ u16 close_code
 `TCP_CLOSE` closes the sending direction for that flow. A peer that receives a
 normal `TCP_CLOSE` may continue sending data until it also sends `TCP_CLOSE` or
 the receiver's configured half-close drain window expires.
+Malformed relay payloads are protocol errors; receivers should send
+`ERROR(Protocol)` before closing the session when the carrier is still writable.
 
 Known close codes:
 

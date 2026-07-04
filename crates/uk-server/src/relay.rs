@@ -445,7 +445,13 @@ async fn handle_tcp_close_frame(
         .await;
     }
     let mut payload = frame.payload;
-    let close = TcpClose::decode(&mut payload)?;
+    let close = match TcpClose::decode(&mut payload) {
+        Ok(close) => close,
+        Err(err) => {
+            send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+            return Err(err.into());
+        }
+    };
     let should_remove = match target_writers.get_mut(&flow_id) {
         Some(FlowSlot::Opening) => true,
         Some(FlowSlot::Open(target)) => {
