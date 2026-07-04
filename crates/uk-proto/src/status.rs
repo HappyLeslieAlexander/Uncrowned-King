@@ -124,4 +124,26 @@ mod tests {
             Err(ProtocolError::InvalidErrorPayload("unknown error code"))
         );
     }
+
+    #[test]
+    fn rejects_truncated_error_payload() {
+        for payload in [b"".as_slice(), &[0x40]] {
+            let mut bytes = Bytes::copy_from_slice(payload);
+            assert_eq!(
+                ErrorPayload::decode(&mut bytes),
+                Err(ProtocolError::Truncated)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_trailing_error_payload_bytes() {
+        let mut bytes = Bytes::from_static(&[0x07, 0x00]);
+        assert_eq!(
+            ErrorPayload::decode(&mut bytes),
+            Err(ProtocolError::InvalidErrorPayload(
+                "trailing error payload bytes"
+            ))
+        );
+    }
 }

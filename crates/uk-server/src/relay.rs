@@ -293,9 +293,10 @@ async fn handle_session_frame(
                 TcpDataDisposition::ForwardPayload => {
                     let mut should_remove = false;
                     let mut should_send_resource_limit = false;
-                    let target = target_writers
-                        .get_mut(&flow_id)
-                        .expect("tcp data disposition checked flow presence");
+                    let Some(target) = target_writers.get_mut(&flow_id) else {
+                        send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+                        return Ok(());
+                    };
                     match target
                         .enqueue_data(frame.payload, context.limits.max_buffered_bytes_per_flow)
                     {
