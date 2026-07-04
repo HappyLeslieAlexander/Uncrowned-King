@@ -20,9 +20,10 @@ use tokio::{
 use tokio_rustls::client::TlsStream;
 use tracing::{debug, info, warn};
 use uk_proto::{
-    ErrorCode, ErrorPayload, FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, Frame, FrameLimits, FrameType,
-    SettingKey, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen,
-    frame::DEFAULT_MAX_FRAME_SIZE, is_client_initiated_flow_id, read_frame, write_frame,
+    ErrorCode, ErrorPayload, FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, Frame, FrameIoError, FrameLimits,
+    FrameType, SettingKey, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target,
+    TcpClose, TcpOpen, frame::DEFAULT_MAX_FRAME_SIZE, is_client_initiated_flow_id, read_frame,
+    write_frame,
 };
 
 use crate::{
@@ -335,7 +336,9 @@ fn spawn_carrier_reader(
                     }
                 }
                 Err(err) => {
-                    warn!(event = "client.session.read.error", error = %err);
+                    if !matches!(err, FrameIoError::Closed) {
+                        warn!(event = "client.session.read.error", error = %err);
+                    }
                     close_session(&session).await;
                     return;
                 }

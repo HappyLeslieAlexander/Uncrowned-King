@@ -14,6 +14,9 @@ pub type FrameIoResult<T> = Result<T, FrameIoError>;
 /// Errors returned while reading or writing frames.
 #[derive(Debug, Error)]
 pub enum FrameIoError {
+    /// The peer closed the stream before starting another frame.
+    #[error("stream closed")]
+    Closed,
     /// Transport IO error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -28,7 +31,11 @@ where
     R: AsyncRead + Unpin,
 {
     let mut fixed = [0_u8; 4];
-    read_exact_or_truncated(reader, &mut fixed).await?;
+    let Some(first) = read_optional_one(reader).await? else {
+        return Err(FrameIoError::Closed);
+    };
+    fixed[0] = first;
+    read_exact_or_truncated(reader, &mut fixed[1..]).await?;
 
     let mut header_bytes = BytesMut::from(&fixed[..]);
     let id = read_varint_async(reader, &mut header_bytes).await?;
@@ -58,6 +65,19 @@ where
     writer.write_all(&encoded).await?;
     writer.flush().await?;
     Ok(())
+}
+
+async fn read_optional_one<R>(reader: &mut R) -> FrameIoResult<Option<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut byte = [0_u8; 1];
+    match reader.read(&mut byte).await {
+        Ok(0) => Ok(None),
+        Ok(_) => Ok(Some(byte[0])),
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => Ok(None),
+        Err(err) => Err(err.into()),
+    }
 }
 
 async fn read_varint_async<R>(reader: &mut R, header_bytes: &mut BytesMut) -> FrameIoResult<u64>
@@ -106,11 +126,51 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
     use bytes::Bytes;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
 
     use super::*;
     use crate::FrameType;
+
+    struct UnexpectedEofReader;
+
+    impl AsyncRead for UnexpectedEofReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(ErrorKind::UnexpectedEof, "tls eof")))
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_closed_before_next_frame_starts() {
+        let mut input = &b""[..];
+
+        let err = read_frame(&mut input, FrameLimits::default())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, FrameIoError::Closed));
+    }
+
+    #[tokio::test]
+    async fn returns_closed_for_unexpected_eof_before_next_frame_starts() {
+        let mut input = UnexpectedEofReader;
+
+        let err = read_frame(&mut input, FrameLimits::default())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, FrameIoError::Closed));
+    }
 
     #[tokio::test]
     async fn roundtrips_frame_over_duplex() {

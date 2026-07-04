@@ -27,9 +27,9 @@ use tracing::{debug, info, warn};
 use uk_auth::Credential;
 use uk_policy::{PolicyContext, PolicyDecision, PolicySet};
 use uk_proto::{
-    ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL,
-    TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, is_client_initiated_flow_id, read_frame,
-    write_frame,
+    ErrorCode, ErrorPayload, Frame, FrameIoError, FrameLimits, FrameType, TCP_CLOSE_ERROR,
+    TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, is_client_initiated_flow_id,
+    read_frame, write_frame,
 };
 
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
@@ -88,6 +88,7 @@ enum SessionEvent {
     Flow(Option<FlowEvent>),
     Frame(Frame),
     IdleTimeout,
+    PeerClosed,
 }
 
 #[derive(Debug)]
@@ -230,6 +231,10 @@ pub(crate) async fn relay_session(
                 info!(event = "server.session.idle_timeout");
                 break Ok(());
             }
+            SessionEvent::PeerClosed => {
+                info!(event = "server.session.peer_closed");
+                break Ok(());
+            }
         }
     };
 
@@ -250,14 +255,22 @@ async fn next_session_event(
     if let Some(idle_timeout) = idle_timeout {
         tokio::select! {
             event = event_rx.recv() => Ok(SessionEvent::Flow(event)),
-            frame = read_frame(carrier_reader, limits) => Ok(SessionEvent::Frame(frame?)),
+            frame = read_frame(carrier_reader, limits) => map_frame_event(frame),
             () = tokio::time::sleep(idle_timeout) => Ok(SessionEvent::IdleTimeout),
         }
     } else {
         tokio::select! {
             event = event_rx.recv() => Ok(SessionEvent::Flow(event)),
-            frame = read_frame(carrier_reader, limits) => Ok(SessionEvent::Frame(frame?)),
+            frame = read_frame(carrier_reader, limits) => map_frame_event(frame),
         }
+    }
+}
+
+fn map_frame_event(result: Result<Frame, FrameIoError>) -> Result<SessionEvent, AnyError> {
+    match result {
+        Ok(frame) => Ok(SessionEvent::Frame(frame)),
+        Err(FrameIoError::Closed) => Ok(SessionEvent::PeerClosed),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -1221,6 +1234,14 @@ mod tests {
             Err(FlowIdRejection::Reserved)
         );
         assert_eq!(validate_client_relay_flow_id(1), Ok(()));
+    }
+
+    #[test]
+    fn maps_clean_carrier_eof_to_peer_closed() {
+        assert!(matches!(
+            map_frame_event(Err(FrameIoError::Closed)).unwrap(),
+            SessionEvent::PeerClosed
+        ));
     }
 
     #[test]
