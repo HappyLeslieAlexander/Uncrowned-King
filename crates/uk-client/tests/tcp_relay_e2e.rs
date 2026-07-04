@@ -312,6 +312,11 @@ async fn closes_flow_when_buffered_byte_limit_is_exceeded() -> Result<(), TestEr
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closes_flow_when_client_buffered_byte_limit_is_exceeded() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_client_buffered_limit_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keeps_server_session_after_client_flow_resource_limit() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -850,6 +855,21 @@ async fn run_buffered_limit_e2e() -> Result<(), TestError> {
 
     let target_received = target_task.await??;
     assert!(target_received.is_empty());
+    Ok(())
+}
+
+async fn run_client_buffered_limit_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let mut harness = ClientBufferedLimitServerHarness::start().await?;
+    let (_socks, connect_reply) = open_socks_connect(
+        harness.socks_addr,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 80)),
+    )
+    .await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    assert_eq!(harness.observed_close_code().await?, TCP_CLOSE_ERROR);
     Ok(())
 }
 
@@ -1799,6 +1819,76 @@ impl Drop for MalformedFrameServerHarness {
     }
 }
 
+struct ClientBufferedLimitServerHarness {
+    temp_dir: PathBuf,
+    socks_addr: SocketAddr,
+    server_task: Option<JoinHandle<Result<u16, TestError>>>,
+    client_task: JoinHandle<Result<(), TestError>>,
+}
+
+impl ClientBufferedLimitServerHarness {
+    async fn start() -> Result<Self, TestError> {
+        let temp_dir = create_temp_dir()?;
+        let cert_path = temp_dir.join("server-cert.pem");
+        let key_path = temp_dir.join("server-key.pem");
+        fs::write(&cert_path, CERT_PEM)?;
+        fs::write(&key_path, KEY_PEM)?;
+
+        let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let server_addr = server_listener.local_addr()?;
+        let socks_addr = unused_loopback_addr().await?;
+        let server_task = tokio::spawn(run_client_buffered_limit_server(
+            server_listener,
+            cert_path.clone(),
+            key_path,
+        ));
+        let mut client_task = tokio::spawn(run_socks5_listener(
+            ClientConfig {
+                server_addr: server_addr.to_string(),
+                server_addrs: None,
+                server_name: "localhost".to_owned(),
+                ca_cert_path: path_string(&cert_path),
+                key_id: KEY_ID.to_owned(),
+                secret: SECRET.to_owned(),
+                handshake_timeout_seconds: Some(3),
+                socks_handshake_timeout_seconds: Some(3),
+                tcp_open_timeout_seconds: Some(3),
+                max_pending_open_bytes: None,
+                max_socks_connections: None,
+                max_buffered_bytes_per_session: None,
+                max_buffered_bytes_per_flow: Some(1),
+            },
+            socks_addr.to_string(),
+        ));
+        wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+
+        Ok(Self {
+            temp_dir,
+            socks_addr,
+            server_task: Some(server_task),
+            client_task,
+        })
+    }
+
+    async fn observed_close_code(&mut self) -> Result<u16, TestError> {
+        let task = self
+            .server_task
+            .take()
+            .ok_or("client buffered limit server task was already awaited")?;
+        tokio::time::timeout(Duration::from_secs(3), task).await??
+    }
+}
+
+impl Drop for ClientBufferedLimitServerHarness {
+    fn drop(&mut self) {
+        self.client_task.abort();
+        if let Some(task) = self.server_task.take() {
+            task.abort();
+        }
+        let _ = fs::remove_dir_all(&self.temp_dir);
+    }
+}
+
 struct PendingOpenCancelServerHarness {
     temp_dir: PathBuf,
     socks_addr: SocketAddr,
@@ -2002,6 +2092,47 @@ async fn run_malformed_frame_server(
     assert_eq!(response.header.id, 0);
     let mut payload = response.payload;
     Ok(ErrorPayload::decode(&mut payload)?.code)
+}
+
+async fn run_client_buffered_limit_server(
+    listener: TcpListener,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+) -> Result<u16, TestError> {
+    let mut stream = accept_fake_server_session(listener, cert_path, key_path).await?;
+    let open_frame = read_frame(&mut stream, FrameLimits::default()).await?;
+    assert_eq!(open_frame.header.frame_type, FrameType::TcpOpen);
+    let flow_id = open_frame.header.id;
+    let mut open_payload = open_frame.payload;
+    TcpOpen::decode(&mut open_payload)?;
+
+    let ack = Frame::new(FrameType::TcpData, 0, flow_id, Bytes::new())?;
+    write_frame(&mut stream, &ack).await?;
+    let oversized = Frame::new(FrameType::TcpData, 0, flow_id, Bytes::from_static(b"xx"))?;
+    write_frame(&mut stream, &oversized).await?;
+
+    let resource_limit = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut stream, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(resource_limit.header.frame_type, FrameType::ResourceLimit);
+    assert_eq!(resource_limit.header.id, flow_id);
+    let mut resource_payload = resource_limit.payload;
+    assert_eq!(
+        ErrorPayload::decode(&mut resource_payload)?.code,
+        ErrorCode::ResourceLimit
+    );
+
+    let close = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut stream, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(close.header.frame_type, FrameType::TcpClose);
+    assert_eq!(close.header.id, flow_id);
+    let mut close_payload = close.payload;
+    Ok(TcpClose::decode(&mut close_payload)?.close_code)
 }
 
 async fn run_pending_open_cancel_server(
