@@ -13,6 +13,9 @@ pub const REQUIRED_FLAG_MASK: u16 = 0xff00;
 /// Default maximum payload length accepted for a frame.
 pub const DEFAULT_MAX_FRAME_SIZE: u64 = 65_536;
 
+/// Largest configurable frame payload accepted by v0.1 implementations.
+pub const MAX_FRAME_PAYLOAD_SIZE: u64 = 16 * 1024 * 1024;
+
 /// Limits applied while reading frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameLimits {

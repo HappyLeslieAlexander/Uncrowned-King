@@ -8,7 +8,7 @@ use uk_auth::{
     DEFAULT_REPLAY_CACHE_WINDOW_SECONDS, MIN_AUTH_RESPONSE_PAYLOAD_SIZE,
 };
 use uk_policy::PolicySet;
-use uk_proto::{MIN_TCP_RELAY_FRAME_SIZE, validate_host_port_endpoint};
+use uk_proto::{MAX_FRAME_PAYLOAD_SIZE, MIN_TCP_RELAY_FRAME_SIZE, validate_host_port_endpoint};
 
 /// Server TOML configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -72,11 +72,21 @@ impl ServerConfig {
             self.max_pre_auth_bytes(),
             MIN_AUTH_RESPONSE_PAYLOAD_SIZE,
         )?;
+        reject_large_limit(
+            "max_pre_auth_bytes",
+            self.max_pre_auth_bytes(),
+            MAX_FRAME_PAYLOAD_SIZE,
+        )?;
         reject_zero_limit("max_frame_size", self.max_frame_size())?;
         reject_small_limit(
             "max_frame_size",
             self.max_frame_size(),
             MIN_TCP_RELAY_FRAME_SIZE,
+        )?;
+        reject_large_limit(
+            "max_frame_size",
+            self.max_frame_size(),
+            MAX_FRAME_PAYLOAD_SIZE,
         )?;
         reject_zero_limit("max_streams", self.max_streams())?;
         reject_zero_limit(
@@ -193,6 +203,18 @@ fn reject_small_limit(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     if value < minimum {
         Err(format!("{name} must be at least {minimum}").into())
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_large_limit(
+    name: &str,
+    value: u64,
+    maximum: u64,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if value > maximum {
+        Err(format!("{name} must be at most {maximum}").into())
     } else {
         Ok(())
     }
@@ -578,6 +600,25 @@ max_pre_auth_bytes = 74
     }
 
     #[test]
+    fn rejects_too_large_pre_auth_limit() {
+        let config: ServerConfig = toml::from_str(&format!(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_pre_auth_bytes = {}
+"#,
+            MAX_FRAME_PAYLOAD_SIZE + 1
+        ))
+        .unwrap();
+
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
     fn rejects_zero_frame_limit() {
         let config: ServerConfig = toml::from_str(
             r#"
@@ -608,6 +649,25 @@ credentials = []
 max_frame_size = 261
 "#,
         )
+        .unwrap();
+
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_too_large_frame_limit() {
+        let config: ServerConfig = toml::from_str(&format!(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_frame_size = {}
+"#,
+            MAX_FRAME_PAYLOAD_SIZE + 1
+        ))
         .unwrap();
 
         assert!(config.validate_limits().is_err());

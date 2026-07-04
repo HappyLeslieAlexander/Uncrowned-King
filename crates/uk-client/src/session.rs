@@ -8,8 +8,9 @@ use tokio_rustls::client::TlsStream;
 use tracing::info;
 use uk_auth::{AuthChallenge, AuthResponse, unix_now};
 use uk_proto::{
-    ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, MIN_TCP_RELAY_FRAME_SIZE, SettingKey,
-    Settings, read_frame, validate_connection_frame, write_frame,
+    ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, MAX_FRAME_PAYLOAD_SIZE,
+    MIN_TCP_RELAY_FRAME_SIZE, SettingKey, Settings, read_frame, validate_connection_frame,
+    write_frame,
 };
 
 use crate::{config::ClientConfig, tls};
@@ -110,6 +111,12 @@ fn validate_server_settings(settings: &Settings) -> Result<(), AnyError> {
         "max_frame_size",
         MIN_TCP_RELAY_FRAME_SIZE,
     )?;
+    reject_large_setting(
+        settings,
+        SettingKey::MaxFrameSize,
+        "max_frame_size",
+        MAX_FRAME_PAYLOAD_SIZE,
+    )?;
     Ok(())
 }
 
@@ -133,6 +140,19 @@ fn reject_small_setting(
 ) -> Result<(), AnyError> {
     if settings.get(key).is_some_and(|value| value < minimum) {
         Err(format!("{name} must be at least {minimum}").into())
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_large_setting(
+    settings: &Settings,
+    key: SettingKey,
+    name: &'static str,
+    maximum: u64,
+) -> Result<(), AnyError> {
+    if settings.get(key).is_some_and(|value| value > maximum) {
+        Err(format!("{name} must be at most {maximum}").into())
     } else {
         Ok(())
     }
@@ -226,6 +246,15 @@ mod tests {
         let mut settings = Settings::default();
         settings.set(SettingKey::ProtocolRevision, 1);
         settings.set(SettingKey::MaxFrameSize, MIN_TCP_RELAY_FRAME_SIZE - 1);
+
+        assert!(validate_server_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn rejects_too_large_max_frame_size() {
+        let mut settings = Settings::default();
+        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::MaxFrameSize, MAX_FRAME_PAYLOAD_SIZE + 1);
 
         assert!(validate_server_settings(&settings).is_err());
     }
