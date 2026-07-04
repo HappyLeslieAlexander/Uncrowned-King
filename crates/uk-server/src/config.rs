@@ -93,6 +93,11 @@ impl ServerConfig {
             "max_buffered_bytes_per_flow",
             self.max_buffered_bytes_per_flow(),
         )?;
+        reject_large_limit(
+            "max_buffered_bytes_per_flow",
+            self.max_buffered_bytes_per_flow(),
+            MAX_FRAME_PAYLOAD_SIZE,
+        )?;
         reject_zero_limit(
             "replay_cache_window_seconds",
             self.replay_cache_window_seconds(),
@@ -704,6 +709,25 @@ credentials = []
 max_buffered_bytes_per_flow = 0
 "#,
         )
+        .unwrap();
+
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_too_large_buffered_bytes_per_flow_limit() {
+        let config: ServerConfig = toml::from_str(&format!(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_buffered_bytes_per_flow = {}
+"#,
+            MAX_FRAME_PAYLOAD_SIZE + 1
+        ))
         .unwrap();
 
         assert!(config.validate_limits().is_err());

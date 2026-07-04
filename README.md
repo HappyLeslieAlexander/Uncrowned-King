@@ -65,8 +65,9 @@ Set `handshake_timeout_seconds = 0` to disable the TLS/auth handshake timeout.
 Set `target_connect_timeout_seconds = 0` to disable the server target dial timeout.
 Set `tcp_half_close_timeout_seconds = 0` to disable the TCP half-close drain timeout.
 Replay cache limits must be greater than zero. `max_pre_auth_bytes` must be at
-least 75 bytes so a minimum `AUTH_RESPONSE` can fit. `max_pre_auth_bytes` and
-`max_frame_size` must be at most 16777216 bytes.
+least 75 bytes so a minimum `AUTH_RESPONSE` can fit. `max_pre_auth_bytes`,
+`max_frame_size`, and `max_buffered_bytes_per_flow` must be at most 16777216
+bytes.
 At least one credential is required. Credential `key_id` values must be unique.
 When set, `policy_group` must be non-empty printable text.
 

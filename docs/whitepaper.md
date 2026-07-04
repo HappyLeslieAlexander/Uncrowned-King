@@ -222,8 +222,8 @@ replay_cache_max_entries = 65536 nonce pairs
 ```
 
 Implementations may reduce these limits. They must reject configured frame
-payload limits above `16777216` bytes and must not silently accept frames above
-configured limits.
+payload and per-flow buffered-byte limits above `16777216` bytes and must not
+silently accept frames above configured limits.
 
 ## 7. Target Encoding
 
