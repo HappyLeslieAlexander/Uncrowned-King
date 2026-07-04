@@ -292,6 +292,11 @@ async fn maps_stream_limit_to_socks_general_failure() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enforces_server_session_limit() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_server_session_limit_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relays_concurrent_socks_flows_over_one_session() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_concurrent_multiplex_e2e()).await?
 }
@@ -695,6 +700,20 @@ async fn run_stream_limit_e2e() -> Result<(), TestError> {
     first_socks.shutdown().await?;
     let target_received = target_task.await??;
     assert_eq!(target_received, b"x");
+    Ok(())
+}
+
+async fn run_server_session_limit_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = ServerHarness::start(test_limits_with_max_sessions(1)).await?;
+    let _held_carrier = connect_tls_carrier(&harness).await?;
+    let result = run_handshake(harness.client_config(SECRET)).await;
+
+    assert!(
+        result.is_err(),
+        "second carrier should fail while max_sessions is exhausted"
+    );
     Ok(())
 }
 
@@ -2466,6 +2485,7 @@ fn test_limits() -> LimitConfig {
     LimitConfig {
         max_pre_auth_bytes: Some(4096),
         max_frame_size: Some(65_536),
+        max_sessions: Some(32),
         max_streams: Some(8),
         idle_timeout_seconds: Some(30),
         max_buffered_bytes_per_flow: Some(1024 * 1024),
@@ -2480,6 +2500,12 @@ fn test_limits() -> LimitConfig {
 fn test_limits_with_max_streams(max_streams: u64) -> LimitConfig {
     let mut limits = test_limits();
     limits.max_streams = Some(max_streams);
+    limits
+}
+
+fn test_limits_with_max_sessions(max_sessions: u64) -> LimitConfig {
+    let mut limits = test_limits();
+    limits.max_sessions = Some(max_sessions);
     limits
 }
 

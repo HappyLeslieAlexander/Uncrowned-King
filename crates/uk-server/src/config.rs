@@ -88,6 +88,7 @@ impl ServerConfig {
             self.max_frame_size(),
             MAX_FRAME_PAYLOAD_SIZE,
         )?;
+        reject_zero_limit("max_sessions", self.max_sessions())?;
         reject_zero_limit("max_streams", self.max_streams())?;
         reject_zero_limit(
             "max_buffered_bytes_per_flow",
@@ -126,6 +127,14 @@ impl ServerConfig {
             .as_ref()
             .and_then(|limits| limits.max_frame_size)
             .unwrap_or(65_536)
+    }
+
+    /// Configured maximum concurrent carrier sessions accepted by the server.
+    pub fn max_sessions(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.max_sessions)
+            .unwrap_or(1024)
     }
 
     /// Configured maximum concurrent TCP streams per authenticated session.
@@ -234,6 +243,8 @@ pub struct LimitConfig {
     pub max_pre_auth_bytes: Option<u64>,
     /// Maximum post-authentication frame payload.
     pub max_frame_size: Option<u64>,
+    /// Maximum concurrent carrier sessions accepted by the server.
+    pub max_sessions: Option<u64>,
     /// Maximum concurrent TCP streams per authenticated session.
     pub max_streams: Option<u64>,
     /// Idle timeout for authenticated relay sessions in seconds.
@@ -411,6 +422,29 @@ max_buffered_bytes_per_flow = 4096
         .unwrap();
 
         assert_eq!(config.max_buffered_bytes_per_flow(), 4096);
+    }
+
+    #[test]
+    fn defaults_max_sessions_limit() {
+        assert_eq!(minimal_config().max_sessions(), 1024);
+    }
+
+    #[test]
+    fn parses_max_sessions_limit() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_sessions = 128
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.max_sessions(), 128);
     }
 
     #[test]
@@ -689,6 +723,24 @@ credentials = []
 
 [limits]
 max_streams = 0
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_session_limit() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_sessions = 0
 "#,
         )
         .unwrap();

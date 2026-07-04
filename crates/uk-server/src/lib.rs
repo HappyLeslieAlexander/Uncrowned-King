@@ -10,7 +10,7 @@ use std::{future, future::Future, io, sync::Arc, time::Duration};
 use bytes::BytesMut;
 use tokio::{
     net::TcpListener,
-    sync::{Mutex, watch},
+    sync::{Mutex, Semaphore, watch},
     task::JoinSet,
     time,
 };
@@ -48,6 +48,8 @@ where
     let tls_config = tls::server_config(&config.cert_path, &config.key_path)?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
     let listener = TcpListener::bind(&config.listen).await?;
+    let max_sessions = usize_limit(config.max_sessions());
+    let session_permits = Arc::new(Semaphore::new(max_sessions));
 
     info!(event = "server.listen", listen = %config.listen);
 
@@ -64,6 +66,10 @@ where
             }
             accepted = listener.accept() => {
                 let (tcp, peer) = accepted?;
+                let Ok(session_permit) = Arc::clone(&session_permits).try_acquire_owned() else {
+                    warn!(event = "server.session.limit", peer = %peer, max_sessions);
+                    continue;
+                };
                 let acceptor = acceptor.clone();
                 let credentials = Arc::clone(&credentials);
                 let policy_set = Arc::clone(&policy_set);
@@ -72,6 +78,7 @@ where
                 let shutdown_rx = shutdown_tx.subscribe();
 
                 connections.spawn(async move {
+                    let _session_permit = session_permit;
                     if let Err(err) =
                         handle_connection(
                             acceptor,
@@ -367,6 +374,7 @@ mod tests {
         config.limits = Some(LimitConfig {
             max_pre_auth_bytes: None,
             max_frame_size: Some(32_768),
+            max_sessions: None,
             max_streams: Some(17),
             idle_timeout_seconds: Some(42),
             max_buffered_bytes_per_flow: None,

@@ -215,6 +215,7 @@ Default limits:
 ```text
 max_frame_size = 65536 bytes
 max_pre_auth_bytes = 4096 bytes
+max_sessions = 1024 carrier sessions
 max_target_host_len = 255 bytes
 max_key_id_len = 64 bytes
 replay_cache_window_seconds = 300
