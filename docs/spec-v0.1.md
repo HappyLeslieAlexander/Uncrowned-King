@@ -239,6 +239,10 @@ needed to carry every valid v0.1 `TCP_OPEN` payload. Implementations must reject
 When `idle_timeout_seconds` is non-zero, a peer may send `PING` frames before
 the deadline to keep active relay flows alive. Implementations should avoid
 keeping otherwise idle sessions alive when no flow is open.
+`PING` payload bytes are opaque to the receiver. A `PONG` response must echo the
+request `PING` payload exactly. Implementations that use `PING` for liveness
+should include an unpredictable or monotonically unique nonce and treat only the
+matching `PONG` as the liveness response for that probe.
 
 ## 7. Error Codes
 

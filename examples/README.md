@@ -19,6 +19,15 @@ uk-server --config examples/server.toml config-check
 uk-client --config examples/client.toml config-check
 ```
 
+Start the local demo services in separate terminals:
+
+```sh
+uk-server --config examples/server.toml serve
+uk-client --config examples/client.toml socks5 --listen 127.0.0.1:1080
+```
+
+Both long-running commands stop gracefully on Ctrl+C or SIGTERM.
+
 Replace the example shared secret before using these configs anywhere outside a
 local throwaway environment.
 
