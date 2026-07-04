@@ -495,8 +495,7 @@ async fn relay_tcp(mut local: TcpStream, mut flow: ClientFlow) -> Result<(), Any
                         }
                     }
                     FrameType::Error | FrameType::PolicyDenied | FrameType::ResourceLimit => {
-                        let mut payload = frame.payload;
-                        let _status = ErrorPayload::decode(&mut payload)?;
+                        validate_flow_status(frame.header.frame_type, frame.payload)?;
                         local.shutdown().await?;
                         local_to_remote_open = false;
                         remote_to_local_open = false;
@@ -508,6 +507,19 @@ async fn relay_tcp(mut local: TcpStream, mut flow: ClientFlow) -> Result<(), Any
     }
 
     Ok(())
+}
+
+fn validate_flow_status(frame_type: FrameType, payload: Bytes) -> Result<(), AnyError> {
+    match frame_type {
+        FrameType::Error => {
+            let mut payload = payload;
+            let _status = ErrorPayload::decode(&mut payload)?;
+            Ok(())
+        }
+        FrameType::PolicyDenied => expect_error_payload(payload, ErrorCode::PolicyDenied),
+        FrameType::ResourceLimit => expect_error_payload(payload, ErrorCode::ResourceLimit),
+        _ => Err("unexpected flow status frame".into()),
+    }
 }
 
 fn decode_open_response(frame: Frame) -> Result<OpenResponse, AnyError> {
@@ -795,6 +807,50 @@ mod tests {
                 "error code {code:?}"
             );
         }
+    }
+
+    #[test]
+    fn accepts_matching_flow_status_payloads() {
+        assert!(
+            validate_flow_status(FrameType::Error, status_payload(ErrorCode::Protocol)).is_ok()
+        );
+        assert!(
+            validate_flow_status(
+                FrameType::PolicyDenied,
+                status_payload(ErrorCode::PolicyDenied)
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_flow_status(
+                FrameType::ResourceLimit,
+                status_payload(ErrorCode::ResourceLimit)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_flow_status_payloads() {
+        assert!(
+            validate_flow_status(
+                FrameType::PolicyDenied,
+                status_payload(ErrorCode::ResourceLimit)
+            )
+            .is_err()
+        );
+        assert!(
+            validate_flow_status(
+                FrameType::ResourceLimit,
+                status_payload(ErrorCode::PolicyDenied)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_unexpected_flow_status_frame_type() {
+        assert!(validate_flow_status(FrameType::TcpData, Bytes::new()).is_err());
     }
 
     #[test]
