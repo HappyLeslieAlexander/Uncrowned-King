@@ -83,6 +83,7 @@ enum ServerSessionState {
 #[derive(Debug)]
 enum OpenFailure {
     PolicyDenied,
+    ResourceLimit,
     TargetUnavailable(io::Error),
     TargetTimeout,
 }
@@ -191,7 +192,6 @@ enum FlowSlot {
 struct OpenFlowCancel {
     cancelled: Arc<AtomicBool>,
     notify: Arc<Notify>,
-    dial_permit: Option<OpenDialPermit>,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +224,7 @@ struct TargetOpenTask {
     target: Target,
     credential: Credential,
     policy_set: Arc<PolicySet>,
+    open_dial_limiter: OpenDialLimiter,
     target_connect_timeout: Option<Duration>,
     event_tx: mpsc::UnboundedSender<FlowEvent>,
     shutdown: SessionShutdown,
@@ -763,19 +764,14 @@ async fn handle_tcp_open_frame(
     }
 
     if let Some((flow_id, target)) = validate_tcp_open_request(context, frame).await? {
-        let Some(dial_permit) = context.open_dial_limiter.try_acquire() else {
-            warn!(event = "tcp.open.dial_limit", flow_id, target = ?target);
-            send_resource_limit(context.carrier_writer, flow_id).await?;
-            send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
-            return Ok(());
-        };
-        let cancel = OpenFlowCancel::with_dial_permit(dial_permit);
+        let cancel = OpenFlowCancel::default();
         target_writers.insert(flow_id, FlowSlot::Opening(cancel.clone()));
         spawn_target_open(TargetOpenTask {
             flow_id,
             target,
             credential: context.credential.clone(),
             policy_set: Arc::clone(&context.policy_set),
+            open_dial_limiter: context.open_dial_limiter.clone(),
             target_connect_timeout: context.limits.target_connect_timeout,
             event_tx: context.event_tx.clone(),
             shutdown: context.shutdown.clone(),
@@ -827,6 +823,7 @@ fn spawn_target_open(task: TargetOpenTask) {
                 &task.target,
                 &task.credential,
                 &task.policy_set,
+                &task.open_dial_limiter,
                 task.target_connect_timeout,
             ) => {
                 if !task.shutdown.is_closed() && !task.cancel.is_cancelled() {
@@ -910,6 +907,11 @@ async fn reject_open_failure(
             warn!(event = "policy.denied", flow_id, target = ?target);
             send_policy_denied(context.carrier_writer, flow_id).await?;
             send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_NORMAL).await?;
+        }
+        OpenFailure::ResourceLimit => {
+            warn!(event = "tcp.open.dial_limit", flow_id, target = ?target);
+            send_resource_limit(context.carrier_writer, flow_id).await?;
+            send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
         }
         OpenFailure::TargetUnavailable(err) => {
             warn!(event = "target.unavailable", flow_id, target = ?target, error = %err);
@@ -1139,7 +1141,6 @@ impl Default for OpenFlowCancel {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
-            dial_permit: None,
         }
     }
 }
@@ -1149,19 +1150,11 @@ impl fmt::Debug for OpenFlowCancel {
         formatter
             .debug_struct("OpenFlowCancel")
             .field("cancelled", &self.is_cancelled())
-            .field("has_dial_permit", &self.dial_permit.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl OpenFlowCancel {
-    fn with_dial_permit(dial_permit: OpenDialPermit) -> Self {
-        Self {
-            dial_permit: Some(dial_permit),
-            ..Self::default()
-        }
-    }
-
     fn cancel(&self) {
         if !self.cancelled.swap(true, Ordering::SeqCst) {
             self.notify.notify_waiters();
@@ -1492,11 +1485,12 @@ async fn connect_allowed_target(
     target: &Target,
     credential: &Credential,
     policy_set: &PolicySet,
+    open_dial_limiter: &OpenDialLimiter,
     target_connect_timeout: Option<Duration>,
 ) -> Result<TcpStream, OpenFailure> {
     with_optional_timeout(
         target_connect_timeout,
-        connect_allowed_target_inner(target, credential, policy_set),
+        connect_allowed_target_inner(target, credential, policy_set, open_dial_limiter),
     )
     .await
 }
@@ -1505,6 +1499,7 @@ async fn connect_allowed_target_inner(
     target: &Target,
     credential: &Credential,
     policy_set: &PolicySet,
+    open_dial_limiter: &OpenDialLimiter,
 ) -> Result<TcpStream, OpenFailure> {
     let addrs = resolve_target(target).await?;
     let resolved_ips = resolved_ips(target, &addrs);
@@ -1517,7 +1512,7 @@ async fn connect_allowed_target_inner(
     if policy_set.evaluate(&context) != PolicyDecision::Allow {
         return Err(OpenFailure::PolicyDenied);
     }
-    connect_socket_addrs(&addrs).await
+    connect_socket_addrs(&addrs, open_dial_limiter).await
 }
 
 async fn resolve_target(target: &Target) -> Result<Vec<SocketAddr>, OpenFailure> {
@@ -1546,11 +1541,12 @@ fn resolved_ips(target: &Target, addrs: &[SocketAddr]) -> Vec<IpAddr> {
     }
 }
 
-async fn connect_socket_addrs(addrs: &[SocketAddr]) -> Result<TcpStream, OpenFailure> {
+async fn connect_socket_addrs(
+    addrs: &[SocketAddr],
+    open_dial_limiter: &OpenDialLimiter,
+) -> Result<TcpStream, OpenFailure> {
     let connector = target_connector();
-    connect_first_successful(addrs, &connector)
-        .await
-        .map_err(OpenFailure::TargetUnavailable)
+    connect_first_successful(addrs, &connector, open_dial_limiter).await
 }
 
 fn target_connector() -> TargetConnector<TcpStream> {
@@ -1568,16 +1564,33 @@ async fn connect_socket_addr(addr: SocketAddr) -> (SocketAddr, io::Result<TcpStr
 async fn connect_first_successful<T>(
     addrs: &[SocketAddr],
     connector: &TargetConnector<T>,
-) -> io::Result<T>
+    open_dial_limiter: &OpenDialLimiter,
+) -> Result<T, OpenFailure>
 where
     T: Send + 'static,
 {
     let mut tasks = JoinSet::new();
     let mut next_index = 0;
-    spawn_target_connects(addrs, &mut next_index, &mut tasks, connector);
 
     let mut last_error = None;
-    while let Some(result) = tasks.join_next().await {
+    loop {
+        spawn_target_connects(
+            addrs,
+            &mut next_index,
+            &mut tasks,
+            connector,
+            open_dial_limiter,
+        );
+        if tasks.is_empty() {
+            if next_index < addrs.len() {
+                return Err(OpenFailure::ResourceLimit);
+            }
+            break;
+        }
+
+        let Some(result) = tasks.join_next().await else {
+            break;
+        };
         match result {
             Ok((addr, Ok(stream))) => {
                 debug!(event = "target.connect.candidate_success", %addr);
@@ -1592,12 +1605,11 @@ where
                 last_error = Some(io::Error::other(err));
             }
         }
-        spawn_target_connects(addrs, &mut next_index, &mut tasks, connector);
     }
 
-    Err(last_error.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "target has no socket addresses")
-    }))
+    Err(OpenFailure::TargetUnavailable(last_error.unwrap_or_else(
+        || io::Error::new(io::ErrorKind::NotFound, "target has no socket addresses"),
+    )))
 }
 
 fn spawn_target_connects<T>(
@@ -1605,14 +1617,21 @@ fn spawn_target_connects<T>(
     next_index: &mut usize,
     tasks: &mut JoinSet<(SocketAddr, io::Result<T>)>,
     connector: &TargetConnector<T>,
+    open_dial_limiter: &OpenDialLimiter,
 ) where
     T: Send + 'static,
 {
     while *next_index < addrs.len() && tasks.len() < TARGET_CONNECT_PARALLELISM {
+        let Some(permit) = open_dial_limiter.try_acquire() else {
+            break;
+        };
         let addr = addrs[*next_index];
         *next_index += 1;
         let connector = Arc::clone(connector);
-        tasks.spawn(async move { connector(addr).await });
+        tasks.spawn(async move {
+            let _permit = permit;
+            connector(addr).await
+        });
     }
 }
 
@@ -2157,21 +2176,6 @@ mod tests {
     }
 
     #[test]
-    fn open_dial_permit_lives_until_all_cancel_handles_drop() {
-        let limiter = OpenDialLimiter::new(1);
-        let permit = limiter.try_acquire().expect("first permit");
-        let cancel = OpenFlowCancel::with_dial_permit(permit);
-        let task_cancel = cancel.clone();
-
-        assert_eq!(limiter.available_permits(), 0);
-        assert!(limiter.try_acquire().is_none());
-        drop(cancel);
-        assert_eq!(limiter.available_permits(), 0);
-        drop(task_cancel);
-        assert_eq!(limiter.available_permits(), 1);
-    }
-
-    #[test]
     fn client_flow_status_ignores_unknown_flow() {
         let mut target_writers = FlowTable::new();
 
@@ -2294,6 +2298,7 @@ mod tests {
         let first_addr = SocketAddr::from(([127, 0, 0, 1], 10_001));
         let second_addr = SocketAddr::from(([127, 0, 0, 1], 10_002));
         let addrs = [first_addr, second_addr];
+        let limiter = OpenDialLimiter::new(2);
         let connector: TargetConnector<SocketAddr> =
             Arc::new(move |addr| -> BoxedConnectFuture<SocketAddr> {
                 Box::pin(async move {
@@ -2310,13 +2315,78 @@ mod tests {
 
         let connected = tokio::time::timeout(
             Duration::from_millis(100),
-            connect_first_successful(&addrs, &connector),
+            connect_first_successful(&addrs, &connector, &limiter),
         )
         .await
         .expect("later candidate should complete before the first candidate")
         .expect("later candidate should succeed");
 
         assert_eq!(connected, second_addr);
+    }
+
+    #[tokio::test]
+    async fn target_connect_rejects_when_dial_limiter_is_exhausted() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 10_001));
+        let addrs = [addr];
+        let limiter = OpenDialLimiter::new(0);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let connector: TargetConnector<SocketAddr> = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |addr| -> BoxedConnectFuture<SocketAddr> {
+                let calls = Arc::clone(&calls);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    (addr, Ok(addr))
+                })
+            })
+        };
+
+        let result = connect_first_successful(&addrs, &connector, &limiter).await;
+
+        assert!(matches!(result, Err(OpenFailure::ResourceLimit)));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn target_connect_limits_concurrent_candidate_dials() {
+        let first_addr = SocketAddr::from(([127, 0, 0, 1], 10_001));
+        let second_addr = SocketAddr::from(([127, 0, 0, 1], 10_002));
+        let addrs = [first_addr, second_addr];
+        let limiter = OpenDialLimiter::new(1);
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let connector: TargetConnector<SocketAddr> = {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            Arc::new(move |addr| -> BoxedConnectFuture<SocketAddr> {
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                Box::pin(async move {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(current, Ordering::SeqCst);
+                    let result = if addr == first_addr {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Err(io::Error::new(io::ErrorKind::TimedOut, "first failed"))
+                    } else {
+                        Ok(addr)
+                    };
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    (addr, result)
+                })
+            })
+        };
+
+        let connected = tokio::time::timeout(
+            Duration::from_secs(1),
+            connect_first_successful(&addrs, &connector, &limiter),
+        )
+        .await
+        .expect("connect should not hang")
+        .expect("second candidate should succeed");
+
+        assert_eq!(connected, second_addr);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(limiter.available_permits(), 1);
     }
 
     #[test]

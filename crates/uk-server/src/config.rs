@@ -158,7 +158,7 @@ impl ServerConfig {
             .unwrap_or(64)
     }
 
-    /// Configured maximum in-flight target dials per authenticated session.
+    /// Configured maximum in-flight target socket dials per authenticated session.
     pub fn max_outbound_dials_per_session(&self) -> u64 {
         self.limits
             .as_ref()
@@ -276,7 +276,7 @@ pub struct LimitConfig {
     pub max_sessions: Option<u64>,
     /// Maximum concurrent TCP streams per authenticated session.
     pub max_streams: Option<u64>,
-    /// Maximum in-flight target dials per authenticated session.
+    /// Maximum in-flight target socket dials per authenticated session.
     pub max_outbound_dials_per_session: Option<u64>,
     /// Maximum queued client-to-target bytes across one authenticated session.
     pub max_buffered_bytes_per_session: Option<u64>,

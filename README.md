@@ -46,7 +46,7 @@ including `169.254.169.254`, `100.100.100.200`, and `fd00:ec2::254`.
 
 Server limits can advertise and enforce the maximum frame size, concurrent
 carrier sessions, concurrent TCP streams per authenticated session, in-flight
-target dials per session, queued client-to-target bytes per session and per
+target socket dials per session, queued client-to-target bytes per session and per
 flow, plus the authenticated session idle timeout:
 
 ```toml
