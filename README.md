@@ -15,6 +15,8 @@ The repository currently focuses on the first runnable v0.1 TCP path:
 - minimal policy decisions in `uk-policy`
 - TLS/TCP authenticated server sessions in `uk-server`
 - SOCKS5 CONNECT entry point and multiplexed TCP relay in `uk-client`
+- graceful Ctrl+C/SIGTERM shutdown for long-running client and server listeners
+- nonce-matched PING/PONG keepalive for active TCP relay flows
 
 The first runnable proxy target is:
 
@@ -85,6 +87,15 @@ sessions:
 uk-server --config examples/server.toml config-check
 uk-client --config examples/client.toml config-check
 ```
+
+Start the local TLS/TCP server and SOCKS5 client in separate terminals:
+
+```sh
+uk-server --config examples/server.toml serve
+uk-client --config examples/client.toml socks5 --listen 127.0.0.1:1080
+```
+
+Both long-running listeners stop gracefully on Ctrl+C or SIGTERM.
 
 Configured endpoints use `host:port` syntax. IPv6 literals must be bracketed,
 for example `[::1]:9443`; port `0` is rejected by config validation.
