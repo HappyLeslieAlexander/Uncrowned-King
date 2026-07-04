@@ -400,6 +400,10 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
         | FrameType::Error
         | FrameType::PolicyDenied
         | FrameType::ResourceLimit => {
+            if is_connection_error_frame(&frame) {
+                validate_flow_status(FrameType::Error, frame.payload)?;
+                return Err("connection error from server".into());
+            }
             let (flow_id, route) = {
                 let mut flows = session.flows.lock().await;
                 route_flow_frame(frame, &mut flows)
@@ -433,6 +437,10 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
 fn validate_session_control_frame(frame: &Frame, expected_type: FrameType) -> Result<(), AnyError> {
     validate_connection_frame(frame, expected_type)?;
     Ok(())
+}
+
+fn is_connection_error_frame(frame: &Frame) -> bool {
+    frame.header.frame_type == FrameType::Error && frame.header.id == 0
 }
 
 fn route_flow_frame(
@@ -745,8 +753,12 @@ mod tests {
         payload.freeze()
     }
 
+    fn error_frame_for(flow_id: u64, code: ErrorCode) -> Frame {
+        Frame::new(FrameType::Error, 0, flow_id, status_payload(code)).unwrap()
+    }
+
     fn error_frame(code: ErrorCode) -> Frame {
-        Frame::new(FrameType::Error, 0, FLOW_ID, status_payload(code)).unwrap()
+        error_frame_for(FLOW_ID, code)
     }
 
     fn data_frame(flow_id: u64, payload: Bytes) -> Frame {
@@ -959,6 +971,33 @@ mod tests {
     #[test]
     fn rejects_unexpected_flow_status_frame_type() {
         assert!(validate_flow_status(FrameType::TcpData, Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_flow_status_payload() {
+        assert!(validate_flow_status(FrameType::Error, Bytes::new()).is_err());
+        assert!(validate_flow_status(FrameType::PolicyDenied, Bytes::new()).is_err());
+        assert!(validate_flow_status(FrameType::ResourceLimit, Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn classifies_connection_error_frames() {
+        assert!(is_connection_error_frame(&error_frame_for(
+            0,
+            ErrorCode::Protocol
+        )));
+        assert!(!is_connection_error_frame(&error_frame(
+            ErrorCode::Protocol
+        )));
+        assert!(!is_connection_error_frame(
+            &Frame::new(
+                FrameType::PolicyDenied,
+                0,
+                0,
+                status_payload(ErrorCode::PolicyDenied)
+            )
+            .unwrap()
+        ));
     }
 
     #[test]
