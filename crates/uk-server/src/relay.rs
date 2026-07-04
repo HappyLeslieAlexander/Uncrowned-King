@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     error::Error,
+    fmt,
     future::Future,
     io,
     net::{IpAddr, SocketAddr},
@@ -20,7 +21,7 @@ use tokio::{
         TcpStream, lookup_host,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
-    sync::{Mutex, mpsc},
+    sync::{Mutex, Notify, mpsc},
 };
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, info, warn};
@@ -125,8 +126,14 @@ struct TargetFlowControl {
 
 #[derive(Debug, Clone)]
 enum FlowSlot {
-    Opening,
+    Opening(OpenFlowCancel),
     Open(TargetFlow),
+}
+
+#[derive(Clone)]
+struct OpenFlowCancel {
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +156,17 @@ struct RelaySessionContext<'a> {
     event_tx: &'a mpsc::UnboundedSender<FlowEvent>,
     limits: RelayLimits,
     shutdown: SessionShutdown,
+}
+
+struct TargetOpenTask {
+    flow_id: u64,
+    target: Target,
+    credential: Credential,
+    policy_set: Arc<PolicySet>,
+    target_connect_timeout: Option<Duration>,
+    event_tx: mpsc::UnboundedSender<FlowEvent>,
+    shutdown: SessionShutdown,
+    cancel: OpenFlowCancel,
 }
 
 pub(crate) async fn relay_session(
@@ -255,7 +273,7 @@ fn handle_target_read_closed(
             }
         }
         if target.is_fully_closed() {
-            target_writers.remove(&flow_id);
+            remove_flow_slot(target_writers, flow_id);
             info!(event = "tcp.closed", flow_id);
         }
     }
@@ -280,7 +298,7 @@ async fn handle_read_drain_expired(
         send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_NORMAL).await?;
     }
     if should_remove {
-        target_writers.remove(&flow_id);
+        remove_flow_slot(target_writers, flow_id);
         info!(event = "tcp.half_close_timeout", flow_id);
     }
     Ok(())
@@ -290,7 +308,7 @@ fn handle_target_write_closed(flow_id: u64, target_writers: &mut FlowTable) {
     if let Some(target) = open_target_flow_mut(target_writers, flow_id) {
         target.mark_client_to_target_closed();
         if target.is_fully_closed() {
-            target_writers.remove(&flow_id);
+            remove_flow_slot(target_writers, flow_id);
             info!(event = "tcp.closed", flow_id);
         }
     }
@@ -393,7 +411,7 @@ async fn handle_tcp_data_frame(
         TcpDataDisposition::OpeningFlow => {
             send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
             send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
-            target_writers.remove(&flow_id);
+            remove_flow_slot(target_writers, flow_id);
         }
         TcpDataDisposition::EmptyPayload => {}
         TcpDataDisposition::ForwardPayload => {
@@ -432,7 +450,7 @@ async fn forward_tcp_data_frame(
         send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
     }
     if should_remove {
-        target_writers.remove(&flow_id);
+        remove_flow_slot(target_writers, flow_id);
     }
     Ok(())
 }
@@ -461,7 +479,7 @@ async fn handle_tcp_close_frame(
         }
     };
     let should_remove = match target_writers.get_mut(&flow_id) {
-        Some(FlowSlot::Opening) => true,
+        Some(FlowSlot::Opening(_)) => true,
         Some(FlowSlot::Open(target)) => {
             if close.close_code == TCP_CLOSE_NORMAL {
                 target.close_client_to_target();
@@ -473,7 +491,7 @@ async fn handle_tcp_close_frame(
         None => false,
     };
     if should_remove {
-        target_writers.remove(&flow_id);
+        remove_flow_slot(target_writers, flow_id);
     }
     Ok(())
 }
@@ -528,7 +546,7 @@ fn tcp_data_disposition(
 ) -> TcpDataDisposition {
     match target_writers.get(&flow_id) {
         None => TcpDataDisposition::UnknownFlow,
-        Some(FlowSlot::Opening) => TcpDataDisposition::OpeningFlow,
+        Some(FlowSlot::Opening(_)) => TcpDataDisposition::OpeningFlow,
         Some(FlowSlot::Open(_)) if payload.is_empty() => TcpDataDisposition::EmptyPayload,
         Some(FlowSlot::Open(_)) => TcpDataDisposition::ForwardPayload,
     }
@@ -554,16 +572,18 @@ async fn handle_tcp_open_frame(
     }
 
     if let Some((flow_id, target)) = validate_tcp_open_request(context, frame).await? {
-        target_writers.insert(flow_id, FlowSlot::Opening);
-        spawn_target_open(
+        let cancel = OpenFlowCancel::default();
+        target_writers.insert(flow_id, FlowSlot::Opening(cancel.clone()));
+        spawn_target_open(TargetOpenTask {
             flow_id,
             target,
-            context.credential.clone(),
-            Arc::clone(&context.policy_set),
-            context.limits.target_connect_timeout,
-            context.event_tx.clone(),
-            context.shutdown.clone(),
-        );
+            credential: context.credential.clone(),
+            policy_set: Arc::clone(&context.policy_set),
+            target_connect_timeout: context.limits.target_connect_timeout,
+            event_tx: context.event_tx.clone(),
+            shutdown: context.shutdown.clone(),
+            cancel,
+        });
     }
     Ok(())
 }
@@ -603,24 +623,24 @@ async fn validate_tcp_open_request(
     Ok(Some((flow_id, open.target)))
 }
 
-fn spawn_target_open(
-    flow_id: u64,
-    target: Target,
-    credential: Credential,
-    policy_set: Arc<PolicySet>,
-    target_connect_timeout: Option<Duration>,
-    event_tx: mpsc::UnboundedSender<FlowEvent>,
-    shutdown: SessionShutdown,
-) {
+fn spawn_target_open(task: TargetOpenTask) {
     tokio::spawn(async move {
-        let result =
-            connect_allowed_target(&target, &credential, &policy_set, target_connect_timeout).await;
-        if !shutdown.is_closed() {
-            let _ = event_tx.send(FlowEvent::OpenCompleted {
-                flow_id,
-                target,
-                result,
-            });
+        tokio::select! {
+            result = connect_allowed_target(
+                &task.target,
+                &task.credential,
+                &task.policy_set,
+                task.target_connect_timeout,
+            ) => {
+                if !task.shutdown.is_closed() && !task.cancel.is_cancelled() {
+                    let _ = task.event_tx.send(FlowEvent::OpenCompleted {
+                        flow_id: task.flow_id,
+                        target: task.target,
+                        result,
+                    });
+                }
+            }
+            () = task.cancel.cancelled() => {}
         }
     });
 }
@@ -632,7 +652,7 @@ async fn handle_tcp_open_completed(
     context: &RelaySessionContext<'_>,
     target_writers: &mut FlowTable,
 ) -> Result<(), AnyError> {
-    if !matches!(target_writers.get(&flow_id), Some(FlowSlot::Opening)) {
+    if !matches!(target_writers.get(&flow_id), Some(FlowSlot::Opening(_))) {
         return Ok(());
     }
 
@@ -643,7 +663,7 @@ async fn handle_tcp_open_completed(
         }
         Err(err) => {
             reject_open_failure(flow_id, &target, err, context).await?;
-            target_writers.remove(&flow_id);
+            remove_flow_slot(target_writers, flow_id);
         }
     }
     Ok(())
@@ -851,6 +871,46 @@ impl SessionShutdown {
     }
 }
 
+impl Default for OpenFlowCancel {
+    fn default() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+}
+
+impl fmt::Debug for OpenFlowCancel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenFlowCancel")
+            .field("cancelled", &self.is_cancelled())
+            .finish_non_exhaustive()
+    }
+}
+
+impl OpenFlowCancel {
+    fn cancel(&self) {
+        if !self.cancelled.swap(true, Ordering::SeqCst) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 impl Default for TargetFlowControl {
     fn default() -> Self {
         Self {
@@ -1009,8 +1069,16 @@ impl TargetFlow {
 fn open_target_flow_mut(target_writers: &mut FlowTable, flow_id: u64) -> Option<&mut TargetFlow> {
     match target_writers.get_mut(&flow_id) {
         Some(FlowSlot::Open(target)) => Some(target),
-        Some(FlowSlot::Opening) | None => None,
+        Some(FlowSlot::Opening(_)) | None => None,
     }
+}
+
+fn remove_flow_slot(target_writers: &mut FlowTable, flow_id: u64) -> Option<FlowSlot> {
+    let slot = target_writers.remove(&flow_id);
+    if let Some(FlowSlot::Opening(cancel)) = &slot {
+        cancel.cancel();
+    }
+    slot
 }
 
 async fn relay_target_to_client(
@@ -1047,8 +1115,9 @@ async fn relay_target_to_client(
 
 fn close_target_flows(target_writers: &mut FlowTable) {
     for slot in target_writers.drain().map(|(_, target)| target) {
-        if let FlowSlot::Open(mut target) = slot {
-            target.close_client_to_target();
+        match slot {
+            FlowSlot::Opening(cancel) => cancel.cancel(),
+            FlowSlot::Open(mut target) => target.close_client_to_target(),
         }
     }
 }
@@ -1264,6 +1333,10 @@ mod tests {
 
     fn test_open_flow_slot() -> FlowSlot {
         FlowSlot::Open(test_target_flow())
+    }
+
+    fn test_opening_flow_slot() -> FlowSlot {
+        FlowSlot::Opening(OpenFlowCancel::default())
     }
 
     fn control_frame(frame_type: FrameType, flow_id: u64) -> Frame {
@@ -1507,7 +1580,7 @@ mod tests {
     #[test]
     fn pending_open_slot_counts_against_stream_limit() {
         let mut target_writers = FlowTable::new();
-        target_writers.insert(1, FlowSlot::Opening);
+        target_writers.insert(1, test_opening_flow_slot());
 
         assert_eq!(
             check_tcp_open_slot(3, &target_writers, 1),
@@ -1518,12 +1591,37 @@ mod tests {
     #[test]
     fn classifies_tcp_data_for_pending_open_flow() {
         let mut target_writers = FlowTable::new();
-        target_writers.insert(1, FlowSlot::Opening);
+        target_writers.insert(1, test_opening_flow_slot());
 
         assert_eq!(
             tcp_data_disposition(1, &Bytes::from_static(b"early"), &target_writers),
             TcpDataDisposition::OpeningFlow
         );
+    }
+
+    #[test]
+    fn removing_pending_open_slot_cancels_connect_task() {
+        let cancel = OpenFlowCancel::default();
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(1, FlowSlot::Opening(cancel.clone()));
+
+        remove_flow_slot(&mut target_writers, 1);
+
+        assert!(cancel.is_cancelled());
+        assert!(target_writers.is_empty());
+    }
+
+    #[test]
+    fn closing_session_cancels_pending_open_slots() {
+        let cancel = OpenFlowCancel::default();
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(1, FlowSlot::Opening(cancel.clone()));
+        target_writers.insert(3, test_open_flow_slot());
+
+        close_target_flows(&mut target_writers);
+
+        assert!(cancel.is_cancelled());
+        assert!(target_writers.is_empty());
     }
 
     #[tokio::test]
