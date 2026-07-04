@@ -117,6 +117,11 @@ non-zero `open_flags`.
 When a `TCP_OPEN` is accepted, the server sends a zero-length `TCP_DATA` on the
 same `id` as the open acknowledgement before forwarding target bytes. Rejection
 uses `POLICY_DENIED`, `RESOURCE_LIMIT`, or `ERROR`, followed by `TCP_CLOSE`.
+Implementations may keep processing other connection frames while target
+resolution or connection for a `TCP_OPEN` is pending. A peer must not send
+`TCP_DATA` on a flow before receiving the zero-length acknowledgement; doing so
+is a protocol error. A `TCP_CLOSE` before acknowledgement cancels the pending
+open for that flow.
 
 `TCP_CLOSE` payload:
 
