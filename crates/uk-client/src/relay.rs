@@ -524,8 +524,13 @@ fn decode_open_response(frame: Frame) -> Result<OpenResponse, AnyError> {
         FrameType::Error => Ok(OpenResponse::Rejected(map_error_payload(frame.payload)?)),
         FrameType::TcpClose => {
             let mut payload = frame.payload;
-            let _close = TcpClose::decode(&mut payload)?;
-            Ok(OpenResponse::Rejected(socks5::Reply::ConnectionRefused))
+            let close = TcpClose::decode(&mut payload)?;
+            let reply = if close.close_code == TCP_CLOSE_NORMAL {
+                socks5::Reply::ConnectionRefused
+            } else {
+                socks5::Reply::GeneralFailure
+            };
+            Ok(OpenResponse::Rejected(reply))
         }
         _ => Err("unexpected frame while opening tcp flow".into()),
     }
@@ -797,6 +802,14 @@ mod tests {
         assert_eq!(
             decode_open_response(close_frame(TCP_CLOSE_NORMAL)).unwrap(),
             OpenResponse::Rejected(socks5::Reply::ConnectionRefused)
+        );
+    }
+
+    #[test]
+    fn maps_tcp_close_error_open_response_to_general_failure() {
+        assert_eq!(
+            decode_open_response(close_frame(TCP_CLOSE_ERROR)).unwrap(),
+            OpenResponse::Rejected(socks5::Reply::GeneralFailure)
         );
     }
 
