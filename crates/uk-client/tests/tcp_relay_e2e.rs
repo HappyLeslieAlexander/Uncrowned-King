@@ -140,6 +140,11 @@ async fn reports_auth_failure_during_handshake() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejects_expired_auth_challenge_during_handshake() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_expired_auth_challenge_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reports_oversized_auth_response_during_handshake() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -949,6 +954,48 @@ async fn run_auth_failure_error_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+async fn run_expired_auth_challenge_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = ServerHarness::start_with_auth_skew(test_limits(), None, 0).await?;
+    let mut carrier = connect_tls_carrier(&harness).await?;
+    let exporter = client_exporter(&carrier)?;
+
+    let challenge_frame = read_frame(&mut carrier, FrameLimits::default()).await?;
+    validate_connection_frame(&challenge_frame, FrameType::AuthChallenge)?;
+    let mut challenge_payload = challenge_frame.payload;
+    let challenge = AuthChallenge::decode(&mut challenge_payload)?;
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let response = AuthResponse::for_challenge(
+        KEY_ID.as_bytes(),
+        SECRET.as_bytes(),
+        &exporter,
+        &challenge,
+        unix_now(),
+        Vec::new(),
+    )?;
+    let mut response_payload = BytesMut::new();
+    response.encode(&mut response_payload)?;
+    let response_frame = Frame::new(FrameType::AuthResponse, 0, 0, response_payload.freeze())?;
+    write_frame(&mut carrier, &response_frame).await?;
+
+    let error_frame = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(error_frame.header.frame_type, FrameType::Error);
+    assert_eq!(error_frame.header.id, 0);
+
+    let mut payload = error_frame.payload;
+    assert_eq!(
+        ErrorPayload::decode(&mut payload)?.code,
+        ErrorCode::AuthFailed
+    );
+    Ok(())
+}
+
 async fn run_oversized_auth_response_error_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -1415,6 +1462,14 @@ impl ServerHarness {
         limits: LimitConfig,
         policy_toml: Option<String>,
     ) -> Result<Self, TestError> {
+        Self::start_with_auth_skew(limits, policy_toml, 30).await
+    }
+
+    async fn start_with_auth_skew(
+        limits: LimitConfig,
+        policy_toml: Option<String>,
+        auth_skew_seconds: u64,
+    ) -> Result<Self, TestError> {
         let temp_dir = create_temp_dir()?;
         let cert_path = temp_dir.join("server-cert.pem");
         let key_path = temp_dir.join("server-key.pem");
@@ -1432,7 +1487,7 @@ impl ServerHarness {
             listen: server_addr.to_string(),
             cert_path: path_string(&cert_path),
             key_path: path_string(&key_path),
-            auth_skew_seconds: Some(30),
+            auth_skew_seconds: Some(auth_skew_seconds),
             limits: Some(limits),
             policy_path: policy_path.as_deref().map(path_string),
             credentials: vec![CredentialConfig {
@@ -1489,6 +1544,15 @@ async fn connect_tls_carrier(
         return Err("UK ALPN protocol was not negotiated".into());
     }
     Ok(stream)
+}
+
+fn client_exporter(stream: &ClientTlsStream<TcpStream>) -> Result<[u8; 32], TestError> {
+    let mut out = [0_u8; 32];
+    stream
+        .get_ref()
+        .1
+        .export_keying_material(&mut out, EXPORTER_LABEL, None)?;
+    Ok(out)
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TestError> {
