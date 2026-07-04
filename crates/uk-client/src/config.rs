@@ -26,6 +26,8 @@ pub struct ClientConfig {
     pub socks_handshake_timeout_seconds: Option<u64>,
     /// Optional timeout for waiting on TCP open acknowledgement in seconds.
     pub tcp_open_timeout_seconds: Option<u64>,
+    /// Optional maximum concurrent local SOCKS5 connections.
+    pub max_socks_connections: Option<u64>,
 }
 
 impl ClientConfig {
@@ -51,6 +53,11 @@ impl ClientConfig {
         self.tcp_open_timeout_seconds.unwrap_or(10)
     }
 
+    /// Maximum concurrent local SOCKS5 connections.
+    pub fn max_socks_connections(&self) -> u64 {
+        self.max_socks_connections.unwrap_or(1024)
+    }
+
     /// Validates local authentication material before opening a network session.
     pub fn validate_auth_material(&self) -> Result<(), AuthError> {
         validate_key_id(self.key_id.as_bytes())?;
@@ -60,6 +67,17 @@ impl ClientConfig {
     /// Validates configured network endpoints without resolving DNS.
     pub fn validate_network_endpoints(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         validate_endpoint("server_addr", &self.server_addr)
+    }
+
+    /// Validates local client resource limits.
+    pub fn validate_resource_limits(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let max_socks_connections = self.max_socks_connections();
+        if max_socks_connections == 0 {
+            return Err("max_socks_connections must be greater than zero".into());
+        }
+        usize::try_from(max_socks_connections)
+            .map_err(|_| "max_socks_connections is too large for this platform")?;
+        Ok(())
     }
 }
 
@@ -86,6 +104,7 @@ mod tests {
             handshake_timeout_seconds: None,
             socks_handshake_timeout_seconds: None,
             tcp_open_timeout_seconds: None,
+            max_socks_connections: None,
         }
     }
 
@@ -156,6 +175,36 @@ tcp_open_timeout_seconds = 6
     }
 
     #[test]
+    fn defaults_max_socks_connections() {
+        assert_eq!(minimal_config().max_socks_connections(), 1024);
+    }
+
+    #[test]
+    fn parses_max_socks_connections() {
+        let config: ClientConfig = toml::from_str(
+            r#"
+server_addr = "127.0.0.1:443"
+server_name = "localhost"
+ca_cert_path = "ca.pem"
+key_id = "client"
+secret = "secret"
+max_socks_connections = 7
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.max_socks_connections(), 7);
+    }
+
+    #[test]
+    fn rejects_zero_max_socks_connections() {
+        let mut config = minimal_config();
+        config.max_socks_connections = Some(0);
+
+        assert!(config.validate_resource_limits().is_err());
+    }
+
+    #[test]
     fn parses_zero_timeout_values() {
         let config: ClientConfig = toml::from_str(
             r#"
@@ -167,6 +216,7 @@ secret = "secret"
 handshake_timeout_seconds = 0
 socks_handshake_timeout_seconds = 0
 tcp_open_timeout_seconds = 0
+max_socks_connections = 1
 "#,
         )
         .unwrap();
@@ -174,6 +224,7 @@ tcp_open_timeout_seconds = 0
         assert_eq!(config.handshake_timeout_seconds(), 0);
         assert_eq!(config.socks_handshake_timeout_seconds(), 0);
         assert_eq!(config.tcp_open_timeout_seconds(), 0);
+        assert_eq!(config.max_socks_connections(), 1);
     }
 
     #[test]

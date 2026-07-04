@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    io::BufReader,
+    io::{self, BufReader},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process,
@@ -356,6 +356,11 @@ async fn closes_idle_socks_handshake_after_timeout() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn limits_concurrent_socks_connections() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_max_socks_connections_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancels_pending_open_when_socks_client_disconnects() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -457,6 +462,65 @@ async fn run_socks_handshake_timeout_e2e() -> Result<(), TestError> {
 
     assert_eq!(socks.read(&mut byte).await?, 0);
     Ok(())
+}
+
+async fn run_max_socks_connections_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = RelayHarness::start_with_max_socks_connections(None, 1).await?;
+    let _first = open_idle_socks_greeting(harness.socks_addr).await?;
+
+    let mut second = TcpStream::connect(harness.socks_addr).await?;
+    let mut byte = [0_u8; 1];
+    match tokio::time::timeout(Duration::from_secs(3), second.read(&mut byte)).await? {
+        Ok(0) => {}
+        Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {}
+        Ok(read) => return Err(format!("limited socks connection read {read} bytes").into()),
+        Err(err) => return Err(err.into()),
+    }
+    Ok(())
+}
+
+async fn open_idle_socks_greeting(socks_addr: SocketAddr) -> Result<TcpStream, TestError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+
+    loop {
+        match try_open_idle_socks_greeting(socks_addr).await {
+            Ok(socks) => return Ok(socks),
+            Err(_err) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn try_open_idle_socks_greeting(socks_addr: SocketAddr) -> Result<TcpStream, TestError> {
+    let mut socks = TcpStream::connect(socks_addr).await?;
+    socks.write_all(&[0x05, 0x01, 0x00]).await?;
+    let mut method_response = [0_u8; 2];
+    match tokio::time::timeout(
+        Duration::from_millis(250),
+        socks.read_exact(&mut method_response),
+    )
+    .await
+    {
+        Ok(Ok(_)) if method_response == [0x05, 0x00] => Ok(socks),
+        Ok(Ok(_)) => Err(format!("unexpected socks method response: {method_response:?}").into()),
+        Ok(Err(err))
+            if matches!(
+                err.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::BrokenPipe
+            ) =>
+        {
+            Err(err.into())
+        }
+        Ok(Err(err)) => Err(err.into()),
+        Err(_) => Err("timed out waiting for socks method response".into()),
+    }
 }
 
 async fn run_pending_open_cancel_on_socks_disconnect_e2e() -> Result<(), TestError> {
@@ -1361,6 +1425,7 @@ async fn run_server_active_session_shutdown_e2e() -> Result<(), TestError> {
         handshake_timeout_seconds: Some(3),
         socks_handshake_timeout_seconds: Some(3),
         tcp_open_timeout_seconds: Some(3),
+        max_socks_connections: None,
     })
     .await?
     .0;
@@ -1397,6 +1462,7 @@ async fn run_socks_listener_shutdown_e2e() -> Result<(), TestError> {
             handshake_timeout_seconds: Some(3),
             socks_handshake_timeout_seconds: Some(3),
             tcp_open_timeout_seconds: Some(3),
+            max_socks_connections: None,
         },
         socks_addr.to_string(),
         async {
@@ -1441,6 +1507,7 @@ async fn run_socks_listener_shutdown_during_connect_e2e() -> Result<(), TestErro
             handshake_timeout_seconds: Some(30),
             socks_handshake_timeout_seconds: Some(3),
             tcp_open_timeout_seconds: Some(30),
+            max_socks_connections: None,
         },
         socks_addr.to_string(),
         async {
@@ -1538,6 +1605,7 @@ impl ServerHarness {
             handshake_timeout_seconds: Some(3),
             socks_handshake_timeout_seconds: Some(3),
             tcp_open_timeout_seconds: Some(3),
+            max_socks_connections: None,
         }
     }
 }
@@ -1660,6 +1728,7 @@ impl MalformedFrameServerHarness {
                 handshake_timeout_seconds: Some(3),
                 socks_handshake_timeout_seconds: Some(3),
                 tcp_open_timeout_seconds: Some(3),
+                max_socks_connections: None,
             },
             socks_addr.to_string(),
         ));
@@ -1729,6 +1798,7 @@ impl PendingOpenCancelServerHarness {
                 handshake_timeout_seconds: Some(3),
                 socks_handshake_timeout_seconds: Some(3),
                 tcp_open_timeout_seconds: Some(tcp_open_timeout_seconds),
+                max_socks_connections: None,
             },
             socks_addr.to_string(),
         ));
@@ -1809,6 +1879,7 @@ impl MissingPongServerHarness {
                 handshake_timeout_seconds: Some(3),
                 socks_handshake_timeout_seconds: Some(3),
                 tcp_open_timeout_seconds: Some(3),
+                max_socks_connections: None,
             },
             socks_addr.to_string(),
         ));
@@ -2060,14 +2131,23 @@ impl RelayHarness {
         Self::start_with_limits(policy_toml, test_limits()).await
     }
 
+    async fn start_with_max_socks_connections(
+        policy_toml: Option<String>,
+        max_socks_connections: u64,
+    ) -> Result<Self, TestError> {
+        Self::start_with_client_options(policy_toml, test_limits(), 3, Some(max_socks_connections))
+            .await
+    }
+
     async fn start_with_client_socks_timeout(
         policy_toml: Option<String>,
         socks_handshake_timeout_seconds: u64,
     ) -> Result<Self, TestError> {
-        Self::start_with_limits_and_client_socks_timeout(
+        Self::start_with_client_options(
             policy_toml,
             test_limits(),
             socks_handshake_timeout_seconds,
+            None,
         )
         .await
     }
@@ -2076,13 +2156,14 @@ impl RelayHarness {
         policy_toml: Option<String>,
         limits: LimitConfig,
     ) -> Result<Self, TestError> {
-        Self::start_with_limits_and_client_socks_timeout(policy_toml, limits, 3).await
+        Self::start_with_client_options(policy_toml, limits, 3, None).await
     }
 
-    async fn start_with_limits_and_client_socks_timeout(
+    async fn start_with_client_options(
         policy_toml: Option<String>,
         limits: LimitConfig,
         socks_handshake_timeout_seconds: u64,
+        max_socks_connections: Option<u64>,
     ) -> Result<Self, TestError> {
         let temp_dir = create_temp_dir()?;
         let cert_path = temp_dir.join("server-cert.pem");
@@ -2128,6 +2209,7 @@ impl RelayHarness {
                 handshake_timeout_seconds: Some(3),
                 socks_handshake_timeout_seconds: Some(socks_handshake_timeout_seconds),
                 tcp_open_timeout_seconds: Some(3),
+                max_socks_connections,
             },
             socks_addr.to_string(),
         ));

@@ -16,7 +16,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, Notify, mpsc, watch},
+    sync::{Mutex, Notify, Semaphore, mpsc, watch},
     task::JoinSet,
     time,
 };
@@ -166,7 +166,9 @@ where
     crate::check_config(&config)?;
     validate_endpoint("socks listen", &listen)?;
     let socks_handshake_timeout = timeout(config.socks_handshake_timeout_seconds());
+    let max_socks_connections = usize_limit(config.max_socks_connections())?;
     let sessions = Arc::new(ClientSessionManager::new(config));
+    let connection_slots = Arc::new(Semaphore::new(max_socks_connections));
     let listener = TcpListener::bind(&listen).await?;
     info!(event = "socks5.listen", listen = %listen);
 
@@ -183,10 +185,26 @@ where
                 break;
             }
             accepted = listener.accept() => {
-                let (local, peer) = accepted?;
+                let (mut local, peer) = accepted?;
+                let Ok(permit) = Arc::clone(&connection_slots).try_acquire_owned() else {
+                    warn!(
+                        event = "socks5.connection.limit",
+                        peer = %peer,
+                        max_connections = max_socks_connections
+                    );
+                    if let Err(err) = local.shutdown().await {
+                        debug!(
+                            event = "socks5.connection.limit_shutdown_error",
+                            peer = %peer,
+                            error = %err
+                        );
+                    }
+                    continue;
+                };
                 let sessions = Arc::clone(&sessions);
                 let shutdown_rx = shutdown_tx.subscribe();
                 connections.spawn(async move {
+                    let _permit = permit;
                     if let Err(err) =
                         handle_socks_connection(
                             local,
@@ -1231,6 +1249,10 @@ fn tcp_data_frame_size(limits: FrameLimits) -> usize {
         .map_or(RELAY_BUFFER_SIZE, |limit| limit.min(RELAY_BUFFER_SIZE))
 }
 
+fn usize_limit(value: u64) -> Result<usize, AnyError> {
+    Ok(usize::try_from(value).map_err(|_| "limit is too large for this platform")?)
+}
+
 fn timeout(seconds: u64) -> Option<Duration> {
     (seconds != 0).then(|| Duration::from_secs(seconds))
 }
@@ -1285,6 +1307,7 @@ mod tests {
             handshake_timeout_seconds: None,
             socks_handshake_timeout_seconds: None,
             tcp_open_timeout_seconds: None,
+            max_socks_connections: None,
         }
     }
 

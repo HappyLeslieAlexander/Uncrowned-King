@@ -8,3 +8,4 @@ secret = "replace-with-a-long-random-shared-secret"
 handshake_timeout_seconds = 10
 socks_handshake_timeout_seconds = 10
 tcp_open_timeout_seconds = 10
+max_socks_connections = 1024
