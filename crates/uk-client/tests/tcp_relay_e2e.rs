@@ -125,6 +125,11 @@ async fn reports_protocol_error_for_zero_id_tcp_close() -> Result<(), TestError>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reports_protocol_error_for_nonzero_id_ping() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_nonzero_id_ping_error_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn responds_to_authenticated_ping() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_authenticated_ping_pong_e2e()).await?
 }
@@ -630,6 +635,32 @@ async fn run_zero_id_tcp_close_error_e2e() -> Result<(), TestError> {
     let mut payload = BytesMut::new();
     TcpClose::new(TCP_CLOSE_NORMAL).encode(&mut payload)?;
     let frame = Frame::new(FrameType::TcpClose, 0, 0, payload.freeze())?;
+    write_frame(&mut carrier, &frame).await?;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(response.header.frame_type, FrameType::Error);
+    assert_eq!(response.header.id, 0);
+
+    let mut payload = response.payload;
+    assert_eq!(
+        ErrorPayload::decode(&mut payload)?.code,
+        ErrorCode::Protocol
+    );
+    Ok(())
+}
+
+async fn run_nonzero_id_ping_error_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = ServerHarness::start(test_limits()).await?;
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(harness.client_config(SECRET)).await?;
+
+    let frame = Frame::new(FrameType::Ping, 0, 1, Bytes::new())?;
     write_frame(&mut carrier, &frame).await?;
 
     let response = tokio::time::timeout(

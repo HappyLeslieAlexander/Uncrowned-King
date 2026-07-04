@@ -305,17 +305,30 @@ async fn handle_session_frame(
         FrameType::TcpData => handle_tcp_data_frame(frame, context, target_writers).await,
         FrameType::TcpClose => handle_tcp_close_frame(frame, context, target_writers).await,
         FrameType::Ping => {
-            validate_session_control_frame(&frame, FrameType::Ping)?;
+            validate_or_report_session_control_frame(&frame, context, FrameType::Ping).await?;
             write_pong(context.carrier_writer, &frame).await
         }
         FrameType::Pong => {
-            validate_session_control_frame(&frame, FrameType::Pong)?;
+            validate_or_report_session_control_frame(&frame, context, FrameType::Pong).await?;
             Ok(())
         }
         _ => Err("unexpected frame while relaying session".into()),
     }
 }
 
+async fn validate_or_report_session_control_frame(
+    frame: &Frame,
+    context: &RelaySessionContext<'_>,
+    expected_type: FrameType,
+) -> Result<(), AnyError> {
+    if let Err(err) = validate_connection_frame(frame, expected_type) {
+        send_error(context.carrier_writer, 0, ErrorCode::Protocol).await?;
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn validate_session_control_frame(frame: &Frame, expected_type: FrameType) -> Result<(), AnyError> {
     validate_connection_frame(frame, expected_type)?;
     Ok(())
