@@ -353,6 +353,9 @@ async fn handle_session_frame(
         FrameType::TcpOpen => handle_tcp_open_frame(context, frame, target_writers).await,
         FrameType::TcpData => handle_tcp_data_frame(frame, context, target_writers).await,
         FrameType::TcpClose => handle_tcp_close_frame(frame, context, target_writers).await,
+        FrameType::Error | FrameType::PolicyDenied | FrameType::ResourceLimit => {
+            handle_client_flow_status_frame(frame, context, target_writers).await
+        }
         FrameType::Ping => {
             validate_or_report_session_control_frame(&frame, context, FrameType::Ping).await?;
             write_pong(context.carrier_writer, &frame).await
@@ -496,6 +499,65 @@ async fn handle_tcp_close_frame(
         remove_flow_slot(target_writers, flow_id);
     }
     Ok(())
+}
+
+async fn handle_client_flow_status_frame(
+    frame: Frame,
+    context: &RelaySessionContext<'_>,
+    target_writers: &mut FlowTable,
+) -> Result<(), AnyError> {
+    let flow_id = frame.header.id;
+    if flow_id == 0 && frame.header.frame_type == FrameType::Error {
+        validate_client_flow_status_payload(frame.header.frame_type, frame.payload)?;
+        return Err("connection error from client".into());
+    }
+    if let Err(rejection) = validate_client_relay_flow_id(flow_id) {
+        return reject_invalid_client_relay_flow_id(
+            context,
+            flow_id,
+            rejection,
+            "flow status id must be non-zero",
+        )
+        .await;
+    }
+    if let Err(err) = validate_client_flow_status_payload(frame.header.frame_type, frame.payload) {
+        send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+        return Err(err);
+    }
+
+    abort_client_flow(flow_id, target_writers);
+    Ok(())
+}
+
+fn abort_client_flow(flow_id: u64, target_writers: &mut FlowTable) {
+    let should_remove = match target_writers.get_mut(&flow_id) {
+        Some(FlowSlot::Opening(_)) => true,
+        Some(FlowSlot::Open(target)) => {
+            target.abort();
+            true
+        }
+        None => false,
+    };
+    if should_remove {
+        remove_flow_slot(target_writers, flow_id);
+        info!(event = "tcp.client_flow_aborted", flow_id);
+    }
+}
+
+fn validate_client_flow_status_payload(
+    frame_type: FrameType,
+    mut payload: Bytes,
+) -> Result<(), AnyError> {
+    let status = ErrorPayload::decode(&mut payload)?;
+    match frame_type {
+        FrameType::Error => Ok(()),
+        FrameType::PolicyDenied if status.code == ErrorCode::PolicyDenied => Ok(()),
+        FrameType::ResourceLimit if status.code == ErrorCode::ResourceLimit => Ok(()),
+        FrameType::PolicyDenied | FrameType::ResourceLimit => {
+            Err("unexpected client flow status code".into())
+        }
+        _ => Err("unexpected client flow status frame".into()),
+    }
 }
 
 async fn reject_invalid_client_relay_flow_id(
@@ -1393,6 +1455,12 @@ mod tests {
         Frame::new(frame_type, 0, flow_id, Bytes::new()).unwrap()
     }
 
+    fn status_payload(code: ErrorCode) -> Bytes {
+        let mut payload = BytesMut::new();
+        ErrorPayload::new(code).encode(&mut payload).unwrap();
+        payload.freeze()
+    }
+
     #[test]
     fn client_half_close_keeps_flow_reserved_until_target_read_closes() {
         let mut flow = test_target_flow();
@@ -1638,6 +1706,73 @@ mod tests {
             Err(FlowIdRejection::Reserved)
         );
         assert_eq!(validate_client_relay_flow_id(1), Ok(()));
+    }
+
+    #[test]
+    fn validates_client_flow_status_payloads() {
+        assert!(
+            validate_client_flow_status_payload(
+                FrameType::Error,
+                status_payload(ErrorCode::Protocol)
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_client_flow_status_payload(
+                FrameType::ResourceLimit,
+                status_payload(ErrorCode::ResourceLimit)
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_client_flow_status_payload(
+                FrameType::PolicyDenied,
+                status_payload(ErrorCode::PolicyDenied)
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_client_flow_status_payload(
+                FrameType::ResourceLimit,
+                status_payload(ErrorCode::Protocol)
+            )
+            .is_err()
+        );
+        assert!(validate_client_flow_status_payload(FrameType::TcpData, Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn client_flow_status_aborts_open_flow() {
+        let flow = test_target_flow();
+        let control = flow.control.clone();
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(1, FlowSlot::Open(flow));
+
+        abort_client_flow(1, &mut target_writers);
+
+        assert!(target_writers.is_empty());
+        assert!(control.is_aborted());
+    }
+
+    #[test]
+    fn client_flow_status_cancels_pending_open() {
+        let cancel = OpenFlowCancel::default();
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(1, FlowSlot::Opening(cancel.clone()));
+
+        abort_client_flow(1, &mut target_writers);
+
+        assert!(target_writers.is_empty());
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn client_flow_status_ignores_unknown_flow() {
+        let mut target_writers = FlowTable::new();
+
+        abort_client_flow(1, &mut target_writers);
+
+        assert!(target_writers.is_empty());
     }
 
     #[test]
