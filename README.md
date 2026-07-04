@@ -46,6 +46,7 @@ timeout:
 
 ```toml
 [limits]
+max_pre_auth_bytes = 4096
 max_frame_size = 65536
 max_streams = 64
 idle_timeout_seconds = 300
@@ -60,6 +61,7 @@ replay_cache_max_entries = 65536
 Set `idle_timeout_seconds = 0` to disable the relay session idle timeout.
 Set `handshake_timeout_seconds = 0` to disable the TLS/auth handshake timeout.
 Set `target_connect_timeout_seconds = 0` to disable the server target dial timeout.
+Set `tcp_half_close_timeout_seconds = 0` to disable the TCP half-close drain timeout.
 Replay cache limits must be greater than zero. `max_pre_auth_bytes` must be at
 least 75 bytes so a minimum `AUTH_RESPONSE` can fit.
 At least one credential is required. Credential `key_id` values must be unique.
@@ -68,7 +70,8 @@ When set, `policy_group` must be non-empty printable text.
 Client configs may also set `handshake_timeout_seconds = 10` to bound the
 server connection, TLS handshake, authentication exchange, and SETTINGS read.
 When running the SOCKS5 listener, `socks_handshake_timeout_seconds = 10` bounds
-the local SOCKS greeting and CONNECT request.
+the local SOCKS greeting and CONNECT request. `tcp_open_timeout_seconds = 10`
+bounds waiting for a UK TCP open response from the server.
 
 Example configs live under `examples/`; see `examples/README.md` for local
 certificate generation. Validate configs without opening listeners or outbound
