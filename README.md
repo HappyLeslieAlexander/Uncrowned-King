@@ -60,7 +60,8 @@ replay_cache_max_entries = 65536
 Set `idle_timeout_seconds = 0` to disable the relay session idle timeout.
 Set `handshake_timeout_seconds = 0` to disable the TLS/auth handshake timeout.
 Set `target_connect_timeout_seconds = 0` to disable the server target dial timeout.
-Replay cache limits must be greater than zero.
+Replay cache limits must be greater than zero. `max_pre_auth_bytes` must be at
+least 75 bytes so a minimum `AUTH_RESPONSE` can fit.
 Credential `key_id` values must be unique. When set, `policy_group` must be
 non-empty printable text.
 

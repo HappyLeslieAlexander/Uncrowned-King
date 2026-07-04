@@ -22,6 +22,8 @@ pub const MAX_KEY_ID_LEN: usize = 64;
 /// Minimum accepted shared secret length in bytes.
 pub const MIN_SECRET_LEN: usize = 32;
 const MIN_RESPONSE_TAIL_LEN: usize = 73;
+/// Minimum AUTH_RESPONSE payload size accepted by the v0.1 wire format.
+pub const MIN_AUTH_RESPONSE_PAYLOAD_SIZE: u64 = 75;
 /// Default replay cache retention window in seconds.
 pub const DEFAULT_REPLAY_CACHE_WINDOW_SECONDS: u64 = 300;
 /// Default maximum accepted nonce pairs retained by the replay cache.

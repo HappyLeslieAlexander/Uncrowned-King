@@ -168,6 +168,8 @@ bytes[32] tag
 
 `key_id_len` must be `1..=64`. Shared secrets are local configuration, never
 sent on the wire, and must contain at least 32 bytes of secret material.
+Implementations with a pre-authentication frame limit must allow at least 75
+payload bytes so a minimum `AUTH_RESPONSE` can be received.
 
 `tag` is:
 
