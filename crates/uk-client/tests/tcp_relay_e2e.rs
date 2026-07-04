@@ -224,6 +224,15 @@ async fn server_listener_stops_on_shutdown_signal() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_shutdown_closes_authenticated_session() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_server_active_session_shutdown_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn socks_listener_stops_on_shutdown_signal() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_socks_listener_shutdown_e2e()).await?
 }
@@ -1211,6 +1220,65 @@ async fn run_server_listener_shutdown_e2e() -> Result<(), TestError> {
     shutdown_tx
         .send(())
         .map_err(|()| "server shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(3), server_task).await???;
+    Ok(())
+}
+
+async fn run_server_active_session_shutdown_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    fs::write(&cert_path, CERT_PEM)?;
+    fs::write(&key_path, KEY_PEM)?;
+    let server_addr = unused_loopback_addr().await?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut server_task = tokio::spawn(uk_server::run_until_shutdown(
+        ServerConfig {
+            listen: server_addr.to_string(),
+            cert_path: path_string(&cert_path),
+            key_path: path_string(&key_path),
+            auth_skew_seconds: Some(30),
+            limits: Some(test_limits()),
+            policy_path: None,
+            credentials: vec![CredentialConfig {
+                key_id: KEY_ID.to_owned(),
+                secret: SECRET.to_owned(),
+                status: Some("active".to_owned()),
+                not_before: None,
+                not_after: None,
+                policy_group: Some("default".to_owned()),
+            }],
+        },
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+    wait_for_listener("uk-server", server_addr, &mut server_task).await?;
+
+    let mut carrier = connect_authenticated_carrier(ClientConfig {
+        server_addr: server_addr.to_string(),
+        server_name: "localhost".to_owned(),
+        ca_cert_path: path_string(&cert_path),
+        key_id: KEY_ID.to_owned(),
+        secret: SECRET.to_owned(),
+        handshake_timeout_seconds: Some(3),
+        socks_handshake_timeout_seconds: Some(3),
+        tcp_open_timeout_seconds: Some(3),
+    })
+    .await?
+    .0;
+
+    shutdown_tx
+        .send(())
+        .map_err(|()| "server shutdown receiver dropped")?;
+    let read_result = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut carrier, FrameLimits::default()),
+    )
+    .await?;
+    assert!(matches!(read_result, Err(FrameIoError::Closed)));
     tokio::time::timeout(Duration::from_secs(3), server_task).await???;
     Ok(())
 }
