@@ -212,6 +212,23 @@ mod tests {
 
     use super::*;
 
+    async fn assert_request_failure_after_shutdown(request: &[u8], expected_reply: Reply) {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
+
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut method_response = [0_u8; 2];
+        client.read_exact(&mut method_response).await.unwrap();
+        assert_eq!(method_response, [0x05, 0x00]);
+
+        let mut reply = [0_u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], expected_reply.code());
+        assert!(server_task.await.unwrap().is_err());
+    }
+
     #[tokio::test]
     async fn negotiates_ipv4_connect() {
         let (mut client, mut server) = tokio::io::duplex(128);
@@ -384,23 +401,31 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_truncated_ipv4_request_with_failure_reply() {
-        let (mut client, mut server) = tokio::io::duplex(128);
-        let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
+        assert_request_failure_after_shutdown(
+            &[0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x01, 127],
+            Reply::GeneralFailure,
+        )
+        .await;
+    }
 
-        client
-            .write_all(&[0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x01, 127])
-            .await
-            .unwrap();
-        client.shutdown().await.unwrap();
+    #[tokio::test]
+    async fn rejects_truncated_domain_request_with_failure_reply() {
+        assert_request_failure_after_shutdown(
+            &[0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, 0x0b, b'e'],
+            Reply::GeneralFailure,
+        )
+        .await;
+    }
 
-        let mut method_response = [0_u8; 2];
-        client.read_exact(&mut method_response).await.unwrap();
-        assert_eq!(method_response, [0x05, 0x00]);
-
-        let mut reply = [0_u8; 10];
-        client.read_exact(&mut reply).await.unwrap();
-        assert_eq!(reply[1], Reply::GeneralFailure.code());
-        assert!(server_task.await.unwrap().is_err());
+    #[tokio::test]
+    async fn rejects_truncated_domain_port_with_failure_reply() {
+        assert_request_failure_after_shutdown(
+            &[
+                0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, 0x03, b'c', b'o', b'm', 0x01,
+            ],
+            Reply::GeneralFailure,
+        )
+        .await;
     }
 
     #[tokio::test]
