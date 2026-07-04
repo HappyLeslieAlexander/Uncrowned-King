@@ -83,6 +83,7 @@ enum OpenResponse {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FlowFrameRoute {
+    InvalidFlowId,
     UnknownFlow,
     Enqueued,
     FlowClosed,
@@ -358,9 +359,17 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
                 let mut flows = session.flows.lock().await;
                 route_flow_frame(frame, &mut flows)
             };
-            if route == FlowFrameRoute::FlowQueueFull {
-                warn!(event = "client.flow.queue_full", flow_id);
-                session.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await?;
+            match route {
+                FlowFrameRoute::InvalidFlowId => {
+                    return Err("invalid tcp relay flow id from server".into());
+                }
+                FlowFrameRoute::FlowQueueFull => {
+                    warn!(event = "client.flow.queue_full", flow_id);
+                    session.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await?;
+                }
+                FlowFrameRoute::UnknownFlow
+                | FlowFrameRoute::Enqueued
+                | FlowFrameRoute::FlowClosed => {}
             }
             Ok(())
         }
@@ -375,6 +384,10 @@ fn route_flow_frame(
     flows: &mut HashMap<u64, mpsc::Sender<Frame>>,
 ) -> (u64, FlowFrameRoute) {
     let flow_id = frame.header.id;
+    if !is_client_initiated_flow_id(flow_id) {
+        return (flow_id, FlowFrameRoute::InvalidFlowId);
+    }
+
     let Some(sender) = flows.get(&flow_id) else {
         return (flow_id, FlowFrameRoute::UnknownFlow);
     };
@@ -704,6 +717,28 @@ mod tests {
         assert_eq!(
             route_flow_frame(data_frame(99, Bytes::from_static(b"late")), &mut flows),
             (99, FlowFrameRoute::UnknownFlow)
+        );
+        assert!(flows.is_empty());
+    }
+
+    #[test]
+    fn rejects_zero_id_carrier_flow_frame() {
+        let mut flows = HashMap::new();
+
+        assert_eq!(
+            route_flow_frame(data_frame(0, Bytes::from_static(b"invalid")), &mut flows),
+            (0, FlowFrameRoute::InvalidFlowId)
+        );
+        assert!(flows.is_empty());
+    }
+
+    #[test]
+    fn rejects_reserved_carrier_flow_frame() {
+        let mut flows = HashMap::new();
+
+        assert_eq!(
+            route_flow_frame(data_frame(2, Bytes::from_static(b"reserved")), &mut flows),
+            (2, FlowFrameRoute::InvalidFlowId)
         );
         assert!(flows.is_empty());
     }
