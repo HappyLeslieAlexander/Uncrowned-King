@@ -308,6 +308,7 @@ impl ClientSession {
             }
             Err(err) => {
                 self.flows.lock().await.remove(&flow_id);
+                report_protocol_error(self).await;
                 Err(err)
             }
         }

@@ -176,6 +176,11 @@ async fn reports_protocol_error_for_malformed_server_relay_frame() -> Result<(),
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reports_protocol_error_for_non_empty_open_ack() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_non_empty_open_ack_error_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reports_protocol_error_for_nonzero_id_ping() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_nonzero_id_ping_error_e2e()).await?
 }
@@ -959,6 +964,21 @@ async fn run_malformed_server_relay_frame_error_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+async fn run_non_empty_open_ack_error_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let mut harness = MalformedFrameServerHarness::start_non_empty_open_ack().await?;
+    let (_socks, connect_reply) = open_socks_connect(
+        harness.socks_addr,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 80)),
+    )
+    .await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_GENERAL_FAILURE);
+
+    assert_eq!(harness.received_error_code().await?, ErrorCode::Protocol);
+    Ok(())
+}
+
 async fn run_nonzero_id_ping_error_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -1123,8 +1143,22 @@ struct MalformedFrameServerHarness {
     client_task: JoinHandle<Result<(), TestError>>,
 }
 
+#[derive(Clone, Copy)]
+enum MalformedFrameScenario {
+    RelayFrameAfterOpen,
+    NonEmptyOpenAck,
+}
+
 impl MalformedFrameServerHarness {
     async fn start() -> Result<Self, TestError> {
+        Self::start_with_scenario(MalformedFrameScenario::RelayFrameAfterOpen).await
+    }
+
+    async fn start_non_empty_open_ack() -> Result<Self, TestError> {
+        Self::start_with_scenario(MalformedFrameScenario::NonEmptyOpenAck).await
+    }
+
+    async fn start_with_scenario(scenario: MalformedFrameScenario) -> Result<Self, TestError> {
         let temp_dir = create_temp_dir()?;
         let cert_path = temp_dir.join("server-cert.pem");
         let key_path = temp_dir.join("server-key.pem");
@@ -1138,6 +1172,7 @@ impl MalformedFrameServerHarness {
             server_listener,
             cert_path.clone(),
             key_path,
+            scenario,
         ));
         let mut client_task = tokio::spawn(run_socks5_listener(
             ClientConfig {
@@ -1315,6 +1350,7 @@ async fn run_malformed_frame_server(
     listener: TcpListener,
     cert_path: PathBuf,
     key_path: PathBuf,
+    scenario: MalformedFrameScenario,
 ) -> Result<ErrorCode, TestError> {
     let mut stream = accept_fake_server_session(listener, cert_path, key_path).await?;
     let open_frame = read_frame(&mut stream, FrameLimits::default()).await?;
@@ -1323,11 +1359,24 @@ async fn run_malformed_frame_server(
     let mut open_payload = open_frame.payload;
     TcpOpen::decode(&mut open_payload)?;
 
-    let ack = Frame::new(FrameType::TcpData, 0, flow_id, Bytes::new())?;
-    write_frame(&mut stream, &ack).await?;
+    match scenario {
+        MalformedFrameScenario::RelayFrameAfterOpen => {
+            let ack = Frame::new(FrameType::TcpData, 0, flow_id, Bytes::new())?;
+            write_frame(&mut stream, &ack).await?;
 
-    let malformed_close = Frame::new(FrameType::TcpClose, 0, flow_id, Bytes::new())?;
-    write_frame(&mut stream, &malformed_close).await?;
+            let malformed_close = Frame::new(FrameType::TcpClose, 0, flow_id, Bytes::new())?;
+            write_frame(&mut stream, &malformed_close).await?;
+        }
+        MalformedFrameScenario::NonEmptyOpenAck => {
+            let malformed_ack = Frame::new(
+                FrameType::TcpData,
+                0,
+                flow_id,
+                Bytes::from_static(b"not an ack"),
+            )?;
+            write_frame(&mut stream, &malformed_ack).await?;
+        }
+    }
 
     let response = tokio::time::timeout(
         Duration::from_secs(3),
