@@ -187,11 +187,18 @@ impl ClientSession {
             next_flow_id: AtomicU64::new(FIRST_CLIENT_FLOW_ID),
         });
         spawn_carrier_reader(carrier_reader, Arc::clone(&session));
+        if let Some(interval) = keepalive_interval(&settings) {
+            spawn_keepalive(Arc::clone(&session), interval);
+        }
         Ok(session)
     }
 
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    async fn has_open_flows(&self) -> bool {
+        !self.flows.lock().await.is_empty()
     }
 
     async fn close(&self) {
@@ -312,6 +319,11 @@ impl ClientSession {
         self.write_frame(&pong_frame).await
     }
 
+    async fn write_ping(&self) -> Result<(), AnyError> {
+        let frame = Frame::new(FrameType::Ping, 0, 0, Bytes::new())?;
+        self.write_frame(&frame).await
+    }
+
     async fn write_frame(&self, frame: &Frame) -> Result<(), AnyError> {
         let result = write_frame_locked(&self.writer, frame).await;
         if result.is_err() {
@@ -342,6 +354,24 @@ fn spawn_carrier_reader(
                     close_session(&session).await;
                     return;
                 }
+            }
+        }
+    });
+}
+
+fn spawn_keepalive(session: Arc<ClientSession>, interval: Duration) {
+    tokio::spawn(async move {
+        loop {
+            time::sleep(interval).await;
+            if session.is_closed() {
+                return;
+            }
+            if !session.has_open_flows().await {
+                continue;
+            }
+            if let Err(err) = session.write_ping().await {
+                debug!(event = "client.session.keepalive.error", error = %err);
+                return;
             }
         }
     });
@@ -609,6 +639,15 @@ fn max_streams(settings: &uk_proto::Settings) -> u64 {
     settings
         .get(SettingKey::MaxStreams)
         .unwrap_or(DEFAULT_MAX_STREAMS)
+}
+
+fn keepalive_interval(settings: &uk_proto::Settings) -> Option<Duration> {
+    let idle_timeout_seconds = settings.get(SettingKey::IdleTimeoutSeconds)?;
+    if idle_timeout_seconds == 0 {
+        return None;
+    }
+    let interval_millis = idle_timeout_seconds.saturating_mul(1000).saturating_div(2);
+    Some(Duration::from_millis(interval_millis.max(1)))
 }
 
 fn tcp_data_frame_size(limits: FrameLimits) -> usize {
@@ -981,6 +1020,40 @@ mod tests {
             }),
             RELAY_BUFFER_SIZE
         );
+    }
+
+    #[test]
+    fn derives_keepalive_interval_from_idle_timeout() {
+        let mut settings = uk_proto::Settings::default();
+        settings.set(SettingKey::IdleTimeoutSeconds, 30);
+
+        assert_eq!(keepalive_interval(&settings), Some(Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn keeps_one_second_idle_timeout_before_deadline() {
+        let mut settings = uk_proto::Settings::default();
+        settings.set(SettingKey::IdleTimeoutSeconds, 1);
+
+        assert_eq!(
+            keepalive_interval(&settings),
+            Some(Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn disables_keepalive_without_idle_timeout() {
+        let settings = uk_proto::Settings::default();
+
+        assert_eq!(keepalive_interval(&settings), None);
+    }
+
+    #[test]
+    fn disables_keepalive_for_zero_idle_timeout() {
+        let mut settings = uk_proto::Settings::default();
+        settings.set(SettingKey::IdleTimeoutSeconds, 0);
+
+        assert_eq!(keepalive_interval(&settings), None);
     }
 
     #[test]

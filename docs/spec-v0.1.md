@@ -220,6 +220,10 @@ If `max_frame_size` or `max_streams` is present, the value must be greater than
 zero. TCP relay implementations must reject `max_frame_size < 262`, the minimum
 needed to carry every valid v0.1 `TCP_OPEN` payload.
 
+When `idle_timeout_seconds` is non-zero, a peer may send `PING` frames before
+the deadline to keep active relay flows alive. Implementations should avoid
+keeping otherwise idle sessions alive when no flow is open.
+
 ## 7. Error Codes
 
 `ERROR`, `POLICY_DENIED`, and `RESOURCE_LIMIT` payloads carry one coarse code:

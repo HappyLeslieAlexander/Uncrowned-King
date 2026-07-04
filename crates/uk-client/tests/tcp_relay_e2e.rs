@@ -195,6 +195,11 @@ async fn reconnects_after_server_idle_timeout() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keeps_idle_tcp_flow_alive_with_ping() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_idle_flow_keepalive_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closes_target_when_socks_client_disconnects() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_client_disconnect_e2e()).await?
 }
@@ -276,6 +281,37 @@ async fn run_idle_reconnect_e2e() -> Result<(), TestError> {
     let (second_target_addr, second_echo_task) = spawn_echo_target().await?;
     assert_echo_roundtrip(harness.socks_addr, second_target_addr, b"second session").await?;
     second_echo_task.await??;
+    Ok(())
+}
+
+async fn run_idle_flow_keepalive_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let first_payload = b"before-idle";
+    let second_payload = b"after-idle";
+    let (target_addr, target_task) =
+        spawn_two_stage_echo_target(first_payload.len(), second_payload.len()).await?;
+    let harness = RelayHarness::start_with_limits(
+        Some(allow_loopback_policy(target_addr.port())),
+        test_limits_with_idle_timeout(1),
+    )
+    .await?;
+
+    let (mut socks, connect_reply) = open_socks_connect(harness.socks_addr, target_addr).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    socks.write_all(first_payload).await?;
+    let mut first_echo = vec![0_u8; first_payload.len()];
+    socks.read_exact(&mut first_echo).await?;
+    assert_eq!(first_echo, first_payload);
+
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+    socks.write_all(second_payload).await?;
+    let mut second_echo = vec![0_u8; second_payload.len()];
+    socks.read_exact(&mut second_echo).await?;
+    assert_eq!(second_echo, second_payload);
+    target_task.await??;
     Ok(())
 }
 
@@ -822,6 +858,26 @@ async fn spawn_fixed_size_echo_target(
         let mut buf = vec![0_u8; expected_len];
         stream.read_exact(&mut buf).await?;
         stream.write_all(&buf).await?;
+        Ok(())
+    });
+    Ok((addr, task))
+}
+
+async fn spawn_two_stage_echo_target(
+    first_len: usize,
+    second_len: usize,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<Result<(), TestError>>), TestError> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut first = vec![0_u8; first_len];
+        stream.read_exact(&mut first).await?;
+        stream.write_all(&first).await?;
+
+        let mut second = vec![0_u8; second_len];
+        stream.read_exact(&mut second).await?;
+        stream.write_all(&second).await?;
         Ok(())
     });
     Ok((addr, task))
