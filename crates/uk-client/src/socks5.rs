@@ -44,8 +44,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     read_greeting(stream).await?;
-    stream.write_all(&[VERSION, METHOD_NO_AUTH]).await?;
-    stream.flush().await?;
+    send_method_selection(stream, METHOD_NO_AUTH).await?;
     read_connect_request(stream).await
 }
 
@@ -69,19 +68,39 @@ where
     }
     let method_count = stream.read_u8().await?;
     if method_count == 0 {
-        stream.write_all(&[VERSION, METHOD_NO_ACCEPTABLE]).await?;
-        stream.flush().await?;
+        send_method_selection(stream, METHOD_NO_ACCEPTABLE).await?;
         return Err(protocol_error("socks greeting has no methods"));
     }
 
     let mut methods = vec![0_u8; usize::from(method_count)];
-    stream.read_exact(&mut methods).await?;
+    read_greeting_exact(stream, &mut methods).await?;
     if methods.contains(&METHOD_NO_AUTH) {
         Ok(())
     } else {
-        stream.write_all(&[VERSION, METHOD_NO_ACCEPTABLE]).await?;
-        stream.flush().await?;
+        send_method_selection(stream, METHOD_NO_ACCEPTABLE).await?;
         Err(protocol_error("socks client offered no supported method"))
+    }
+}
+
+async fn send_method_selection<S>(stream: &mut S, method: u8) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    stream.write_all(&[VERSION, method]).await?;
+    stream.flush().await
+}
+
+async fn read_greeting_exact<S>(stream: &mut S, buf: &mut [u8]) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match stream.read_exact(buf).await {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+            let _ = send_method_selection(stream, METHOD_NO_ACCEPTABLE).await;
+            Err(protocol_error("truncated socks greeting"))
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -278,6 +297,20 @@ mod tests {
         let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
 
         client.write_all(&[0x05, 0x02, 0x01, 0x02]).await.unwrap();
+
+        let mut method_response = [0_u8; 2];
+        client.read_exact(&mut method_response).await.unwrap();
+        assert_eq!(method_response, [0x05, 0xff]);
+        assert!(server_task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_truncated_greeting_with_no_acceptable_method() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
+
+        client.write_all(&[0x05, 0x02, 0x00]).await.unwrap();
+        client.shutdown().await.unwrap();
 
         let mut method_response = [0_u8; 2];
         client.read_exact(&mut method_response).await.unwrap();
