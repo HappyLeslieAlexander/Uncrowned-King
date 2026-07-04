@@ -638,8 +638,24 @@ impl TargetFlowControl {
     }
 
     fn release_bytes(&self, amount: usize) {
-        let previous = self.buffered_bytes.fetch_sub(amount, Ordering::SeqCst);
-        debug_assert!(previous >= amount);
+        let mut current = self.buffered_bytes.load(Ordering::SeqCst);
+        loop {
+            let next = current.saturating_sub(amount);
+            match self.buffered_bytes.compare_exchange(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn buffered_bytes(&self) -> usize {
+        self.buffered_bytes.load(Ordering::SeqCst)
     }
 
     fn close(&self) {
@@ -1032,6 +1048,33 @@ mod tests {
         assert!(!flow.target_to_client_open);
         assert!(flow.is_fully_closed());
         assert!(flow.control.is_aborted());
+    }
+
+    #[test]
+    fn target_flow_control_tracks_buffered_bytes() {
+        let control = TargetFlowControl::default();
+
+        assert!(control.reserve_bytes(8, 10));
+        assert_eq!(control.buffered_bytes(), 8);
+        assert!(!control.reserve_bytes(3, 10));
+        assert_eq!(control.buffered_bytes(), 8);
+
+        control.release_bytes(4);
+        assert_eq!(control.buffered_bytes(), 4);
+        assert!(control.reserve_bytes(6, 10));
+        assert_eq!(control.buffered_bytes(), 10);
+    }
+
+    #[test]
+    fn target_flow_control_release_saturates_at_zero() {
+        let control = TargetFlowControl::default();
+
+        control.release_bytes(1);
+        assert_eq!(control.buffered_bytes(), 0);
+
+        assert!(control.reserve_bytes(5, 10));
+        control.release_bytes(8);
+        assert_eq!(control.buffered_bytes(), 0);
     }
 
     #[tokio::test]
