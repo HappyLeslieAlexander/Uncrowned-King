@@ -53,6 +53,8 @@ pub(crate) struct RelayLimits {
 enum ServerSessionState {
     Authenticated,
     Relaying,
+    Closing,
+    Closed,
 }
 
 #[derive(Debug)]
@@ -218,9 +220,11 @@ pub(crate) async fn relay_session(
         }
     };
 
+    transition(&mut state, ServerSessionState::Closing);
     shutdown.close();
     close_target_flows(&mut target_writers);
     shutdown_carrier_writer(&carrier_writer).await;
+    transition(&mut state, ServerSessionState::Closed);
     result
 }
 
@@ -939,7 +943,10 @@ const fn is_valid_session_transition(from: ServerSessionState, next: ServerSessi
         (
             ServerSessionState::Authenticated,
             ServerSessionState::Relaying
-        )
+        ) | (
+            ServerSessionState::Relaying,
+            ServerSessionState::Closing | ServerSessionState::Closed
+        ) | (ServerSessionState::Closing, ServerSessionState::Closed)
     )
 }
 
@@ -1094,10 +1101,19 @@ mod tests {
 
     #[test]
     fn accepts_server_session_transition_to_relaying() {
-        assert!(is_valid_session_transition(
-            ServerSessionState::Authenticated,
-            ServerSessionState::Relaying
-        ));
+        let valid = [
+            (
+                ServerSessionState::Authenticated,
+                ServerSessionState::Relaying,
+            ),
+            (ServerSessionState::Relaying, ServerSessionState::Closing),
+            (ServerSessionState::Relaying, ServerSessionState::Closed),
+            (ServerSessionState::Closing, ServerSessionState::Closed),
+        ];
+
+        for (from, next) in valid {
+            assert!(is_valid_session_transition(from, next));
+        }
     }
 
     #[test]
@@ -1105,6 +1121,10 @@ mod tests {
         assert!(!is_valid_session_transition(
             ServerSessionState::Relaying,
             ServerSessionState::Authenticated
+        ));
+        assert!(!is_valid_session_transition(
+            ServerSessionState::Closed,
+            ServerSessionState::Relaying
         ));
     }
 }
