@@ -275,8 +275,11 @@ impl AuthResponse {
         src.copy_to_slice(&mut client_nonce);
         let client_time = src.get_u64();
         let client_capabilities = read_varbytes(src, "client capabilities")?;
-        if src.remaining() != 32 {
-            return Err(AuthError::InvalidPayload("invalid tag length"));
+        if src.remaining() < 32 {
+            return Err(AuthError::InvalidPayload("response tag is truncated"));
+        }
+        if src.remaining() > 32 {
+            return Err(AuthError::InvalidPayload("trailing response bytes"));
         }
         let mut tag = [0_u8; 32];
         src.copy_to_slice(&mut tag);
@@ -637,7 +640,21 @@ mod tests {
 
         assert_eq!(
             AuthResponse::decode(&mut bytes),
-            Err(AuthError::InvalidPayload("invalid tag length"))
+            Err(AuthError::InvalidPayload("trailing response bytes"))
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_response_tag_after_capabilities() {
+        let (_, _, _, response) = fixture();
+        let mut out = Vec::new();
+        response.encode(&mut out).unwrap();
+        out.pop();
+        let mut bytes = bytes::Bytes::from(out);
+
+        assert_eq!(
+            AuthResponse::decode(&mut bytes),
+            Err(AuthError::InvalidPayload("response tag is truncated"))
         );
     }
 
