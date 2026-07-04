@@ -76,10 +76,11 @@ impl TcpClose {
 
     /// Decodes a TCP close payload.
     pub fn decode(src: &mut impl Buf) -> ProtocolResult<Self> {
-        if src.remaining() != 2 {
-            return Err(ProtocolError::InvalidTcpPayload(
-                "tcp close must contain one close code",
-            ));
+        if src.remaining() < 2 {
+            return Err(ProtocolError::Truncated);
+        }
+        if src.remaining() > 2 {
+            return Err(ProtocolError::InvalidTcpPayload("trailing tcp close bytes"));
         }
         let close_code = src.get_u16();
         validate_close_code(close_code)?;
@@ -180,6 +181,21 @@ mod tests {
         assert_eq!(
             TcpClose::decode(&mut bytes),
             Err(ProtocolError::InvalidTcpPayload("unknown tcp close code"))
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_tcp_close() {
+        let mut bytes = Bytes::from_static(&[0x00]);
+        assert_eq!(TcpClose::decode(&mut bytes), Err(ProtocolError::Truncated));
+    }
+
+    #[test]
+    fn rejects_trailing_tcp_close_bytes() {
+        let mut bytes = Bytes::from_static(&[0x00, 0x00, 0xff]);
+        assert_eq!(
+            TcpClose::decode(&mut bytes),
+            Err(ProtocolError::InvalidTcpPayload("trailing tcp close bytes"))
         );
     }
 
