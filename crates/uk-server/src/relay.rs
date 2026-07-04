@@ -65,6 +65,7 @@ pub(crate) struct RelayLimits {
     frame: FrameLimits,
     max_streams: u64,
     data_frame_size: usize,
+    max_buffered_bytes_per_session: usize,
     max_buffered_bytes_per_flow: usize,
     target_connect_timeout: Option<Duration>,
     tcp_half_close_timeout: Option<Duration>,
@@ -121,7 +122,7 @@ enum SessionEvent {
 
 #[derive(Debug)]
 enum TargetCommand {
-    Data(Bytes),
+    Data(BufferedTargetData),
     Close,
 }
 
@@ -140,8 +141,21 @@ enum TcpDataDisposition {
 }
 
 #[derive(Debug, Clone)]
+struct SessionBufferControl {
+    buffered_bytes: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+struct BufferedTargetData {
+    payload: Bytes,
+    payload_len: usize,
+    control: TargetFlowControl,
+}
+
+#[derive(Debug, Clone)]
 struct TargetFlowControl {
     buffered_bytes: Arc<AtomicUsize>,
+    session_buffer: SessionBufferControl,
     closed: Arc<AtomicBool>,
     aborted: Arc<AtomicBool>,
     abort_notify: Arc<Notify>,
@@ -180,6 +194,7 @@ struct RelaySessionContext<'a> {
     event_tx: &'a mpsc::UnboundedSender<FlowEvent>,
     limits: RelayLimits,
     shutdown: SessionShutdown,
+    session_buffer: SessionBufferControl,
 }
 
 struct TargetOpenTask {
@@ -208,6 +223,7 @@ pub(crate) async fn relay_session(
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let mut target_writers = FlowTable::new();
     let shutdown = SessionShutdown::default();
+    let session_buffer = SessionBufferControl::default();
     let carrier_writer = CarrierWriter::new(carrier_writer, shutdown.clone());
     let context = RelaySessionContext {
         credential,
@@ -216,6 +232,7 @@ pub(crate) async fn relay_session(
         event_tx: &event_tx,
         limits,
         shutdown: shutdown.clone(),
+        session_buffer,
     };
 
     let result = loop {
@@ -489,7 +506,11 @@ async fn forward_tcp_data_frame(
         send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
         return Ok(());
     };
-    match target.enqueue_data(payload, context.limits.max_buffered_bytes_per_flow) {
+    match target.enqueue_data(
+        payload,
+        context.limits.max_buffered_bytes_per_flow,
+        context.limits.max_buffered_bytes_per_session,
+    ) {
         Ok(()) => {}
         Err(EnqueueError::Closed) => {
             target.mark_client_to_target_closed();
@@ -792,7 +813,7 @@ async fn accept_open_target(
 ) -> Result<TargetFlow, AnyError> {
     let (target_reader, target_writer) = target_stream.into_split();
     let (target_writer_tx, target_writer_rx) = mpsc::channel(TARGET_WRITE_QUEUE_CAPACITY);
-    let flow_control = TargetFlowControl::default();
+    let flow_control = TargetFlowControl::new(context.session_buffer.clone());
     let target_flow = TargetFlow::new(target_writer_tx, flow_control.clone());
     send_tcp_data(context.carrier_writer, flow_id, Bytes::new()).await?;
     spawn_target_reader(
@@ -932,25 +953,16 @@ async fn relay_client_to_target(
             break;
         };
         match command {
-            TargetCommand::Data(payload) => {
-                let payload_len = payload.len();
+            TargetCommand::Data(buffered_data) => {
                 if flow_control.is_aborted() || shutdown.is_closed() {
-                    flow_control.release_bytes(payload_len);
                     return Ok(());
                 }
 
                 let write_result = tokio::select! {
-                    result = target_writer.write_all(&payload) => result,
-                    () = shutdown.closed() => {
-                        flow_control.release_bytes(payload_len);
-                        return Ok(());
-                    }
-                    () = flow_control.aborted() => {
-                        flow_control.release_bytes(payload_len);
-                        return Ok(());
-                    }
+                    result = target_writer.write_all(buffered_data.payload()) => result,
+                    () = shutdown.closed() => return Ok(()),
+                    () = flow_control.aborted() => return Ok(()),
                 };
-                flow_control.release_bytes(payload_len);
                 write_result?;
                 let _ = event_tx.send(FlowEvent::Activity);
             }
@@ -971,6 +983,7 @@ impl RelayLimits {
     pub(crate) fn new(
         frame: FrameLimits,
         max_streams: u64,
+        max_buffered_bytes_per_session: usize,
         max_buffered_bytes_per_flow: usize,
         target_connect_timeout: Option<Duration>,
         tcp_half_close_timeout: Option<Duration>,
@@ -979,6 +992,7 @@ impl RelayLimits {
             frame,
             max_streams,
             data_frame_size: tcp_data_frame_size(frame),
+            max_buffered_bytes_per_session,
             max_buffered_bytes_per_flow,
             target_connect_timeout,
             tcp_half_close_timeout,
@@ -1057,10 +1071,40 @@ impl OpenFlowCancel {
     }
 }
 
-impl Default for TargetFlowControl {
+impl Default for SessionBufferControl {
     fn default() -> Self {
         Self {
             buffered_bytes: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl SessionBufferControl {
+    fn reserve_bytes(&self, amount: usize, limit: usize) -> bool {
+        reserve_bytes(&self.buffered_bytes, amount, limit)
+    }
+
+    fn release_bytes(&self, amount: usize) {
+        release_bytes(&self.buffered_bytes, amount);
+    }
+
+    #[cfg(test)]
+    fn buffered_bytes(&self) -> usize {
+        self.buffered_bytes.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for TargetFlowControl {
+    fn default() -> Self {
+        Self::new(SessionBufferControl::default())
+    }
+}
+
+impl TargetFlowControl {
+    fn new(session_buffer: SessionBufferControl) -> Self {
+        Self {
+            buffered_bytes: Arc::new(AtomicUsize::new(0)),
+            session_buffer,
             closed: Arc::new(AtomicBool::new(false)),
             aborted: Arc::new(AtomicBool::new(false)),
             abort_notify: Arc::new(Notify::new()),
@@ -1069,41 +1113,20 @@ impl Default for TargetFlowControl {
 }
 
 impl TargetFlowControl {
-    fn reserve_bytes(&self, amount: usize, limit: usize) -> bool {
-        let mut current = self.buffered_bytes.load(Ordering::SeqCst);
-        loop {
-            let Some(next) = current.checked_add(amount) else {
-                return false;
-            };
-            if next > limit {
-                return false;
-            }
-            match self.buffered_bytes.compare_exchange(
-                current,
-                next,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => current = actual,
-            }
+    fn reserve_bytes(&self, amount: usize, flow_limit: usize, session_limit: usize) -> bool {
+        if !reserve_bytes(&self.buffered_bytes, amount, flow_limit) {
+            return false;
         }
+        if !self.session_buffer.reserve_bytes(amount, session_limit) {
+            release_bytes(&self.buffered_bytes, amount);
+            return false;
+        }
+        true
     }
 
     fn release_bytes(&self, amount: usize) {
-        let mut current = self.buffered_bytes.load(Ordering::SeqCst);
-        loop {
-            let next = current.saturating_sub(amount);
-            match self.buffered_bytes.compare_exchange(
-                current,
-                next,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return,
-                Err(actual) => current = actual,
-            }
-        }
+        release_bytes(&self.buffered_bytes, amount);
+        self.session_buffer.release_bytes(amount);
     }
 
     #[cfg(test)]
@@ -1141,6 +1164,63 @@ impl TargetFlowControl {
     }
 }
 
+impl BufferedTargetData {
+    fn new(
+        payload: Bytes,
+        control: TargetFlowControl,
+        flow_byte_limit: usize,
+        session_byte_limit: usize,
+    ) -> Result<Self, Bytes> {
+        let payload_len = payload.len();
+        if control.reserve_bytes(payload_len, flow_byte_limit, session_byte_limit) {
+            Ok(Self {
+                payload,
+                payload_len,
+                control,
+            })
+        } else {
+            Err(payload)
+        }
+    }
+
+    fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+impl Drop for BufferedTargetData {
+    fn drop(&mut self) {
+        self.control.release_bytes(self.payload_len);
+    }
+}
+
+fn reserve_bytes(buffered_bytes: &AtomicUsize, amount: usize, limit: usize) -> bool {
+    let mut current = buffered_bytes.load(Ordering::SeqCst);
+    loop {
+        let Some(next) = current.checked_add(amount) else {
+            return false;
+        };
+        if next > limit {
+            return false;
+        }
+        match buffered_bytes.compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn release_bytes(buffered_bytes: &AtomicUsize, amount: usize) {
+    let mut current = buffered_bytes.load(Ordering::SeqCst);
+    loop {
+        let next = current.saturating_sub(amount);
+        match buffered_bytes.compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 impl TargetFlow {
     fn new(commands: mpsc::Sender<TargetCommand>, control: TargetFlowControl) -> Self {
         Self {
@@ -1151,30 +1231,34 @@ impl TargetFlow {
         }
     }
 
-    fn enqueue_data(&mut self, payload: Bytes, byte_limit: usize) -> Result<(), EnqueueError> {
+    fn enqueue_data(
+        &mut self,
+        payload: Bytes,
+        flow_byte_limit: usize,
+        session_byte_limit: usize,
+    ) -> Result<(), EnqueueError> {
         if self.control.is_closed() {
             return Err(EnqueueError::Closed);
         }
 
-        let payload_len = payload.len();
-        if !self.control.reserve_bytes(payload_len, byte_limit) {
+        let Ok(buffered_data) = BufferedTargetData::new(
+            payload,
+            self.control.clone(),
+            flow_byte_limit,
+            session_byte_limit,
+        ) else {
             self.close_client_to_target_queue();
             return Err(EnqueueError::ResourceLimit);
-        }
+        };
 
         let Some(commands) = &self.commands else {
-            self.control.release_bytes(payload_len);
             return Err(EnqueueError::Closed);
         };
 
-        match commands.try_send(TargetCommand::Data(payload)) {
+        match commands.try_send(TargetCommand::Data(buffered_data)) {
             Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.control.release_bytes(payload_len);
-                Err(EnqueueError::Closed)
-            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(EnqueueError::Closed),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.control.release_bytes(payload_len);
                 self.close_client_to_target_queue();
                 Err(EnqueueError::ResourceLimit)
             }
@@ -1633,29 +1717,51 @@ mod tests {
 
     #[test]
     fn target_flow_control_tracks_buffered_bytes() {
-        let control = TargetFlowControl::default();
+        let session = SessionBufferControl::default();
+        let control = TargetFlowControl::new(session.clone());
 
-        assert!(control.reserve_bytes(8, 10));
+        assert!(control.reserve_bytes(8, 10, 16));
         assert_eq!(control.buffered_bytes(), 8);
-        assert!(!control.reserve_bytes(3, 10));
+        assert_eq!(session.buffered_bytes(), 8);
+        assert!(!control.reserve_bytes(3, 10, 16));
         assert_eq!(control.buffered_bytes(), 8);
+        assert_eq!(session.buffered_bytes(), 8);
 
         control.release_bytes(4);
         assert_eq!(control.buffered_bytes(), 4);
-        assert!(control.reserve_bytes(6, 10));
+        assert_eq!(session.buffered_bytes(), 4);
+        assert!(control.reserve_bytes(6, 10, 16));
         assert_eq!(control.buffered_bytes(), 10);
+        assert_eq!(session.buffered_bytes(), 10);
+    }
+
+    #[test]
+    fn target_flow_control_rejects_session_buffer_limit() {
+        let session = SessionBufferControl::default();
+        let first = TargetFlowControl::new(session.clone());
+        let second = TargetFlowControl::new(session.clone());
+
+        assert!(first.reserve_bytes(8, 10, 10));
+        assert!(!second.reserve_bytes(3, 10, 10));
+
+        assert_eq!(first.buffered_bytes(), 8);
+        assert_eq!(second.buffered_bytes(), 0);
+        assert_eq!(session.buffered_bytes(), 8);
     }
 
     #[test]
     fn target_flow_control_release_saturates_at_zero() {
-        let control = TargetFlowControl::default();
+        let session = SessionBufferControl::default();
+        let control = TargetFlowControl::new(session.clone());
 
         control.release_bytes(1);
         assert_eq!(control.buffered_bytes(), 0);
+        assert_eq!(session.buffered_bytes(), 0);
 
-        assert!(control.reserve_bytes(5, 10));
+        assert!(control.reserve_bytes(5, 10, 10));
         control.release_bytes(8);
         assert_eq!(control.buffered_bytes(), 0);
+        assert_eq!(session.buffered_bytes(), 0);
     }
 
     #[tokio::test]
@@ -1720,7 +1826,7 @@ mod tests {
         let (commands, mut commands_rx) = mpsc::channel(1);
         let mut flow = TargetFlow::new(commands, TargetFlowControl::default());
 
-        flow.enqueue_data(Bytes::from_static(b"queued"), 1024)
+        flow.enqueue_data(Bytes::from_static(b"queued"), 1024, 1024)
             .unwrap();
         flow.close_client_to_target();
 
@@ -1728,11 +1834,29 @@ mod tests {
         assert!(flow.control.is_closed());
         match commands_rx.recv().await {
             Some(TargetCommand::Data(payload)) => {
-                assert_eq!(payload, Bytes::from_static(b"queued"));
+                assert_eq!(payload.payload(), b"queued");
             }
             other => panic!("unexpected target command: {other:?}"),
         }
         assert!(commands_rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn dropped_queued_target_data_releases_session_buffer() {
+        let session = SessionBufferControl::default();
+        let control = TargetFlowControl::new(session.clone());
+        let (commands, commands_rx) = mpsc::channel(1);
+        let mut flow = TargetFlow::new(commands, control.clone());
+
+        flow.enqueue_data(Bytes::from_static(b"queued"), 1024, 1024)
+            .unwrap();
+        assert_eq!(control.buffered_bytes(), 6);
+        assert_eq!(session.buffered_bytes(), 6);
+
+        drop(commands_rx);
+
+        assert_eq!(control.buffered_bytes(), 0);
+        assert_eq!(session.buffered_bytes(), 0);
     }
 
     #[tokio::test]
@@ -1794,9 +1918,11 @@ mod tests {
         let flow_control = TargetFlowControl::default();
         let shutdown = SessionShutdown::default();
         let payload = Bytes::from_static(b"writer activity");
+        let buffered_payload =
+            BufferedTargetData::new(payload.clone(), flow_control.clone(), 1024, 1024).unwrap();
 
         commands_tx
-            .send(TargetCommand::Data(payload.clone()))
+            .send(TargetCommand::Data(buffered_payload))
             .await
             .unwrap();
         drop(commands_tx);

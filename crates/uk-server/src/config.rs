@@ -91,6 +91,15 @@ impl ServerConfig {
         reject_zero_limit("max_sessions", self.max_sessions())?;
         reject_zero_limit("max_streams", self.max_streams())?;
         reject_zero_limit(
+            "max_buffered_bytes_per_session",
+            self.max_buffered_bytes_per_session(),
+        )?;
+        reject_large_limit(
+            "max_buffered_bytes_per_session",
+            self.max_buffered_bytes_per_session(),
+            MAX_FRAME_PAYLOAD_SIZE,
+        )?;
+        reject_zero_limit(
             "max_buffered_bytes_per_flow",
             self.max_buffered_bytes_per_flow(),
         )?;
@@ -143,6 +152,14 @@ impl ServerConfig {
             .as_ref()
             .and_then(|limits| limits.max_streams)
             .unwrap_or(64)
+    }
+
+    /// Maximum queued client-to-target bytes across one authenticated session.
+    pub fn max_buffered_bytes_per_session(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.max_buffered_bytes_per_session)
+            .unwrap_or(MAX_FRAME_PAYLOAD_SIZE)
     }
 
     /// Configured idle timeout in seconds. Zero disables idle timeout.
@@ -247,6 +264,8 @@ pub struct LimitConfig {
     pub max_sessions: Option<u64>,
     /// Maximum concurrent TCP streams per authenticated session.
     pub max_streams: Option<u64>,
+    /// Maximum queued client-to-target bytes across one authenticated session.
+    pub max_buffered_bytes_per_session: Option<u64>,
     /// Idle timeout for authenticated relay sessions in seconds.
     pub idle_timeout_seconds: Option<u64>,
     /// Maximum queued client-to-target bytes per TCP flow.
@@ -362,6 +381,14 @@ idle_timeout_seconds = 42
     }
 
     #[test]
+    fn defaults_buffered_bytes_per_session_limit() {
+        assert_eq!(
+            minimal_config().max_buffered_bytes_per_session(),
+            MAX_FRAME_PAYLOAD_SIZE
+        );
+    }
+
+    #[test]
     fn accepts_default_limits() {
         assert!(minimal_config().validate_limits().is_ok());
     }
@@ -422,6 +449,24 @@ max_buffered_bytes_per_flow = 4096
         .unwrap();
 
         assert_eq!(config.max_buffered_bytes_per_flow(), 4096);
+    }
+
+    #[test]
+    fn parses_buffered_bytes_per_session_limit() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_buffered_bytes_per_session = 8192
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.max_buffered_bytes_per_session(), 8192);
     }
 
     #[test]
@@ -767,6 +812,24 @@ max_buffered_bytes_per_flow = 0
     }
 
     #[test]
+    fn rejects_zero_buffered_bytes_per_session_limit() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_buffered_bytes_per_session = 0
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
     fn rejects_too_large_buffered_bytes_per_flow_limit() {
         let config: ServerConfig = toml::from_str(&format!(
             r#"
@@ -777,6 +840,25 @@ credentials = []
 
 [limits]
 max_buffered_bytes_per_flow = {}
+"#,
+            MAX_FRAME_PAYLOAD_SIZE + 1
+        ))
+        .unwrap();
+
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_too_large_buffered_bytes_per_session_limit() {
+        let config: ServerConfig = toml::from_str(&format!(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_buffered_bytes_per_session = {}
 "#,
             MAX_FRAME_PAYLOAD_SIZE + 1
         ))

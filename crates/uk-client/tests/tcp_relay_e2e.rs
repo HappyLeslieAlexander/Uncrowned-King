@@ -707,7 +707,7 @@ async fn run_server_session_limit_e2e() -> Result<(), TestError> {
     init_tracing();
 
     let harness = ServerHarness::start(test_limits_with_max_sessions(1)).await?;
-    let _held_carrier = connect_tls_carrier(&harness).await?;
+    let _held_carrier = connect_tls_carrier_after_probe(&harness).await?;
     let result = run_handshake(harness.client_config(SECRET)).await;
 
     assert!(
@@ -1563,6 +1563,22 @@ async fn connect_tls_carrier(
         return Err("UK ALPN protocol was not negotiated".into());
     }
     Ok(stream)
+}
+
+async fn connect_tls_carrier_after_probe(
+    harness: &ServerHarness,
+) -> Result<ClientTlsStream<TcpStream>, TestError> {
+    let mut last_error = None;
+    for _ in 0..20 {
+        match connect_tls_carrier(harness).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) => {
+                last_error = Some(err);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "failed to connect tls carrier".into()))
 }
 
 fn client_exporter(stream: &ClientTlsStream<TcpStream>) -> Result<[u8; 32], TestError> {
@@ -2487,6 +2503,7 @@ fn test_limits() -> LimitConfig {
         max_frame_size: Some(65_536),
         max_sessions: Some(32),
         max_streams: Some(8),
+        max_buffered_bytes_per_session: Some(4 * 1024 * 1024),
         idle_timeout_seconds: Some(30),
         max_buffered_bytes_per_flow: Some(1024 * 1024),
         handshake_timeout_seconds: Some(3),

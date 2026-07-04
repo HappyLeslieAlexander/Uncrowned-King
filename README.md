@@ -45,8 +45,9 @@ Known cloud metadata service IPs are denied before ordered rules are evaluated,
 including `169.254.169.254`, `100.100.100.200`, and `fd00:ec2::254`.
 
 Server limits can advertise and enforce the maximum frame size, concurrent
-carrier sessions, concurrent TCP streams per authenticated session, plus the
-authenticated session idle timeout:
+carrier sessions, concurrent TCP streams per authenticated session, queued
+client-to-target bytes per session and per flow, plus the authenticated session
+idle timeout:
 
 ```toml
 [limits]
@@ -54,6 +55,7 @@ max_pre_auth_bytes = 4096
 max_frame_size = 65536
 max_sessions = 1024
 max_streams = 64
+max_buffered_bytes_per_session = 16777216
 idle_timeout_seconds = 300
 max_buffered_bytes_per_flow = 2097152
 handshake_timeout_seconds = 10
@@ -69,8 +71,8 @@ Set `target_connect_timeout_seconds = 0` to disable the server target dial timeo
 Set `tcp_half_close_timeout_seconds = 0` to disable the TCP half-close drain timeout.
 Replay cache limits must be greater than zero. `max_pre_auth_bytes` must be at
 least 75 bytes so a minimum `AUTH_RESPONSE` can fit. `max_pre_auth_bytes`,
-`max_frame_size`, and `max_buffered_bytes_per_flow` must be at most 16777216
-bytes.
+`max_frame_size`, `max_buffered_bytes_per_session`, and
+`max_buffered_bytes_per_flow` must be at most 16777216 bytes.
 At least one credential is required. Credential `key_id` values must be unique.
 When set, `policy_group` must be non-empty printable text.
 
