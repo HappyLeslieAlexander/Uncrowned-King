@@ -357,6 +357,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_missing_request_head_with_failure_reply() {
+        assert_request_failure_after_shutdown(&[0x05, 0x01, 0x00], Reply::GeneralFailure).await;
+    }
+
+    #[tokio::test]
     async fn rejects_unsupported_command() {
         let (mut client, mut server) = tokio::io::duplex(128);
         let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
