@@ -1422,6 +1422,7 @@ mod tests {
     fn minimal_config() -> ClientConfig {
         ClientConfig {
             server_addr: "127.0.0.1:443".to_owned(),
+            server_addrs: None,
             server_name: "localhost".to_owned(),
             ca_cert_path: "missing-ca.pem".to_owned(),
             key_id: "client".to_owned(),

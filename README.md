@@ -79,6 +79,8 @@ When set, `policy_group` must be non-empty printable text.
 
 Client configs may also set `handshake_timeout_seconds = 10` to bound the
 server connection, TLS handshake, authentication exchange, and SETTINGS read.
+Set `server_addrs = ["backup.example.com:443"]` to try fallback server
+endpoints after `server_addr` within that same timeout.
 When running the SOCKS5 listener, `socks_handshake_timeout_seconds = 10` bounds
 the local SOCKS greeting and CONNECT request. `tcp_open_timeout_seconds = 10`
 bounds waiting for a UK TCP open response from the server.

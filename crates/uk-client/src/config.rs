@@ -12,6 +12,8 @@ use uk_proto::{MAX_FRAME_PAYLOAD_SIZE, validate_host_port_endpoint};
 pub struct ClientConfig {
     /// UK server socket address.
     pub server_addr: String,
+    /// Optional fallback UK server socket addresses.
+    pub server_addrs: Option<Vec<String>>,
     /// TLS server name.
     pub server_name: String,
     /// CA certificate PEM path.
@@ -75,6 +77,24 @@ impl ClientConfig {
     /// Validates configured network endpoints without resolving DNS.
     pub fn validate_network_endpoints(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         validate_endpoint("server_addr", &self.server_addr)
+            .map_err(|err| format!("server_addr: {err}"))?;
+        for (index, endpoint) in self.server_addrs().iter().enumerate() {
+            validate_endpoint("server_addrs", endpoint)
+                .map_err(|err| format!("server_addrs[{index}]: {err}"))?;
+        }
+        Ok(())
+    }
+
+    /// Additional fallback UK server endpoints.
+    pub fn server_addrs(&self) -> &[String] {
+        self.server_addrs.as_deref().unwrap_or(&[])
+    }
+
+    /// Returns primary then fallback UK server endpoints in dial order.
+    pub fn server_endpoints(&self) -> Vec<&str> {
+        std::iter::once(self.server_addr.as_str())
+            .chain(self.server_addrs().iter().map(String::as_str))
+            .collect()
     }
 
     /// Validates local client resource limits.
@@ -115,6 +135,7 @@ mod tests {
     fn minimal_config() -> ClientConfig {
         ClientConfig {
             server_addr: "127.0.0.1:443".to_owned(),
+            server_addrs: None,
             server_name: "localhost".to_owned(),
             ca_cert_path: "ca.pem".to_owned(),
             key_id: "client".to_owned(),
@@ -327,9 +348,38 @@ handshake_timeout_secondz = 4
     }
 
     #[test]
+    fn parses_fallback_server_addrs() {
+        let config: ClientConfig = toml::from_str(
+            r#"
+server_addr = "127.0.0.1:443"
+server_addrs = ["uk-a.example.com:443", "[::1]:9443"]
+server_name = "localhost"
+ca_cert_path = "ca.pem"
+key_id = "client"
+secret = "secret"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.server_endpoints(),
+            vec!["127.0.0.1:443", "uk-a.example.com:443", "[::1]:9443"]
+        );
+        assert!(config.validate_network_endpoints().is_ok());
+    }
+
+    #[test]
     fn rejects_server_addr_without_port() {
         let mut config = minimal_config();
         config.server_addr = "uk.example.com".to_owned();
+
+        assert!(config.validate_network_endpoints().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_fallback_server_addr() {
+        let mut config = minimal_config();
+        config.server_addrs = Some(vec!["uk.example.com".to_owned()]);
 
         assert!(config.validate_network_endpoints().is_err());
     }

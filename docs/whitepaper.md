@@ -428,6 +428,7 @@ Maintain 1 warm control connection.
 Maintain up to N active carrier connections.
 Bound concurrent local SOCKS listener connections.
 Bound queued server-to-local bytes per client session.
+Try configured fallback server endpoints before surfacing connect failure.
 Prefer QUIC when RTT and loss are acceptable.
 Fallback to TLS/TCP or WebSocket when QUIC is unavailable.
 Avoid putting bulk download and latency-sensitive streams on the same TLS/TCP carrier.

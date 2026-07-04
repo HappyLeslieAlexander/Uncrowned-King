@@ -140,6 +140,11 @@ async fn reports_auth_failure_during_handshake() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn falls_back_to_secondary_server_addr_during_handshake() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_handshake_fallback_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rejects_expired_auth_challenge_during_handshake() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_expired_auth_challenge_e2e()).await?
 }
@@ -1037,6 +1042,19 @@ async fn run_auth_failure_error_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+async fn run_handshake_fallback_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = ServerHarness::start(test_limits()).await?;
+    let unused_primary = unused_loopback_addr().await?;
+    let mut config = harness.client_config(SECRET);
+    config.server_addr = unused_primary.to_string();
+    config.server_addrs = Some(vec![harness.server_addr.to_string()]);
+
+    run_handshake(config).await?;
+    Ok(())
+}
+
 async fn run_expired_auth_challenge_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -1418,6 +1436,7 @@ async fn run_server_active_session_shutdown_e2e() -> Result<(), TestError> {
 
     let mut carrier = connect_authenticated_carrier(ClientConfig {
         server_addr: server_addr.to_string(),
+        server_addrs: None,
         server_name: "localhost".to_owned(),
         ca_cert_path: path_string(&cert_path),
         key_id: KEY_ID.to_owned(),
@@ -1456,6 +1475,7 @@ async fn run_socks_listener_shutdown_e2e() -> Result<(), TestError> {
     let mut client_task = tokio::spawn(run_socks5_listener_until_shutdown(
         ClientConfig {
             server_addr: server_addr.to_string(),
+            server_addrs: None,
             server_name: "localhost".to_owned(),
             ca_cert_path: path_string(&cert_path),
             key_id: KEY_ID.to_owned(),
@@ -1502,6 +1522,7 @@ async fn run_socks_listener_shutdown_during_connect_e2e() -> Result<(), TestErro
     let mut client_task = tokio::spawn(run_socks5_listener_until_shutdown(
         ClientConfig {
             server_addr: server_addr.to_string(),
+            server_addrs: None,
             server_name: "localhost".to_owned(),
             ca_cert_path: path_string(&cert_path),
             key_id: KEY_ID.to_owned(),
@@ -1601,6 +1622,7 @@ impl ServerHarness {
     fn client_config(&self, secret: &str) -> ClientConfig {
         ClientConfig {
             server_addr: self.server_addr.to_string(),
+            server_addrs: None,
             server_name: "localhost".to_owned(),
             ca_cert_path: path_string(&self.cert_path),
             key_id: KEY_ID.to_owned(),
@@ -1725,6 +1747,7 @@ impl MalformedFrameServerHarness {
         let mut client_task = tokio::spawn(run_socks5_listener(
             ClientConfig {
                 server_addr: server_addr.to_string(),
+                server_addrs: None,
                 server_name: "localhost".to_owned(),
                 ca_cert_path: path_string(&cert_path),
                 key_id: KEY_ID.to_owned(),
@@ -1796,6 +1819,7 @@ impl PendingOpenCancelServerHarness {
         let mut client_task = tokio::spawn(run_socks5_listener(
             ClientConfig {
                 server_addr: server_addr.to_string(),
+                server_addrs: None,
                 server_name: "localhost".to_owned(),
                 ca_cert_path: path_string(&cert_path),
                 key_id: KEY_ID.to_owned(),
@@ -1878,6 +1902,7 @@ impl MissingPongServerHarness {
         let mut client_task = tokio::spawn(run_socks5_listener(
             ClientConfig {
                 server_addr: server_addr.to_string(),
+                server_addrs: None,
                 server_name: "localhost".to_owned(),
                 ca_cert_path: path_string(&cert_path),
                 key_id: KEY_ID.to_owned(),
@@ -2209,6 +2234,7 @@ impl RelayHarness {
         let mut client_task = tokio::spawn(run_socks5_listener(
             ClientConfig {
                 server_addr: server_addr.to_string(),
+                server_addrs: None,
                 server_name: "localhost".to_owned(),
                 ca_cert_path: path_string(&cert_path),
                 key_id: KEY_ID.to_owned(),

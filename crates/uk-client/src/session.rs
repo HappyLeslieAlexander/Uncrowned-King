@@ -3,9 +3,10 @@
 use std::{error::Error, time::Duration};
 
 use bytes::BytesMut;
+use rustls::pki_types::ServerName;
 use tokio::{net::TcpStream, time};
-use tokio_rustls::client::TlsStream;
-use tracing::info;
+use tokio_rustls::{TlsConnector, client::TlsStream};
+use tracing::{info, warn};
 use uk_auth::{AuthChallenge, AuthResponse, unix_now};
 use uk_proto::{
     ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, MAX_FRAME_PAYLOAD_SIZE,
@@ -37,9 +38,36 @@ async fn connect_authenticated_inner(
     config: &ClientConfig,
 ) -> Result<(TlsStream<TcpStream>, Settings), AnyError> {
     let connector = tls::connector(&config.ca_cert_path)?;
-    let tcp = TcpStream::connect(&config.server_addr).await?;
-    tcp.set_nodelay(true)?;
     let server_name = tls::server_name(config.server_name.clone())?;
+    let mut last_error = None;
+
+    for endpoint in config.server_endpoints() {
+        match connect_authenticated_endpoint(config, &connector, server_name.clone(), endpoint)
+            .await
+        {
+            Ok(session) => return Ok(session),
+            Err(err) => {
+                warn!(
+                    event = "client.session.connect_endpoint_failed",
+                    server_addr = %endpoint,
+                    error = %err
+                );
+                last_error = Some(err);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "no server endpoints configured".into()))
+}
+
+async fn connect_authenticated_endpoint(
+    config: &ClientConfig,
+    connector: &TlsConnector,
+    server_name: ServerName<'static>,
+    endpoint: &str,
+) -> Result<(TlsStream<TcpStream>, Settings), AnyError> {
+    let tcp = TcpStream::connect(endpoint).await?;
+    tcp.set_nodelay(true)?;
     let mut stream = connector.connect(server_name, tcp).await?;
     tls::verify_alpn(&stream)?;
     let exporter = tls::exporter(&stream)?;
