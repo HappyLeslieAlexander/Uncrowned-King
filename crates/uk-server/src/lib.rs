@@ -234,7 +234,13 @@ fn is_clean_tls_handshake_disconnect(error: &AnyError) -> bool {
         .as_ref()
         .downcast_ref::<io::Error>()
         .is_some_and(|error| {
-            error.kind() == io::ErrorKind::UnexpectedEof || is_tls_handshake_eof(error)
+            matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+            ) || is_tls_handshake_eof(error)
         })
         || error.to_string() == "tls handshake eof"
 }
@@ -312,12 +318,21 @@ mod tests {
     fn classifies_clean_tls_handshake_disconnects() {
         let unexpected_eof: AnyError =
             io::Error::new(io::ErrorKind::UnexpectedEof, "client closed").into();
+        let connection_reset: AnyError =
+            io::Error::new(io::ErrorKind::ConnectionReset, "client reset").into();
+        let broken_pipe: AnyError =
+            io::Error::new(io::ErrorKind::BrokenPipe, "client pipe closed").into();
+        let not_connected: AnyError =
+            io::Error::new(io::ErrorKind::NotConnected, "client gone").into();
         let rustls_eof: AnyError =
             io::Error::new(io::ErrorKind::InvalidData, "tls handshake eof").into();
         let protocol_error: AnyError =
             io::Error::new(io::ErrorKind::InvalidData, "invalid certificate").into();
 
         assert!(is_clean_tls_handshake_disconnect(&unexpected_eof));
+        assert!(is_clean_tls_handshake_disconnect(&connection_reset));
+        assert!(is_clean_tls_handshake_disconnect(&broken_pipe));
+        assert!(is_clean_tls_handshake_disconnect(&not_connected));
         assert!(is_clean_tls_handshake_disconnect(&rustls_eof));
         assert!(!is_clean_tls_handshake_disconnect(&protocol_error));
     }

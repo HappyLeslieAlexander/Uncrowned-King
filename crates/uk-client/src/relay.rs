@@ -124,7 +124,15 @@ fn is_clean_socks_disconnect(error: &AnyError) -> bool {
     error
         .as_ref()
         .downcast_ref::<io::Error>()
-        .is_some_and(|error| error.kind() == io::ErrorKind::UnexpectedEof)
+        .is_some_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+            )
+        })
 }
 
 impl ClientSessionManager {
@@ -1229,6 +1237,15 @@ mod tests {
     fn classifies_clean_socks_disconnects() {
         assert!(is_clean_socks_disconnect(&boxed_io_error(
             io::ErrorKind::UnexpectedEof
+        )));
+        assert!(is_clean_socks_disconnect(&boxed_io_error(
+            io::ErrorKind::ConnectionReset
+        )));
+        assert!(is_clean_socks_disconnect(&boxed_io_error(
+            io::ErrorKind::BrokenPipe
+        )));
+        assert!(is_clean_socks_disconnect(&boxed_io_error(
+            io::ErrorKind::NotConnected
         )));
         assert!(!is_clean_socks_disconnect(&boxed_io_error(
             io::ErrorKind::InvalidData
