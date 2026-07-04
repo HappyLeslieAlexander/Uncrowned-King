@@ -122,6 +122,7 @@ struct TargetFlowControl {
     buffered_bytes: Arc<AtomicUsize>,
     closed: Arc<AtomicBool>,
     aborted: Arc<AtomicBool>,
+    abort_notify: Arc<Notify>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +148,7 @@ struct TargetFlow {
 #[derive(Debug, Clone)]
 struct SessionShutdown {
     closed: Arc<AtomicBool>,
+    notify: Arc<Notify>,
 }
 
 struct RelaySessionContext<'a> {
@@ -807,7 +809,15 @@ async fn relay_client_to_target(
     event_tx: &mpsc::UnboundedSender<FlowEvent>,
     shutdown: &SessionShutdown,
 ) -> Result<(), AnyError> {
-    while let Some(command) = commands.recv().await {
+    loop {
+        let command = tokio::select! {
+            command = commands.recv() => command,
+            () = shutdown.closed() => return Ok(()),
+            () = flow_control.aborted() => return Ok(()),
+        };
+        let Some(command) = command else {
+            break;
+        };
         match command {
             TargetCommand::Data(payload) => {
                 let payload_len = payload.len();
@@ -816,7 +826,17 @@ async fn relay_client_to_target(
                     return Ok(());
                 }
 
-                let write_result = target_writer.write_all(&payload).await;
+                let write_result = tokio::select! {
+                    result = target_writer.write_all(&payload) => result,
+                    () = shutdown.closed() => {
+                        flow_control.release_bytes(payload_len);
+                        return Ok(());
+                    }
+                    () = flow_control.aborted() => {
+                        flow_control.release_bytes(payload_len);
+                        return Ok(());
+                    }
+                };
                 flow_control.release_bytes(payload_len);
                 write_result?;
                 let _ = event_tx.send(FlowEvent::Activity);
@@ -857,17 +877,30 @@ impl Default for SessionShutdown {
     fn default() -> Self {
         Self {
             closed: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
         }
     }
 }
 
 impl SessionShutdown {
     fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            self.notify.notify_waiters();
+        }
     }
 
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    async fn closed(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.is_closed() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -917,6 +950,7 @@ impl Default for TargetFlowControl {
             buffered_bytes: Arc::new(AtomicUsize::new(0)),
             closed: Arc::new(AtomicBool::new(false)),
             aborted: Arc::new(AtomicBool::new(false)),
+            abort_notify: Arc::new(Notify::new()),
         }
     }
 }
@@ -973,12 +1007,24 @@ impl TargetFlowControl {
     }
 
     fn abort(&self) {
-        self.aborted.store(true, Ordering::SeqCst);
+        if !self.aborted.swap(true, Ordering::SeqCst) {
+            self.abort_notify.notify_waiters();
+        }
         self.close();
     }
 
     fn is_aborted(&self) -> bool {
         self.aborted.load(Ordering::SeqCst)
+    }
+
+    async fn aborted(&self) {
+        loop {
+            let notified = self.abort_notify.notified();
+            if self.is_aborted() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -1095,7 +1141,11 @@ async fn relay_target_to_client(
         if shutdown.is_closed() || flow_control.is_aborted() {
             return Ok(());
         }
-        let read = target_reader.read(target_buf.as_mut()).await?;
+        let read = tokio::select! {
+            read = target_reader.read(target_buf.as_mut()) => read?,
+            () = shutdown.closed() => return Ok(()),
+            () = flow_control.aborted() => return Ok(()),
+        };
         if shutdown.is_closed() || flow_control.is_aborted() {
             return Ok(());
         }
@@ -1414,6 +1464,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_shutdown_notifies_waiters() {
+        let shutdown = SessionShutdown::default();
+        let waiter = shutdown.clone();
+        let task = tokio::spawn(async move {
+            waiter.closed().await;
+        });
+
+        shutdown.close();
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn target_flow_abort_notifies_waiters() {
+        let control = TargetFlowControl::default();
+        let waiter = control.clone();
+        let task = tokio::spawn(async move {
+            waiter.aborted().await;
+        });
+
+        control.abort();
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn half_close_drops_full_target_queue_sender() {
         let (commands, mut commands_rx) = mpsc::channel(1);
         let mut flow = TargetFlow::new(commands, TargetFlowControl::default());
@@ -1446,6 +1528,38 @@ mod tests {
             commands_rx.recv().await,
             Some(TargetCommand::Close)
         ));
+    }
+
+    #[tokio::test]
+    async fn target_writer_exits_when_session_shutdown_notifies() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let target_stream = TcpStream::connect(addr).await.unwrap();
+        let (_target_peer, _) = listener.accept().await.unwrap();
+        let (_target_reader, target_writer) = target_stream.into_split();
+        let (_commands_tx, commands_rx) = mpsc::channel(1);
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let flow_control = TargetFlowControl::default();
+        let shutdown = SessionShutdown::default();
+        let shutdown_handle = shutdown.clone();
+
+        let writer = tokio::spawn(async move {
+            relay_client_to_target(
+                target_writer,
+                commands_rx,
+                flow_control,
+                &event_tx,
+                &shutdown,
+            )
+            .await
+        });
+        shutdown_handle.close();
+
+        tokio::time::timeout(Duration::from_secs(1), writer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
