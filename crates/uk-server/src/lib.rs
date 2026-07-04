@@ -5,12 +5,12 @@ pub mod config;
 mod relay;
 mod tls;
 
-use std::{sync::Arc, time::Duration};
+use std::{io, sync::Arc, time::Duration};
 
 use bytes::BytesMut;
 use tokio::{net::TcpListener, sync::Mutex, time};
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uk_auth::{AuthChallenge, AuthResponse, ReplayCache, unix_now, verify_auth_response};
 use uk_proto::{
     ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, SettingKey, Settings, read_frame,
@@ -51,7 +51,11 @@ pub async fn run(config: ServerConfig) -> Result<(), AnyError> {
                 handle_connection(acceptor, tcp, credentials, policy_set, replay_cache, config)
                     .await
             {
-                warn!(event = "protocol.error", peer = %peer, error = %err);
+                if is_clean_tls_handshake_disconnect(&err) {
+                    debug!(event = "tls.handshake.closed", peer = %peer);
+                } else {
+                    warn!(event = "protocol.error", peer = %peer, error = %err);
+                }
             }
         });
     }
@@ -222,6 +226,20 @@ fn tcp_half_close_timeout(seconds: u64) -> Option<Duration> {
     (seconds != 0).then(|| Duration::from_secs(seconds))
 }
 
+fn is_clean_tls_handshake_disconnect(error: &AnyError) -> bool {
+    error
+        .as_ref()
+        .downcast_ref::<io::Error>()
+        .is_some_and(|error| {
+            error.kind() == io::ErrorKind::UnexpectedEof || is_tls_handshake_eof(error)
+        })
+        || error.to_string() == "tls handshake eof"
+}
+
+fn is_tls_handshake_eof(error: &io::Error) -> bool {
+    error.to_string() == "tls handshake eof"
+}
+
 fn usize_limit(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
@@ -285,5 +303,19 @@ mod tests {
             ErrorPayload::decode(&mut payload).unwrap().code,
             ErrorCode::AuthFailed
         );
+    }
+
+    #[test]
+    fn classifies_clean_tls_handshake_disconnects() {
+        let unexpected_eof: AnyError =
+            io::Error::new(io::ErrorKind::UnexpectedEof, "client closed").into();
+        let rustls_eof: AnyError =
+            io::Error::new(io::ErrorKind::InvalidData, "tls handshake eof").into();
+        let protocol_error: AnyError =
+            io::Error::new(io::ErrorKind::InvalidData, "invalid certificate").into();
+
+        assert!(is_clean_tls_handshake_disconnect(&unexpected_eof));
+        assert!(is_clean_tls_handshake_disconnect(&rustls_eof));
+        assert!(!is_clean_tls_handshake_disconnect(&protocol_error));
     }
 }
