@@ -60,7 +60,7 @@ struct ClientSession {
     data_frame_size: usize,
     max_streams: u64,
     open_timeout: Option<Duration>,
-    closed: AtomicBool,
+    shutdown: ClientSessionShutdown,
     next_flow_id: AtomicU64,
     next_ping_nonce: AtomicU64,
     last_pong_nonce: AtomicU64,
@@ -113,6 +113,46 @@ enum FlowFrameRoute {
     Enqueued,
     FlowClosed,
     FlowQueueFull,
+}
+
+#[derive(Clone)]
+struct ClientSessionShutdown {
+    closed: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl Default for ClientSessionShutdown {
+    fn default() -> Self {
+        Self {
+            closed: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+}
+
+impl ClientSessionShutdown {
+    fn close(&self) -> bool {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            false
+        } else {
+            self.notify.notify_waiters();
+            true
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    async fn closed(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.is_closed() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 pub(crate) async fn run_socks5_listener_until_shutdown<F>(
@@ -317,7 +357,7 @@ impl ClientSession {
             data_frame_size: tcp_data_frame_size(limits),
             max_streams: max_streams(&settings),
             open_timeout: timeout(config.tcp_open_timeout_seconds()),
-            closed: AtomicBool::new(false),
+            shutdown: ClientSessionShutdown::default(),
             next_flow_id: AtomicU64::new(FIRST_CLIENT_FLOW_ID),
             next_ping_nonce: AtomicU64::new(0),
             last_pong_nonce: AtomicU64::new(0),
@@ -331,7 +371,7 @@ impl ClientSession {
     }
 
     fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+        self.shutdown.is_closed()
     }
 
     async fn has_open_flows(&self) -> bool {
@@ -339,7 +379,7 @@ impl ClientSession {
     }
 
     async fn close(&self) {
-        if !self.closed.swap(true, Ordering::SeqCst) {
+        if self.shutdown.close() {
             self.pong_notify.notify_waiters();
             self.flows.lock().await.clear();
             let mut writer = self.writer.lock().await;
@@ -582,7 +622,7 @@ impl ClientSession {
     }
 
     async fn write_frame(&self, frame: &Frame) -> Result<(), AnyError> {
-        let result = write_frame_locked(&self.writer, frame).await;
+        let result = write_frame_locked(&self.writer, frame, &self.shutdown).await;
         if result.is_err() {
             self.close().await;
         }
@@ -1128,10 +1168,39 @@ fn map_error_payload(mut payload: Bytes) -> Result<socks5::Reply, AnyError> {
     Ok(reply)
 }
 
-async fn write_frame_locked(writer: &CarrierWriter, frame: &Frame) -> Result<(), AnyError> {
-    let mut writer = writer.lock().await;
-    write_frame(&mut *writer, frame).await?;
+async fn write_frame_locked(
+    writer: &CarrierWriter,
+    frame: &Frame,
+    shutdown: &ClientSessionShutdown,
+) -> Result<(), AnyError> {
+    let mut writer = tokio::select! {
+        writer = writer.lock() => writer,
+        () = shutdown.closed() => return Err(session_shutdown_error().into()),
+    };
+    if shutdown.is_closed() {
+        return Err(session_shutdown_error().into());
+    }
+    write_frame_or_shutdown(&mut *writer, frame, shutdown).await?;
     Ok(())
+}
+
+async fn write_frame_or_shutdown<W>(
+    writer: &mut W,
+    frame: &Frame,
+    shutdown: &ClientSessionShutdown,
+) -> Result<(), AnyError>
+where
+    W: AsyncWrite + Unpin,
+{
+    tokio::select! {
+        result = write_frame(writer, frame) => result?,
+        () = shutdown.closed() => return Err(session_shutdown_error().into()),
+    }
+    Ok(())
+}
+
+fn session_shutdown_error() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "session shutdown")
 }
 
 fn frame_limits(settings: &uk_proto::Settings) -> FrameLimits {
@@ -1662,6 +1731,37 @@ mod tests {
             .unwrap();
 
         assert!(!wrote_payload);
+    }
+
+    #[tokio::test]
+    async fn carrier_write_exits_when_session_shutdown_notifies() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let shutdown = ClientSessionShutdown::default();
+        let shutdown_handle = shutdown.clone();
+        let frame = Frame::new(
+            FrameType::TcpData,
+            0,
+            FLOW_ID,
+            Bytes::from(vec![0x42; 1024]),
+        )
+        .unwrap();
+
+        let task =
+            tokio::spawn(
+                async move { write_frame_or_shutdown(&mut writer, &frame, &shutdown).await },
+            );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!task.is_finished());
+
+        shutdown_handle.close();
+
+        let err = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        let io_error = err.downcast_ref::<io::Error>().unwrap();
+        assert_eq!(io_error.kind(), io::ErrorKind::Interrupted);
     }
 
     #[test]

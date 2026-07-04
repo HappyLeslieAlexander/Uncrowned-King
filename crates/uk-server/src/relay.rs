@@ -1507,6 +1507,9 @@ async fn write_frame_locked(writer: &CarrierWriter, frame: &Frame) -> Result<(),
         writer = writer.inner.lock() => writer,
         () = writer.shutdown.closed() => return Err(session_shutdown_error().into()),
     };
+    if writer.shutdown.is_closed() {
+        return Err(session_shutdown_error().into());
+    }
     write_frame_or_shutdown(&mut *guard, frame, &writer.shutdown).await?;
     Ok(())
 }
