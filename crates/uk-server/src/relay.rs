@@ -755,7 +755,9 @@ fn spawn_target_writer(
     shutdown: SessionShutdown,
 ) {
     tokio::spawn(async move {
-        match relay_client_to_target(target_writer, commands, flow_control, &shutdown).await {
+        match relay_client_to_target(target_writer, commands, flow_control, &event_tx, &shutdown)
+            .await
+        {
             Err(err) if !shutdown.is_closed() => {
                 warn!(event = "tcp.target.write.error", flow_id, error = %err);
                 let _ = send_error(&carrier_writer, flow_id, ErrorCode::TargetUnavailable).await;
@@ -782,6 +784,7 @@ async fn relay_client_to_target(
     mut target_writer: OwnedWriteHalf,
     mut commands: mpsc::Receiver<TargetCommand>,
     flow_control: TargetFlowControl,
+    event_tx: &mpsc::UnboundedSender<FlowEvent>,
     shutdown: &SessionShutdown,
 ) -> Result<(), AnyError> {
     while let Some(command) = commands.recv().await {
@@ -796,6 +799,7 @@ async fn relay_client_to_target(
                 let write_result = target_writer.write_all(&payload).await;
                 flow_control.release_bytes(payload_len);
                 write_result?;
+                let _ = event_tx.send(FlowEvent::Activity);
             }
             TargetCommand::Close => {
                 flow_control.close();
@@ -1369,6 +1373,44 @@ mod tests {
             commands_rx.recv().await,
             Some(TargetCommand::Close)
         ));
+    }
+
+    #[tokio::test]
+    async fn target_writer_reports_activity_after_payload_write() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let target_stream = TcpStream::connect(addr).await.unwrap();
+        let (mut target_peer, _) = listener.accept().await.unwrap();
+        let (_target_reader, target_writer) = target_stream.into_split();
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let flow_control = TargetFlowControl::default();
+        let shutdown = SessionShutdown::default();
+        let payload = Bytes::from_static(b"writer activity");
+
+        commands_tx
+            .send(TargetCommand::Data(payload.clone()))
+            .await
+            .unwrap();
+        drop(commands_tx);
+
+        let writer = relay_client_to_target(
+            target_writer,
+            commands_rx,
+            flow_control,
+            &event_tx,
+            &shutdown,
+        );
+        let reader = async {
+            let mut received = vec![0_u8; payload.len()];
+            target_peer.read_exact(&mut received).await?;
+            Ok::<_, io::Error>(received)
+        };
+        let (writer_result, reader_result) = tokio::join!(writer, reader);
+
+        writer_result.unwrap();
+        assert_eq!(reader_result.unwrap(), payload);
+        assert!(matches!(event_rx.recv().await, Some(FlowEvent::Activity)));
     }
 
     #[test]
