@@ -52,6 +52,8 @@ bytes   payload
   frame limit.
 - `AUTH_CHALLENGE`, `AUTH_RESPONSE`, `SETTINGS`, `PING`, and `PONG` are
   connection-scoped and must use `id = 0`.
+- Flow-scoped frame ids must be non-zero UK varints. Client-initiated flow ids
+  are odd; server-initiated flow ids are even.
 
 Frame types:
 

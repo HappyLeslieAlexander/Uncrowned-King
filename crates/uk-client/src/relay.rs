@@ -24,7 +24,7 @@ use uk_proto::{
     ErrorCode, ErrorPayload, FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, Frame, FrameIoError, FrameLimits,
     FrameType, SettingKey, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target,
     TcpClose, TcpOpen, frame::DEFAULT_MAX_FRAME_SIZE, is_client_initiated_flow_id, read_frame,
-    validate_connection_frame, write_frame,
+    validate_connection_frame, varint::MAX_VARINT, write_frame,
 };
 
 use crate::{
@@ -276,13 +276,11 @@ impl ClientSession {
         }
     }
 
-    fn allocate_flow_id(&self) -> u64 {
-        self.next_flow_id.fetch_add(FLOW_ID_STEP, Ordering::Relaxed)
-    }
-
     async fn reserve_flow(&self) -> Result<Option<(u64, mpsc::Receiver<Frame>)>, AnyError> {
         for _ in 0..FLOW_ID_ALLOCATION_ATTEMPTS {
-            let flow_id = self.allocate_flow_id();
+            let Some(flow_id) = allocate_client_flow_id(&self.next_flow_id) else {
+                return Err("client flow id space exhausted".into());
+            };
             if !is_client_initiated_flow_id(flow_id) {
                 continue;
             }
@@ -342,6 +340,25 @@ impl ClientSession {
             self.close().await;
         }
         result
+    }
+}
+
+fn allocate_client_flow_id(next_flow_id: &AtomicU64) -> Option<u64> {
+    let mut current = next_flow_id.load(Ordering::Relaxed);
+    loop {
+        if current > MAX_VARINT {
+            return None;
+        }
+        let next = current.saturating_add(FLOW_ID_STEP);
+        match next_flow_id.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(current),
+            Err(actual) => current = actual,
+        }
     }
 }
 
@@ -1107,6 +1124,25 @@ mod tests {
         assert!(!is_clean_socks_disconnect(&boxed_io_error(
             io::ErrorKind::InvalidData
         )));
+    }
+
+    #[test]
+    fn allocates_client_flow_ids_up_to_varint_limit() {
+        let next_flow_id = AtomicU64::new(MAX_VARINT - FLOW_ID_STEP);
+
+        assert_eq!(
+            allocate_client_flow_id(&next_flow_id),
+            Some(MAX_VARINT - FLOW_ID_STEP)
+        );
+        assert_eq!(allocate_client_flow_id(&next_flow_id), Some(MAX_VARINT));
+        assert_eq!(allocate_client_flow_id(&next_flow_id), None);
+    }
+
+    #[test]
+    fn stops_allocating_unrepresentable_client_flow_ids() {
+        let next_flow_id = AtomicU64::new(MAX_VARINT + FLOW_ID_STEP);
+
+        assert_eq!(allocate_client_flow_id(&next_flow_id), None);
     }
 
     #[tokio::test]
