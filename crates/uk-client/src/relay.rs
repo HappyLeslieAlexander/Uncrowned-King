@@ -15,7 +15,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, mpsc},
+    sync::{Mutex, Notify, mpsc},
     time,
 };
 use tokio_rustls::client::TlsStream;
@@ -60,6 +60,8 @@ struct ClientSession {
     open_timeout: Option<Duration>,
     closed: AtomicBool,
     next_flow_id: AtomicU64,
+    pong_epoch: AtomicU64,
+    pong_notify: Notify,
 }
 
 struct ClientSessionManager {
@@ -228,6 +230,8 @@ impl ClientSession {
             open_timeout: timeout(config.tcp_open_timeout_seconds()),
             closed: AtomicBool::new(false),
             next_flow_id: AtomicU64::new(FIRST_CLIENT_FLOW_ID),
+            pong_epoch: AtomicU64::new(0),
+            pong_notify: Notify::new(),
         });
         spawn_carrier_reader(carrier_reader, Arc::clone(&session));
         if let Some(interval) = keepalive_interval(&settings) {
@@ -454,6 +458,25 @@ impl ClientSession {
         self.write_frame(&frame).await
     }
 
+    fn observed_pong_epoch(&self) -> u64 {
+        self.pong_epoch.load(Ordering::SeqCst)
+    }
+
+    fn record_pong(&self) {
+        self.pong_epoch.fetch_add(1, Ordering::SeqCst);
+        self.pong_notify.notify_one();
+    }
+
+    async fn wait_for_pong_after(&self, observed_epoch: u64) {
+        loop {
+            let notified = self.pong_notify.notified();
+            if self.observed_pong_epoch() != observed_epoch {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     async fn write_frame(&self, frame: &Frame) -> Result<(), AnyError> {
         let result = write_frame_locked(&self.writer, frame).await;
         if result.is_err() {
@@ -570,8 +593,19 @@ fn spawn_keepalive(session: Arc<ClientSession>, interval: Duration) {
             if !session.has_open_flows().await {
                 continue;
             }
+            let observed_pong_epoch = session.observed_pong_epoch();
             if let Err(err) = session.write_ping().await {
                 debug!(event = "client.session.keepalive.error", error = %err);
+                return;
+            }
+            if time::timeout(interval, session.wait_for_pong_after(observed_pong_epoch))
+                .await
+                .is_err()
+            {
+                if !session.is_closed() {
+                    warn!(event = "client.session.keepalive.timeout");
+                    session.close().await;
+                }
                 return;
             }
         }
@@ -628,6 +662,7 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
                 report_protocol_error(session).await;
                 return Err(err);
             }
+            session.record_pong();
             Ok(())
         }
         _ => {

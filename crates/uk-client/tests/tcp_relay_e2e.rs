@@ -36,9 +36,9 @@ use uk_client::{
     config::ClientConfig, connect_authenticated_carrier, run_handshake, run_socks5_listener,
 };
 use uk_proto::{
-    ALPN_PROTOCOL, ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, SettingKey, Settings,
-    TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TcpClose, TcpOpen, read_frame, validate_connection_frame,
-    write_frame,
+    ALPN_PROTOCOL, ErrorCode, ErrorPayload, Frame, FrameIoError, FrameLimits, FrameType,
+    SettingKey, Settings, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TcpClose, TcpOpen, read_frame,
+    validate_connection_frame, write_frame,
 };
 use uk_server::config::{CredentialConfig, LimitConfig, ServerConfig};
 
@@ -256,6 +256,11 @@ async fn keeps_idle_tcp_flow_alive_with_ping() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closes_session_when_keepalive_pong_is_missing() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_missing_pong_keepalive_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closes_target_when_socks_client_disconnects() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_client_disconnect_e2e()).await?
 }
@@ -448,6 +453,30 @@ async fn run_idle_flow_keepalive_e2e() -> Result<(), TestError> {
     socks.read_exact(&mut second_echo).await?;
     assert_eq!(second_echo, second_payload);
     target_task.await??;
+    Ok(())
+}
+
+async fn run_missing_pong_keepalive_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let mut harness = MissingPongServerHarness::start().await?;
+    let mut socks = TcpStream::connect(harness.socks_addr).await?;
+    let request = socks_connect_request(SocketAddr::from((Ipv4Addr::LOCALHOST, 80)));
+    socks.write_all(&request).await?;
+
+    let mut method_response = [0_u8; 2];
+    socks.read_exact(&mut method_response).await?;
+    assert_eq!(method_response, [0x05, 0x00]);
+    let mut connect_reply = [0_u8; 10];
+    socks.read_exact(&mut connect_reply).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    harness.observed_client_close_after_ping().await?;
+    let mut byte = [0_u8; 1];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), socks.read(&mut byte)).await??,
+        0
+    );
     Ok(())
 }
 
@@ -1153,6 +1182,71 @@ impl Drop for PendingOpenCancelServerHarness {
     }
 }
 
+struct MissingPongServerHarness {
+    temp_dir: PathBuf,
+    socks_addr: SocketAddr,
+    server_task: Option<JoinHandle<Result<(), TestError>>>,
+    client_task: JoinHandle<Result<(), TestError>>,
+}
+
+impl MissingPongServerHarness {
+    async fn start() -> Result<Self, TestError> {
+        let temp_dir = create_temp_dir()?;
+        let cert_path = temp_dir.join("server-cert.pem");
+        let key_path = temp_dir.join("server-key.pem");
+        fs::write(&cert_path, CERT_PEM)?;
+        fs::write(&key_path, KEY_PEM)?;
+
+        let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let server_addr = server_listener.local_addr()?;
+        let socks_addr = unused_loopback_addr().await?;
+        let server_task = tokio::spawn(run_missing_pong_server(
+            server_listener,
+            cert_path.clone(),
+            key_path,
+        ));
+        let mut client_task = tokio::spawn(run_socks5_listener(
+            ClientConfig {
+                server_addr: server_addr.to_string(),
+                server_name: "localhost".to_owned(),
+                ca_cert_path: path_string(&cert_path),
+                key_id: KEY_ID.to_owned(),
+                secret: SECRET.to_owned(),
+                handshake_timeout_seconds: Some(3),
+                socks_handshake_timeout_seconds: Some(3),
+                tcp_open_timeout_seconds: Some(3),
+            },
+            socks_addr.to_string(),
+        ));
+        wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+
+        Ok(Self {
+            temp_dir,
+            socks_addr,
+            server_task: Some(server_task),
+            client_task,
+        })
+    }
+
+    async fn observed_client_close_after_ping(&mut self) -> Result<(), TestError> {
+        let task = self
+            .server_task
+            .take()
+            .ok_or("missing pong server task was already awaited")?;
+        tokio::time::timeout(Duration::from_secs(4), task).await??
+    }
+}
+
+impl Drop for MissingPongServerHarness {
+    fn drop(&mut self) {
+        self.client_task.abort();
+        if let Some(task) = self.server_task.take() {
+            task.abort();
+        }
+        let _ = fs::remove_dir_all(&self.temp_dir);
+    }
+}
+
 async fn run_malformed_frame_server(
     listener: TcpListener,
     cert_path: PathBuf,
@@ -1205,10 +1299,62 @@ async fn run_pending_open_cancel_server(
     Ok(TcpClose::decode(&mut payload)?.close_code)
 }
 
+async fn run_missing_pong_server(
+    listener: TcpListener,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+) -> Result<(), TestError> {
+    let mut settings = fake_server_settings();
+    settings.set(SettingKey::IdleTimeoutSeconds, 1);
+    let mut stream =
+        accept_fake_server_session_with_settings(listener, cert_path, key_path, settings).await?;
+    let open_frame = read_frame(&mut stream, FrameLimits::default()).await?;
+    assert_eq!(open_frame.header.frame_type, FrameType::TcpOpen);
+    let flow_id = open_frame.header.id;
+    let mut open_payload = open_frame.payload;
+    TcpOpen::decode(&mut open_payload)?;
+
+    let ack = Frame::new(FrameType::TcpData, 0, flow_id, Bytes::new())?;
+    write_frame(&mut stream, &ack).await?;
+
+    let ping = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut stream, FrameLimits::default()),
+    )
+    .await??;
+    validate_connection_frame(&ping, FrameType::Ping)?;
+
+    match tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut stream, FrameLimits::default()),
+    )
+    .await
+    {
+        Ok(Err(FrameIoError::Closed)) => Ok(()),
+        Ok(Ok(frame)) => Err(format!(
+            "unexpected frame after unanswered ping: {:?}",
+            frame.header.frame_type
+        )
+        .into()),
+        Ok(Err(err)) => Err(err.into()),
+        Err(_) => Err("client did not close session after unanswered ping".into()),
+    }
+}
+
 async fn accept_fake_server_session(
     listener: TcpListener,
     cert_path: PathBuf,
     key_path: PathBuf,
+) -> Result<ServerTlsStream<TcpStream>, TestError> {
+    accept_fake_server_session_with_settings(listener, cert_path, key_path, fake_server_settings())
+        .await
+}
+
+async fn accept_fake_server_session_with_settings(
+    listener: TcpListener,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    settings: Settings,
 ) -> Result<ServerTlsStream<TcpStream>, TestError> {
     let (tcp, _) = listener.accept().await?;
     tcp.set_nodelay(true)?;
@@ -1244,7 +1390,6 @@ async fn accept_fake_server_session(
         &mut replay_cache,
     )?;
 
-    let settings = fake_server_settings();
     let mut settings_payload = BytesMut::new();
     settings.encode(&mut settings_payload)?;
     let settings_frame = Frame::new(FrameType::Settings, 0, 0, settings_payload.freeze())?;
