@@ -319,6 +319,13 @@ impl ClientSession {
         self.write_frame(&frame).await
     }
 
+    async fn send_connection_error(&self, code: ErrorCode) -> Result<(), AnyError> {
+        let mut payload = BytesMut::new();
+        ErrorPayload::new(code).encode(&mut payload)?;
+        let frame = Frame::new(FrameType::Error, 0, 0, payload.freeze())?;
+        self.write_frame(&frame).await
+    }
+
     async fn write_pong(&self, request_frame: &Frame) -> Result<(), AnyError> {
         let pong_frame = Frame::new(
             FrameType::Pong,
@@ -417,8 +424,11 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
         | FrameType::Error
         | FrameType::PolicyDenied
         | FrameType::ResourceLimit => {
+            if let Err(err) = validate_server_flow_frame(&frame) {
+                report_protocol_error(session).await;
+                return Err(err);
+            }
             if is_connection_error_frame(&frame) {
-                validate_flow_status(FrameType::Error, frame.payload)?;
                 return Err("connection error from server".into());
             }
             let (flow_id, route) = {
@@ -427,6 +437,7 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
             };
             match route {
                 FlowFrameRoute::InvalidFlowId => {
+                    report_protocol_error(session).await;
                     return Err("invalid tcp relay flow id from server".into());
                 }
                 FlowFrameRoute::FlowQueueFull => {
@@ -440,20 +451,48 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
             Ok(())
         }
         FrameType::Ping => {
-            validate_session_control_frame(&frame, FrameType::Ping)?;
+            if let Err(err) = validate_session_control_frame(&frame, FrameType::Ping) {
+                report_protocol_error(session).await;
+                return Err(err);
+            }
             session.write_pong(&frame).await
         }
         FrameType::Pong => {
-            validate_session_control_frame(&frame, FrameType::Pong)?;
+            if let Err(err) = validate_session_control_frame(&frame, FrameType::Pong) {
+                report_protocol_error(session).await;
+                return Err(err);
+            }
             Ok(())
         }
-        _ => Err("unexpected frame on client session".into()),
+        _ => {
+            report_protocol_error(session).await;
+            Err("unexpected frame on client session".into())
+        }
     }
+}
+
+async fn report_protocol_error(session: &ClientSession) {
+    let _ = session.send_connection_error(ErrorCode::Protocol).await;
 }
 
 fn validate_session_control_frame(frame: &Frame, expected_type: FrameType) -> Result<(), AnyError> {
     validate_connection_frame(frame, expected_type)?;
     Ok(())
+}
+
+fn validate_server_flow_frame(frame: &Frame) -> Result<(), AnyError> {
+    match frame.header.frame_type {
+        FrameType::TcpData => Ok(()),
+        FrameType::TcpClose => {
+            let mut payload = frame.payload.clone();
+            TcpClose::decode(&mut payload)?;
+            Ok(())
+        }
+        FrameType::Error | FrameType::PolicyDenied | FrameType::ResourceLimit => {
+            validate_flow_status(frame.header.frame_type, frame.payload.clone())
+        }
+        _ => Err("unexpected server flow frame".into()),
+    }
 }
 
 fn is_connection_error_frame(frame: &Frame) -> bool {
@@ -995,6 +1034,30 @@ mod tests {
         assert!(validate_flow_status(FrameType::Error, Bytes::new()).is_err());
         assert!(validate_flow_status(FrameType::PolicyDenied, Bytes::new()).is_err());
         assert!(validate_flow_status(FrameType::ResourceLimit, Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn validates_server_flow_frames_before_routing() {
+        assert!(validate_server_flow_frame(&data_frame(FLOW_ID, Bytes::new())).is_ok());
+        assert!(validate_server_flow_frame(&close_frame(TCP_CLOSE_NORMAL)).is_ok());
+        assert!(validate_server_flow_frame(&error_frame(ErrorCode::Protocol)).is_ok());
+    }
+
+    #[test]
+    fn rejects_malformed_server_flow_frames_before_routing() {
+        let malformed_close = Frame::new(FrameType::TcpClose, 0, FLOW_ID, Bytes::new()).unwrap();
+        let malformed_status = Frame::new(FrameType::Error, 0, FLOW_ID, Bytes::new()).unwrap();
+        let mismatched_policy_denied = Frame::new(
+            FrameType::PolicyDenied,
+            0,
+            FLOW_ID,
+            status_payload(ErrorCode::ResourceLimit),
+        )
+        .unwrap();
+
+        assert!(validate_server_flow_frame(&malformed_close).is_err());
+        assert!(validate_server_flow_frame(&malformed_status).is_err());
+        assert!(validate_server_flow_frame(&mismatched_policy_denied).is_err());
     }
 
     #[test]

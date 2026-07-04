@@ -15,8 +15,8 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use rustls::{
-    ClientConfig as RustlsClientConfig, RootCertStore,
-    pki_types::{CertificateDer, ServerName},
+    ClientConfig as RustlsClientConfig, RootCertStore, ServerConfig as RustlsServerConfig,
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -24,13 +24,20 @@ use tokio::{
     sync::Barrier,
     task::JoinHandle,
 };
-use tokio_rustls::{TlsConnector, client::TlsStream};
+use tokio_rustls::{
+    TlsAcceptor, TlsConnector, client::TlsStream as ClientTlsStream,
+    server::TlsStream as ServerTlsStream,
+};
+use uk_auth::{
+    AuthChallenge, AuthResponse, Credential, EXPORTER_LABEL, ReplayCache, unix_now,
+    verify_auth_response,
+};
 use uk_client::{
     config::ClientConfig, connect_authenticated_carrier, run_handshake, run_socks5_listener,
 };
 use uk_proto::{
-    ALPN_PROTOCOL, ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, TCP_CLOSE_NORMAL,
-    TcpClose, read_frame, write_frame,
+    ALPN_PROTOCOL, ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, SettingKey, Settings,
+    TCP_CLOSE_NORMAL, TcpClose, TcpOpen, read_frame, validate_connection_frame, write_frame,
 };
 use uk_server::config::{CredentialConfig, LimitConfig, ServerConfig};
 
@@ -149,6 +156,15 @@ async fn reports_protocol_error_for_unexpected_session_frame() -> Result<(), Tes
     tokio::time::timeout(
         Duration::from_secs(10),
         run_unexpected_session_frame_error_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reports_protocol_error_for_malformed_server_relay_frame() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_malformed_server_relay_frame_error_e2e(),
     )
     .await?
 }
@@ -763,6 +779,21 @@ async fn run_unexpected_session_frame_error_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+async fn run_malformed_server_relay_frame_error_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let mut harness = MalformedFrameServerHarness::start().await?;
+    let (_socks, connect_reply) = open_socks_connect(
+        harness.socks_addr,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 80)),
+    )
+    .await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    assert_eq!(harness.received_error_code().await?, ErrorCode::Protocol);
+    Ok(())
+}
+
 async fn run_nonzero_id_ping_error_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -866,7 +897,9 @@ impl ServerHarness {
     }
 }
 
-async fn connect_tls_carrier(harness: &ServerHarness) -> Result<TlsStream<TcpStream>, TestError> {
+async fn connect_tls_carrier(
+    harness: &ServerHarness,
+) -> Result<ClientTlsStream<TcpStream>, TestError> {
     let mut roots = RootCertStore::empty();
     for cert in load_certs(&harness.cert_path)? {
         roots.add(cert)?;
@@ -902,6 +935,173 @@ impl Drop for ServerHarness {
         self.server_task.abort();
         let _ = fs::remove_dir_all(&self.temp_dir);
     }
+}
+
+struct MalformedFrameServerHarness {
+    temp_dir: PathBuf,
+    socks_addr: SocketAddr,
+    server_task: Option<JoinHandle<Result<ErrorCode, TestError>>>,
+    client_task: JoinHandle<Result<(), TestError>>,
+}
+
+impl MalformedFrameServerHarness {
+    async fn start() -> Result<Self, TestError> {
+        let temp_dir = create_temp_dir()?;
+        let cert_path = temp_dir.join("server-cert.pem");
+        let key_path = temp_dir.join("server-key.pem");
+        fs::write(&cert_path, CERT_PEM)?;
+        fs::write(&key_path, KEY_PEM)?;
+
+        let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let server_addr = server_listener.local_addr()?;
+        let socks_addr = unused_loopback_addr().await?;
+        let server_task = tokio::spawn(run_malformed_frame_server(
+            server_listener,
+            cert_path.clone(),
+            key_path,
+        ));
+        let mut client_task = tokio::spawn(run_socks5_listener(
+            ClientConfig {
+                server_addr: server_addr.to_string(),
+                server_name: "localhost".to_owned(),
+                ca_cert_path: path_string(&cert_path),
+                key_id: KEY_ID.to_owned(),
+                secret: SECRET.to_owned(),
+                handshake_timeout_seconds: Some(3),
+                socks_handshake_timeout_seconds: Some(3),
+                tcp_open_timeout_seconds: Some(3),
+            },
+            socks_addr.to_string(),
+        ));
+        wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+
+        Ok(Self {
+            temp_dir,
+            socks_addr,
+            server_task: Some(server_task),
+            client_task,
+        })
+    }
+
+    async fn received_error_code(&mut self) -> Result<ErrorCode, TestError> {
+        let task = self
+            .server_task
+            .take()
+            .ok_or("malformed frame server task was already awaited")?;
+        tokio::time::timeout(Duration::from_secs(3), task).await??
+    }
+}
+
+impl Drop for MalformedFrameServerHarness {
+    fn drop(&mut self) {
+        self.client_task.abort();
+        if let Some(task) = self.server_task.take() {
+            task.abort();
+        }
+        let _ = fs::remove_dir_all(&self.temp_dir);
+    }
+}
+
+async fn run_malformed_frame_server(
+    listener: TcpListener,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+) -> Result<ErrorCode, TestError> {
+    let (tcp, _) = listener.accept().await?;
+    tcp.set_nodelay(true)?;
+    let acceptor = TlsAcceptor::from(Arc::new(server_tls_config(&cert_path, &key_path)?));
+    let mut stream = acceptor.accept(tcp).await?;
+    if stream.get_ref().1.alpn_protocol() != Some(ALPN_PROTOCOL) {
+        return Err("UK ALPN protocol was not negotiated".into());
+    }
+
+    let exporter = server_exporter(&stream)?;
+    let challenge = AuthChallenge::generate(unix_now());
+    let mut challenge_payload = BytesMut::new();
+    challenge.encode(&mut challenge_payload)?;
+    let challenge_frame = Frame::new(FrameType::AuthChallenge, 0, 0, challenge_payload.freeze())?;
+    write_frame(&mut stream, &challenge_frame).await?;
+
+    let response_frame = read_frame(&mut stream, FrameLimits::default()).await?;
+    validate_connection_frame(&response_frame, FrameType::AuthResponse)?;
+    let mut response_payload = response_frame.payload;
+    let response = AuthResponse::decode(&mut response_payload)?;
+    let credentials = [Credential::active(
+        KEY_ID.as_bytes().to_vec(),
+        SECRET.as_bytes().to_vec(),
+    )?];
+    let mut replay_cache = ReplayCache::default();
+    verify_auth_response(
+        &credentials,
+        &exporter,
+        &challenge,
+        &response,
+        unix_now(),
+        Duration::from_secs(30),
+        &mut replay_cache,
+    )?;
+
+    let settings = fake_server_settings();
+    let mut settings_payload = BytesMut::new();
+    settings.encode(&mut settings_payload)?;
+    let settings_frame = Frame::new(FrameType::Settings, 0, 0, settings_payload.freeze())?;
+    write_frame(&mut stream, &settings_frame).await?;
+
+    let open_frame = read_frame(&mut stream, FrameLimits::default()).await?;
+    assert_eq!(open_frame.header.frame_type, FrameType::TcpOpen);
+    let flow_id = open_frame.header.id;
+    let mut open_payload = open_frame.payload;
+    TcpOpen::decode(&mut open_payload)?;
+
+    let ack = Frame::new(FrameType::TcpData, 0, flow_id, Bytes::new())?;
+    write_frame(&mut stream, &ack).await?;
+
+    let malformed_close = Frame::new(FrameType::TcpClose, 0, flow_id, Bytes::new())?;
+    write_frame(&mut stream, &malformed_close).await?;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut stream, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(response.header.frame_type, FrameType::Error);
+    assert_eq!(response.header.id, 0);
+    let mut payload = response.payload;
+    Ok(ErrorPayload::decode(&mut payload)?.code)
+}
+
+fn server_tls_config(cert_path: &Path, key_path: &Path) -> Result<RustlsServerConfig, TestError> {
+    let certs = load_certs(cert_path)?;
+    let key = load_private_key(key_path)?;
+    let mut config = RustlsServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+    config.max_early_data_size = 0;
+    Ok(config)
+}
+
+fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TestError> {
+    let mut reader = BufReader::new(fs::File::open(path)?);
+    rustls_pemfile::private_key(&mut reader)?.ok_or_else(|| "missing private key".into())
+}
+
+fn server_exporter(stream: &ServerTlsStream<TcpStream>) -> Result<[u8; 32], TestError> {
+    let mut out = [0_u8; 32];
+    stream
+        .get_ref()
+        .1
+        .export_keying_material(&mut out, EXPORTER_LABEL, None)?;
+    Ok(out)
+}
+
+fn fake_server_settings() -> Settings {
+    let mut settings = Settings::default();
+    settings.set(SettingKey::ProtocolRevision, 1);
+    settings.set(SettingKey::MaxFrameSize, 65_536);
+    settings.set(SettingKey::MaxStreams, 8);
+    settings.set(SettingKey::IdleTimeoutSeconds, 30);
+    settings
 }
 
 struct RelayHarness {
