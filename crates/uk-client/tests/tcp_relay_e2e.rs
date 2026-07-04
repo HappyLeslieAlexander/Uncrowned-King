@@ -1426,6 +1426,7 @@ async fn run_server_active_session_shutdown_e2e() -> Result<(), TestError> {
         socks_handshake_timeout_seconds: Some(3),
         tcp_open_timeout_seconds: Some(3),
         max_socks_connections: None,
+        max_buffered_bytes_per_session: None,
     })
     .await?
     .0;
@@ -1463,6 +1464,7 @@ async fn run_socks_listener_shutdown_e2e() -> Result<(), TestError> {
             socks_handshake_timeout_seconds: Some(3),
             tcp_open_timeout_seconds: Some(3),
             max_socks_connections: None,
+            max_buffered_bytes_per_session: None,
         },
         socks_addr.to_string(),
         async {
@@ -1508,6 +1510,7 @@ async fn run_socks_listener_shutdown_during_connect_e2e() -> Result<(), TestErro
             socks_handshake_timeout_seconds: Some(3),
             tcp_open_timeout_seconds: Some(30),
             max_socks_connections: None,
+            max_buffered_bytes_per_session: None,
         },
         socks_addr.to_string(),
         async {
@@ -1606,6 +1609,7 @@ impl ServerHarness {
             socks_handshake_timeout_seconds: Some(3),
             tcp_open_timeout_seconds: Some(3),
             max_socks_connections: None,
+            max_buffered_bytes_per_session: None,
         }
     }
 }
@@ -1729,6 +1733,7 @@ impl MalformedFrameServerHarness {
                 socks_handshake_timeout_seconds: Some(3),
                 tcp_open_timeout_seconds: Some(3),
                 max_socks_connections: None,
+                max_buffered_bytes_per_session: None,
             },
             socks_addr.to_string(),
         ));
@@ -1799,6 +1804,7 @@ impl PendingOpenCancelServerHarness {
                 socks_handshake_timeout_seconds: Some(3),
                 tcp_open_timeout_seconds: Some(tcp_open_timeout_seconds),
                 max_socks_connections: None,
+                max_buffered_bytes_per_session: None,
             },
             socks_addr.to_string(),
         ));
@@ -1880,6 +1886,7 @@ impl MissingPongServerHarness {
                 socks_handshake_timeout_seconds: Some(3),
                 tcp_open_timeout_seconds: Some(3),
                 max_socks_connections: None,
+                max_buffered_bytes_per_session: None,
             },
             socks_addr.to_string(),
         ));
@@ -2210,6 +2217,7 @@ impl RelayHarness {
                 socks_handshake_timeout_seconds: Some(socks_handshake_timeout_seconds),
                 tcp_open_timeout_seconds: Some(3),
                 max_socks_connections,
+                max_buffered_bytes_per_session: None,
             },
             socks_addr.to_string(),
         ));

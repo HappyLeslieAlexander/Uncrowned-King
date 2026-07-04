@@ -83,7 +83,8 @@ When running the SOCKS5 listener, `socks_handshake_timeout_seconds = 10` bounds
 the local SOCKS greeting and CONNECT request. `tcp_open_timeout_seconds = 10`
 bounds waiting for a UK TCP open response from the server.
 `max_socks_connections = 1024` bounds concurrent local SOCKS connections before
-and during relay.
+and during relay. `max_buffered_bytes_per_session = 16777216` bounds queued
+server-to-local relay bytes per UK session.
 
 Example configs live under `examples/`; see `examples/README.md` for local
 certificate generation. Validate configs without opening listeners or outbound

@@ -4,7 +4,7 @@ use std::{error::Error, fs, path::Path};
 
 use serde::Deserialize;
 use uk_auth::{AuthError, validate_key_id, validate_shared_secret};
-use uk_proto::validate_host_port_endpoint;
+use uk_proto::{MAX_FRAME_PAYLOAD_SIZE, validate_host_port_endpoint};
 
 /// Client TOML configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -28,6 +28,8 @@ pub struct ClientConfig {
     pub tcp_open_timeout_seconds: Option<u64>,
     /// Optional maximum concurrent local SOCKS5 connections.
     pub max_socks_connections: Option<u64>,
+    /// Optional maximum queued server-to-local bytes across one UK session.
+    pub max_buffered_bytes_per_session: Option<u64>,
 }
 
 impl ClientConfig {
@@ -58,6 +60,12 @@ impl ClientConfig {
         self.max_socks_connections.unwrap_or(1024)
     }
 
+    /// Maximum queued server-to-local bytes across one UK session.
+    pub fn max_buffered_bytes_per_session(&self) -> u64 {
+        self.max_buffered_bytes_per_session
+            .unwrap_or(MAX_FRAME_PAYLOAD_SIZE)
+    }
+
     /// Validates local authentication material before opening a network session.
     pub fn validate_auth_material(&self) -> Result<(), AuthError> {
         validate_key_id(self.key_id.as_bytes())?;
@@ -77,6 +85,16 @@ impl ClientConfig {
         }
         usize::try_from(max_socks_connections)
             .map_err(|_| "max_socks_connections is too large for this platform")?;
+        let max_buffered_bytes_per_session = self.max_buffered_bytes_per_session();
+        if max_buffered_bytes_per_session == 0 {
+            return Err("max_buffered_bytes_per_session must be greater than zero".into());
+        }
+        if max_buffered_bytes_per_session > MAX_FRAME_PAYLOAD_SIZE {
+            return Err(format!(
+                "max_buffered_bytes_per_session must be at most {MAX_FRAME_PAYLOAD_SIZE}"
+            )
+            .into());
+        }
         Ok(())
     }
 }
@@ -105,6 +123,7 @@ mod tests {
             socks_handshake_timeout_seconds: None,
             tcp_open_timeout_seconds: None,
             max_socks_connections: None,
+            max_buffered_bytes_per_session: None,
         }
     }
 
@@ -205,6 +224,47 @@ max_socks_connections = 7
     }
 
     #[test]
+    fn defaults_buffered_bytes_per_session_limit() {
+        assert_eq!(
+            minimal_config().max_buffered_bytes_per_session(),
+            MAX_FRAME_PAYLOAD_SIZE
+        );
+    }
+
+    #[test]
+    fn parses_buffered_bytes_per_session_limit() {
+        let config: ClientConfig = toml::from_str(
+            r#"
+server_addr = "127.0.0.1:443"
+server_name = "localhost"
+ca_cert_path = "ca.pem"
+key_id = "client"
+secret = "secret"
+max_buffered_bytes_per_session = 8192
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.max_buffered_bytes_per_session(), 8192);
+    }
+
+    #[test]
+    fn rejects_zero_buffered_bytes_per_session_limit() {
+        let mut config = minimal_config();
+        config.max_buffered_bytes_per_session = Some(0);
+
+        assert!(config.validate_resource_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_too_large_buffered_bytes_per_session_limit() {
+        let mut config = minimal_config();
+        config.max_buffered_bytes_per_session = Some(MAX_FRAME_PAYLOAD_SIZE + 1);
+
+        assert!(config.validate_resource_limits().is_err());
+    }
+
+    #[test]
     fn parses_zero_timeout_values() {
         let config: ClientConfig = toml::from_str(
             r#"
@@ -217,6 +277,7 @@ handshake_timeout_seconds = 0
 socks_handshake_timeout_seconds = 0
 tcp_open_timeout_seconds = 0
 max_socks_connections = 1
+max_buffered_bytes_per_session = 1024
 "#,
         )
         .unwrap();
@@ -225,6 +286,7 @@ max_socks_connections = 1
         assert_eq!(config.socks_handshake_timeout_seconds(), 0);
         assert_eq!(config.tcp_open_timeout_seconds(), 0);
         assert_eq!(config.max_socks_connections(), 1);
+        assert_eq!(config.max_buffered_bytes_per_session(), 1024);
     }
 
     #[test]
