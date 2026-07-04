@@ -321,6 +321,11 @@ async fn cancels_pending_open_when_socks_client_disconnects() -> Result<(), Test
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn returns_socks_failure_when_tcp_open_times_out() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_tcp_open_timeout_failure_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancels_pending_open_after_buffering_early_socks_data() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -423,6 +428,25 @@ async fn run_pending_open_cancel_on_socks_disconnect_e2e() -> Result<(), TestErr
     assert_eq!(method_response, [0x05, 0x00]);
     drop(socks);
 
+    assert_eq!(harness.received_close_code().await?, TCP_CLOSE_ERROR);
+    Ok(())
+}
+
+async fn run_tcp_open_timeout_failure_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let mut harness = PendingOpenCancelServerHarness::start_with_tcp_open_timeout(1).await?;
+    let mut socks = TcpStream::connect(harness.socks_addr).await?;
+    let request = socks_connect_request(SocketAddr::from((Ipv4Addr::LOCALHOST, 80)));
+    socks.write_all(&request).await?;
+
+    let mut method_response = [0_u8; 2];
+    socks.read_exact(&mut method_response).await?;
+    assert_eq!(method_response, [0x05, 0x00]);
+
+    let mut connect_reply = [0_u8; 10];
+    socks.read_exact(&mut connect_reply).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_GENERAL_FAILURE);
     assert_eq!(harness.received_close_code().await?, TCP_CLOSE_ERROR);
     Ok(())
 }
@@ -1334,6 +1358,10 @@ struct PendingOpenCancelServerHarness {
 
 impl PendingOpenCancelServerHarness {
     async fn start() -> Result<Self, TestError> {
+        Self::start_with_tcp_open_timeout(30).await
+    }
+
+    async fn start_with_tcp_open_timeout(tcp_open_timeout_seconds: u64) -> Result<Self, TestError> {
         let temp_dir = create_temp_dir()?;
         let cert_path = temp_dir.join("server-cert.pem");
         let key_path = temp_dir.join("server-key.pem");
@@ -1357,7 +1385,7 @@ impl PendingOpenCancelServerHarness {
                 secret: SECRET.to_owned(),
                 handshake_timeout_seconds: Some(3),
                 socks_handshake_timeout_seconds: Some(3),
-                tcp_open_timeout_seconds: Some(30),
+                tcp_open_timeout_seconds: Some(tcp_open_timeout_seconds),
             },
             socks_addr.to_string(),
         ));

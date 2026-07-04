@@ -85,6 +85,7 @@ enum OpenOutcome {
 enum OpenWaitOutcome {
     Frame(Frame),
     Cancelled,
+    TimedOut,
     LocalResourceLimit,
 }
 
@@ -294,7 +295,7 @@ impl ClientSession {
         {
             OpenWaitOutcome::Frame(frame) => frame,
             OpenWaitOutcome::Cancelled => return Ok(OpenOutcome::Cancelled),
-            OpenWaitOutcome::LocalResourceLimit => {
+            OpenWaitOutcome::TimedOut | OpenWaitOutcome::LocalResourceLimit => {
                 return Ok(OpenOutcome::Rejected(socks5::Reply::GeneralFailure));
             }
         };
@@ -333,7 +334,7 @@ impl ClientSession {
             } else {
                 warn!(event = "client.flow.open.timeout", flow_id);
                 self.cancel_pending_open(flow_id).await;
-                Ok(OpenWaitOutcome::Cancelled)
+                Ok(OpenWaitOutcome::TimedOut)
             }
         } else {
             self.wait_for_open_frame_inner(flow_id, frames, local, pending_local_data)
