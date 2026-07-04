@@ -575,6 +575,7 @@ fn spawn_carrier_reader(
                 Err(err) => {
                     if !matches!(err, FrameIoError::Closed) {
                         warn!(event = "client.session.read.error", error = %err);
+                        report_frame_io_error(&session, &err).await;
                     }
                     close_session(&session).await;
                     return;
@@ -675,6 +676,14 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
 
 async fn report_protocol_error(session: &ClientSession) {
     let _ = session.send_connection_error(ErrorCode::Protocol).await;
+}
+
+async fn report_frame_io_error(session: &ClientSession, error: &FrameIoError) {
+    if let FrameIoError::Protocol(error) = error {
+        let _ = session
+            .send_connection_error(ErrorCode::from_protocol_error(error))
+            .await;
+    }
 }
 
 fn validate_session_control_frame(frame: &Frame, expected_type: FrameType) -> Result<(), AnyError> {

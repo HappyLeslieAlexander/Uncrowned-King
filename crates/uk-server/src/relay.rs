@@ -99,6 +99,7 @@ enum FlowEvent {
 enum SessionEvent {
     Flow(Option<FlowEvent>),
     Frame(Frame),
+    FrameReadError(FrameIoError),
     IdleTimeout,
     PeerClosed,
 }
@@ -223,6 +224,10 @@ pub(crate) async fn relay_session(
                     break Err(err);
                 }
             }
+            SessionEvent::FrameReadError(err) => {
+                report_frame_io_error(context.carrier_writer, &err).await;
+                break Err(err.into());
+            }
             SessionEvent::IdleTimeout => {
                 info!(event = "server.session.idle_timeout");
                 break Ok(());
@@ -331,22 +336,22 @@ async fn next_session_event(
     if let Some(idle_timeout) = idle_timeout {
         tokio::select! {
             event = event_rx.recv() => Ok(SessionEvent::Flow(event)),
-            frame = read_frame(carrier_reader, limits) => map_frame_event(frame),
+            frame = read_frame(carrier_reader, limits) => Ok(map_frame_event(frame)),
             () = tokio::time::sleep(idle_timeout) => Ok(SessionEvent::IdleTimeout),
         }
     } else {
         tokio::select! {
             event = event_rx.recv() => Ok(SessionEvent::Flow(event)),
-            frame = read_frame(carrier_reader, limits) => map_frame_event(frame),
+            frame = read_frame(carrier_reader, limits) => Ok(map_frame_event(frame)),
         }
     }
 }
 
-fn map_frame_event(result: Result<Frame, FrameIoError>) -> Result<SessionEvent, AnyError> {
+fn map_frame_event(result: Result<Frame, FrameIoError>) -> SessionEvent {
     match result {
-        Ok(frame) => Ok(SessionEvent::Frame(frame)),
-        Err(FrameIoError::Closed) => Ok(SessionEvent::PeerClosed),
-        Err(err) => Err(err.into()),
+        Ok(frame) => SessionEvent::Frame(frame),
+        Err(FrameIoError::Closed) => SessionEvent::PeerClosed,
+        Err(err) => SessionEvent::FrameReadError(err),
     }
 }
 
@@ -380,6 +385,12 @@ async fn reject_unexpected_session_frame(
 ) -> Result<(), AnyError> {
     send_error(context.carrier_writer, frame.header.id, ErrorCode::Protocol).await?;
     Err("unexpected frame while relaying session".into())
+}
+
+async fn report_frame_io_error(writer: &CarrierWriter, error: &FrameIoError) {
+    if let FrameIoError::Protocol(error) = error {
+        let _ = send_error(writer, 0, ErrorCode::from_protocol_error(error)).await;
+    }
 }
 
 async fn validate_or_report_session_control_frame(
@@ -1835,7 +1846,7 @@ mod tests {
     #[test]
     fn maps_clean_carrier_eof_to_peer_closed() {
         assert!(matches!(
-            map_frame_event(Err(FrameIoError::Closed)).unwrap(),
+            map_frame_event(Err(FrameIoError::Closed)),
             SessionEvent::PeerClosed
         ));
     }

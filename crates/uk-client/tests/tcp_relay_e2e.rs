@@ -36,9 +36,9 @@ use uk_client::{
     config::ClientConfig, connect_authenticated_carrier, run_handshake, run_socks5_listener,
 };
 use uk_proto::{
-    ALPN_PROTOCOL, ErrorCode, ErrorPayload, Frame, FrameIoError, FrameLimits, FrameType,
-    SettingKey, Settings, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose,
-    TcpOpen, read_frame, validate_connection_frame, write_frame,
+    ALPN_PROTOCOL, ErrorCode, ErrorPayload, Frame, FrameHeader, FrameIoError, FrameLimits,
+    FrameType, SettingKey, Settings, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE,
+    Target, TcpClose, TcpOpen, read_frame, validate_connection_frame, write_frame,
 };
 use uk_server::config::{CredentialConfig, LimitConfig, ServerConfig};
 
@@ -178,6 +178,24 @@ async fn reports_protocol_error_for_malformed_server_relay_frame() -> Result<(),
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reports_protocol_error_for_non_empty_open_ack() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_non_empty_open_ack_error_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reports_oversized_server_frame_during_open() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_oversized_server_frame_during_open_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reports_oversized_client_frame_to_server() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_oversized_client_frame_error_e2e(),
+    )
+    .await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -923,6 +941,31 @@ async fn run_malformed_tcp_close_error_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+async fn run_oversized_client_frame_error_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = ServerHarness::start(test_limits()).await?;
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(harness.client_config(SECRET)).await?;
+
+    write_oversized_tcp_data_header(&mut carrier, 1).await?;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(response.header.frame_type, FrameType::Error);
+    assert_eq!(response.header.id, 0);
+
+    let mut payload = response.payload;
+    assert_eq!(
+        ErrorPayload::decode(&mut payload)?.code,
+        ErrorCode::OversizedFrame
+    );
+    Ok(())
+}
+
 async fn run_unexpected_session_frame_error_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -976,6 +1019,24 @@ async fn run_non_empty_open_ack_error_e2e() -> Result<(), TestError> {
     assert_eq!(connect_reply[1], SOCKS_REPLY_GENERAL_FAILURE);
 
     assert_eq!(harness.received_error_code().await?, ErrorCode::Protocol);
+    Ok(())
+}
+
+async fn run_oversized_server_frame_during_open_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let mut harness = MalformedFrameServerHarness::start_oversized_frame_during_open().await?;
+    let (_socks, connect_reply) = open_socks_connect(
+        harness.socks_addr,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 80)),
+    )
+    .await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_GENERAL_FAILURE);
+
+    assert_eq!(
+        harness.received_error_code().await?,
+        ErrorCode::OversizedFrame
+    );
     Ok(())
 }
 
@@ -1147,6 +1208,7 @@ struct MalformedFrameServerHarness {
 enum MalformedFrameScenario {
     RelayFrameAfterOpen,
     NonEmptyOpenAck,
+    OversizedFrameDuringOpen,
 }
 
 impl MalformedFrameServerHarness {
@@ -1156,6 +1218,10 @@ impl MalformedFrameServerHarness {
 
     async fn start_non_empty_open_ack() -> Result<Self, TestError> {
         Self::start_with_scenario(MalformedFrameScenario::NonEmptyOpenAck).await
+    }
+
+    async fn start_oversized_frame_during_open() -> Result<Self, TestError> {
+        Self::start_with_scenario(MalformedFrameScenario::OversizedFrameDuringOpen).await
     }
 
     async fn start_with_scenario(scenario: MalformedFrameScenario) -> Result<Self, TestError> {
@@ -1375,6 +1441,9 @@ async fn run_malformed_frame_server(
                 Bytes::from_static(b"not an ack"),
             )?;
             write_frame(&mut stream, &malformed_ack).await?;
+        }
+        MalformedFrameScenario::OversizedFrameDuringOpen => {
+            write_oversized_tcp_data_header(&mut stream, flow_id).await?;
         }
     }
 
@@ -1879,6 +1948,23 @@ fn flow_status_frame(
     let mut payload = BytesMut::new();
     ErrorPayload::new(code).encode(&mut payload)?;
     Ok(Frame::new(frame_type, 0, flow_id, payload.freeze())?)
+}
+
+async fn write_oversized_tcp_data_header<W>(writer: &mut W, flow_id: u64) -> Result<(), TestError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let header = FrameHeader::new(
+        FrameType::TcpData,
+        0,
+        flow_id,
+        FrameLimits::default().max_frame_size + 1,
+    )?;
+    let mut encoded = BytesMut::new();
+    header.encode(&mut encoded)?;
+    writer.write_all(&encoded).await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 async fn read_open_ack(

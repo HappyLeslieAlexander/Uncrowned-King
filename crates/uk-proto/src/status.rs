@@ -32,6 +32,25 @@ pub enum ErrorCode {
     TargetTimeout = 11,
 }
 
+impl ErrorCode {
+    /// Maps a local protocol decode error to the closest wire error code.
+    pub fn from_protocol_error(error: &ProtocolError) -> Self {
+        match error {
+            ProtocolError::UnsupportedVersion(_) => Self::UnsupportedVersion,
+            ProtocolError::UnsupportedFlag(_) => Self::UnsupportedFlag,
+            ProtocolError::OversizedFrame { .. } => Self::OversizedFrame,
+            ProtocolError::Truncated => Self::TruncatedFrame,
+            ProtocolError::InvalidTarget(_) => Self::InvalidTarget,
+            ProtocolError::InvalidVarint
+            | ProtocolError::UnknownFrameType(_)
+            | ProtocolError::InvalidFrame(_)
+            | ProtocolError::InvalidSettings(_)
+            | ProtocolError::InvalidTcpPayload(_)
+            | ProtocolError::InvalidErrorPayload(_) => Self::Protocol,
+        }
+    }
+}
+
 impl TryFrom<u64> for ErrorCode {
     type Error = ProtocolError;
 
@@ -114,6 +133,37 @@ mod tests {
             .encode(&mut out)
             .unwrap();
         assert_eq!(out, [0x0b]);
+    }
+
+    #[test]
+    fn maps_protocol_errors_to_wire_error_codes() {
+        assert_eq!(
+            ErrorCode::from_protocol_error(&ProtocolError::UnsupportedVersion(2)),
+            ErrorCode::UnsupportedVersion
+        );
+        assert_eq!(
+            ErrorCode::from_protocol_error(&ProtocolError::UnsupportedFlag(0x0100)),
+            ErrorCode::UnsupportedFlag
+        );
+        assert_eq!(
+            ErrorCode::from_protocol_error(&ProtocolError::OversizedFrame {
+                length: 2,
+                limit: 1,
+            }),
+            ErrorCode::OversizedFrame
+        );
+        assert_eq!(
+            ErrorCode::from_protocol_error(&ProtocolError::Truncated),
+            ErrorCode::TruncatedFrame
+        );
+        assert_eq!(
+            ErrorCode::from_protocol_error(&ProtocolError::InvalidTarget("bad target")),
+            ErrorCode::InvalidTarget
+        );
+        assert_eq!(
+            ErrorCode::from_protocol_error(&ProtocolError::InvalidFrame("bad frame")),
+            ErrorCode::Protocol
+        );
     }
 
     #[test]
