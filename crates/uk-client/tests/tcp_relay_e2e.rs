@@ -18,7 +18,7 @@ use tokio::{
     sync::Barrier,
     task::JoinHandle,
 };
-use uk_client::{config::ClientConfig, run_socks5_listener};
+use uk_client::{config::ClientConfig, run_handshake, run_socks5_listener};
 use uk_server::config::{CredentialConfig, LimitConfig, ServerConfig};
 
 const CERT_PEM: &str = r"-----BEGIN CERTIFICATE-----
@@ -75,6 +75,7 @@ VODOlcdwgEkE3j5MxS0brpI9
 
 const KEY_ID: &str = "e2e-client";
 const SECRET: &str = "0123456789abcdef0123456789abcdef";
+const WRONG_SECRET: &str = "fedcba9876543210fedcba9876543210";
 const SOCKS_REPLY_SUCCEEDED: u8 = 0x00;
 const SOCKS_REPLY_GENERAL_FAILURE: u8 = 0x01;
 const SOCKS_REPLY_NOT_ALLOWED: u8 = 0x02;
@@ -104,6 +105,11 @@ async fn maps_policy_denied_to_socks_not_allowed() -> Result<(), TestError> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn maps_target_unavailable_to_socks_host_unreachable() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_target_unavailable_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reports_auth_failure_during_handshake() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_auth_failure_error_e2e()).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -544,6 +550,55 @@ async fn run_target_unavailable_e2e() -> Result<(), TestError> {
     let (_socks, connect_reply) =
         open_socks_connect(harness.socks_addr, unavailable_target).await?;
     assert_eq!(connect_reply[1], SOCKS_REPLY_HOST_UNREACHABLE);
+    Ok(())
+}
+
+async fn run_auth_failure_error_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    fs::write(&cert_path, CERT_PEM)?;
+    fs::write(&key_path, KEY_PEM)?;
+    let server_addr = unused_loopback_addr().await?;
+    let mut server_task = tokio::spawn(uk_server::run(ServerConfig {
+        listen: server_addr.to_string(),
+        cert_path: path_string(&cert_path),
+        key_path: path_string(&key_path),
+        auth_skew_seconds: Some(30),
+        limits: Some(test_limits()),
+        policy_path: None,
+        credentials: vec![CredentialConfig {
+            key_id: KEY_ID.to_owned(),
+            secret: SECRET.to_owned(),
+            status: Some("active".to_owned()),
+            not_before: None,
+            not_after: None,
+            policy_group: Some("default".to_owned()),
+        }],
+    }));
+    wait_for_listener("uk-server", server_addr, &mut server_task).await?;
+
+    let result = run_handshake(ClientConfig {
+        server_addr: server_addr.to_string(),
+        server_name: "localhost".to_owned(),
+        ca_cert_path: path_string(&cert_path),
+        key_id: KEY_ID.to_owned(),
+        secret: WRONG_SECRET.to_owned(),
+        handshake_timeout_seconds: Some(3),
+        socks_handshake_timeout_seconds: Some(3),
+        tcp_open_timeout_seconds: Some(3),
+    })
+    .await;
+
+    server_task.abort();
+    fs::remove_dir_all(&temp_dir)?;
+    let error = result.expect_err("wrong secret must fail authentication");
+    assert!(
+        error.to_string().contains("authentication failed"),
+        "unexpected auth failure error: {error}"
+    );
     Ok(())
 }
 

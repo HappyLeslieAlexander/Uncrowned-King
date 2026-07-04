@@ -8,8 +8,8 @@ use tokio_rustls::client::TlsStream;
 use tracing::info;
 use uk_auth::{AuthChallenge, AuthResponse, unix_now};
 use uk_proto::{
-    Frame, FrameLimits, FrameType, MIN_TCP_RELAY_FRAME_SIZE, SettingKey, Settings, read_frame,
-    validate_connection_frame, write_frame,
+    ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, MIN_TCP_RELAY_FRAME_SIZE, SettingKey,
+    Settings, read_frame, validate_connection_frame, write_frame,
 };
 
 use crate::{config::ClientConfig, tls};
@@ -62,15 +62,37 @@ async fn connect_authenticated_inner(
     write_frame(&mut stream, &response_frame).await?;
 
     let settings_frame = read_frame(&mut stream, FrameLimits::default()).await?;
-    validate_connection_frame(&settings_frame, FrameType::Settings)?;
-    let mut settings_payload = settings_frame.payload;
-    let settings = Settings::decode(&mut settings_payload)?;
-    validate_server_settings(&settings)?;
+    let settings = decode_server_settings_frame(settings_frame)?;
     info!(
         event = "auth.success",
         max_frame_size = ?settings.get(SettingKey::MaxFrameSize)
     );
     Ok((stream, settings))
+}
+
+fn decode_server_settings_frame(frame: Frame) -> Result<Settings, AnyError> {
+    match frame.header.frame_type {
+        FrameType::Settings => {
+            validate_connection_frame(&frame, FrameType::Settings)?;
+            let mut settings_payload = frame.payload;
+            let settings = Settings::decode(&mut settings_payload)?;
+            validate_server_settings(&settings)?;
+            Ok(settings)
+        }
+        FrameType::Error => {
+            validate_connection_frame(&frame, FrameType::Error)?;
+            let mut payload = frame.payload;
+            let status = ErrorPayload::decode(&mut payload)?;
+            match status.code {
+                ErrorCode::AuthFailed => Err("authentication failed".into()),
+                code => Err(format!("server returned handshake error: {code:?}").into()),
+            }
+        }
+        _ => {
+            validate_connection_frame(&frame, FrameType::Settings)?;
+            Err("unexpected connection frame type".into())
+        }
+    }
 }
 
 fn validate_server_settings(settings: &Settings) -> Result<(), AnyError> {
@@ -124,12 +146,55 @@ fn handshake_timeout(seconds: u64) -> Option<Duration> {
 mod tests {
     use super::*;
 
+    fn settings_frame(settings: &Settings) -> Frame {
+        let mut payload = BytesMut::new();
+        settings.encode(&mut payload).unwrap();
+        Frame::new(FrameType::Settings, 0, 0, payload.freeze()).unwrap()
+    }
+
+    fn error_frame(code: ErrorCode) -> Frame {
+        let mut payload = BytesMut::new();
+        ErrorPayload::new(code).encode(&mut payload).unwrap();
+        Frame::new(FrameType::Error, 0, 0, payload.freeze()).unwrap()
+    }
+
     #[test]
     fn accepts_supported_protocol_revision() {
         let mut settings = Settings::default();
         settings.set(SettingKey::ProtocolRevision, 1);
 
         assert!(validate_server_settings(&settings).is_ok());
+    }
+
+    #[test]
+    fn decodes_server_settings_frame() {
+        let mut settings = Settings::default();
+        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::MaxFrameSize, 4096);
+        settings.set(SettingKey::MaxStreams, 8);
+
+        assert_eq!(
+            decode_server_settings_frame(settings_frame(&settings)).unwrap(),
+            settings
+        );
+    }
+
+    #[test]
+    fn maps_auth_failed_error_frame() {
+        let error = decode_server_settings_frame(error_frame(ErrorCode::AuthFailed)).unwrap_err();
+
+        assert!(error.to_string().contains("authentication failed"));
+    }
+
+    #[test]
+    fn rejects_non_auth_handshake_error_frame() {
+        let error = decode_server_settings_frame(error_frame(ErrorCode::Protocol)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("server returned handshake error")
+        );
     }
 
     #[test]

@@ -13,8 +13,8 @@ use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tracing::{info, warn};
 use uk_auth::{AuthChallenge, AuthResponse, ReplayCache, unix_now, verify_auth_response};
 use uk_proto::{
-    Frame, FrameLimits, FrameType, SettingKey, Settings, read_frame, validate_connection_frame,
-    write_frame,
+    ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, SettingKey, Settings, read_frame,
+    validate_connection_frame, write_frame,
 };
 
 use crate::config::ServerConfig;
@@ -137,9 +137,15 @@ async fn complete_handshake(
     validate_connection_frame(&response_frame, FrameType::AuthResponse)?;
 
     let mut response_payload = response_frame.payload;
-    let response = AuthResponse::decode(&mut response_payload)?;
+    let response = match AuthResponse::decode(&mut response_payload) {
+        Ok(response) => response,
+        Err(err) => {
+            let _ = write_connection_error(&mut stream, ErrorCode::AuthFailed).await;
+            return Err(err.into());
+        }
+    };
     let now = unix_now();
-    let credential = {
+    let verification = {
         let mut replay_cache = replay_cache.lock().await;
         verify_auth_response(
             &credentials,
@@ -149,7 +155,14 @@ async fn complete_handshake(
             now,
             Duration::from_secs(config.auth_skew_seconds.unwrap_or(30)),
             &mut replay_cache,
-        )?
+        )
+    };
+    let credential = match verification {
+        Ok(credential) => credential,
+        Err(err) => {
+            let _ = write_connection_error(&mut stream, ErrorCode::AuthFailed).await;
+            return Err(err.into());
+        }
     };
 
     info!(
@@ -164,6 +177,21 @@ async fn complete_handshake(
     write_frame(&mut stream, &settings_frame).await?;
 
     Ok((stream, credential))
+}
+
+async fn write_connection_error(
+    stream: &mut TlsStream<tokio::net::TcpStream>,
+    code: ErrorCode,
+) -> Result<(), AnyError> {
+    let frame = connection_error_frame(code)?;
+    write_frame(stream, &frame).await?;
+    Ok(())
+}
+
+fn connection_error_frame(code: ErrorCode) -> Result<Frame, AnyError> {
+    let mut payload = BytesMut::new();
+    ErrorPayload::new(code).encode(&mut payload)?;
+    Ok(Frame::new(FrameType::Error, 0, 0, payload.freeze())?)
 }
 
 fn server_settings(config: &ServerConfig) -> Settings {
@@ -244,5 +272,18 @@ mod tests {
         assert_eq!(settings.get(SettingKey::MaxFrameSize), Some(32_768));
         assert_eq!(settings.get(SettingKey::MaxStreams), Some(17));
         assert_eq!(settings.get(SettingKey::IdleTimeoutSeconds), Some(42));
+    }
+
+    #[test]
+    fn connection_error_frame_encodes_error_code() {
+        let frame = connection_error_frame(ErrorCode::AuthFailed).unwrap();
+
+        assert_eq!(frame.header.frame_type, FrameType::Error);
+        assert_eq!(frame.header.id, 0);
+        let mut payload = frame.payload;
+        assert_eq!(
+            ErrorPayload::decode(&mut payload).unwrap().code,
+            ErrorCode::AuthFailed
+        );
     }
 }
