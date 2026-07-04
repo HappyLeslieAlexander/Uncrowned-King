@@ -7,6 +7,7 @@ use std::{
     future::Future,
     io,
     net::{IpAddr, SocketAddr},
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -22,6 +23,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::{Mutex, Notify, mpsc},
+    task::JoinSet,
 };
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, info, warn};
@@ -34,11 +36,15 @@ use uk_proto::{
 };
 
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
+const TARGET_CONNECT_PARALLELISM: usize = 4;
 const TARGET_WRITE_QUEUE_CAPACITY: usize = 32;
 
 type AnyError = Box<dyn Error + Send + Sync>;
 type CarrierWriter = Arc<Mutex<WriteHalf<TlsStream<TcpStream>>>>;
 type FlowTable = HashMap<u64, FlowSlot>;
+type BoxedConnectFuture<T> =
+    Pin<Box<dyn Future<Output = (SocketAddr, io::Result<T>)> + Send + 'static>>;
+type TargetConnector<T> = Arc<dyn Fn(SocketAddr) -> BoxedConnectFuture<T> + Send + Sync + 'static>;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RelayLimits {
@@ -1300,22 +1306,73 @@ fn resolved_ips(target: &Target, addrs: &[SocketAddr]) -> Vec<IpAddr> {
 }
 
 async fn connect_socket_addrs(addrs: &[SocketAddr]) -> Result<TcpStream, OpenFailure> {
+    let connector = target_connector();
+    connect_first_successful(addrs, &connector)
+        .await
+        .map_err(OpenFailure::TargetUnavailable)
+}
+
+fn target_connector() -> TargetConnector<TcpStream> {
+    Arc::new(|addr| -> BoxedConnectFuture<TcpStream> { Box::pin(connect_socket_addr(addr)) })
+}
+
+async fn connect_socket_addr(addr: SocketAddr) -> (SocketAddr, io::Result<TcpStream>) {
+    let result = match TcpStream::connect(addr).await {
+        Ok(stream) => stream.set_nodelay(true).map(|()| stream),
+        Err(err) => Err(err),
+    };
+    (addr, result)
+}
+
+async fn connect_first_successful<T>(
+    addrs: &[SocketAddr],
+    connector: &TargetConnector<T>,
+) -> io::Result<T>
+where
+    T: Send + 'static,
+{
+    let mut tasks = JoinSet::new();
+    let mut next_index = 0;
+    spawn_target_connects(addrs, &mut next_index, &mut tasks, connector);
+
     let mut last_error = None;
-    for addr in addrs {
-        match TcpStream::connect(*addr).await {
-            Ok(stream) => {
-                stream
-                    .set_nodelay(true)
-                    .map_err(OpenFailure::TargetUnavailable)?;
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok((addr, Ok(stream))) => {
+                debug!(event = "target.connect.candidate_success", %addr);
+                tasks.abort_all();
                 return Ok(stream);
             }
-            Err(err) => last_error = Some(err),
+            Ok((addr, Err(err))) => {
+                debug!(event = "target.connect.candidate_failed", %addr, error = %err);
+                last_error = Some(err);
+            }
+            Err(err) => {
+                last_error = Some(io::Error::other(err));
+            }
         }
+        spawn_target_connects(addrs, &mut next_index, &mut tasks, connector);
     }
 
-    Err(OpenFailure::TargetUnavailable(last_error.unwrap_or_else(
-        || io::Error::new(io::ErrorKind::NotFound, "target has no socket addresses"),
-    )))
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "target has no socket addresses")
+    }))
+}
+
+fn spawn_target_connects<T>(
+    addrs: &[SocketAddr],
+    next_index: &mut usize,
+    tasks: &mut JoinSet<(SocketAddr, io::Result<T>)>,
+    connector: &TargetConnector<T>,
+) where
+    T: Send + 'static,
+{
+    while *next_index < addrs.len() && tasks.len() < TARGET_CONNECT_PARALLELISM {
+        let addr = addrs[*next_index];
+        *next_index += 1;
+        let connector = Arc::clone(connector);
+        tasks.spawn(async move { connector(addr).await });
+    }
 }
 
 async fn with_optional_timeout<T, F>(
@@ -1882,6 +1939,36 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(OpenFailure::TargetTimeout)));
+    }
+
+    #[tokio::test]
+    async fn target_connect_uses_later_candidate_while_first_is_pending() {
+        let first_addr = SocketAddr::from(([127, 0, 0, 1], 10_001));
+        let second_addr = SocketAddr::from(([127, 0, 0, 1], 10_002));
+        let addrs = [first_addr, second_addr];
+        let connector: TargetConnector<SocketAddr> =
+            Arc::new(move |addr| -> BoxedConnectFuture<SocketAddr> {
+                Box::pin(async move {
+                    if addr == first_addr {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        return (
+                            addr,
+                            Err(io::Error::new(io::ErrorKind::TimedOut, "still pending")),
+                        );
+                    }
+                    (addr, Ok(addr))
+                })
+            });
+
+        let connected = tokio::time::timeout(
+            Duration::from_millis(100),
+            connect_first_successful(&addrs, &connector),
+        )
+        .await
+        .expect("later candidate should complete before the first candidate")
+        .expect("later candidate should succeed");
+
+        assert_eq!(connected, second_addr);
     }
 
     #[test]
