@@ -39,7 +39,7 @@ use uk_client::{
 use uk_proto::{
     ALPN_PROTOCOL, ErrorCode, ErrorPayload, Frame, FrameHeader, FrameIoError, FrameLimits,
     FrameType, SettingKey, Settings, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE,
-    Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR, UdpClose, UdpOpen, read_frame,
+    Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose, UdpOpen, read_frame,
     validate_connection_frame, write_frame,
 };
 use uk_server::config::{CredentialConfig, LimitConfig, ServerConfig};
@@ -242,8 +242,18 @@ async fn reports_protocol_error_for_zero_id_tcp_close() -> Result<(), TestError>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reports_protocol_error_for_zero_id_udp_close() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_zero_id_udp_close_error_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reports_protocol_error_for_malformed_tcp_close() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_malformed_tcp_close_error_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reports_protocol_error_for_malformed_udp_close() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_malformed_udp_close_error_e2e()).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -251,6 +261,15 @@ async fn reports_protocol_error_for_malformed_tcp_open_flags() -> Result<(), Tes
     tokio::time::timeout(
         Duration::from_secs(10),
         run_malformed_tcp_open_flags_error_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reports_invalid_target_for_malformed_udp_open() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_malformed_udp_open_target_error_e2e(),
     )
     .await?
 }
@@ -1658,6 +1677,32 @@ async fn run_zero_id_tcp_close_error_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+async fn run_zero_id_udp_close_error_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = ServerHarness::start(test_limits()).await?;
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(harness.client_config(SECRET)).await?;
+
+    let frame = udp_close_frame(0, UDP_CLOSE_NORMAL)?;
+    write_frame(&mut carrier, &frame).await?;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(response.header.frame_type, FrameType::Error);
+    assert_eq!(response.header.id, 0);
+
+    let mut payload = response.payload;
+    assert_eq!(
+        ErrorPayload::decode(&mut payload)?.code,
+        ErrorCode::Protocol
+    );
+    Ok(())
+}
+
 async fn run_malformed_tcp_close_error_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -1666,6 +1711,32 @@ async fn run_malformed_tcp_close_error_e2e() -> Result<(), TestError> {
         connect_authenticated_carrier(harness.client_config(SECRET)).await?;
 
     let frame = Frame::new(FrameType::TcpClose, 0, 1, Bytes::new())?;
+    write_frame(&mut carrier, &frame).await?;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(response.header.frame_type, FrameType::Error);
+    assert_eq!(response.header.id, 1);
+
+    let mut payload = response.payload;
+    assert_eq!(
+        ErrorPayload::decode(&mut payload)?.code,
+        ErrorCode::Protocol
+    );
+    Ok(())
+}
+
+async fn run_malformed_udp_close_error_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = ServerHarness::start(test_limits()).await?;
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(harness.client_config(SECRET)).await?;
+
+    let frame = Frame::new(FrameType::UdpClose, 0, 1, Bytes::new())?;
     write_frame(&mut carrier, &frame).await?;
 
     let response = tokio::time::timeout(
@@ -1696,6 +1767,19 @@ async fn run_malformed_tcp_open_flags_error_e2e() -> Result<(), TestError> {
     write_frame(&mut carrier, &frame).await?;
     assert_flow_error(&mut carrier, 1, ErrorCode::Protocol).await?;
     assert_tcp_close(&mut carrier, 1, TCP_CLOSE_ERROR).await?;
+    Ok(())
+}
+
+async fn run_malformed_udp_open_target_error_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = ServerHarness::start(test_limits()).await?;
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(harness.client_config(SECRET)).await?;
+
+    write_frame(&mut carrier, &malformed_udp_open_target_frame(1)?).await?;
+    assert_flow_error(&mut carrier, 1, ErrorCode::InvalidTarget).await?;
+    assert_udp_close(&mut carrier, 1, UDP_CLOSE_ERROR).await?;
     Ok(())
 }
 
@@ -3695,6 +3779,15 @@ fn udp_open_frame(flow_id: u64, target_addr: SocketAddr) -> Result<Frame, TestEr
         0,
         flow_id,
         payload.freeze(),
+    )?)
+}
+
+fn malformed_udp_open_target_frame(flow_id: u64) -> Result<Frame, TestError> {
+    Ok(Frame::new(
+        FrameType::UdpOpen,
+        0,
+        flow_id,
+        Bytes::from_static(&[0xff, 0x00, 0x00, 0x35]),
     )?)
 }
 
