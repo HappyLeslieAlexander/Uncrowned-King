@@ -1,6 +1,6 @@
 //! Client configuration.
 
-use std::{error::Error, fs, path::Path};
+use std::{collections::HashSet, error::Error, fs, path::Path};
 
 use serde::Deserialize;
 use uk_auth::{AuthError, validate_key_id, validate_shared_secret};
@@ -99,9 +99,13 @@ impl ClientConfig {
     pub fn validate_network_endpoints(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         validate_endpoint("server_addr", &self.server_addr)
             .map_err(|err| format!("server_addr: {err}"))?;
+        let mut seen = HashSet::from([self.server_addr.as_str()]);
         for (index, endpoint) in self.server_addrs().iter().enumerate() {
             validate_endpoint("server_addrs", endpoint)
                 .map_err(|err| format!("server_addrs[{index}]: {err}"))?;
+            if !seen.insert(endpoint.as_str()) {
+                return Err(format!("server_addrs[{index}]: duplicate server endpoint").into());
+            }
         }
         Ok(())
     }
@@ -527,6 +531,25 @@ secret = "secret"
     fn rejects_invalid_fallback_server_addr() {
         let mut config = minimal_config();
         config.server_addrs = Some(vec!["uk.example.com".to_owned()]);
+
+        assert!(config.validate_network_endpoints().is_err());
+    }
+
+    #[test]
+    fn rejects_fallback_server_addr_duplicate_of_primary() {
+        let mut config = minimal_config();
+        config.server_addrs = Some(vec![config.server_addr.clone()]);
+
+        assert!(config.validate_network_endpoints().is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_fallback_server_addrs() {
+        let mut config = minimal_config();
+        config.server_addrs = Some(vec![
+            "backup.example.com:443".to_owned(),
+            "backup.example.com:443".to_owned(),
+        ]);
 
         assert!(config.validate_network_endpoints().is_err());
     }
