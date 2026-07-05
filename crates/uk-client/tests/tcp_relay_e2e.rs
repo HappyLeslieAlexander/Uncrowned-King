@@ -227,6 +227,16 @@ async fn closes_existing_udp_flow_after_duplicate_udp_open() -> Result<(), TestE
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keeps_session_alive_after_unknown_tcp_data() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_unknown_tcp_data_error_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejects_reserved_relay_flow_ids() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_reserved_flow_id_error_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reports_protocol_error_for_unexpected_session_frame() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -1625,6 +1635,55 @@ async fn run_duplicate_udp_open_error_e2e() -> Result<(), TestError> {
     assert_flow_error(&mut carrier, 1, ErrorCode::Protocol).await?;
 
     target_task.abort();
+    Ok(())
+}
+
+async fn run_unknown_tcp_data_error_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = ServerHarness::start(test_limits()).await?;
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(harness.client_config(SECRET)).await?;
+
+    let data = Frame::new(
+        FrameType::TcpData,
+        0,
+        1,
+        Bytes::from_static(b"orphan tcp data"),
+    )?;
+    write_frame(&mut carrier, &data).await?;
+    assert_flow_error(&mut carrier, 1, ErrorCode::Protocol).await?;
+
+    let payload = Bytes::from_static(b"session survives unknown flow");
+    let keepalive_probe = Frame::new(FrameType::Ping, 0, 0, payload.clone())?;
+    write_frame(&mut carrier, &keepalive_probe).await?;
+
+    let reply_frame = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(reply_frame.header.frame_type, FrameType::Pong);
+    assert_eq!(reply_frame.header.id, 0);
+    assert_eq!(reply_frame.payload, payload);
+    Ok(())
+}
+
+async fn run_reserved_flow_id_error_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let target_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+    let harness = ServerHarness::start(test_limits()).await?;
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(harness.client_config(SECRET)).await?;
+
+    write_frame(&mut carrier, &tcp_open_frame(2, target_addr)?).await?;
+    assert_flow_error(&mut carrier, 2, ErrorCode::Protocol).await?;
+    assert_tcp_close(&mut carrier, 2, TCP_CLOSE_ERROR).await?;
+
+    write_frame(&mut carrier, &udp_open_frame(4, target_addr)?).await?;
+    assert_flow_error(&mut carrier, 4, ErrorCode::Protocol).await?;
+    assert_udp_close(&mut carrier, 4, UDP_CLOSE_ERROR).await?;
     Ok(())
 }
 
@@ -3344,6 +3403,40 @@ async fn assert_flow_error(
     assert_eq!(response.header.id, flow_id);
     let mut payload = response.payload;
     assert_eq!(ErrorPayload::decode(&mut payload)?.code, expected);
+    Ok(())
+}
+
+async fn assert_tcp_close(
+    carrier: &mut ClientTlsStream<TcpStream>,
+    flow_id: u64,
+    expected: u16,
+) -> Result<(), TestError> {
+    let close = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(close.header.frame_type, FrameType::TcpClose);
+    assert_eq!(close.header.id, flow_id);
+    let mut payload = close.payload;
+    assert_eq!(TcpClose::decode(&mut payload)?.close_code, expected);
+    Ok(())
+}
+
+async fn assert_udp_close(
+    carrier: &mut ClientTlsStream<TcpStream>,
+    flow_id: u64,
+    expected: u16,
+) -> Result<(), TestError> {
+    let close = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(close.header.frame_type, FrameType::UdpClose);
+    assert_eq!(close.header.id, flow_id);
+    let mut payload = close.payload;
+    assert_eq!(UdpClose::decode(&mut payload)?.close_code, expected);
     Ok(())
 }
 
