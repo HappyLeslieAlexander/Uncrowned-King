@@ -45,8 +45,11 @@ port_end = 443
 ```
 
 Rules are evaluated in order; the first matching rule wins.
-Known cloud metadata service IPs are denied before ordered rules are evaluated,
-including `169.254.169.254`, `100.100.100.200`, and `fd00:ec2::254`.
+`private = true` matches private, loopback, link-local, documentation,
+multicast, unspecified, shared, benchmarking, and reserved IP ranges, including
+resolved domain addresses. Known cloud metadata service IPs are denied before
+ordered rules are evaluated, including `169.254.169.254`, `100.100.100.200`,
+and `fd00:ec2::254`.
 
 Server limits can advertise and enforce the maximum frame size, concurrent
 carrier sessions, concurrent TCP streams per authenticated session, in-flight
