@@ -2361,7 +2361,7 @@ where
         match result {
             Ok((addr, Ok(stream))) => {
                 debug!(event = "target.connect.candidate_success", %addr);
-                tasks.abort_all();
+                abort_connect_tasks(&mut tasks).await;
                 return Ok(stream);
             }
             Ok((addr, Err(err))) => {
@@ -2377,6 +2377,14 @@ where
     Err(OpenFailure::TargetUnavailable(last_error.unwrap_or_else(
         || io::Error::new(io::ErrorKind::NotFound, "target has no socket addresses"),
     )))
+}
+
+async fn abort_connect_tasks<T>(tasks: &mut JoinSet<(SocketAddr, io::Result<T>)>)
+where
+    T: Send + 'static,
+{
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
 }
 
 fn spawn_target_connects<T>(
@@ -3374,6 +3382,7 @@ mod tests {
         .expect("later candidate should succeed");
 
         assert_eq!(connected, second_addr);
+        assert_eq!(limiter.available_permits(), 2);
     }
 
     #[tokio::test]
