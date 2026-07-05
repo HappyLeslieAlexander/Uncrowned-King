@@ -20,7 +20,7 @@ use rustls::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::{Barrier, oneshot},
     task::JoinHandle,
 };
@@ -117,6 +117,11 @@ type TestError = Box<dyn std::error::Error + Send + Sync>;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relays_tcp_through_socks5_to_echo_target() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_tcp_relay_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relays_udp_through_socks5_to_echo_target() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_udp_relay_e2e()).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -411,6 +416,31 @@ async fn run_tcp_relay_e2e() -> Result<(), TestError> {
     let mut echoed = vec![0_u8; "uncrowned king e2e".len()];
     socks.read_exact(&mut echoed).await?;
     assert_eq!(echoed, b"uncrowned king e2e");
+
+    echo_task.await??;
+    Ok(())
+}
+
+async fn run_udp_relay_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, echo_task) = spawn_udp_echo_target().await?;
+    let harness = RelayHarness::start(Some(allow_loopback_policy(target_addr.port()))).await?;
+    let (_socks_control, udp_relay_addr) = open_socks_udp_associate(harness.socks_addr).await?;
+    let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let payload = b"uncrowned king udp e2e";
+
+    udp_client
+        .send_to(&socks_udp_datagram(target_addr, payload), udp_relay_addr)
+        .await?;
+
+    let mut buf = vec![0_u8; 1024];
+    let (read, peer) =
+        tokio::time::timeout(Duration::from_secs(3), udp_client.recv_from(&mut buf)).await??;
+    assert_eq!(peer, udp_relay_addr);
+    let (reply_target, reply_payload) = parse_socks_udp_datagram(&buf[..read])?;
+    assert_eq!(reply_target, target_addr);
+    assert_eq!(reply_payload, payload);
 
     echo_task.await??;
     Ok(())
@@ -2459,6 +2489,19 @@ async fn spawn_echo_target()
     Ok((addr, task))
 }
 
+async fn spawn_udp_echo_target()
+-> Result<(SocketAddr, tokio::task::JoinHandle<Result<(), TestError>>), TestError> {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = socket.local_addr()?;
+    let task = tokio::spawn(async move {
+        let mut buf = [0_u8; 1024];
+        let (read, peer) = socket.recv_from(&mut buf).await?;
+        socket.send_to(&buf[..read], peer).await?;
+        Ok(())
+    });
+    Ok((addr, task))
+}
+
 async fn spawn_fixed_size_echo_target(
     expected_len: usize,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<Result<(), TestError>>), TestError> {
@@ -2668,6 +2711,56 @@ async fn open_socks_connect(
     Ok((socks, connect_reply))
 }
 
+async fn open_socks_udp_associate(
+    socks_addr: SocketAddr,
+) -> Result<(TcpStream, SocketAddr), TestError> {
+    let mut socks = TcpStream::connect(socks_addr).await?;
+    socks
+        .write_all(&[
+            0x05, 0x01, 0x00, 0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0x00, 0x00,
+        ])
+        .await?;
+
+    let mut method_response = [0_u8; 2];
+    socks.read_exact(&mut method_response).await?;
+    assert_eq!(method_response, [0x05, 0x00]);
+
+    let mut head = [0_u8; 4];
+    socks.read_exact(&mut head).await?;
+    assert_eq!(head[0], 0x05);
+    assert_eq!(head[1], SOCKS_REPLY_SUCCEEDED);
+    assert_eq!(head[2], 0x00);
+    let bound_addr = read_socks_reply_addr(&mut socks, head[3]).await?;
+    Ok((socks, bound_addr))
+}
+
+async fn read_socks_reply_addr(
+    socks: &mut TcpStream,
+    addr_type: u8,
+) -> Result<SocketAddr, TestError> {
+    match addr_type {
+        0x01 => {
+            let mut octets = [0_u8; 4];
+            socks.read_exact(&mut octets).await?;
+            let port = read_socks_port(socks).await?;
+            Ok(SocketAddr::from((Ipv4Addr::from(octets), port)))
+        }
+        0x04 => {
+            let mut octets = [0_u8; 16];
+            socks.read_exact(&mut octets).await?;
+            let port = read_socks_port(socks).await?;
+            Ok(SocketAddr::from((Ipv6Addr::from(octets), port)))
+        }
+        other => Err(format!("unexpected socks reply address type: {other:#x}").into()),
+    }
+}
+
+async fn read_socks_port(socks: &mut TcpStream) -> Result<u16, TestError> {
+    let mut port = [0_u8; 2];
+    socks.read_exact(&mut port).await?;
+    Ok(u16::from_be_bytes(port))
+}
+
 fn tcp_open_frame(flow_id: u64, target_addr: SocketAddr) -> Result<Frame, TestError> {
     let open = TcpOpen::new(target_from_socket_addr(target_addr), TCP_OPEN_FLAGS_NONE);
     let mut payload = BytesMut::new();
@@ -2768,6 +2861,52 @@ fn socks_connect_request(target_addr: SocketAddr) -> Vec<u8> {
     }
     request.extend_from_slice(&port.to_be_bytes());
     request
+}
+
+fn socks_udp_datagram(target_addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let mut datagram = vec![0x00, 0x00, 0x00];
+    match target_addr {
+        SocketAddr::V4(addr) => {
+            datagram.push(0x01);
+            datagram.extend_from_slice(&addr.ip().octets());
+            datagram.extend_from_slice(&addr.port().to_be_bytes());
+        }
+        SocketAddr::V6(addr) => {
+            datagram.push(0x04);
+            datagram.extend_from_slice(&addr.ip().octets());
+            datagram.extend_from_slice(&addr.port().to_be_bytes());
+        }
+    }
+    datagram.extend_from_slice(payload);
+    datagram
+}
+
+fn parse_socks_udp_datagram(datagram: &[u8]) -> Result<(SocketAddr, Vec<u8>), TestError> {
+    if datagram.len() < 4 || datagram[0] != 0 || datagram[1] != 0 || datagram[2] != 0 {
+        return Err("invalid socks udp datagram header".into());
+    }
+    match datagram[3] {
+        0x01 => {
+            if datagram.len() < 10 {
+                return Err("truncated socks udp ipv4 datagram".into());
+            }
+            let addr = Ipv4Addr::new(datagram[4], datagram[5], datagram[6], datagram[7]);
+            let port = u16::from_be_bytes([datagram[8], datagram[9]]);
+            Ok((SocketAddr::from((addr, port)), datagram[10..].to_vec()))
+        }
+        0x04 => {
+            if datagram.len() < 22 {
+                return Err("truncated socks udp ipv6 datagram".into());
+            }
+            let octets: [u8; 16] = datagram[4..20].try_into()?;
+            let port = u16::from_be_bytes([datagram[20], datagram[21]]);
+            Ok((
+                SocketAddr::from((Ipv6Addr::from(octets), port)),
+                datagram[22..].to_vec(),
+            ))
+        }
+        other => Err(format!("unexpected socks udp address type: {other:#x}").into()),
+    }
 }
 
 async fn assert_echo_roundtrip(
