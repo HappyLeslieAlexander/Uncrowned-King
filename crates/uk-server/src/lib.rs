@@ -302,6 +302,8 @@ fn server_settings(config: &ServerConfig) -> Settings {
     settings.set(SettingKey::MaxFrameSize, config.max_frame_size());
     settings.set(SettingKey::MaxStreams, config.max_streams());
     settings.set(SettingKey::MaxUdpFlows, config.max_udp_flows());
+    settings.set(SettingKey::SupportsUdpDatagram, 0);
+    settings.set(SettingKey::SupportsUdpStreamFallback, 1);
     settings.set(
         SettingKey::IdleTimeoutSeconds,
         config.idle_timeout_seconds(),
@@ -404,6 +406,8 @@ mod tests {
         assert_eq!(settings.get(SettingKey::MaxFrameSize), Some(32_768));
         assert_eq!(settings.get(SettingKey::MaxStreams), Some(17));
         assert_eq!(settings.get(SettingKey::MaxUdpFlows), Some(11));
+        assert_eq!(settings.get(SettingKey::SupportsUdpDatagram), Some(0));
+        assert_eq!(settings.get(SettingKey::SupportsUdpStreamFallback), Some(1));
         assert_eq!(settings.get(SettingKey::IdleTimeoutSeconds), Some(42));
     }
 

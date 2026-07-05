@@ -133,6 +133,16 @@ fn validate_server_settings(settings: &Settings) -> Result<(), AnyError> {
     }
     reject_zero_setting(settings, SettingKey::MaxFrameSize, "max_frame_size")?;
     reject_zero_setting(settings, SettingKey::MaxStreams, "max_streams")?;
+    reject_boolean_setting(
+        settings,
+        SettingKey::SupportsUdpDatagram,
+        "supports_udp_datagram",
+    )?;
+    reject_boolean_setting(
+        settings,
+        SettingKey::SupportsUdpStreamFallback,
+        "supports_udp_stream_fallback",
+    )?;
     reject_small_setting(
         settings,
         SettingKey::MaxFrameSize,
@@ -155,6 +165,18 @@ fn reject_zero_setting(
 ) -> Result<(), AnyError> {
     if settings.get(key) == Some(0) {
         Err(format!("{name} must be greater than zero").into())
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_boolean_setting(
+    settings: &Settings,
+    key: SettingKey,
+    name: &'static str,
+) -> Result<(), AnyError> {
+    if settings.get(key).is_some_and(|value| value > 1) {
+        Err(format!("{name} must be 0 or 1").into())
     } else {
         Ok(())
     }
@@ -292,6 +314,25 @@ mod tests {
         let mut settings = Settings::default();
         settings.set(SettingKey::ProtocolRevision, 1);
         settings.set(SettingKey::MaxStreams, 0);
+
+        assert!(validate_server_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn accepts_boolean_udp_support_settings() {
+        let mut settings = Settings::default();
+        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::SupportsUdpDatagram, 0);
+        settings.set(SettingKey::SupportsUdpStreamFallback, 1);
+
+        assert!(validate_server_settings(&settings).is_ok());
+    }
+
+    #[test]
+    fn rejects_non_boolean_udp_support_settings() {
+        let mut settings = Settings::default();
+        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::SupportsUdpStreamFallback, 2);
 
         assert!(validate_server_settings(&settings).is_err());
     }

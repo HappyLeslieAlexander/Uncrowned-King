@@ -62,6 +62,7 @@ struct ClientSession {
     data_frame_size: usize,
     max_streams: u64,
     max_udp_flows: u64,
+    supports_udp_stream_fallback: bool,
     max_pending_open_bytes: usize,
     max_buffered_bytes_per_session: usize,
     max_buffered_bytes_per_flow: usize,
@@ -572,6 +573,7 @@ impl ClientSession {
             data_frame_size: tcp_data_frame_size(limits),
             max_streams: max_streams(&settings),
             max_udp_flows: max_udp_flows(&settings),
+            supports_udp_stream_fallback: supports_udp_stream_fallback(&settings),
             max_pending_open_bytes: usize_limit(config.max_pending_open_bytes())?,
             max_buffered_bytes_per_session: usize_limit(config.max_buffered_bytes_per_session())?,
             max_buffered_bytes_per_flow: usize_limit(config.max_buffered_bytes_per_flow())?,
@@ -668,6 +670,9 @@ impl ClientSession {
     async fn open_udp_flow(self: &Arc<Self>, target: Target) -> Result<OpenOutcome, AnyError> {
         if self.is_closed() {
             return Err("uk session is closed".into());
+        }
+        if !self.supports_udp_stream_fallback {
+            return Ok(OpenOutcome::Rejected(socks5::Reply::GeneralFailure));
         }
         let Some((flow_id, frames)) = self.reserve_flow(FlowProtocol::Udp).await? else {
             return Ok(OpenOutcome::Rejected(socks5::Reply::GeneralFailure));
@@ -1980,6 +1985,13 @@ fn max_udp_flows(settings: &uk_proto::Settings) -> u64 {
         .unwrap_or_else(|| max_streams(settings))
 }
 
+fn supports_udp_stream_fallback(settings: &uk_proto::Settings) -> bool {
+    settings
+        .get(SettingKey::SupportsUdpStreamFallback)
+        .unwrap_or(1)
+        != 0
+}
+
 fn keepalive_interval(settings: &uk_proto::Settings) -> Option<Duration> {
     let idle_timeout_seconds = settings.get(SettingKey::IdleTimeoutSeconds)?;
     if idle_timeout_seconds == 0 {
@@ -2964,6 +2976,21 @@ mod tests {
         settings.set(SettingKey::MaxUdpFlows, 0);
 
         assert_eq!(max_udp_flows(&settings), 0);
+    }
+
+    #[test]
+    fn udp_stream_fallback_defaults_to_supported_for_legacy_settings() {
+        let settings = uk_proto::Settings::default();
+
+        assert!(supports_udp_stream_fallback(&settings));
+    }
+
+    #[test]
+    fn udp_stream_fallback_can_be_disabled_by_settings() {
+        let mut settings = uk_proto::Settings::default();
+        settings.set(SettingKey::SupportsUdpStreamFallback, 0);
+
+        assert!(!supports_udp_stream_fallback(&settings));
     }
 
     #[test]

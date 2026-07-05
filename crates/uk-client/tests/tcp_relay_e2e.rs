@@ -2561,6 +2561,8 @@ fn fake_server_settings() -> Settings {
     settings.set(SettingKey::MaxFrameSize, 65_536);
     settings.set(SettingKey::MaxStreams, 8);
     settings.set(SettingKey::MaxUdpFlows, 8);
+    settings.set(SettingKey::SupportsUdpDatagram, 0);
+    settings.set(SettingKey::SupportsUdpStreamFallback, 1);
     settings.set(SettingKey::IdleTimeoutSeconds, 30);
     settings
 }

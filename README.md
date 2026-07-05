@@ -19,6 +19,7 @@ The repository currently focuses on the first runnable v0.1 TLS/TCP carrier:
 - graceful Ctrl+C/SIGTERM shutdown for long-running client and server listeners
 - nonce-matched PING/PONG keepalive for active relay flows
 - negotiated UDP flow limits and idle UDP flow cleanup on both client and server
+- SETTINGS-advertised UDP stream fallback capability for the TLS/TCP carrier
 
 The first runnable proxy targets are:
 
