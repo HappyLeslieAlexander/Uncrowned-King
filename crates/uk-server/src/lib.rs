@@ -174,6 +174,7 @@ async fn handle_connection(
             max_buffered_bytes_per_flow: usize_limit(config.max_buffered_bytes_per_flow()),
             target_connect_timeout: target_connect_timeout(config.target_connect_timeout_seconds()),
             tcp_half_close_timeout: tcp_half_close_timeout(config.tcp_half_close_timeout_seconds()),
+            udp_flow_idle_timeout: udp_flow_idle_timeout(config.udp_flow_idle_timeout_seconds()),
         }),
         idle_timeout(config.idle_timeout_seconds()),
         shutdown_rx,
@@ -324,6 +325,10 @@ fn tcp_half_close_timeout(seconds: u64) -> Option<Duration> {
     (seconds != 0).then(|| Duration::from_secs(seconds))
 }
 
+fn udp_flow_idle_timeout(seconds: u64) -> Option<Duration> {
+    (seconds != 0).then(|| Duration::from_secs(seconds))
+}
+
 fn is_clean_tls_handshake_disconnect(error: &AnyError) -> bool {
     error
         .as_ref()
@@ -388,6 +393,7 @@ mod tests {
             handshake_timeout_seconds: None,
             target_connect_timeout_seconds: None,
             tcp_half_close_timeout_seconds: None,
+            udp_flow_idle_timeout_seconds: None,
             replay_cache_window_seconds: None,
             replay_cache_max_entries: None,
         });

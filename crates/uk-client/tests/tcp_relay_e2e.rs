@@ -140,6 +140,15 @@ async fn releases_idle_udp_flow_for_new_target() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_expires_idle_udp_flow_for_new_target() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_server_udp_flow_idle_reuse_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relays_data_sent_before_socks_success_reply() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_early_socks_data_e2e()).await?
 }
@@ -560,6 +569,51 @@ async fn run_udp_flow_idle_reuse_e2e() -> Result<(), TestError> {
     let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let first_payload = b"uncrowned king udp idle first target";
     let second_payload = b"uncrowned king udp idle second target";
+
+    udp_client
+        .send_to(
+            &socks_udp_datagram(first_target_addr, first_payload),
+            udp_relay_addr,
+        )
+        .await?;
+    let (reply_target, reply_payload) =
+        recv_socks_udp_datagram(&udp_client, udp_relay_addr).await?;
+    assert_eq!(reply_target, first_target_addr);
+    assert_eq!(reply_payload, first_payload);
+    first_echo_task.await??;
+
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+
+    udp_client
+        .send_to(
+            &socks_udp_datagram(second_target_addr, second_payload),
+            udp_relay_addr,
+        )
+        .await?;
+    let (reply_target, reply_payload) =
+        recv_socks_udp_datagram(&udp_client, udp_relay_addr).await?;
+    assert_eq!(reply_target, second_target_addr);
+    assert_eq!(reply_payload, second_payload);
+
+    second_echo_task.await??;
+    Ok(())
+}
+
+async fn run_server_udp_flow_idle_reuse_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (first_target_addr, first_echo_task) = spawn_udp_echo_target().await?;
+    let (second_target_addr, second_echo_task) = spawn_udp_echo_target().await?;
+    let harness = RelayHarness::start_with_client_udp_idle_timeout(
+        Some(allow_loopback_any_port_policy()),
+        test_limits_with_udp_idle_timeout(1),
+        0,
+    )
+    .await?;
+    let (_socks_control, udp_relay_addr) = open_socks_udp_associate(harness.socks_addr).await?;
+    let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let first_payload = b"uncrowned king server udp idle first";
+    let second_payload = b"uncrowned king server udp idle second";
 
     udp_client
         .send_to(
@@ -3154,6 +3208,7 @@ fn test_limits() -> LimitConfig {
         handshake_timeout_seconds: Some(3),
         target_connect_timeout_seconds: Some(3),
         tcp_half_close_timeout_seconds: Some(3),
+        udp_flow_idle_timeout_seconds: None,
         replay_cache_window_seconds: None,
         replay_cache_max_entries: None,
     }
@@ -3168,6 +3223,12 @@ fn test_limits_with_max_streams(max_streams: u64) -> LimitConfig {
 fn test_limits_with_max_udp_flows(max_udp_flows: u64) -> LimitConfig {
     let mut limits = test_limits();
     limits.max_udp_flows = Some(max_udp_flows);
+    limits
+}
+
+fn test_limits_with_udp_idle_timeout(udp_flow_idle_timeout_seconds: u64) -> LimitConfig {
+    let mut limits = test_limits_with_max_udp_flows(1);
+    limits.udp_flow_idle_timeout_seconds = Some(udp_flow_idle_timeout_seconds);
     limits
 }
 

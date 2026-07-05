@@ -73,6 +73,7 @@ pub(crate) struct RelayLimits {
     max_buffered_bytes_per_flow: usize,
     target_connect_timeout: Option<Duration>,
     tcp_half_close_timeout: Option<Duration>,
+    udp_flow_idle_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,6 +86,7 @@ pub(crate) struct RelayLimitConfig {
     pub(crate) max_buffered_bytes_per_flow: usize,
     pub(crate) target_connect_timeout: Option<Duration>,
     pub(crate) tcp_half_close_timeout: Option<Duration>,
+    pub(crate) udp_flow_idle_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +138,7 @@ enum FlowEvent {
     },
     ReadClosed(u64),
     UdpReadClosed(u64),
+    UdpActivity(u64),
     HalfCloseDrainExpired {
         flow_id: u64,
         token: FlowToken,
@@ -156,6 +159,7 @@ enum SessionEvent {
     Frame(Frame),
     FrameReadError(FrameIoError),
     IdleTimeout,
+    UdpIdleMaintenance,
     PeerClosed,
     Shutdown,
 }
@@ -255,6 +259,7 @@ struct TargetFlow {
 struct UdpTargetFlow {
     socket: Arc<UdpSocket>,
     control: TargetFlowControl,
+    last_activity: time::Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -330,6 +335,7 @@ pub(crate) async fn relay_session(
         flow_tokens,
     };
     let mut idle_deadline = next_idle_deadline(idle_timeout);
+    let mut udp_idle_interval = udp_idle_interval(limits.udp_flow_idle_timeout);
 
     let result = loop {
         let event = match next_session_event(
@@ -337,6 +343,7 @@ pub(crate) async fn relay_session(
             &mut event_rx,
             limits.frame,
             idle_deadline,
+            &mut udp_idle_interval,
             &mut shutdown_rx,
         )
         .await
@@ -352,6 +359,11 @@ pub(crate) async fn relay_session(
             }
             SessionEvent::Frame(frame) => {
                 if let Err(err) = handle_session_frame(frame, &context, &mut target_writers).await {
+                    break Err(err);
+                }
+            }
+            SessionEvent::UdpIdleMaintenance => {
+                if let Err(err) = close_idle_udp_flows(&context, &mut target_writers).await {
                     break Err(err);
                 }
             }
@@ -409,6 +421,11 @@ async fn handle_flow_event(
             if matches!(target_writers.get(&flow_id), Some(FlowSlot::Udp(_))) {
                 remove_flow_slot(target_writers, flow_id);
                 info!(event = "udp.closed", flow_id);
+            }
+        }
+        Some(FlowEvent::UdpActivity(flow_id)) => {
+            if let Some(target) = udp_target_flow_mut(target_writers, flow_id) {
+                target.record_activity();
             }
         }
         Some(FlowEvent::HalfCloseDrainExpired {
@@ -532,6 +549,7 @@ async fn next_session_event(
     event_rx: &mut mpsc::UnboundedReceiver<FlowEvent>,
     limits: FrameLimits,
     idle_deadline: Option<time::Instant>,
+    udp_idle_interval: &mut Option<time::Interval>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<SessionEvent, AnyError> {
     if *shutdown_rx.borrow() {
@@ -547,6 +565,9 @@ async fn next_session_event(
                 Ok(SessionEvent::Shutdown)
             }
             () = time::sleep_until(idle_deadline) => Ok(SessionEvent::IdleTimeout),
+            () = tick_udp_idle_interval(udp_idle_interval), if udp_idle_interval.is_some() => {
+                Ok(SessionEvent::UdpIdleMaintenance)
+            }
         }
     } else {
         tokio::select! {
@@ -556,6 +577,9 @@ async fn next_session_event(
                 let _ = changed;
                 Ok(SessionEvent::Shutdown)
             }
+            () = tick_udp_idle_interval(udp_idle_interval), if udp_idle_interval.is_some() => {
+                Ok(SessionEvent::UdpIdleMaintenance)
+            }
         }
     }
 }
@@ -563,7 +587,8 @@ async fn next_session_event(
 fn session_event_counts_as_activity(event: &SessionEvent) -> bool {
     matches!(
         event,
-        SessionEvent::Frame(_) | SessionEvent::Flow(Some(FlowEvent::Activity))
+        SessionEvent::Frame(_)
+            | SessionEvent::Flow(Some(FlowEvent::Activity | FlowEvent::UdpActivity(_)))
     )
 }
 
@@ -573,6 +598,19 @@ fn next_idle_deadline(idle_timeout: Option<Duration>) -> Option<time::Instant> {
             .checked_add(timeout)
             .unwrap_or_else(time::Instant::now)
     })
+}
+
+fn udp_idle_interval(idle_timeout: Option<Duration>) -> Option<time::Interval> {
+    let idle_timeout = idle_timeout?;
+    Some(time::interval(idle_timeout.min(Duration::from_secs(1))))
+}
+
+async fn tick_udp_idle_interval(interval: &mut Option<time::Interval>) {
+    if let Some(interval) = interval {
+        interval.tick().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
 }
 
 fn map_frame_event(result: Result<Frame, FrameIoError>) -> SessionEvent {
@@ -1100,6 +1138,7 @@ async fn forward_udp_data_frame(
         send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
         return Ok(());
     };
+    target.record_activity();
     if let Err(err) = target.socket.send(&payload).await {
         warn!(event = "udp.target.write.error", flow_id, error = %err);
         send_error(
@@ -1153,6 +1192,32 @@ async fn handle_udp_close_frame(
     };
     if should_remove {
         remove_flow_slot(target_writers, flow_id);
+    }
+    Ok(())
+}
+
+async fn close_idle_udp_flows(
+    context: &RelaySessionContext<'_>,
+    target_writers: &mut FlowTable,
+) -> Result<(), AnyError> {
+    let Some(idle_timeout) = context.limits.udp_flow_idle_timeout else {
+        return Ok(());
+    };
+    let now = time::Instant::now();
+    let expired = target_writers
+        .iter()
+        .filter_map(|(flow_id, slot)| match slot {
+            FlowSlot::Udp(target) if now.duration_since(target.last_activity) >= idle_timeout => {
+                Some(*flow_id)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    for flow_id in expired {
+        send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_NORMAL).await?;
+        remove_flow_slot(target_writers, flow_id);
+        info!(event = "udp.idle_timeout", flow_id);
     }
     Ok(())
 }
@@ -1574,6 +1639,7 @@ impl RelayLimits {
             max_buffered_bytes_per_flow: config.max_buffered_bytes_per_flow,
             target_connect_timeout: config.target_connect_timeout,
             tcp_half_close_timeout: config.tcp_half_close_timeout,
+            udp_flow_idle_timeout: config.udp_flow_idle_timeout,
         }
     }
 }
@@ -1955,11 +2021,19 @@ impl Drop for TargetFlow {
 
 impl UdpTargetFlow {
     fn new(socket: Arc<UdpSocket>, control: TargetFlowControl) -> Self {
-        Self { socket, control }
+        Self {
+            socket,
+            control,
+            last_activity: time::Instant::now(),
+        }
     }
 
     fn abort(&self) {
         self.control.abort();
+    }
+
+    fn record_activity(&mut self) {
+        self.last_activity = time::Instant::now();
     }
 }
 
@@ -2055,7 +2129,7 @@ async fn relay_udp_target_to_client(
             Bytes::copy_from_slice(&target_buf[..read]),
         )
         .await?;
-        let _ = event_tx.send(FlowEvent::Activity);
+        let _ = event_tx.send(FlowEvent::UdpActivity(flow_id));
     }
 }
 
@@ -3013,6 +3087,9 @@ mod tests {
     fn target_data_events_count_as_session_activity() {
         assert!(session_event_counts_as_activity(&SessionEvent::Flow(Some(
             FlowEvent::Activity
+        ))));
+        assert!(session_event_counts_as_activity(&SessionEvent::Flow(Some(
+            FlowEvent::UdpActivity(1)
         ))));
     }
 
