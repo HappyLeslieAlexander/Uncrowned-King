@@ -91,6 +91,7 @@ struct ClientFlow {
 struct UdpAssociation {
     socket: Arc<UdpSocket>,
     idle_timeout: Option<Duration>,
+    flow_event_tx: mpsc::UnboundedSender<UdpAssociationFlowEvent>,
     client_endpoint: Option<SocketAddr>,
     flows_by_target: HashMap<Target, UdpAssociationFlow>,
     flow_tasks: JoinSet<UdpFlowTaskResult>,
@@ -107,6 +108,10 @@ struct UdpFlowTaskResult {
     flow_id: u64,
     target: Target,
     outcome: Result<(), AnyError>,
+}
+
+enum UdpAssociationFlowEvent {
+    Activity { flow_id: u64, target: Target },
 }
 
 enum OpenOutcome {
@@ -1488,7 +1493,9 @@ async fn relay_udp_association(
     let bound_endpoint = socks5::SocksEndpoint::from(socket.local_addr()?);
     socks5::send_reply_with_endpoint(&mut local, socks5::Reply::Succeeded, &bound_endpoint).await?;
 
-    let mut association = UdpAssociation::new(socket, sessions.udp_flow_idle_timeout());
+    let (flow_event_tx, mut flow_event_rx) = mpsc::unbounded_channel();
+    let mut association =
+        UdpAssociation::new(socket, sessions.udp_flow_idle_timeout(), flow_event_tx);
     let mut idle_interval = udp_idle_interval(association.idle_timeout);
     let mut udp_buf = vec![0_u8; UDP_ASSOCIATION_BUFFER_SIZE].into_boxed_slice();
     let mut tcp_buf = [0_u8; 1];
@@ -1519,6 +1526,9 @@ async fn relay_udp_association(
             joined = association.flow_tasks.join_next(), if !association.flow_tasks.is_empty() => {
                 association.handle_flow_task_result(joined);
             }
+            event = flow_event_rx.recv() => {
+                association.handle_flow_event(event);
+            }
             () = tick_udp_idle_interval(&mut idle_interval), if idle_interval.is_some() => {
                 association.close_idle_flows().await;
             }
@@ -1530,10 +1540,15 @@ async fn relay_udp_association(
 }
 
 impl UdpAssociation {
-    fn new(socket: Arc<UdpSocket>, idle_timeout: Option<Duration>) -> Self {
+    fn new(
+        socket: Arc<UdpSocket>,
+        idle_timeout: Option<Duration>,
+        flow_event_tx: mpsc::UnboundedSender<UdpAssociationFlowEvent>,
+    ) -> Self {
         Self {
             socket,
             idle_timeout,
+            flow_event_tx,
             client_endpoint: None,
             flows_by_target: HashMap::new(),
             flow_tasks: JoinSet::new(),
@@ -1615,6 +1630,7 @@ impl UdpAssociation {
         shutdown_rx: watch::Receiver<bool>,
     ) {
         let socket = Arc::clone(&self.socket);
+        let flow_event_tx = self.flow_event_tx.clone();
         let Some(client_endpoint) = self.client_endpoint else {
             warn!(
                 event = "client.udp_flow.missing_client_endpoint",
@@ -1625,7 +1641,15 @@ impl UdpAssociation {
             return;
         };
         self.flow_tasks.spawn(async move {
-            relay_udp_flow_to_client(flow, target, socket, client_endpoint, shutdown_rx).await
+            relay_udp_flow_to_client(
+                flow,
+                target,
+                socket,
+                client_endpoint,
+                shutdown_rx,
+                flow_event_tx,
+            )
+            .await
         });
     }
 
@@ -1669,6 +1693,18 @@ impl UdpAssociation {
             Err(err) => {
                 warn!(event = "client.udp_flow.join_error", error = %err);
             }
+        }
+    }
+
+    fn handle_flow_event(&mut self, event: Option<UdpAssociationFlowEvent>) {
+        let Some(UdpAssociationFlowEvent::Activity { flow_id, target }) = event else {
+            return;
+        };
+        let Some(flow) = self.flows_by_target.get_mut(&target) else {
+            return;
+        };
+        if flow.id == flow_id {
+            flow.record_activity();
         }
     }
 
@@ -1720,12 +1756,19 @@ async fn relay_udp_flow_to_client(
     socket: Arc<UdpSocket>,
     client_endpoint: SocketAddr,
     shutdown_rx: watch::Receiver<bool>,
+    flow_event_tx: mpsc::UnboundedSender<UdpAssociationFlowEvent>,
 ) -> UdpFlowTaskResult {
     let flow_id = flow.id;
     let session = Arc::clone(&flow.session);
-    let outcome =
-        relay_udp_flow_to_client_inner(flow, target.clone(), socket, client_endpoint, shutdown_rx)
-            .await;
+    let outcome = relay_udp_flow_to_client_inner(
+        flow,
+        target.clone(),
+        socket,
+        client_endpoint,
+        shutdown_rx,
+        flow_event_tx,
+    )
+    .await;
     session.flows.lock().await.remove(&flow_id);
     UdpFlowTaskResult {
         flow_id,
@@ -1740,7 +1783,9 @@ async fn relay_udp_flow_to_client_inner(
     socket: Arc<UdpSocket>,
     client_endpoint: SocketAddr,
     mut shutdown_rx: watch::Receiver<bool>,
+    flow_event_tx: mpsc::UnboundedSender<UdpAssociationFlowEvent>,
 ) -> Result<(), AnyError> {
+    let flow_id = flow.id;
     loop {
         tokio::select! {
             changed = shutdown_rx.changed() => {
@@ -1755,6 +1800,10 @@ async fn relay_udp_flow_to_client_inner(
                     FrameType::UdpData => {
                         let packet = socks5::encode_udp_datagram(&target, &frame.payload)?;
                         socket.send_to(&packet, client_endpoint).await?;
+                        let _ = flow_event_tx.send(UdpAssociationFlowEvent::Activity {
+                            flow_id,
+                            target: target.clone(),
+                        });
                     }
                     FrameType::UdpClose => {
                         let mut payload = frame.payload;

@@ -180,6 +180,15 @@ async fn releases_idle_udp_flow_for_new_target() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keeps_udp_flow_alive_on_downstream_activity() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_udp_downstream_activity_idle_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_expires_idle_udp_flow_for_new_target() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -805,6 +814,42 @@ async fn run_udp_flow_idle_reuse_e2e() -> Result<(), TestError> {
     assert_eq!(reply_payload, second_payload);
 
     second_echo_task.await??;
+    Ok(())
+}
+
+async fn run_udp_downstream_activity_idle_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, target_task) = spawn_udp_downstream_activity_target().await?;
+    let harness = RelayHarness::start_with_client_udp_idle_timeout(
+        Some(allow_loopback_any_port_policy()),
+        test_limits(),
+        1,
+    )
+    .await?;
+    let (_socks_control, udp_relay_addr) = open_socks_udp_associate(harness.socks_addr).await?;
+    let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+
+    udp_client
+        .send_to(
+            &socks_udp_datagram(target_addr, b"Uncrowned King downstream activity"),
+            udp_relay_addr,
+        )
+        .await?;
+
+    for expected in [
+        b"downstream-0".as_slice(),
+        b"downstream-1".as_slice(),
+        b"downstream-2".as_slice(),
+        b"downstream-3".as_slice(),
+    ] {
+        let (reply_target, reply_payload) =
+            recv_socks_udp_datagram(&udp_client, udp_relay_addr).await?;
+        assert_eq!(reply_target, target_addr);
+        assert_eq!(reply_payload, expected);
+    }
+
+    target_task.await??;
     Ok(())
 }
 
@@ -3472,6 +3517,27 @@ async fn spawn_udp_echo_target()
         let mut buf = [0_u8; 1024];
         let (read, peer) = socket.recv_from(&mut buf).await?;
         socket.send_to(&buf[..read], peer).await?;
+        Ok(())
+    });
+    Ok((addr, task))
+}
+
+async fn spawn_udp_downstream_activity_target()
+-> Result<(SocketAddr, tokio::task::JoinHandle<Result<(), TestError>>), TestError> {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = socket.local_addr()?;
+    let task = tokio::spawn(async move {
+        let mut buf = [0_u8; 1024];
+        let (_read, peer) = socket.recv_from(&mut buf).await?;
+        for payload in [
+            b"downstream-0".as_slice(),
+            b"downstream-1".as_slice(),
+            b"downstream-2".as_slice(),
+            b"downstream-3".as_slice(),
+        ] {
+            socket.send_to(payload, peer).await?;
+            tokio::time::sleep(Duration::from_millis(700)).await;
+        }
         Ok(())
     });
     Ok((addr, task))
