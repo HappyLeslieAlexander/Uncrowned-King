@@ -140,6 +140,15 @@ async fn respects_disabled_udp_stream_fallback_setting() -> Result<(), TestError
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reports_udp_associate_failure_when_server_is_unavailable() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_udp_associate_server_unavailable_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enforces_udp_flow_limit_per_session() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_udp_flow_limit_e2e()).await?
 }
@@ -543,27 +552,51 @@ async fn run_udp_stream_fallback_disabled_e2e() -> Result<(), TestError> {
     init_tracing();
 
     let mut harness = UdpStreamFallbackDisabledServerHarness::start().await?;
-    let (_socks_control, udp_relay_addr) = open_socks_udp_associate(harness.socks_addr).await?;
-    let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let (mut socks_control, head) = open_socks_udp_associate_reply(harness.socks_addr).await?;
+    assert_eq!(head[1], SOCKS_REPLY_GENERAL_FAILURE);
+    let bound_addr = read_socks_reply_addr(&mut socks_control, head[3]).await?;
+    assert_eq!(bound_addr, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
 
-    udp_client
-        .send_to(
-            &socks_udp_datagram(
-                SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
-                b"udp stream fallback disabled",
-            ),
-            udp_relay_addr,
-        )
-        .await?;
-
-    let mut buf = [0_u8; 1024];
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), udp_client.recv_from(&mut buf))
-            .await
-            .is_err(),
-        "client should not relay UDP when the server disables stream fallback"
-    );
     harness.observed_no_udp_open().await?;
+    Ok(())
+}
+
+async fn run_udp_associate_server_unavailable_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    fs::write(&cert_path, CERT_PEM)?;
+    let server_addr = unused_loopback_addr().await?;
+    let socks_addr = unused_loopback_addr().await?;
+    let mut client_task = tokio::spawn(run_socks5_listener(
+        ClientConfig {
+            server_addr: server_addr.to_string(),
+            server_addrs: None,
+            server_name: "localhost".to_owned(),
+            ca_cert_path: path_string(&cert_path),
+            key_id: KEY_ID.to_owned(),
+            secret: SECRET.to_owned(),
+            handshake_timeout_seconds: Some(1),
+            socks_handshake_timeout_seconds: Some(3),
+            tcp_open_timeout_seconds: Some(3),
+            udp_flow_idle_timeout_seconds: None,
+            max_pending_open_bytes: None,
+            max_socks_connections: None,
+            max_buffered_bytes_per_session: None,
+            max_buffered_bytes_per_flow: None,
+        },
+        socks_addr.to_string(),
+    ));
+    wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+
+    let (mut socks_control, head) = open_socks_udp_associate_reply(socks_addr).await?;
+    assert_eq!(head[1], SOCKS_REPLY_GENERAL_FAILURE);
+    let bound_addr = read_socks_reply_addr(&mut socks_control, head[3]).await?;
+    assert_eq!(bound_addr, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
+
+    client_task.abort();
+    fs::remove_dir_all(&temp_dir)?;
     Ok(())
 }
 
@@ -3237,6 +3270,15 @@ async fn open_socks_connect(
 async fn open_socks_udp_associate(
     socks_addr: SocketAddr,
 ) -> Result<(TcpStream, SocketAddr), TestError> {
+    let (mut socks, head) = open_socks_udp_associate_reply(socks_addr).await?;
+    assert_eq!(head[1], SOCKS_REPLY_SUCCEEDED);
+    let bound_addr = read_socks_reply_addr(&mut socks, head[3]).await?;
+    Ok((socks, bound_addr))
+}
+
+async fn open_socks_udp_associate_reply(
+    socks_addr: SocketAddr,
+) -> Result<(TcpStream, [u8; 4]), TestError> {
     let mut socks = TcpStream::connect(socks_addr).await?;
     socks
         .write_all(&[
@@ -3251,10 +3293,8 @@ async fn open_socks_udp_associate(
     let mut head = [0_u8; 4];
     socks.read_exact(&mut head).await?;
     assert_eq!(head[0], 0x05);
-    assert_eq!(head[1], SOCKS_REPLY_SUCCEEDED);
     assert_eq!(head[2], 0x00);
-    let bound_addr = read_socks_reply_addr(&mut socks, head[3]).await?;
-    Ok((socks, bound_addr))
+    Ok((socks, head))
 }
 
 async fn read_socks_reply_addr(

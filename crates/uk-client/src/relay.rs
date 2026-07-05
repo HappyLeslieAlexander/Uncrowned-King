@@ -555,6 +555,10 @@ impl ClientSessionManager {
         self.closed.load(Ordering::SeqCst)
     }
 
+    async fn supports_udp_stream_fallback(&self) -> Result<bool, AnyError> {
+        Ok(self.current_session().await?.supports_udp_stream_fallback)
+    }
+
     fn udp_flow_idle_timeout(&self) -> Option<Duration> {
         timeout(self.config.udp_flow_idle_timeout_seconds())
     }
@@ -1430,6 +1434,18 @@ async fn relay_udp_association(
     sessions: Arc<ClientSessionManager>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AnyError> {
+    match sessions.supports_udp_stream_fallback().await {
+        Ok(true) => {}
+        Ok(false) => {
+            socks5::send_reply(&mut local, socks5::Reply::GeneralFailure).await?;
+            return Ok(());
+        }
+        Err(err) => {
+            let _ = socks5::send_reply(&mut local, socks5::Reply::GeneralFailure).await;
+            return Err(err);
+        }
+    }
+
     let bind_addr = udp_association_bind_addr(local.local_addr()?);
     let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
     let bound_endpoint = socks5::SocksEndpoint::from(socket.local_addr()?);
