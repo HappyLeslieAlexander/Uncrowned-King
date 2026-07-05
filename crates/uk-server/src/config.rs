@@ -10,6 +10,9 @@ use uk_auth::{
 use uk_policy::PolicySet;
 use uk_proto::{MAX_FRAME_PAYLOAD_SIZE, MIN_TCP_RELAY_FRAME_SIZE, validate_host_port_endpoint};
 
+/// Default accepted authentication timestamp skew in seconds.
+pub const DEFAULT_AUTH_SKEW_SECONDS: u64 = 30;
+
 /// Server TOML configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -125,6 +128,11 @@ impl ServerConfig {
     pub fn validate_network_endpoints(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         validate_host_port_endpoint("listen", &self.listen)?;
         Ok(())
+    }
+
+    /// Allowed authentication timestamp skew in seconds.
+    pub fn auth_skew_seconds(&self) -> u64 {
+        self.auth_skew_seconds.unwrap_or(DEFAULT_AUTH_SKEW_SECONDS)
     }
 
     /// Configured pre-auth frame limit.
@@ -386,6 +394,30 @@ mod tests {
             policy_path: None,
             credentials: Vec::new(),
         }
+    }
+
+    #[test]
+    fn defaults_auth_skew() {
+        assert_eq!(
+            minimal_config().auth_skew_seconds(),
+            DEFAULT_AUTH_SKEW_SECONDS
+        );
+    }
+
+    #[test]
+    fn parses_auth_skew() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+auth_skew_seconds = 45
+credentials = []
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.auth_skew_seconds(), 45);
     }
 
     #[test]

@@ -220,6 +220,7 @@ max_outbound_dials_per_session = 16 target socket dials
 max_buffered_bytes_per_session = 16777216 bytes
 max_target_host_len = 255 bytes
 max_key_id_len = 64 bytes
+auth_skew_seconds = 30
 replay_cache_window_seconds = 300
 replay_cache_max_entries = 65536 nonce pairs
 ```

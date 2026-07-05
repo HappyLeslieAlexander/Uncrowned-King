@@ -246,7 +246,7 @@ async fn complete_handshake(
             &challenge,
             &response,
             now,
-            Duration::from_secs(config.auth_skew_seconds.unwrap_or(30)),
+            Duration::from_secs(config.auth_skew_seconds()),
             &mut replay_cache,
         )
     };

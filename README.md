@@ -57,6 +57,8 @@ target socket dials per session, concurrent UDP relay flows, queued
 client-to-target bytes per session and per flow, plus idle timeouts:
 
 ```toml
+auth_skew_seconds = 30
+
 [limits]
 max_pre_auth_bytes = 4096
 max_frame_size = 65536
@@ -81,6 +83,8 @@ Set `target_connect_timeout_seconds = 0` to disable the server target dial timeo
 Set `tcp_half_close_timeout_seconds = 0` to disable the TCP half-close drain timeout.
 Set `udp_flow_idle_timeout_seconds = 0` to disable server-side UDP flow idle cleanup.
 Set `max_udp_flows = 0` to disable UDP relay.
+`auth_skew_seconds` defaults to 30 and bounds accepted client and server
+authentication timestamps.
 Replay cache limits must be greater than zero. `max_pre_auth_bytes` must be at
 least 75 bytes so a minimum `AUTH_RESPONSE` can fit. `max_pre_auth_bytes`,
 `max_frame_size`, `max_buffered_bytes_per_session`, and
