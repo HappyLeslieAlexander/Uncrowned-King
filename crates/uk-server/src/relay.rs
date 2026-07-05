@@ -10,7 +10,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -110,6 +110,7 @@ enum FlowEvent {
     ReadClosed(u64),
     HalfCloseDrainExpired {
         flow_id: u64,
+        token: FlowToken,
         closed_side: HalfCloseSide,
     },
     WriteClosed(u64),
@@ -177,6 +178,14 @@ struct OpenDialLimiter {
     semaphore: Arc<Semaphore>,
 }
 
+#[derive(Debug, Clone)]
+struct FlowTokenAllocator {
+    next: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FlowToken(u64);
+
 #[derive(Clone)]
 struct OpenDialPermit {
     _permit: Arc<OwnedSemaphorePermit>,
@@ -196,6 +205,7 @@ struct OpenFlowCancel {
 
 #[derive(Debug, Clone)]
 struct TargetFlow {
+    token: FlowToken,
     commands: Option<mpsc::Sender<TargetCommand>>,
     control: TargetFlowControl,
     target_to_client_open: bool,
@@ -217,6 +227,7 @@ struct RelaySessionContext<'a> {
     shutdown: SessionShutdown,
     session_buffer: SessionBufferControl,
     open_dial_limiter: OpenDialLimiter,
+    flow_tokens: FlowTokenAllocator,
 }
 
 struct TargetOpenTask {
@@ -248,6 +259,7 @@ pub(crate) async fn relay_session(
     let shutdown = SessionShutdown::default();
     let session_buffer = SessionBufferControl::default();
     let open_dial_limiter = OpenDialLimiter::new(limits.max_outbound_dials_per_session);
+    let flow_tokens = FlowTokenAllocator::default();
     let carrier_writer = CarrierWriter::new(carrier_writer, shutdown.clone());
     let context = RelaySessionContext {
         credential,
@@ -258,6 +270,7 @@ pub(crate) async fn relay_session(
         shutdown: shutdown.clone(),
         session_buffer,
         open_dial_limiter,
+        flow_tokens,
     };
 
     let result = loop {
@@ -326,9 +339,11 @@ async fn handle_flow_event(
         }
         Some(FlowEvent::HalfCloseDrainExpired {
             flow_id,
+            token,
             closed_side,
         }) => {
-            handle_half_close_drain_expired(flow_id, closed_side, context, target_writers).await?;
+            handle_half_close_drain_expired(flow_id, token, closed_side, context, target_writers)
+                .await?;
         }
         Some(FlowEvent::WriteClosed(flow_id)) => {
             handle_target_write_closed(flow_id, target_writers);
@@ -344,12 +359,14 @@ fn handle_target_read_closed(
     target_writers: &mut FlowTable,
 ) {
     if let Some(target) = open_target_flow_mut(target_writers, flow_id) {
+        let token = target.token;
         target.mark_target_to_client_closed();
         info!(event = "tcp.target_read_closed", flow_id);
         if target.client_to_target_open {
             if let Some(timeout) = context.limits.tcp_half_close_timeout {
                 spawn_half_close_timer(
                     flow_id,
+                    token,
                     HalfCloseSide::TargetToClient,
                     timeout,
                     context.event_tx.clone(),
@@ -365,39 +382,65 @@ fn handle_target_read_closed(
 
 async fn handle_half_close_drain_expired(
     flow_id: u64,
+    token: FlowToken,
     closed_side: HalfCloseSide,
     context: &RelaySessionContext<'_>,
     target_writers: &mut FlowTable,
 ) -> Result<(), AnyError> {
-    let (should_remove, should_close_peer) =
-        if let Some(target) = open_target_flow_mut(target_writers, flow_id) {
-            let should_close_peer = match closed_side {
-                HalfCloseSide::TargetToClient
-                    if !target.target_to_client_open && target.client_to_target_open =>
-                {
-                    target.close_client_to_target();
-                    true
-                }
-                HalfCloseSide::ClientToTarget
-                    if !target.client_to_target_open && target.target_to_client_open =>
-                {
-                    target.abort();
-                    true
-                }
-                _ => false,
-            };
-            (target.is_fully_closed(), should_close_peer)
-        } else {
-            (false, false)
-        };
-    if should_close_peer {
-        send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_NORMAL).await?;
-    }
-    if should_remove {
-        remove_flow_slot(target_writers, flow_id);
-        info!(event = "tcp.half_close_timeout", flow_id, side = ?closed_side);
+    match expire_half_close_drain(flow_id, token, closed_side, target_writers) {
+        HalfCloseDrainDecision::Ignored => {}
+        HalfCloseDrainDecision::ClosePeer { remove } => {
+            send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_NORMAL).await?;
+            if remove {
+                remove_flow_slot(target_writers, flow_id);
+                info!(event = "tcp.half_close_timeout", flow_id, side = ?closed_side);
+            }
+        }
     }
     Ok(())
+}
+
+fn expire_half_close_drain(
+    flow_id: u64,
+    token: FlowToken,
+    closed_side: HalfCloseSide,
+    target_writers: &mut FlowTable,
+) -> HalfCloseDrainDecision {
+    let Some(target) = open_target_flow_mut(target_writers, flow_id) else {
+        return HalfCloseDrainDecision::Ignored;
+    };
+    if target.token != token {
+        return HalfCloseDrainDecision::Ignored;
+    }
+
+    let should_close_peer = match closed_side {
+        HalfCloseSide::TargetToClient
+            if !target.target_to_client_open && target.client_to_target_open =>
+        {
+            target.close_client_to_target();
+            true
+        }
+        HalfCloseSide::ClientToTarget
+            if !target.client_to_target_open && target.target_to_client_open =>
+        {
+            target.abort();
+            true
+        }
+        _ => false,
+    };
+    if should_close_peer {
+        HalfCloseDrainDecision::ClosePeer {
+            remove: target.is_fully_closed(),
+        }
+    } else {
+        HalfCloseDrainDecision::Ignored
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HalfCloseDrainDecision {
+    Ignored,
+    ClosePeer { remove: bool },
 }
 
 fn handle_target_write_closed(flow_id: u64, target_writers: &mut FlowTable) {
@@ -605,11 +648,13 @@ async fn handle_tcp_close_frame(
         Some(FlowSlot::Open(target)) => {
             if close.close_code == TCP_CLOSE_NORMAL {
                 let should_start_drain_timer = target.target_to_client_open;
+                let token = target.token;
                 target.close_client_to_target();
                 if should_start_drain_timer {
                     if let Some(timeout) = context.limits.tcp_half_close_timeout {
                         spawn_half_close_timer(
                             flow_id,
+                            token,
                             HalfCloseSide::ClientToTarget,
                             timeout,
                             context.event_tx.clone(),
@@ -872,7 +917,8 @@ async fn accept_open_target(
     let (target_reader, target_writer) = target_stream.into_split();
     let (target_writer_tx, target_writer_rx) = mpsc::channel(TARGET_WRITE_QUEUE_CAPACITY);
     let flow_control = TargetFlowControl::new(context.session_buffer.clone());
-    let target_flow = TargetFlow::new(target_writer_tx, flow_control.clone());
+    let token = context.flow_tokens.next();
+    let target_flow = TargetFlow::new(token, target_writer_tx, flow_control.clone());
     send_tcp_data(context.carrier_writer, flow_id, Bytes::new()).await?;
     spawn_target_reader(
         flow_id,
@@ -990,6 +1036,7 @@ fn spawn_target_writer(
 
 fn spawn_half_close_timer(
     flow_id: u64,
+    token: FlowToken,
     closed_side: HalfCloseSide,
     timeout: Duration,
     event_tx: mpsc::UnboundedSender<FlowEvent>,
@@ -998,6 +1045,7 @@ fn spawn_half_close_timer(
         tokio::time::sleep(timeout).await;
         let _ = event_tx.send(FlowEvent::HalfCloseDrainExpired {
             flow_id,
+            token,
             closed_side,
         });
     });
@@ -1097,6 +1145,20 @@ impl SessionShutdown {
             }
             notified.await;
         }
+    }
+}
+
+impl Default for FlowTokenAllocator {
+    fn default() -> Self {
+        Self {
+            next: Arc::new(AtomicU64::new(1)),
+        }
+    }
+}
+
+impl FlowTokenAllocator {
+    fn next(&self) -> FlowToken {
+        FlowToken(self.next.fetch_add(1, Ordering::Relaxed))
     }
 }
 
@@ -1327,8 +1389,13 @@ fn release_bytes(buffered_bytes: &AtomicUsize, amount: usize) {
 }
 
 impl TargetFlow {
-    fn new(commands: mpsc::Sender<TargetCommand>, control: TargetFlowControl) -> Self {
+    fn new(
+        token: FlowToken,
+        commands: mpsc::Sender<TargetCommand>,
+        control: TargetFlowControl,
+    ) -> Self {
         Self {
+            token,
             commands: Some(commands),
             control,
             target_to_client_open: true,
@@ -1629,8 +1696,10 @@ fn spawn_target_connects<T>(
         *next_index += 1;
         let connector = Arc::clone(connector);
         tasks.spawn(async move {
-            let _permit = permit;
-            connector(addr).await
+            let permit_guard = permit;
+            let result = connector(addr).await;
+            drop(permit_guard);
+            result
         });
     }
 }
@@ -1780,9 +1849,16 @@ fn tcp_data_frame_size(limits: FrameLimits) -> usize {
 mod tests {
     use super::*;
 
+    const TEST_FLOW_TOKEN: FlowToken = FlowToken(1);
+    const STALE_FLOW_TOKEN: FlowToken = FlowToken(2);
+
     fn test_target_flow() -> TargetFlow {
+        test_target_flow_with_token(TEST_FLOW_TOKEN)
+    }
+
+    fn test_target_flow_with_token(token: FlowToken) -> TargetFlow {
         let (commands, _commands_rx) = mpsc::channel(1);
-        TargetFlow::new(commands, TargetFlowControl::default())
+        TargetFlow::new(token, commands, TargetFlowControl::default())
     }
 
     fn test_open_flow_slot() -> FlowSlot {
@@ -1844,6 +1920,50 @@ mod tests {
         assert!(!flow.target_to_client_open);
         assert!(flow.is_fully_closed());
         assert!(flow.control.is_aborted());
+    }
+
+    #[test]
+    fn stale_half_close_timer_does_not_affect_reused_flow_id() {
+        let mut target_writers = FlowTable::new();
+        let mut flow = test_target_flow_with_token(TEST_FLOW_TOKEN);
+        flow.mark_target_to_client_closed();
+        target_writers.insert(1, FlowSlot::Open(flow));
+
+        assert_eq!(
+            expire_half_close_drain(
+                1,
+                STALE_FLOW_TOKEN,
+                HalfCloseSide::TargetToClient,
+                &mut target_writers
+            ),
+            HalfCloseDrainDecision::Ignored
+        );
+
+        let target = open_target_flow_mut(&mut target_writers, 1).expect("flow should remain open");
+        assert!(target.client_to_target_open);
+        assert!(!target.control.is_closed());
+    }
+
+    #[test]
+    fn matching_half_close_timer_closes_original_flow() {
+        let mut target_writers = FlowTable::new();
+        let mut flow = test_target_flow_with_token(TEST_FLOW_TOKEN);
+        flow.mark_target_to_client_closed();
+        target_writers.insert(1, FlowSlot::Open(flow));
+
+        assert_eq!(
+            expire_half_close_drain(
+                1,
+                TEST_FLOW_TOKEN,
+                HalfCloseSide::TargetToClient,
+                &mut target_writers
+            ),
+            HalfCloseDrainDecision::ClosePeer { remove: true }
+        );
+
+        let target = open_target_flow_mut(&mut target_writers, 1).expect("removal is caller-owned");
+        assert!(!target.client_to_target_open);
+        assert!(target.control.is_closed());
     }
 
     #[test]
@@ -1955,7 +2075,7 @@ mod tests {
     #[tokio::test]
     async fn half_close_drops_full_target_queue_sender() {
         let (commands, mut commands_rx) = mpsc::channel(1);
-        let mut flow = TargetFlow::new(commands, TargetFlowControl::default());
+        let mut flow = TargetFlow::new(TEST_FLOW_TOKEN, commands, TargetFlowControl::default());
 
         flow.enqueue_data(Bytes::from_static(b"queued"), 1024, 1024)
             .unwrap();
@@ -1977,7 +2097,7 @@ mod tests {
         let session = SessionBufferControl::default();
         let control = TargetFlowControl::new(session.clone());
         let (commands, commands_rx) = mpsc::channel(1);
-        let mut flow = TargetFlow::new(commands, control.clone());
+        let mut flow = TargetFlow::new(TEST_FLOW_TOKEN, commands, control.clone());
 
         flow.enqueue_data(Bytes::from_static(b"queued"), 1024, 1024)
             .unwrap();
@@ -1993,7 +2113,7 @@ mod tests {
     #[tokio::test]
     async fn half_close_enqueues_close_when_target_queue_has_capacity() {
         let (commands, mut commands_rx) = mpsc::channel(1);
-        let mut flow = TargetFlow::new(commands, TargetFlowControl::default());
+        let mut flow = TargetFlow::new(TEST_FLOW_TOKEN, commands, TargetFlowControl::default());
 
         flow.close_client_to_target();
 
