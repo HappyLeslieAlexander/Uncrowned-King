@@ -24,6 +24,7 @@ use tokio::{
     },
     sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
     task::JoinSet,
+    time,
 };
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, info, warn};
@@ -328,13 +329,14 @@ pub(crate) async fn relay_session(
         open_dial_limiter,
         flow_tokens,
     };
+    let mut idle_deadline = next_idle_deadline(idle_timeout);
 
     let result = loop {
         let event = match next_session_event(
             &mut carrier_reader,
             &mut event_rx,
             limits.frame,
-            idle_timeout,
+            idle_deadline,
             &mut shutdown_rx,
         )
         .await
@@ -342,6 +344,7 @@ pub(crate) async fn relay_session(
             Ok(event) => event,
             Err(err) => break Err(err),
         };
+        let counts_as_activity = session_event_counts_as_activity(&event);
 
         match event {
             SessionEvent::Flow(event) => {
@@ -368,6 +371,10 @@ pub(crate) async fn relay_session(
                 info!(event = "server.session.shutdown");
                 break Ok(());
             }
+        }
+
+        if counts_as_activity {
+            idle_deadline = next_idle_deadline(idle_timeout);
         }
     };
 
@@ -524,14 +531,14 @@ async fn next_session_event(
     carrier_reader: &mut tokio::io::ReadHalf<TlsStream<TcpStream>>,
     event_rx: &mut mpsc::UnboundedReceiver<FlowEvent>,
     limits: FrameLimits,
-    idle_timeout: Option<Duration>,
+    idle_deadline: Option<time::Instant>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<SessionEvent, AnyError> {
     if *shutdown_rx.borrow() {
         return Ok(SessionEvent::Shutdown);
     }
 
-    if let Some(idle_timeout) = idle_timeout {
+    if let Some(idle_deadline) = idle_deadline {
         tokio::select! {
             event = event_rx.recv() => Ok(SessionEvent::Flow(event)),
             frame = read_frame(carrier_reader, limits) => Ok(map_frame_event(frame)),
@@ -539,7 +546,7 @@ async fn next_session_event(
                 let _ = changed;
                 Ok(SessionEvent::Shutdown)
             }
-            () = tokio::time::sleep(idle_timeout) => Ok(SessionEvent::IdleTimeout),
+            () = time::sleep_until(idle_deadline) => Ok(SessionEvent::IdleTimeout),
         }
     } else {
         tokio::select! {
@@ -551,6 +558,21 @@ async fn next_session_event(
             }
         }
     }
+}
+
+fn session_event_counts_as_activity(event: &SessionEvent) -> bool {
+    matches!(
+        event,
+        SessionEvent::Frame(_) | SessionEvent::Flow(Some(FlowEvent::Activity))
+    )
+}
+
+fn next_idle_deadline(idle_timeout: Option<Duration>) -> Option<time::Instant> {
+    idle_timeout.map(|timeout| {
+        time::Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(time::Instant::now)
+    })
 }
 
 fn map_frame_event(result: Result<Frame, FrameIoError>) -> SessionEvent {
@@ -2978,6 +3000,35 @@ mod tests {
             map_frame_event(Err(FrameIoError::Closed)),
             SessionEvent::PeerClosed
         ));
+    }
+
+    #[test]
+    fn peer_frames_count_as_session_activity() {
+        assert!(session_event_counts_as_activity(&SessionEvent::Frame(
+            control_frame(FrameType::Ping, 0)
+        )));
+    }
+
+    #[test]
+    fn target_data_events_count_as_session_activity() {
+        assert!(session_event_counts_as_activity(&SessionEvent::Flow(Some(
+            FlowEvent::Activity
+        ))));
+    }
+
+    #[test]
+    fn internal_flow_events_do_not_count_as_session_activity() {
+        assert!(!session_event_counts_as_activity(&SessionEvent::Flow(
+            Some(FlowEvent::ReadClosed(1))
+        )));
+        assert!(!session_event_counts_as_activity(&SessionEvent::Flow(
+            Some(FlowEvent::HalfCloseDrainExpired {
+                flow_id: 1,
+                token: TEST_FLOW_TOKEN,
+                closed_side: HalfCloseSide::ClientToTarget,
+            })
+        )));
+        assert!(!session_event_counts_as_activity(&SessionEvent::Shutdown));
     }
 
     #[test]
