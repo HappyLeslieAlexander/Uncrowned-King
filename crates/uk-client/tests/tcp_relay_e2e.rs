@@ -266,6 +266,24 @@ async fn closes_existing_udp_flow_after_duplicate_udp_open() -> Result<(), TestE
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closes_tcp_flow_after_wrong_protocol_udp_close() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_wrong_protocol_udp_close_on_tcp_flow_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closes_udp_flow_after_wrong_protocol_tcp_close() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_wrong_protocol_tcp_close_on_udp_flow_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keeps_session_alive_after_unknown_tcp_data() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_unknown_tcp_data_error_e2e()).await?
 }
@@ -1741,6 +1759,71 @@ async fn run_duplicate_udp_open_error_e2e() -> Result<(), TestError> {
         0,
         1,
         Bytes::from_static(b"duplicate udp open must close old slot"),
+    )?;
+    write_frame(&mut carrier, &data).await?;
+    assert_flow_error(&mut carrier, 1, ErrorCode::Protocol).await?;
+
+    target_task.abort();
+    Ok(())
+}
+
+async fn run_wrong_protocol_udp_close_on_tcp_flow_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, target_task) = spawn_read_to_eof_target().await?;
+    let harness = ServerHarness::start_with_policy(
+        test_limits(),
+        Some(allow_loopback_policy(target_addr.port())),
+    )
+    .await?;
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(harness.client_config(SECRET)).await?;
+
+    write_frame(&mut carrier, &tcp_open_frame(1, target_addr)?).await?;
+    read_open_ack(&mut carrier, 1).await?;
+
+    write_frame(&mut carrier, &udp_close_frame(1, UDP_CLOSE_ERROR)?).await?;
+    assert_flow_error(&mut carrier, 1, ErrorCode::Protocol).await?;
+    assert_tcp_close(&mut carrier, 1, TCP_CLOSE_ERROR).await?;
+
+    let data = Frame::new(
+        FrameType::TcpData,
+        0,
+        1,
+        Bytes::from_static(b"tcp flow should be gone"),
+    )?;
+    write_frame(&mut carrier, &data).await?;
+    assert_flow_error(&mut carrier, 1, ErrorCode::Protocol).await?;
+
+    let target_received = tokio::time::timeout(Duration::from_secs(3), target_task).await???;
+    assert!(target_received.is_empty());
+    Ok(())
+}
+
+async fn run_wrong_protocol_tcp_close_on_udp_flow_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, target_task) = spawn_udp_echo_target().await?;
+    let harness = ServerHarness::start_with_policy(
+        test_limits(),
+        Some(allow_loopback_policy(target_addr.port())),
+    )
+    .await?;
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(harness.client_config(SECRET)).await?;
+
+    write_frame(&mut carrier, &udp_open_frame(1, target_addr)?).await?;
+    read_udp_open_ack(&mut carrier, 1).await?;
+
+    write_frame(&mut carrier, &tcp_close_frame(1, TCP_CLOSE_ERROR)?).await?;
+    assert_flow_error(&mut carrier, 1, ErrorCode::Protocol).await?;
+    assert_udp_close(&mut carrier, 1, UDP_CLOSE_ERROR).await?;
+
+    let data = Frame::new(
+        FrameType::UdpData,
+        0,
+        1,
+        Bytes::from_static(b"udp flow should be gone"),
     )?;
     write_frame(&mut carrier, &data).await?;
     assert_flow_error(&mut carrier, 1, ErrorCode::Protocol).await?;
@@ -3525,6 +3608,17 @@ fn tcp_close_frame(flow_id: u64, close_code: u16) -> Result<Frame, TestError> {
     TcpClose::new(close_code).encode(&mut payload)?;
     Ok(Frame::new(
         FrameType::TcpClose,
+        0,
+        flow_id,
+        payload.freeze(),
+    )?)
+}
+
+fn udp_close_frame(flow_id: u64, close_code: u16) -> Result<Frame, TestError> {
+    let mut payload = BytesMut::new();
+    UdpClose::new(close_code).encode(&mut payload)?;
+    Ok(Frame::new(
+        FrameType::UdpClose,
         0,
         flow_id,
         payload.freeze(),

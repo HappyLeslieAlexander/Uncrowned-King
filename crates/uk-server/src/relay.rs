@@ -774,6 +774,7 @@ async fn handle_tcp_close_frame(
         }
     };
     let mut should_report_protocol_error = false;
+    let mut should_send_udp_close = false;
     let should_remove = match target_writers.get_mut(&flow_id) {
         Some(FlowSlot::OpeningTcp(_)) => true,
         Some(FlowSlot::Tcp(target)) => {
@@ -799,12 +800,16 @@ async fn handle_tcp_close_frame(
         }
         Some(FlowSlot::OpeningUdp(_) | FlowSlot::Udp(_)) => {
             should_report_protocol_error = true;
-            false
+            should_send_udp_close = true;
+            true
         }
         None => false,
     };
     if should_report_protocol_error {
         send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+    }
+    if should_send_udp_close {
+        send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
     }
     if should_remove {
         remove_flow_slot(target_writers, flow_id);
@@ -1183,6 +1188,7 @@ async fn handle_udp_close_frame(
             return Err(err.into());
         }
     };
+    let mut should_send_tcp_close = false;
     let should_remove = match target_writers.get_mut(&flow_id) {
         Some(FlowSlot::OpeningUdp(_)) => true,
         Some(FlowSlot::Udp(target)) => {
@@ -1193,10 +1199,14 @@ async fn handle_udp_close_frame(
         }
         Some(FlowSlot::OpeningTcp(_) | FlowSlot::Tcp(_)) => {
             send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
-            false
+            should_send_tcp_close = true;
+            true
         }
         None => false,
     };
+    if should_send_tcp_close {
+        send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
+    }
     if should_remove {
         remove_flow_slot(target_writers, flow_id);
     }
