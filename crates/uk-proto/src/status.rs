@@ -46,6 +46,7 @@ impl ErrorCode {
             | ProtocolError::InvalidFrame(_)
             | ProtocolError::InvalidSettings(_)
             | ProtocolError::InvalidTcpPayload(_)
+            | ProtocolError::InvalidUdpPayload(_)
             | ProtocolError::InvalidErrorPayload(_) => Self::Protocol,
         }
     }
@@ -162,6 +163,10 @@ mod tests {
         );
         assert_eq!(
             ErrorCode::from_protocol_error(&ProtocolError::InvalidFrame("bad frame")),
+            ErrorCode::Protocol
+        );
+        assert_eq!(
+            ErrorCode::from_protocol_error(&ProtocolError::InvalidUdpPayload("bad udp")),
             ErrorCode::Protocol
         );
     }

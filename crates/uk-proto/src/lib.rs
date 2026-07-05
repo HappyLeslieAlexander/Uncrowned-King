@@ -12,6 +12,7 @@ pub mod settings;
 pub mod status;
 pub mod target;
 pub mod tcp;
+pub mod udp;
 pub mod varint;
 
 pub use endpoint::{EndpointError, validate_host_port_endpoint};
@@ -30,3 +31,4 @@ pub use tcp::{
     MIN_TCP_RELAY_FRAME_SIZE, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, TcpClose,
     TcpOpen,
 };
+pub use udp::{MIN_UDP_RELAY_FRAME_SIZE, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose, UdpOpen};

@@ -152,7 +152,35 @@ Known close codes:
 
 Decoders must reject unknown close codes.
 
-## 5. Authentication Payloads
+## 5. UDP Relay Payloads
+
+UDP relay flow IDs are non-zero. v0.1 requires client-initiated UDP flows to
+use odd IDs. Even non-zero IDs are reserved for future server-initiated flows.
+
+`UDP_OPEN` payload:
+
+```text
+Target target
+```
+
+`UDP_DATA` payload is one uninterpreted UDP datagram byte string.
+
+`UDP_CLOSE` payload:
+
+```text
+u16 close_code
+```
+
+Known UDP close codes match TCP close codes:
+
+| Code | Name |
+| ---: | --- |
+| `0` | normal close |
+| `1` | generic error |
+
+Decoders must reject unknown UDP close codes.
+
+## 6. Authentication Payloads
 
 The carrier supplies a 32-byte TLS/QUIC exporter binding. Until carriers are
 implemented, tests pass this value explicitly.
@@ -208,7 +236,7 @@ encoded above, including `server_time`, `server_capabilities_len`, and
 `limits_len`. Servers must reject responses when either `server_time` or
 `client_time` is outside the configured authentication skew window.
 
-## 6. SETTINGS Payload
+## 7. SETTINGS Payload
 
 v0.1 settings use repeated key/value pairs:
 
@@ -250,7 +278,7 @@ request `PING` payload exactly. Implementations that use `PING` for liveness
 should include an unpredictable or monotonically unique nonce and treat only the
 matching `PONG` as the liveness response for that probe.
 
-## 7. Error Codes
+## 8. Error Codes
 
 `ERROR`, `POLICY_DENIED`, and `RESOURCE_LIMIT` payloads carry one coarse code:
 
