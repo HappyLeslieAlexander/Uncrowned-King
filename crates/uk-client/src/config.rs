@@ -28,6 +28,8 @@ pub struct ClientConfig {
     pub socks_handshake_timeout_seconds: Option<u64>,
     /// Optional timeout for waiting on TCP open acknowledgement in seconds.
     pub tcp_open_timeout_seconds: Option<u64>,
+    /// Optional idle timeout for per-target UDP relay flows in seconds.
+    pub udp_flow_idle_timeout_seconds: Option<u64>,
     /// Optional maximum local bytes buffered while waiting for TCP open ack.
     pub max_pending_open_bytes: Option<u64>,
     /// Optional maximum concurrent local SOCKS5 connections.
@@ -59,6 +61,11 @@ impl ClientConfig {
     /// TCP open acknowledgement timeout in seconds. Zero disables it.
     pub fn tcp_open_timeout_seconds(&self) -> u64 {
         self.tcp_open_timeout_seconds.unwrap_or(10)
+    }
+
+    /// Per-target UDP relay flow idle timeout in seconds. Zero disables it.
+    pub fn udp_flow_idle_timeout_seconds(&self) -> u64 {
+        self.udp_flow_idle_timeout_seconds.unwrap_or(120)
     }
 
     /// Maximum local bytes buffered while waiting for TCP open ack.
@@ -176,6 +183,7 @@ mod tests {
             handshake_timeout_seconds: None,
             socks_handshake_timeout_seconds: None,
             tcp_open_timeout_seconds: None,
+            udp_flow_idle_timeout_seconds: None,
             max_pending_open_bytes: None,
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
@@ -233,6 +241,11 @@ socks_handshake_timeout_seconds = 5
     }
 
     #[test]
+    fn defaults_udp_flow_idle_timeout() {
+        assert_eq!(minimal_config().udp_flow_idle_timeout_seconds(), 120);
+    }
+
+    #[test]
     fn parses_tcp_open_timeout() {
         let config: ClientConfig = toml::from_str(
             r#"
@@ -247,6 +260,23 @@ tcp_open_timeout_seconds = 6
         .unwrap();
 
         assert_eq!(config.tcp_open_timeout_seconds(), 6);
+    }
+
+    #[test]
+    fn parses_udp_flow_idle_timeout() {
+        let config: ClientConfig = toml::from_str(
+            r#"
+server_addr = "127.0.0.1:443"
+server_name = "localhost"
+ca_cert_path = "ca.pem"
+key_id = "client"
+secret = "secret"
+udp_flow_idle_timeout_seconds = 7
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.udp_flow_idle_timeout_seconds(), 7);
     }
 
     #[test]
@@ -408,6 +438,7 @@ secret = "secret"
 handshake_timeout_seconds = 0
 socks_handshake_timeout_seconds = 0
 tcp_open_timeout_seconds = 0
+udp_flow_idle_timeout_seconds = 0
 max_pending_open_bytes = 1024
 max_socks_connections = 1
 max_buffered_bytes_per_session = 1024
@@ -419,6 +450,7 @@ max_buffered_bytes_per_flow = 1024
         assert_eq!(config.handshake_timeout_seconds(), 0);
         assert_eq!(config.socks_handshake_timeout_seconds(), 0);
         assert_eq!(config.tcp_open_timeout_seconds(), 0);
+        assert_eq!(config.udp_flow_idle_timeout_seconds(), 0);
         assert_eq!(config.max_pending_open_bytes(), 1024);
         assert_eq!(config.max_socks_connections(), 1);
         assert_eq!(config.max_buffered_bytes_per_session(), 1024);

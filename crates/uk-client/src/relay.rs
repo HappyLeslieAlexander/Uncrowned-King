@@ -90,6 +90,7 @@ struct ClientFlow {
 
 struct UdpAssociation {
     socket: Arc<UdpSocket>,
+    idle_timeout: Option<Duration>,
     client_endpoint: Option<SocketAddr>,
     flows_by_target: HashMap<Target, UdpAssociationFlow>,
     flow_tasks: JoinSet<UdpFlowTaskResult>,
@@ -99,6 +100,7 @@ struct UdpAssociation {
 struct UdpAssociationFlow {
     id: u64,
     session: Arc<ClientSession>,
+    last_activity: time::Instant,
 }
 
 struct UdpFlowTaskResult {
@@ -550,6 +552,10 @@ impl ClientSessionManager {
 
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    fn udp_flow_idle_timeout(&self) -> Option<Duration> {
+        timeout(self.config.udp_flow_idle_timeout_seconds())
     }
 }
 
@@ -1424,7 +1430,8 @@ async fn relay_udp_association(
     let bound_endpoint = socks5::SocksEndpoint::from(socket.local_addr()?);
     socks5::send_reply_with_endpoint(&mut local, socks5::Reply::Succeeded, &bound_endpoint).await?;
 
-    let mut association = UdpAssociation::new(socket);
+    let mut association = UdpAssociation::new(socket, sessions.udp_flow_idle_timeout());
+    let mut idle_interval = udp_idle_interval(association.idle_timeout);
     let mut udp_buf = vec![0_u8; UDP_ASSOCIATION_BUFFER_SIZE].into_boxed_slice();
     let mut tcp_buf = [0_u8; 1];
 
@@ -1454,6 +1461,9 @@ async fn relay_udp_association(
             joined = association.flow_tasks.join_next(), if !association.flow_tasks.is_empty() => {
                 association.handle_flow_task_result(joined);
             }
+            () = tick_udp_idle_interval(&mut idle_interval), if idle_interval.is_some() => {
+                association.close_idle_flows().await;
+            }
         }
     }
 
@@ -1462,9 +1472,10 @@ async fn relay_udp_association(
 }
 
 impl UdpAssociation {
-    fn new(socket: Arc<UdpSocket>) -> Self {
+    fn new(socket: Arc<UdpSocket>, idle_timeout: Option<Duration>) -> Self {
         Self {
             socket,
+            idle_timeout,
             client_endpoint: None,
             flows_by_target: HashMap::new(),
             flow_tasks: JoinSet::new(),
@@ -1515,7 +1526,8 @@ impl UdpAssociation {
         sessions: &Arc<ClientSessionManager>,
         shutdown_rx: &watch::Receiver<bool>,
     ) -> Result<Option<UdpAssociationFlow>, AnyError> {
-        if let Some(flow) = self.flows_by_target.get(&target) {
+        if let Some(flow) = self.flows_by_target.get_mut(&target) {
+            flow.record_activity();
             return Ok(Some(flow.clone()));
         }
 
@@ -1530,6 +1542,7 @@ impl UdpAssociation {
         let association_flow = UdpAssociationFlow {
             id: flow.id,
             session: Arc::clone(&flow.session),
+            last_activity: time::Instant::now(),
         };
         self.flows_by_target
             .insert(target.clone(), association_flow.clone());
@@ -1585,6 +1598,37 @@ impl UdpAssociation {
         self.flows_by_target.clear();
         self.flow_tasks.abort_all();
         while self.flow_tasks.join_next().await.is_some() {}
+    }
+
+    async fn close_idle_flows(&mut self) {
+        let Some(idle_timeout) = self.idle_timeout else {
+            return;
+        };
+        let now = time::Instant::now();
+        let expired = self
+            .flows_by_target
+            .iter()
+            .filter(|(_, flow)| now.duration_since(flow.last_activity) >= idle_timeout)
+            .map(|(target, flow)| (target.clone(), flow.clone()))
+            .collect::<Vec<_>>();
+
+        for (target, flow) in expired {
+            if self.flows_by_target.remove(&target).is_some() {
+                debug!(
+                    event = "client.udp_flow.idle_timeout",
+                    flow_id = flow.id,
+                    target = ?target
+                );
+                let _ = flow.session.send_udp_close(flow.id, UDP_CLOSE_NORMAL).await;
+                flow.session.flows.lock().await.remove(&flow.id);
+            }
+        }
+    }
+}
+
+impl UdpAssociationFlow {
+    fn record_activity(&mut self) {
+        self.last_activity = time::Instant::now();
     }
 }
 
@@ -1650,6 +1694,19 @@ fn udp_association_bind_addr(tcp_local_addr: SocketAddr) -> SocketAddr {
     match tcp_local_addr.ip() {
         IpAddr::V4(ip) => SocketAddr::new(IpAddr::V4(ip), 0),
         IpAddr::V6(ip) => SocketAddr::new(IpAddr::V6(ip), 0),
+    }
+}
+
+fn udp_idle_interval(idle_timeout: Option<Duration>) -> Option<time::Interval> {
+    let idle_timeout = idle_timeout?;
+    Some(time::interval(idle_timeout.min(Duration::from_secs(1))))
+}
+
+async fn tick_udp_idle_interval(interval: &mut Option<time::Interval>) {
+    if let Some(interval) = interval {
+        interval.tick().await;
+    } else {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -2025,6 +2082,7 @@ mod tests {
             handshake_timeout_seconds: None,
             socks_handshake_timeout_seconds: None,
             tcp_open_timeout_seconds: None,
+            udp_flow_idle_timeout_seconds: None,
             max_pending_open_bytes: None,
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,

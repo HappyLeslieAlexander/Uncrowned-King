@@ -135,6 +135,11 @@ async fn enforces_udp_flow_limit_per_session() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn releases_idle_udp_flow_for_new_target() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_udp_flow_idle_reuse_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relays_data_sent_before_socks_success_reply() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_early_socks_data_e2e()).await?
 }
@@ -537,6 +542,51 @@ async fn run_udp_flow_limit_e2e() -> Result<(), TestError> {
 
     first_echo_task.await??;
     second_echo_task.abort();
+    Ok(())
+}
+
+async fn run_udp_flow_idle_reuse_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (first_target_addr, first_echo_task) = spawn_udp_echo_target().await?;
+    let (second_target_addr, second_echo_task) = spawn_udp_echo_target().await?;
+    let harness = RelayHarness::start_with_client_udp_idle_timeout(
+        Some(allow_loopback_any_port_policy()),
+        test_limits_with_max_udp_flows(1),
+        1,
+    )
+    .await?;
+    let (_socks_control, udp_relay_addr) = open_socks_udp_associate(harness.socks_addr).await?;
+    let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let first_payload = b"uncrowned king udp idle first target";
+    let second_payload = b"uncrowned king udp idle second target";
+
+    udp_client
+        .send_to(
+            &socks_udp_datagram(first_target_addr, first_payload),
+            udp_relay_addr,
+        )
+        .await?;
+    let (reply_target, reply_payload) =
+        recv_socks_udp_datagram(&udp_client, udp_relay_addr).await?;
+    assert_eq!(reply_target, first_target_addr);
+    assert_eq!(reply_payload, first_payload);
+    first_echo_task.await??;
+
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+
+    udp_client
+        .send_to(
+            &socks_udp_datagram(second_target_addr, second_payload),
+            udp_relay_addr,
+        )
+        .await?;
+    let (reply_target, reply_payload) =
+        recv_socks_udp_datagram(&udp_client, udp_relay_addr).await?;
+    assert_eq!(reply_target, second_target_addr);
+    assert_eq!(reply_payload, second_payload);
+
+    second_echo_task.await??;
     Ok(())
 }
 
@@ -1620,6 +1670,7 @@ async fn run_server_active_session_shutdown_e2e() -> Result<(), TestError> {
         handshake_timeout_seconds: Some(3),
         socks_handshake_timeout_seconds: Some(3),
         tcp_open_timeout_seconds: Some(3),
+        udp_flow_idle_timeout_seconds: None,
         max_pending_open_bytes: None,
         max_socks_connections: None,
         max_buffered_bytes_per_session: None,
@@ -1661,6 +1712,7 @@ async fn run_socks_listener_shutdown_e2e() -> Result<(), TestError> {
             handshake_timeout_seconds: Some(3),
             socks_handshake_timeout_seconds: Some(3),
             tcp_open_timeout_seconds: Some(3),
+            udp_flow_idle_timeout_seconds: None,
             max_pending_open_bytes: None,
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
@@ -1710,6 +1762,7 @@ async fn run_socks_listener_shutdown_during_connect_e2e() -> Result<(), TestErro
             handshake_timeout_seconds: Some(30),
             socks_handshake_timeout_seconds: Some(3),
             tcp_open_timeout_seconds: Some(30),
+            udp_flow_idle_timeout_seconds: None,
             max_pending_open_bytes: None,
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
@@ -1812,6 +1865,7 @@ impl ServerHarness {
             handshake_timeout_seconds: Some(3),
             socks_handshake_timeout_seconds: Some(3),
             tcp_open_timeout_seconds: Some(3),
+            udp_flow_idle_timeout_seconds: None,
             max_pending_open_bytes: None,
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
@@ -1939,6 +1993,7 @@ impl MalformedFrameServerHarness {
                 handshake_timeout_seconds: Some(3),
                 socks_handshake_timeout_seconds: Some(3),
                 tcp_open_timeout_seconds: Some(3),
+                udp_flow_idle_timeout_seconds: None,
                 max_pending_open_bytes: None,
                 max_socks_connections: None,
                 max_buffered_bytes_per_session: None,
@@ -2009,6 +2064,7 @@ impl ClientBufferedLimitServerHarness {
                 handshake_timeout_seconds: Some(3),
                 socks_handshake_timeout_seconds: Some(3),
                 tcp_open_timeout_seconds: Some(3),
+                udp_flow_idle_timeout_seconds: None,
                 max_pending_open_bytes: None,
                 max_socks_connections: None,
                 max_buffered_bytes_per_session: None,
@@ -2083,6 +2139,7 @@ impl PendingOpenCancelServerHarness {
                 handshake_timeout_seconds: Some(3),
                 socks_handshake_timeout_seconds: Some(3),
                 tcp_open_timeout_seconds: Some(tcp_open_timeout_seconds),
+                udp_flow_idle_timeout_seconds: None,
                 max_pending_open_bytes: None,
                 max_socks_connections: None,
                 max_buffered_bytes_per_session: None,
@@ -2168,6 +2225,7 @@ impl MissingPongServerHarness {
                 handshake_timeout_seconds: Some(3),
                 socks_handshake_timeout_seconds: Some(3),
                 tcp_open_timeout_seconds: Some(3),
+                udp_flow_idle_timeout_seconds: None,
                 max_pending_open_bytes: None,
                 max_socks_connections: None,
                 max_buffered_bytes_per_session: None,
@@ -2469,8 +2527,14 @@ impl RelayHarness {
         policy_toml: Option<String>,
         max_socks_connections: u64,
     ) -> Result<Self, TestError> {
-        Self::start_with_client_options(policy_toml, test_limits(), 3, Some(max_socks_connections))
-            .await
+        Self::start_with_client_options(
+            policy_toml,
+            test_limits(),
+            3,
+            Some(max_socks_connections),
+            None,
+        )
+        .await
     }
 
     async fn start_with_client_socks_timeout(
@@ -2482,6 +2546,7 @@ impl RelayHarness {
             test_limits(),
             socks_handshake_timeout_seconds,
             None,
+            None,
         )
         .await
     }
@@ -2490,7 +2555,22 @@ impl RelayHarness {
         policy_toml: Option<String>,
         limits: LimitConfig,
     ) -> Result<Self, TestError> {
-        Self::start_with_client_options(policy_toml, limits, 3, None).await
+        Self::start_with_client_options(policy_toml, limits, 3, None, None).await
+    }
+
+    async fn start_with_client_udp_idle_timeout(
+        policy_toml: Option<String>,
+        limits: LimitConfig,
+        udp_flow_idle_timeout_seconds: u64,
+    ) -> Result<Self, TestError> {
+        Self::start_with_client_options(
+            policy_toml,
+            limits,
+            3,
+            None,
+            Some(udp_flow_idle_timeout_seconds),
+        )
+        .await
     }
 
     async fn start_with_client_options(
@@ -2498,6 +2578,7 @@ impl RelayHarness {
         limits: LimitConfig,
         socks_handshake_timeout_seconds: u64,
         max_socks_connections: Option<u64>,
+        udp_flow_idle_timeout_seconds: Option<u64>,
     ) -> Result<Self, TestError> {
         let temp_dir = create_temp_dir()?;
         let cert_path = temp_dir.join("server-cert.pem");
@@ -2544,6 +2625,7 @@ impl RelayHarness {
                 handshake_timeout_seconds: Some(3),
                 socks_handshake_timeout_seconds: Some(socks_handshake_timeout_seconds),
                 tcp_open_timeout_seconds: Some(3),
+                udp_flow_idle_timeout_seconds,
                 max_pending_open_bytes: None,
                 max_socks_connections,
                 max_buffered_bytes_per_session: None,
