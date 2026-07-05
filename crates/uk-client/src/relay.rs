@@ -749,7 +749,8 @@ impl ClientSession {
     }
 
     async fn write_ping(&self) -> Result<u64, AnyError> {
-        let nonce = next_keepalive_nonce(&self.next_ping_nonce);
+        let nonce =
+            next_keepalive_nonce(&self.next_ping_nonce).ok_or("keepalive nonce space exhausted")?;
         let frame = Frame::new(FrameType::Ping, 0, 0, keepalive_nonce_payload(nonce))?;
         self.write_frame(&frame).await?;
         Ok(nonce)
@@ -865,12 +866,12 @@ fn allocate_client_flow_id(next_flow_id: &AtomicU64) -> Option<u64> {
     }
 }
 
-fn next_keepalive_nonce(counter: &AtomicU64) -> u64 {
+fn next_keepalive_nonce(counter: &AtomicU64) -> Option<u64> {
     let mut current = counter.load(Ordering::Relaxed);
     loop {
-        let next = if current == u64::MAX { 1 } else { current + 1 };
+        let next = current.checked_add(1)?;
         match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return next,
+            Ok(_) => return Some(next),
             Err(actual) => current = actual,
         }
     }
@@ -2125,15 +2126,17 @@ mod tests {
     fn allocates_nonzero_keepalive_nonces() {
         let counter = AtomicU64::new(0);
 
-        assert_eq!(next_keepalive_nonce(&counter), 1);
-        assert_eq!(next_keepalive_nonce(&counter), 2);
+        assert_eq!(next_keepalive_nonce(&counter), Some(1));
+        assert_eq!(next_keepalive_nonce(&counter), Some(2));
     }
 
     #[test]
-    fn keepalive_nonce_wrap_skips_zero() {
-        let counter = AtomicU64::new(u64::MAX);
+    fn keepalive_nonce_exhaustion_does_not_wrap() {
+        let counter = AtomicU64::new(u64::MAX - 1);
 
-        assert_eq!(next_keepalive_nonce(&counter), 1);
+        assert_eq!(next_keepalive_nonce(&counter), Some(u64::MAX));
+        assert_eq!(next_keepalive_nonce(&counter), None);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 
     #[test]
