@@ -1128,10 +1128,19 @@ async fn handle_socks_connection(
         return Ok(());
     }
     let mut state = ClientConnectionState::NegotiatingSocks;
-    let target = tokio::select! {
-        result = negotiate_socks_connect(&mut local, socks_handshake_timeout) => result?,
+    let request = tokio::select! {
+        result = negotiate_socks_request(&mut local, socks_handshake_timeout) => result?,
         changed = shutdown_rx.changed() => {
             let _ = changed;
+            transition(&mut state, ClientConnectionState::Closed);
+            return Ok(());
+        }
+    };
+    let target = match request {
+        socks5::Request::Connect(target) => target,
+        socks5::Request::UdpAssociate(endpoint) => {
+            debug!(event = "socks5.udp_associate.unsupported", endpoint = ?endpoint);
+            socks5::send_reply(&mut local, socks5::Reply::CommandNotSupported).await?;
             transition(&mut state, ClientConnectionState::Closed);
             return Ok(());
         }
@@ -1179,17 +1188,17 @@ async fn handle_socks_connection(
     relay_result
 }
 
-async fn negotiate_socks_connect(
+async fn negotiate_socks_request(
     local: &mut TcpStream,
     socks_handshake_timeout: Option<Duration>,
-) -> Result<Target, AnyError> {
+) -> Result<socks5::Request, AnyError> {
     if let Some(timeout) = socks_handshake_timeout {
-        match time::timeout(timeout, socks5::negotiate_connect(local)).await {
+        match time::timeout(timeout, socks5::negotiate_request(local)).await {
             Ok(result) => Ok(result?),
             Err(_) => Err("socks handshake timeout".into()),
         }
     } else {
-        Ok(socks5::negotiate_connect(local).await?)
+        Ok(socks5::negotiate_request(local).await?)
     }
 }
 
@@ -1498,7 +1507,7 @@ const fn is_valid_connection_transition(
         (from, next),
         (
             ClientConnectionState::NegotiatingSocks,
-            ClientConnectionState::Opening
+            ClientConnectionState::Opening | ClientConnectionState::Closed
         ) | (
             ClientConnectionState::Opening,
             ClientConnectionState::Relaying
@@ -2276,6 +2285,10 @@ mod tests {
             (
                 ClientConnectionState::NegotiatingSocks,
                 ClientConnectionState::Opening,
+            ),
+            (
+                ClientConnectionState::NegotiatingSocks,
+                ClientConnectionState::Closed,
             ),
             (
                 ClientConnectionState::Opening,
