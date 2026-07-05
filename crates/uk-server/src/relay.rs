@@ -861,21 +861,22 @@ async fn handle_client_flow_status_frame(
 }
 
 fn abort_client_flow(flow_id: u64, target_writers: &mut FlowTable) {
-    let should_remove = match target_writers.get_mut(&flow_id) {
-        Some(FlowSlot::OpeningTcp(_) | FlowSlot::OpeningUdp(_)) => true,
+    let protocol = match target_writers.get_mut(&flow_id) {
+        Some(FlowSlot::OpeningTcp(_)) => Some("tcp"),
+        Some(FlowSlot::OpeningUdp(_)) => Some("udp"),
         Some(FlowSlot::Tcp(target)) => {
             target.abort();
-            true
+            Some("tcp")
         }
         Some(FlowSlot::Udp(target)) => {
             target.abort();
-            true
+            Some("udp")
         }
-        None => false,
+        None => None,
     };
-    if should_remove {
+    if let Some(protocol) = protocol {
         remove_flow_slot(target_writers, flow_id);
-        info!(event = "tcp.client_flow_aborted", flow_id);
+        info!(event = "client_flow.aborted", flow_id, protocol);
     }
 }
 
@@ -3097,6 +3098,18 @@ mod tests {
     }
 
     #[test]
+    fn client_flow_status_cancels_pending_udp_open() {
+        let cancel = OpenFlowCancel::default();
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(1, FlowSlot::OpeningUdp(cancel.clone()));
+
+        abort_client_flow(1, &mut target_writers);
+
+        assert!(target_writers.is_empty());
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
     fn client_flow_status_ignores_unknown_flow() {
         let mut target_writers = FlowTable::new();
 
@@ -3273,6 +3286,18 @@ mod tests {
         let cancel = OpenFlowCancel::default();
         let mut target_writers = FlowTable::new();
         target_writers.insert(1, FlowSlot::OpeningTcp(cancel.clone()));
+
+        remove_flow_slot(&mut target_writers, 1);
+
+        assert!(cancel.is_cancelled());
+        assert!(target_writers.is_empty());
+    }
+
+    #[test]
+    fn removing_pending_udp_open_slot_cancels_connect_task() {
+        let cancel = OpenFlowCancel::default();
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(1, FlowSlot::OpeningUdp(cancel.clone()));
 
         remove_flow_slot(&mut target_writers, 1);
 
