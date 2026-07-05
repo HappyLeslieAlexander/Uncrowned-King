@@ -260,7 +260,7 @@ async fn complete_handshake(
 
     info!(
         event = "auth.success",
-        key_id = %String::from_utf8_lossy(&credential.key_id)
+        key_id_hex = %hex_encode(&credential.key_id)
     );
 
     let settings = server_settings(config);
@@ -358,6 +358,16 @@ fn usize_limit(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +439,12 @@ mod tests {
             ErrorPayload::decode(&mut payload).unwrap().code,
             ErrorCode::AuthFailed
         );
+    }
+
+    #[test]
+    fn hex_encode_keeps_opaque_key_ids_log_safe() {
+        assert_eq!(hex_encode(b"client"), "636c69656e74");
+        assert_eq!(hex_encode(&[0x00, 0x1f, 0x7f, 0x80, 0xff]), "001f7f80ff");
     }
 
     #[test]

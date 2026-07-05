@@ -498,6 +498,7 @@ All client-controlled fields must be escaped. Logs must never contain:
 - shared secrets
 - auth tags
 - raw unescaped targets
+- raw opaque key identifier bytes; log a stable encoded form instead
 - private key material
 - full connection URLs containing credentials
 
