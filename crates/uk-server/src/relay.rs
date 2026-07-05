@@ -351,21 +351,24 @@ pub(crate) async fn relay_session(
             Ok(event) => event,
             Err(err) => break Err(err),
         };
-        let counts_as_activity = session_event_counts_as_activity(&event);
-
-        match event {
+        let counts_as_activity = match event {
             SessionEvent::Flow(event) => {
+                let counts_as_activity =
+                    flow_event_counts_as_session_activity(event.as_ref(), &target_writers);
                 handle_flow_event(event, &context, &mut target_writers).await?;
+                counts_as_activity
             }
             SessionEvent::Frame(frame) => {
                 if let Err(err) = handle_session_frame(frame, &context, &mut target_writers).await {
                     break Err(err);
                 }
+                session_has_activity_flows(&target_writers)
             }
             SessionEvent::UdpIdleMaintenance => {
                 if let Err(err) = close_idle_udp_flows(&context, &mut target_writers).await {
                     break Err(err);
                 }
+                false
             }
             SessionEvent::FrameReadError(err) => {
                 report_frame_io_error(context.carrier_writer, &err).await;
@@ -383,7 +386,7 @@ pub(crate) async fn relay_session(
                 info!(event = "server.session.shutdown");
                 break Ok(());
             }
-        }
+        };
 
         if counts_as_activity {
             idle_deadline = next_idle_deadline(idle_timeout);
@@ -584,12 +587,19 @@ async fn next_session_event(
     }
 }
 
-fn session_event_counts_as_activity(event: &SessionEvent) -> bool {
-    matches!(
-        event,
-        SessionEvent::Frame(_)
-            | SessionEvent::Flow(Some(FlowEvent::Activity | FlowEvent::UdpActivity(_)))
-    )
+fn flow_event_counts_as_session_activity(
+    event: Option<&FlowEvent>,
+    target_writers: &FlowTable,
+) -> bool {
+    match event {
+        Some(FlowEvent::Activity) => true,
+        Some(FlowEvent::UdpActivity(flow_id)) => target_writers.contains_key(flow_id),
+        _ => false,
+    }
+}
+
+fn session_has_activity_flows(target_writers: &FlowTable) -> bool {
+    !target_writers.is_empty()
 }
 
 fn next_idle_deadline(idle_timeout: Option<Duration>) -> Option<time::Instant> {
@@ -3104,35 +3114,52 @@ mod tests {
     }
 
     #[test]
-    fn peer_frames_count_as_session_activity() {
-        assert!(session_event_counts_as_activity(&SessionEvent::Frame(
-            control_frame(FrameType::Ping, 0)
-        )));
+    fn peer_frames_count_as_session_activity_only_with_flows() {
+        let mut target_writers = FlowTable::new();
+
+        assert!(!session_has_activity_flows(&target_writers));
+
+        target_writers.insert(1, test_open_flow_slot());
+
+        assert!(session_has_activity_flows(&target_writers));
     }
 
     #[test]
     fn target_data_events_count_as_session_activity() {
-        assert!(session_event_counts_as_activity(&SessionEvent::Flow(Some(
-            FlowEvent::Activity
-        ))));
-        assert!(session_event_counts_as_activity(&SessionEvent::Flow(Some(
-            FlowEvent::UdpActivity(1)
-        ))));
+        let mut target_writers = FlowTable::new();
+        assert!(flow_event_counts_as_session_activity(
+            Some(&FlowEvent::Activity),
+            &target_writers
+        ));
+        assert!(!flow_event_counts_as_session_activity(
+            Some(&FlowEvent::UdpActivity(1)),
+            &target_writers
+        ));
+
+        target_writers.insert(1, test_opening_udp_flow_slot());
+
+        assert!(flow_event_counts_as_session_activity(
+            Some(&FlowEvent::UdpActivity(1)),
+            &target_writers
+        ));
     }
 
     #[test]
     fn internal_flow_events_do_not_count_as_session_activity() {
-        assert!(!session_event_counts_as_activity(&SessionEvent::Flow(
-            Some(FlowEvent::ReadClosed(1))
-        )));
-        assert!(!session_event_counts_as_activity(&SessionEvent::Flow(
-            Some(FlowEvent::HalfCloseDrainExpired {
+        let target_writers = FlowTable::new();
+
+        assert!(!flow_event_counts_as_session_activity(
+            Some(&FlowEvent::ReadClosed(1)),
+            &target_writers
+        ));
+        assert!(!flow_event_counts_as_session_activity(
+            Some(&FlowEvent::HalfCloseDrainExpired {
                 flow_id: 1,
                 token: TEST_FLOW_TOKEN,
                 closed_side: HalfCloseSide::ClientToTarget,
-            })
-        )));
-        assert!(!session_event_counts_as_activity(&SessionEvent::Shutdown));
+            }),
+            &target_writers
+        ));
     }
 
     #[test]

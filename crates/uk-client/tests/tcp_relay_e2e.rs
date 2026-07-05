@@ -517,6 +517,11 @@ async fn reconnects_after_server_idle_timeout() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expires_idle_session_without_open_flows_despite_ping() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_no_flow_ping_idle_expiry_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keeps_idle_tcp_flow_alive_with_ping() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_idle_flow_keepalive_e2e()).await?
 }
@@ -1093,6 +1098,31 @@ async fn run_idle_reconnect_e2e() -> Result<(), TestError> {
     assert_echo_roundtrip(harness.socks_addr, second_target_addr, b"second session").await?;
     second_echo_task.await??;
     Ok(())
+}
+
+async fn run_no_flow_ping_idle_expiry_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = ServerHarness::start(test_limits_with_idle_timeout(1)).await?;
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(harness.client_config(SECRET)).await?;
+
+    write_ping_expect_pong(&mut carrier, Bytes::from_static(b"no-flow-ping-1")).await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    write_ping_expect_pong(&mut carrier, Bytes::from_static(b"no-flow-ping-2")).await?;
+    tokio::time::sleep(Duration::from_millis(650)).await;
+
+    match tokio::time::timeout(
+        Duration::from_millis(200),
+        read_frame(&mut carrier, FrameLimits::default()),
+    )
+    .await
+    {
+        Ok(Err(FrameIoError::Closed)) => Ok(()),
+        Ok(Err(err)) => Err(err.into()),
+        Ok(Ok(frame)) => Err(format!("unexpected frame after idle expiry: {frame:?}").into()),
+        Err(_) => Err("no-flow ping extended the idle session".into()),
+    }
 }
 
 async fn run_idle_flow_keepalive_e2e() -> Result<(), TestError> {
@@ -3997,6 +4027,24 @@ async fn assert_udp_close(
     assert_eq!(close.header.id, flow_id);
     let mut payload = close.payload;
     assert_eq!(UdpClose::decode(&mut payload)?.close_code, expected);
+    Ok(())
+}
+
+async fn write_ping_expect_pong(
+    carrier: &mut ClientTlsStream<TcpStream>,
+    payload: Bytes,
+) -> Result<(), TestError> {
+    let frame = Frame::new(FrameType::Ping, 0, 0, payload.clone())?;
+    write_frame(carrier, &frame).await?;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(response.header.frame_type, FrameType::Pong);
+    assert_eq!(response.header.id, 0);
+    assert_eq!(response.payload, payload);
     Ok(())
 }
 
