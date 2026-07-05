@@ -424,18 +424,60 @@ fn private_matches(context: &PolicyContext<'_>, want_private: bool) -> bool {
 
 fn is_private(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        IpAddr::V4(ip) => is_restricted_ipv4(ip),
         IpAddr::V6(ip) => {
             ipv4_mapped(ip).is_some_and(|ip| is_private(IpAddr::V4(ip)))
                 || ip.is_unique_local()
                 || ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
                 || is_ipv6_unicast_link_local(ip)
+                || is_ipv6_documentation(ip)
         }
     }
 }
 
+fn is_restricted_ipv4(ip: Ipv4Addr) -> bool {
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || is_ipv4_documentation(ip)
+        || is_ipv4_shared_address(ip)
+        || is_ipv4_benchmarking(ip)
+        || is_ipv4_reserved(ip)
+}
+
+fn is_ipv4_documentation(ip: Ipv4Addr) -> bool {
+    matches!(
+        ip.octets(),
+        [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _]
+    )
+}
+
+fn is_ipv4_shared_address(ip: Ipv4Addr) -> bool {
+    let [first, second, _, _] = ip.octets();
+    first == 100 && (64..=127).contains(&second)
+}
+
+fn is_ipv4_benchmarking(ip: Ipv4Addr) -> bool {
+    let [first, second, _, _] = ip.octets();
+    first == 198 && matches!(second, 18 | 19)
+}
+
+fn is_ipv4_reserved(ip: Ipv4Addr) -> bool {
+    ip.octets()[0] >= 240
+}
+
 fn is_ipv6_unicast_link_local(ip: Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xffc0) == 0xfe80
+}
+
+fn is_ipv6_documentation(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0x2001 && segments[1] == 0x0db8
 }
 
 fn ipv4_mapped(ip: Ipv6Addr) -> Option<Ipv4Addr> {
@@ -607,6 +649,50 @@ mod tests {
             policy.evaluate(&context(&target, Some("default"), &[])),
             PolicyDecision::Deny
         );
+    }
+
+    #[test]
+    fn denies_restricted_ipv4_ranges_by_private_rule() {
+        let mut rule = PolicyRule::new(PolicyDecision::Deny);
+        rule.private = Some(true);
+        let policy = PolicySet::new(vec![rule]);
+        let restricted = [
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            Ipv4Addr::new(224, 0, 0, 1),
+            Ipv4Addr::new(192, 0, 2, 1),
+            Ipv4Addr::new(100, 64, 0, 1),
+            Ipv4Addr::new(198, 18, 0, 1),
+            Ipv4Addr::new(240, 0, 0, 1),
+        ];
+
+        for ip in restricted {
+            let target = Target::Ipv4(ip, 443);
+            assert_eq!(
+                policy.evaluate(&context(&target, Some("default"), &[])),
+                PolicyDecision::Deny
+            );
+        }
+    }
+
+    #[test]
+    fn private_false_rejects_restricted_ipv6_resolution() {
+        let mut rule = PolicyRule::new(PolicyDecision::Allow);
+        rule.private = Some(false);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Domain("restricted.example".to_owned(), 443);
+        let restricted = [
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            IpAddr::V6("ff02::1".parse().unwrap()),
+            IpAddr::V6("2001:db8::1".parse().unwrap()),
+        ];
+
+        for ip in restricted {
+            assert_eq!(
+                policy.evaluate(&context(&target, Some("default"), &[ip])),
+                PolicyDecision::Deny
+            );
+        }
     }
 
     #[test]
