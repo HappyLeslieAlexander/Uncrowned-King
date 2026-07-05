@@ -1578,11 +1578,35 @@ impl UdpAssociation {
         shutdown_rx: watch::Receiver<bool>,
     ) {
         let socket = Arc::clone(&self.socket);
-        let client_endpoint = self
-            .client_endpoint
-            .expect("udp client endpoint must be known before opening a flow");
+        let Some(client_endpoint) = self.client_endpoint else {
+            warn!(
+                event = "client.udp_flow.missing_client_endpoint",
+                flow_id = flow.id,
+                target = ?target
+            );
+            self.spawn_udp_flow_cleanup(flow, target);
+            return;
+        };
         self.flow_tasks.spawn(async move {
             relay_udp_flow_to_client(flow, target, socket, client_endpoint, shutdown_rx).await
+        });
+    }
+
+    fn spawn_udp_flow_cleanup(&mut self, flow: ClientFlow, target: Target) {
+        self.flow_tasks.spawn(async move {
+            let flow_id = flow.id;
+            let session = Arc::clone(&flow.session);
+            let outcome = async {
+                session.send_udp_close(flow_id, UDP_CLOSE_ERROR).await?;
+                session.flows.lock().await.remove(&flow_id);
+                Ok(())
+            }
+            .await;
+            UdpFlowTaskResult {
+                flow_id,
+                target,
+                outcome,
+            }
         });
     }
 
