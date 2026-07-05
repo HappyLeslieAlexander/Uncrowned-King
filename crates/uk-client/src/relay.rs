@@ -824,12 +824,25 @@ impl ClientSession {
                         .ok_or_else(|| "uk session closed while opening udp flow".into());
                 }
                 read = local.read(tcp_buf) => {
-                    if read? == 0 {
-                        debug!(event = "client.udp_flow.open.cancelled", flow_id);
-                        self.cancel_pending_udp_open(flow_id).await;
-                        return Ok(UdpOpenWaitOutcome::Cancelled);
+                    match read {
+                        Ok(0) => {
+                            debug!(event = "client.udp_flow.open.cancelled", flow_id);
+                            self.cancel_pending_udp_open(flow_id).await;
+                            return Ok(UdpOpenWaitOutcome::Cancelled);
+                        }
+                        Ok(_) => {
+                            debug!(event = "socks5.udp_associate.control_data_ignored");
+                        }
+                        Err(err) => {
+                            debug!(
+                                event = "client.udp_flow.open.control_read_error",
+                                flow_id,
+                                error = %err
+                            );
+                            self.cancel_pending_udp_open(flow_id).await;
+                            return Ok(UdpOpenWaitOutcome::Cancelled);
+                        }
                     }
-                    debug!(event = "socks5.udp_associate.control_data_ignored");
                 }
                 changed = shutdown_rx.changed() => {
                     let _ = changed;
