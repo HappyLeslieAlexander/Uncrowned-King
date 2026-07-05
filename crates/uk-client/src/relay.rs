@@ -677,26 +677,14 @@ impl ClientSession {
     async fn reserve_flow(
         &self,
     ) -> Result<Option<(u64, mpsc::Receiver<BufferedFlowFrame>)>, AnyError> {
-        for _ in 0..FLOW_ID_ALLOCATION_ATTEMPTS {
-            let Some(flow_id) = allocate_client_flow_id(&self.next_flow_id) else {
-                return Err("client flow id space exhausted".into());
-            };
-            if !is_client_initiated_flow_id(flow_id) {
-                continue;
-            }
-
-            let (sender, frames) = mpsc::channel(FLOW_FRAME_QUEUE_CAPACITY);
-            let mut flows = self.flows.lock().await;
-            if flows.len() as u64 >= self.max_streams {
-                return Ok(None);
-            }
-            if let Entry::Vacant(entry) = flows.entry(flow_id) {
-                entry.insert(ClientFlowRoute::new(sender));
-                return Ok(Some((flow_id, frames)));
-            }
-        }
-
-        Err("no available client flow id".into())
+        let (sender, frames) = mpsc::channel(FLOW_FRAME_QUEUE_CAPACITY);
+        let mut flows = self.flows.lock().await;
+        let Some(flow_id) =
+            reserve_flow_slot(&mut flows, self.max_streams, &self.next_flow_id, sender)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((flow_id, frames)))
     }
 
     async fn send_tcp_open(&self, flow_id: u64, target: Target) -> Result<(), AnyError> {
@@ -792,6 +780,33 @@ impl ClientSession {
         }
         result
     }
+}
+
+fn reserve_flow_slot(
+    flows: &mut HashMap<u64, ClientFlowRoute>,
+    max_streams: u64,
+    next_flow_id: &AtomicU64,
+    sender: mpsc::Sender<BufferedFlowFrame>,
+) -> Result<Option<u64>, AnyError> {
+    if flows.len() as u64 >= max_streams {
+        return Ok(None);
+    }
+
+    for _ in 0..FLOW_ID_ALLOCATION_ATTEMPTS {
+        let Some(flow_id) = allocate_client_flow_id(next_flow_id) else {
+            return Err("client flow id space exhausted".into());
+        };
+        if !is_client_initiated_flow_id(flow_id) {
+            continue;
+        }
+
+        if let Entry::Vacant(entry) = flows.entry(flow_id) {
+            entry.insert(ClientFlowRoute::new(sender));
+            return Ok(Some(flow_id));
+        }
+    }
+
+    Err("no available client flow id".into())
 }
 
 #[derive(Default)]
@@ -1577,6 +1592,41 @@ mod tests {
             usize::MAX,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn reserve_flow_slot_allocates_route_when_capacity_is_available() {
+        let mut flows = HashMap::new();
+        let next_flow_id = AtomicU64::new(FIRST_CLIENT_FLOW_ID);
+        let (sender, _receiver) = mpsc::channel(1);
+
+        assert_eq!(
+            reserve_flow_slot(&mut flows, 1, &next_flow_id, sender).unwrap(),
+            Some(FIRST_CLIENT_FLOW_ID)
+        );
+
+        assert!(flows.contains_key(&FIRST_CLIENT_FLOW_ID));
+        assert_eq!(
+            next_flow_id.load(Ordering::Relaxed),
+            FIRST_CLIENT_FLOW_ID + FLOW_ID_STEP
+        );
+    }
+
+    #[test]
+    fn reserve_flow_slot_does_not_consume_id_when_stream_limit_is_full() {
+        let mut flows = HashMap::new();
+        let (existing_sender, _existing_receiver) = mpsc::channel(1);
+        flows.insert(FLOW_ID, ClientFlowRoute::new(existing_sender));
+        let next_flow_id = AtomicU64::new(FIRST_CLIENT_FLOW_ID);
+        let (sender, _receiver) = mpsc::channel(1);
+
+        assert_eq!(
+            reserve_flow_slot(&mut flows, 1, &next_flow_id, sender).unwrap(),
+            None
+        );
+
+        assert_eq!(flows.len(), 1);
+        assert_eq!(next_flow_id.load(Ordering::Relaxed), FIRST_CLIENT_FLOW_ID);
     }
 
     #[test]
