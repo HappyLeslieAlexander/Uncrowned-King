@@ -406,7 +406,8 @@ udp_flow_idle_timeout_seconds
 ```
 
 Capacity limits must be greater than zero, except `max_udp_flows` may be zero
-when the implementation explicitly documents zero as disabling UDP relay.
+when the implementation explicitly documents zero as disabling UDP relay. When
+non-zero, `max_udp_flows` must not exceed `max_streams_per_session`.
 Timeout fields may use zero only when the implementation explicitly documents
 zero as disabling that timeout.
 

@@ -6,6 +6,9 @@ use bytes::{Buf, BufMut};
 
 use crate::{ProtocolError, ProtocolResult, varint};
 
+/// Default maximum concurrent streams when SETTINGS omits `max_streams`.
+pub const DEFAULT_MAX_STREAMS: u64 = 64;
+
 /// Known v0.1 setting keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u64)]

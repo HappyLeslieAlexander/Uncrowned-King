@@ -24,7 +24,7 @@ pub use frame::{
     Frame, FrameHeader, FrameLimits, FrameType, MAX_FRAME_PAYLOAD_SIZE, validate_connection_frame,
 };
 pub use io::{FrameIoError, FrameIoResult, read_frame, write_frame};
-pub use settings::{SettingKey, Settings};
+pub use settings::{DEFAULT_MAX_STREAMS, SettingKey, Settings};
 pub use status::{ErrorCode, ErrorPayload};
 pub use target::Target;
 pub use tcp::{

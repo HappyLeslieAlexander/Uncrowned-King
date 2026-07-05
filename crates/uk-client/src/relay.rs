@@ -24,10 +24,10 @@ use tokio::{
 use tokio_rustls::client::TlsStream;
 use tracing::{debug, info, warn};
 use uk_proto::{
-    ErrorCode, ErrorPayload, FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, Frame, FrameIoError, FrameLimits,
-    FrameType, SettingKey, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target,
-    TcpClose, TcpOpen, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose, UdpOpen,
-    frame::DEFAULT_MAX_FRAME_SIZE, is_client_initiated_flow_id, read_frame,
+    DEFAULT_MAX_STREAMS, ErrorCode, ErrorPayload, FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, Frame,
+    FrameIoError, FrameLimits, FrameType, SettingKey, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL,
+    TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose,
+    UdpOpen, frame::DEFAULT_MAX_FRAME_SIZE, is_client_initiated_flow_id, read_frame,
     validate_connection_frame, varint::MAX_VARINT, write_frame,
 };
 
@@ -40,7 +40,6 @@ const FLOW_ID_ALLOCATION_ATTEMPTS: usize = 1024;
 const FLOW_FRAME_QUEUE_CAPACITY: usize = 32;
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const UDP_ASSOCIATION_BUFFER_SIZE: usize = 65_536;
-const DEFAULT_MAX_STREAMS: u64 = 64;
 
 type AnyError = Box<dyn Error + Send + Sync>;
 type CarrierWriter = Arc<Mutex<WriteHalf<TlsStream<TcpStream>>>>;

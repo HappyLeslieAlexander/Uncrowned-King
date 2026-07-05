@@ -9,9 +9,9 @@ use tokio_rustls::{TlsConnector, client::TlsStream};
 use tracing::{info, warn};
 use uk_auth::{AuthChallenge, AuthResponse, unix_now};
 use uk_proto::{
-    ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, MAX_FRAME_PAYLOAD_SIZE,
-    MIN_TCP_RELAY_FRAME_SIZE, SettingKey, Settings, read_frame, validate_connection_frame,
-    write_frame,
+    DEFAULT_MAX_STREAMS, ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType,
+    MAX_FRAME_PAYLOAD_SIZE, MIN_TCP_RELAY_FRAME_SIZE, SettingKey, Settings, read_frame,
+    validate_connection_frame, write_frame,
 };
 
 use crate::{config::ClientConfig, tls};
@@ -143,6 +143,7 @@ fn validate_server_settings(settings: &Settings) -> Result<(), AnyError> {
         SettingKey::SupportsUdpStreamFallback,
         "supports_udp_stream_fallback",
     )?;
+    reject_udp_flow_limit(settings)?;
     reject_small_setting(
         settings,
         SettingKey::MaxFrameSize,
@@ -177,6 +178,18 @@ fn reject_boolean_setting(
 ) -> Result<(), AnyError> {
     if settings.get(key).is_some_and(|value| value > 1) {
         Err(format!("{name} must be 0 or 1").into())
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_udp_flow_limit(settings: &Settings) -> Result<(), AnyError> {
+    let max_streams = settings
+        .get(SettingKey::MaxStreams)
+        .unwrap_or(DEFAULT_MAX_STREAMS);
+    let max_udp_flows = settings.get(SettingKey::MaxUdpFlows).unwrap_or(max_streams);
+    if max_udp_flows > max_streams {
+        Err("max_udp_flows must not exceed max_streams".into())
     } else {
         Ok(())
     }
@@ -316,6 +329,27 @@ mod tests {
         settings.set(SettingKey::MaxStreams, 0);
 
         assert!(validate_server_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn rejects_udp_flow_limit_above_stream_limit() {
+        let mut settings = Settings::default();
+        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::MaxStreams, 8);
+        settings.set(SettingKey::MaxUdpFlows, 9);
+
+        let error = validate_server_settings(&settings).unwrap_err();
+        assert!(error.to_string().contains("max_udp_flows"));
+    }
+
+    #[test]
+    fn rejects_udp_flow_limit_above_default_stream_limit() {
+        let mut settings = Settings::default();
+        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::MaxUdpFlows, DEFAULT_MAX_STREAMS + 1);
+
+        let error = validate_server_settings(&settings).unwrap_err();
+        assert!(error.to_string().contains("max_udp_flows"));
     }
 
     #[test]
