@@ -146,10 +146,17 @@ enum FlowFrameRoute {
     SessionQueueFull,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlowProtocol {
+    Tcp,
+    Udp,
+}
+
 #[derive(Debug, Clone)]
 struct ClientFlowRoute {
     sender: mpsc::Sender<BufferedFlowFrame>,
     flow_buffer: ClientFlowBufferControl,
+    protocol: FlowProtocol,
 }
 
 #[derive(Debug, Clone)]
@@ -263,10 +270,11 @@ impl ClientFlowBufferControl {
 }
 
 impl ClientFlowRoute {
-    fn new(sender: mpsc::Sender<BufferedFlowFrame>) -> Self {
+    fn new(sender: mpsc::Sender<BufferedFlowFrame>, protocol: FlowProtocol) -> Self {
         Self {
             sender,
             flow_buffer: ClientFlowBufferControl::default(),
+            protocol,
         }
     }
 }
@@ -602,7 +610,7 @@ impl ClientSession {
         if self.is_closed() {
             return Err("uk session is closed".into());
         }
-        let Some((flow_id, frames)) = self.reserve_flow().await? else {
+        let Some((flow_id, frames)) = self.reserve_flow(FlowProtocol::Tcp).await? else {
             return Ok(OpenOutcome::Rejected(socks5::Reply::GeneralFailure));
         };
         if self.is_closed() {
@@ -653,7 +661,7 @@ impl ClientSession {
         if self.is_closed() {
             return Err("uk session is closed".into());
         }
-        let Some((flow_id, frames)) = self.reserve_flow().await? else {
+        let Some((flow_id, frames)) = self.reserve_flow(FlowProtocol::Udp).await? else {
             return Ok(OpenOutcome::Rejected(socks5::Reply::GeneralFailure));
         };
         if self.is_closed() {
@@ -807,11 +815,17 @@ impl ClientSession {
 
     async fn reserve_flow(
         &self,
+        protocol: FlowProtocol,
     ) -> Result<Option<(u64, mpsc::Receiver<BufferedFlowFrame>)>, AnyError> {
         let (sender, frames) = mpsc::channel(FLOW_FRAME_QUEUE_CAPACITY);
         let mut flows = self.flows.lock().await;
-        let Some(flow_id) =
-            reserve_flow_slot(&mut flows, self.max_streams, &self.next_flow_id, sender)?
+        let Some(flow_id) = reserve_flow_slot(
+            &mut flows,
+            self.max_streams,
+            &self.next_flow_id,
+            sender,
+            protocol,
+        )?
         else {
             return Ok(None);
         };
@@ -938,6 +952,7 @@ fn reserve_flow_slot(
     max_streams: u64,
     next_flow_id: &AtomicU64,
     sender: mpsc::Sender<BufferedFlowFrame>,
+    protocol: FlowProtocol,
 ) -> Result<Option<u64>, AnyError> {
     if flows.len() as u64 >= max_streams {
         return Ok(None);
@@ -952,7 +967,7 @@ fn reserve_flow_slot(
         }
 
         if let Entry::Vacant(entry) = flows.entry(flow_id) {
-            entry.insert(ClientFlowRoute::new(sender));
+            entry.insert(ClientFlowRoute::new(sender, protocol));
             return Ok(Some(flow_id));
         }
     }
@@ -1132,7 +1147,7 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
                 return Err("connection error from server".into());
             }
             let frame_type = frame.header.frame_type;
-            let (flow_id, route) = {
+            let (flow_id, protocol, route) = {
                 let mut flows = session.flows.lock().await;
                 route_flow_frame(
                     frame,
@@ -1150,12 +1165,12 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
                 FlowFrameRoute::FlowQueueFull => {
                     warn!(event = "client.flow.queue_full", flow_id);
                     session.send_resource_limit(flow_id).await?;
-                    send_flow_error_close(session, flow_id, frame_type).await?;
+                    send_flow_error_close(session, flow_id, protocol, frame_type).await?;
                 }
                 FlowFrameRoute::SessionQueueFull => {
                     warn!(event = "client.session.queue_full", flow_id);
                     session.send_resource_limit(flow_id).await?;
-                    send_flow_error_close(session, flow_id, frame_type).await?;
+                    send_flow_error_close(session, flow_id, protocol, frame_type).await?;
                 }
                 FlowFrameRoute::UnknownFlow
                 | FlowFrameRoute::Enqueued
@@ -1188,13 +1203,18 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
 async fn send_flow_error_close(
     session: &ClientSession,
     flow_id: u64,
+    protocol: Option<FlowProtocol>,
     frame_type: FrameType,
 ) -> Result<(), AnyError> {
-    match frame_type {
-        FrameType::UdpData | FrameType::UdpClose => {
-            session.send_udp_close(flow_id, UDP_CLOSE_ERROR).await
-        }
-        _ => session.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await,
+    match protocol {
+        Some(FlowProtocol::Udp) => session.send_udp_close(flow_id, UDP_CLOSE_ERROR).await,
+        Some(FlowProtocol::Tcp) => session.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await,
+        None => match frame_type {
+            FrameType::UdpData | FrameType::UdpClose => {
+                session.send_udp_close(flow_id, UDP_CLOSE_ERROR).await
+            }
+            _ => session.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await,
+        },
     }
 }
 
@@ -1245,17 +1265,18 @@ fn route_flow_frame(
     session_buffer: ClientSessionBufferControl,
     flow_byte_limit: usize,
     session_byte_limit: usize,
-) -> (u64, FlowFrameRoute) {
+) -> (u64, Option<FlowProtocol>, FlowFrameRoute) {
     let flow_id = frame.header.id;
     if !is_client_initiated_flow_id(flow_id) {
-        return (flow_id, FlowFrameRoute::InvalidFlowId);
+        return (flow_id, None, FlowFrameRoute::InvalidFlowId);
     }
 
     let Some(route) = flows.get(&flow_id) else {
-        return (flow_id, FlowFrameRoute::UnknownFlow);
+        return (flow_id, None, FlowFrameRoute::UnknownFlow);
     };
     let sender = route.sender.clone();
     let flow_buffer = route.flow_buffer.clone();
+    let protocol = route.protocol;
 
     let buffered_frame = match BufferedFlowFrame::new(
         frame,
@@ -1267,11 +1288,11 @@ fn route_flow_frame(
         Ok(frame) => frame,
         Err(BufferReserveError::FlowLimit) => {
             flows.remove(&flow_id);
-            return (flow_id, FlowFrameRoute::FlowQueueFull);
+            return (flow_id, Some(protocol), FlowFrameRoute::FlowQueueFull);
         }
         Err(BufferReserveError::SessionLimit) => {
             flows.remove(&flow_id);
-            return (flow_id, FlowFrameRoute::SessionQueueFull);
+            return (flow_id, Some(protocol), FlowFrameRoute::SessionQueueFull);
         }
     };
 
@@ -1286,7 +1307,7 @@ fn route_flow_frame(
     ) {
         flows.remove(&flow_id);
     }
-    (flow_id, route)
+    (flow_id, Some(protocol), route)
 }
 
 async fn handle_socks_connection(
@@ -2036,13 +2057,14 @@ mod tests {
         frame: Frame,
         flows: &mut HashMap<u64, ClientFlowRoute>,
     ) -> (u64, FlowFrameRoute) {
-        route_flow_frame(
+        let (flow_id, _protocol, route) = route_flow_frame(
             frame,
             flows,
             ClientSessionBufferControl::default(),
             usize::MAX,
             usize::MAX,
-        )
+        );
+        (flow_id, route)
     }
 
     fn buffered_flow_frame(frame: Frame) -> BufferedFlowFrame {
@@ -2063,7 +2085,7 @@ mod tests {
         let (sender, _receiver) = mpsc::channel(1);
 
         assert_eq!(
-            reserve_flow_slot(&mut flows, 1, &next_flow_id, sender).unwrap(),
+            reserve_flow_slot(&mut flows, 1, &next_flow_id, sender, FlowProtocol::Tcp).unwrap(),
             Some(FIRST_CLIENT_FLOW_ID)
         );
 
@@ -2078,12 +2100,15 @@ mod tests {
     fn reserve_flow_slot_does_not_consume_id_when_stream_limit_is_full() {
         let mut flows = HashMap::new();
         let (existing_sender, _existing_receiver) = mpsc::channel(1);
-        flows.insert(FLOW_ID, ClientFlowRoute::new(existing_sender));
+        flows.insert(
+            FLOW_ID,
+            ClientFlowRoute::new(existing_sender, FlowProtocol::Tcp),
+        );
         let next_flow_id = AtomicU64::new(FIRST_CLIENT_FLOW_ID);
         let (sender, _receiver) = mpsc::channel(1);
 
         assert_eq!(
-            reserve_flow_slot(&mut flows, 1, &next_flow_id, sender).unwrap(),
+            reserve_flow_slot(&mut flows, 1, &next_flow_id, sender, FlowProtocol::Tcp).unwrap(),
             None
         );
 
@@ -2095,7 +2120,7 @@ mod tests {
     fn routes_carrier_frame_to_existing_flow() {
         let (sender, mut receiver) = mpsc::channel(1);
         let mut flows = HashMap::new();
-        flows.insert(FLOW_ID, ClientFlowRoute::new(sender));
+        flows.insert(FLOW_ID, ClientFlowRoute::new(sender, FlowProtocol::Tcp));
 
         assert_eq!(
             route_test_flow_frame(
@@ -2149,7 +2174,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
         let mut flows = HashMap::new();
-        flows.insert(FLOW_ID, ClientFlowRoute::new(sender));
+        flows.insert(FLOW_ID, ClientFlowRoute::new(sender, FlowProtocol::Tcp));
 
         assert_eq!(
             route_test_flow_frame(data_frame(FLOW_ID, Bytes::from_static(b"late")), &mut flows),
@@ -2168,7 +2193,7 @@ mod tests {
             )))
             .unwrap();
         let mut flows = HashMap::new();
-        flows.insert(FLOW_ID, ClientFlowRoute::new(sender));
+        flows.insert(FLOW_ID, ClientFlowRoute::new(sender, FlowProtocol::Tcp));
 
         assert_eq!(
             route_test_flow_frame(
@@ -2188,7 +2213,7 @@ mod tests {
     fn removes_flow_when_flow_buffer_limit_is_exceeded() {
         let (sender, _receiver) = mpsc::channel(1);
         let mut flows = HashMap::new();
-        flows.insert(FLOW_ID, ClientFlowRoute::new(sender));
+        flows.insert(FLOW_ID, ClientFlowRoute::new(sender, FlowProtocol::Tcp));
         let session_buffer = ClientSessionBufferControl::default();
 
         assert_eq!(
@@ -2199,7 +2224,11 @@ mod tests {
                 4,
                 usize::MAX,
             ),
-            (FLOW_ID, FlowFrameRoute::FlowQueueFull)
+            (
+                FLOW_ID,
+                Some(FlowProtocol::Tcp),
+                FlowFrameRoute::FlowQueueFull
+            )
         );
 
         assert!(!flows.contains_key(&FLOW_ID));
@@ -2210,7 +2239,7 @@ mod tests {
     fn removes_flow_when_session_buffer_limit_is_exceeded() {
         let (sender, _receiver) = mpsc::channel(1);
         let mut flows = HashMap::new();
-        flows.insert(FLOW_ID, ClientFlowRoute::new(sender));
+        flows.insert(FLOW_ID, ClientFlowRoute::new(sender, FlowProtocol::Tcp));
         let session_buffer = ClientSessionBufferControl::default();
 
         assert_eq!(
@@ -2221,7 +2250,11 @@ mod tests {
                 usize::MAX,
                 4,
             ),
-            (FLOW_ID, FlowFrameRoute::SessionQueueFull)
+            (
+                FLOW_ID,
+                Some(FlowProtocol::Tcp),
+                FlowFrameRoute::SessionQueueFull
+            )
         );
 
         assert!(!flows.contains_key(&FLOW_ID));
