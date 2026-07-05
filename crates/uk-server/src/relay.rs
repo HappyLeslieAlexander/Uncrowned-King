@@ -194,7 +194,7 @@ struct OpenDialPermit {
 #[derive(Debug)]
 enum FlowSlot {
     Opening(OpenFlowCancel),
-    Open(TargetFlow),
+    Tcp(TargetFlow),
 }
 
 #[derive(Clone)]
@@ -645,7 +645,7 @@ async fn handle_tcp_close_frame(
     };
     let should_remove = match target_writers.get_mut(&flow_id) {
         Some(FlowSlot::Opening(_)) => true,
-        Some(FlowSlot::Open(target)) => {
+        Some(FlowSlot::Tcp(target)) => {
             if close.close_code == TCP_CLOSE_NORMAL {
                 let should_start_drain_timer = target.target_to_client_open;
                 let token = target.token;
@@ -705,7 +705,7 @@ async fn handle_client_flow_status_frame(
 fn abort_client_flow(flow_id: u64, target_writers: &mut FlowTable) {
     let should_remove = match target_writers.get_mut(&flow_id) {
         Some(FlowSlot::Opening(_)) => true,
-        Some(FlowSlot::Open(target)) => {
+        Some(FlowSlot::Tcp(target)) => {
             target.abort();
             true
         }
@@ -784,8 +784,8 @@ fn tcp_data_disposition(
     match target_writers.get(&flow_id) {
         None => TcpDataDisposition::UnknownFlow,
         Some(FlowSlot::Opening(_)) => TcpDataDisposition::OpeningFlow,
-        Some(FlowSlot::Open(_)) if payload.is_empty() => TcpDataDisposition::EmptyPayload,
-        Some(FlowSlot::Open(_)) => TcpDataDisposition::ForwardPayload,
+        Some(FlowSlot::Tcp(_)) if payload.is_empty() => TcpDataDisposition::EmptyPayload,
+        Some(FlowSlot::Tcp(_)) => TcpDataDisposition::ForwardPayload,
     }
 }
 
@@ -898,7 +898,7 @@ async fn handle_tcp_open_completed(
     match result {
         Ok(target_stream) => {
             let target_flow = accept_open_target(flow_id, target, target_stream, context).await?;
-            target_writers.insert(flow_id, FlowSlot::Open(target_flow));
+            target_writers.insert(flow_id, FlowSlot::Tcp(target_flow));
         }
         Err(err) => {
             reject_open_failure(flow_id, &target, err, context).await?;
@@ -1494,7 +1494,7 @@ impl Drop for TargetFlow {
 
 fn open_target_flow_mut(target_writers: &mut FlowTable, flow_id: u64) -> Option<&mut TargetFlow> {
     match target_writers.get_mut(&flow_id) {
-        Some(FlowSlot::Open(target)) => Some(target),
+        Some(FlowSlot::Tcp(target)) => Some(target),
         Some(FlowSlot::Opening(_)) | None => None,
     }
 }
@@ -1547,7 +1547,7 @@ fn close_target_flows(target_writers: &mut FlowTable) {
     for slot in target_writers.drain().map(|(_, target)| target) {
         match slot {
             FlowSlot::Opening(cancel) => cancel.cancel(),
-            FlowSlot::Open(mut target) => target.close_client_to_target(),
+            FlowSlot::Tcp(mut target) => target.close_client_to_target(),
         }
     }
 }
@@ -1873,7 +1873,7 @@ mod tests {
     }
 
     fn test_open_flow_slot() -> FlowSlot {
-        FlowSlot::Open(test_target_flow())
+        FlowSlot::Tcp(test_target_flow())
     }
 
     fn test_opening_flow_slot() -> FlowSlot {
@@ -1960,7 +1960,7 @@ mod tests {
         let mut target_writers = FlowTable::new();
         let mut flow = test_target_flow_with_token(TEST_FLOW_TOKEN);
         flow.mark_target_to_client_closed();
-        target_writers.insert(1, FlowSlot::Open(flow));
+        target_writers.insert(1, FlowSlot::Tcp(flow));
 
         assert_eq!(
             expire_half_close_drain(
@@ -1982,7 +1982,7 @@ mod tests {
         let mut target_writers = FlowTable::new();
         let mut flow = test_target_flow_with_token(TEST_FLOW_TOKEN);
         flow.mark_target_to_client_closed();
-        target_writers.insert(1, FlowSlot::Open(flow));
+        target_writers.insert(1, FlowSlot::Tcp(flow));
 
         assert_eq!(
             expire_half_close_drain(
@@ -2308,7 +2308,7 @@ mod tests {
         let flow = test_target_flow();
         let control = flow.control.clone();
         let mut target_writers = FlowTable::new();
-        target_writers.insert(1, FlowSlot::Open(flow));
+        target_writers.insert(1, FlowSlot::Tcp(flow));
 
         abort_client_flow(1, &mut target_writers);
 
