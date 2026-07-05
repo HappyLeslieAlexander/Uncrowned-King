@@ -696,8 +696,13 @@ async fn handle_tcp_data_frame(
         .await;
     }
     match tcp_data_disposition(flow_id, &frame.payload, target_writers) {
-        TcpDataDisposition::UnknownFlow | TcpDataDisposition::OtherProtocolFlow => {
+        TcpDataDisposition::UnknownFlow => {
             send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+        }
+        TcpDataDisposition::OtherProtocolFlow => {
+            send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+            send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
+            remove_flow_slot(target_writers, flow_id);
         }
         TcpDataDisposition::OpeningFlow => {
             send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
@@ -1125,8 +1130,13 @@ async fn handle_udp_data_frame(
         .await;
     }
     match udp_data_disposition(flow_id, target_writers) {
-        UdpDataDisposition::UnknownFlow | UdpDataDisposition::TcpFlow => {
+        UdpDataDisposition::UnknownFlow => {
             send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+        }
+        UdpDataDisposition::TcpFlow => {
+            send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+            send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
+            remove_flow_slot(target_writers, flow_id);
         }
         UdpDataDisposition::OpeningFlow => {
             send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
