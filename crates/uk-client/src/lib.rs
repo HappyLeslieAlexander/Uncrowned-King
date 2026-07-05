@@ -43,7 +43,7 @@ pub async fn connect_authenticated_carrier(
     session::connect_authenticated(&config).await
 }
 
-/// Starts a local SOCKS5 listener backed by UK TCP relay.
+/// Starts a local SOCKS5 listener backed by UK TCP and UDP relay.
 pub async fn run_socks5_listener(config: ClientConfig, listen: String) -> Result<(), AnyError> {
     run_socks5_listener_until_shutdown(config, listen, future::pending()).await
 }

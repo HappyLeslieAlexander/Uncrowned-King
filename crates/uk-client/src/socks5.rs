@@ -1,4 +1,4 @@
-//! Minimal SOCKS5 CONNECT parser.
+//! Minimal SOCKS5 CONNECT and UDP ASSOCIATE parser.
 
 use std::{
     io,

@@ -1,4 +1,4 @@
-//! End-to-end TCP relay tests.
+//! End-to-end TCP and UDP relay tests.
 
 use std::{
     fs,

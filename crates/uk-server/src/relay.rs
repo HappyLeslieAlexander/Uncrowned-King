@@ -1,4 +1,4 @@
-//! Server-side UK TCP relay.
+//! Server-side UK TCP and UDP relay.
 
 use std::{
     collections::HashMap,
@@ -23,7 +23,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
-    task::JoinSet,
+    task::{Id, JoinSet},
     time,
 };
 use tokio_rustls::server::TlsStream;
@@ -46,6 +46,11 @@ type FlowTable = HashMap<u64, FlowSlot>;
 type BoxedConnectFuture<T> =
     Pin<Box<dyn Future<Output = (SocketAddr, io::Result<T>)> + Send + 'static>>;
 type TargetConnector<T> = Arc<dyn Fn(SocketAddr) -> BoxedConnectFuture<T> + Send + Sync + 'static>;
+
+struct ConnectTasks<T> {
+    tasks: JoinSet<(SocketAddr, io::Result<T>)>,
+    permits: HashMap<Id, OpenDialPermit>,
+}
 
 #[derive(Clone)]
 struct CarrierWriter {
@@ -2328,6 +2333,55 @@ async fn connect_udp_socket_addr(addr: SocketAddr) -> (SocketAddr, io::Result<Ud
     (addr, result)
 }
 
+impl<T> ConnectTasks<T>
+where
+    T: Send + 'static,
+{
+    fn new() -> Self {
+        Self {
+            tasks: JoinSet::new(),
+            permits: HashMap::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    fn spawn(&mut self, addr: SocketAddr, connector: &TargetConnector<T>, permit: OpenDialPermit) {
+        let connector = Arc::clone(connector);
+        let handle = self.tasks.spawn(async move { connector(addr).await });
+        self.permits.insert(handle.id(), permit);
+    }
+
+    async fn join_next(
+        &mut self,
+    ) -> Option<Result<(SocketAddr, io::Result<T>), tokio::task::JoinError>> {
+        let result = self.tasks.join_next_with_id().await?;
+        Some(match result {
+            Ok((id, output)) => {
+                self.permits.remove(&id);
+                Ok(output)
+            }
+            Err(err) => {
+                let id = err.id();
+                self.permits.remove(&id);
+                Err(err)
+            }
+        })
+    }
+
+    async fn abort_all(&mut self) {
+        self.tasks.abort_all();
+        while self.join_next().await.is_some() {}
+        self.permits.clear();
+    }
+}
+
 async fn connect_first_successful<T>(
     addrs: &[SocketAddr],
     connector: &TargetConnector<T>,
@@ -2336,7 +2390,7 @@ async fn connect_first_successful<T>(
 where
     T: Send + 'static,
 {
-    let mut tasks = JoinSet::new();
+    let mut tasks = ConnectTasks::new();
     let mut next_index = 0;
 
     let mut last_error = None;
@@ -2379,18 +2433,17 @@ where
     )))
 }
 
-async fn abort_connect_tasks<T>(tasks: &mut JoinSet<(SocketAddr, io::Result<T>)>)
+async fn abort_connect_tasks<T>(tasks: &mut ConnectTasks<T>)
 where
     T: Send + 'static,
 {
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
+    tasks.abort_all().await;
 }
 
 fn spawn_target_connects<T>(
     addrs: &[SocketAddr],
     next_index: &mut usize,
-    tasks: &mut JoinSet<(SocketAddr, io::Result<T>)>,
+    tasks: &mut ConnectTasks<T>,
     connector: &TargetConnector<T>,
     open_dial_limiter: &OpenDialLimiter,
 ) where
@@ -2402,13 +2455,7 @@ fn spawn_target_connects<T>(
         };
         let addr = addrs[*next_index];
         *next_index += 1;
-        let connector = Arc::clone(connector);
-        tasks.spawn(async move {
-            let permit_guard = permit;
-            let result = connector(addr).await;
-            drop(permit_guard);
-            result
-        });
+        tasks.spawn(addr, connector, permit);
     }
 }
 
@@ -3351,6 +3398,30 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(OpenFailure::TargetTimeout)));
+    }
+
+    #[tokio::test]
+    async fn target_connect_timeout_releases_candidate_permits() {
+        let first_addr = SocketAddr::from(([127, 0, 0, 1], 10_001));
+        let second_addr = SocketAddr::from(([127, 0, 0, 1], 10_002));
+        let addrs = [first_addr, second_addr];
+        let limiter = OpenDialLimiter::new(2);
+        let connector: TargetConnector<SocketAddr> =
+            Arc::new(move |addr| -> BoxedConnectFuture<SocketAddr> {
+                Box::pin(async move {
+                    std::future::pending::<()>().await;
+                    (addr, Ok(addr))
+                })
+            });
+
+        let result = with_optional_timeout(
+            Some(Duration::from_millis(1)),
+            connect_first_successful(&addrs, &connector, &limiter),
+        )
+        .await;
+
+        assert!(matches!(result, Err(OpenFailure::TargetTimeout)));
+        assert_eq!(limiter.available_permits(), 2);
     }
 
     #[tokio::test]

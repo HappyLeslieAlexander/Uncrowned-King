@@ -1,4 +1,4 @@
-//! SOCKS5-to-UK TCP relay.
+//! SOCKS5-to-UK TCP and UDP relay.
 
 use std::{
     collections::{HashMap, hash_map::Entry},
