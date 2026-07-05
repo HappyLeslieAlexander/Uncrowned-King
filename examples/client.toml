@@ -9,6 +9,7 @@ secret = "replace-with-a-long-random-shared-secret"
 handshake_timeout_seconds = 10
 socks_handshake_timeout_seconds = 10
 tcp_open_timeout_seconds = 10
+udp_flow_idle_timeout_seconds = 120
 max_pending_open_bytes = 65536
 max_socks_connections = 1024
 max_buffered_bytes_per_session = 16777216

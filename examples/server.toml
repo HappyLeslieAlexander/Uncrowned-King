@@ -11,6 +11,7 @@ max_pre_auth_bytes = 4096
 max_frame_size = 65536
 max_sessions = 1024
 max_streams = 64
+max_udp_flows = 64
 max_outbound_dials_per_session = 16
 max_buffered_bytes_per_session = 16777216
 idle_timeout_seconds = 300
@@ -18,6 +19,7 @@ max_buffered_bytes_per_flow = 2097152
 handshake_timeout_seconds = 10
 target_connect_timeout_seconds = 10
 tcp_half_close_timeout_seconds = 30
+udp_flow_idle_timeout_seconds = 120
 replay_cache_window_seconds = 300
 replay_cache_max_entries = 65536
 

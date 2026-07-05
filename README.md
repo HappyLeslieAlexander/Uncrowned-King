@@ -6,7 +6,7 @@ being developed in small, testable increments.
 
 ## Current Milestone
 
-The repository currently focuses on the first runnable v0.1 TCP path:
+The repository currently focuses on the first runnable v0.1 TLS/TCP carrier:
 
 - binary frame and QUIC-style varint encoding in `uk-proto`
 - strict target encoding in `uk-proto`
@@ -14,14 +14,17 @@ The repository currently focuses on the first runnable v0.1 TCP path:
 - challenge-response HMAC authentication in `uk-auth`
 - minimal policy decisions in `uk-policy`
 - TLS/TCP authenticated server sessions in `uk-server`
-- SOCKS5 CONNECT entry point and multiplexed TCP relay in `uk-client`
+- SOCKS5 CONNECT and UDP ASSOCIATE entry points in `uk-client`
+- multiplexed TCP relay and UDP relay over the TLS/TCP carrier
 - graceful Ctrl+C/SIGTERM shutdown for long-running client and server listeners
-- nonce-matched PING/PONG keepalive for active TCP relay flows
+- nonce-matched PING/PONG keepalive for active relay flows
+- negotiated UDP flow limits and idle UDP flow cleanup on both client and server
 
-The first runnable proxy target is:
+The first runnable proxy targets are:
 
 ```text
 SOCKS5 client -> UK over TLS/TCP -> UK server -> TCP target
+SOCKS5 client -> UK over TLS/TCP -> UK server -> UDP target
 ```
 
 Server policy is deny-all unless `policy_path` is set in the server config. A
@@ -46,8 +49,8 @@ including `169.254.169.254`, `100.100.100.200`, and `fd00:ec2::254`.
 
 Server limits can advertise and enforce the maximum frame size, concurrent
 carrier sessions, concurrent TCP streams per authenticated session, in-flight
-target socket dials per session, queued client-to-target bytes per session and per
-flow, plus the authenticated session idle timeout:
+target socket dials per session, concurrent UDP relay flows, queued
+client-to-target bytes per session and per flow, plus idle timeouts:
 
 ```toml
 [limits]
@@ -55,6 +58,7 @@ max_pre_auth_bytes = 4096
 max_frame_size = 65536
 max_sessions = 1024
 max_streams = 64
+max_udp_flows = 64
 max_outbound_dials_per_session = 16
 max_buffered_bytes_per_session = 16777216
 idle_timeout_seconds = 300
@@ -62,6 +66,7 @@ max_buffered_bytes_per_flow = 2097152
 handshake_timeout_seconds = 10
 target_connect_timeout_seconds = 10
 tcp_half_close_timeout_seconds = 30
+udp_flow_idle_timeout_seconds = 120
 replay_cache_window_seconds = 300
 replay_cache_max_entries = 65536
 ```
@@ -70,6 +75,8 @@ Set `idle_timeout_seconds = 0` to disable the relay session idle timeout.
 Set `handshake_timeout_seconds = 0` to disable the TLS/auth handshake timeout.
 Set `target_connect_timeout_seconds = 0` to disable the server target dial timeout.
 Set `tcp_half_close_timeout_seconds = 0` to disable the TCP half-close drain timeout.
+Set `udp_flow_idle_timeout_seconds = 0` to disable server-side UDP flow idle cleanup.
+Set `max_udp_flows = 0` to disable UDP relay.
 Replay cache limits must be greater than zero. `max_pre_auth_bytes` must be at
 least 75 bytes so a minimum `AUTH_RESPONSE` can fit. `max_pre_auth_bytes`,
 `max_frame_size`, `max_buffered_bytes_per_session`, and
@@ -84,6 +91,8 @@ endpoints after `server_addr` within that same timeout.
 When running the SOCKS5 listener, `socks_handshake_timeout_seconds = 10` bounds
 the local SOCKS greeting and CONNECT request. `tcp_open_timeout_seconds = 10`
 bounds waiting for a UK TCP open response from the server.
+`udp_flow_idle_timeout_seconds = 120` bounds how long a per-target UDP flow may
+sit idle in a local SOCKS UDP association before the client closes it.
 `max_pending_open_bytes = 65536` bounds local bytes buffered before that open
 response arrives.
 `max_socks_connections = 1024` bounds concurrent local SOCKS connections before

@@ -371,7 +371,7 @@ Default UDP limits:
 
 ```text
 max_udp_flows = max_streams by default; 0 disables UDP relay
-udp_idle_timeout = 120s
+udp_flow_idle_timeout_seconds = 120
 max_udp_payload = 65507 bytes, further limited by carrier MTU
 ```
 
@@ -398,10 +398,11 @@ Required limits:
 
 ```text
 max_streams_per_session
-max_udp_flows_per_session
+max_udp_flows
 max_buffered_bytes_per_session
 max_buffered_bytes_per_flow
 max_outbound_dials_per_session
+udp_flow_idle_timeout_seconds
 ```
 
 Capacity limits must be greater than zero, except `max_udp_flows` may be zero
