@@ -282,7 +282,7 @@ fn reject_large_limit(
 }
 
 /// Server resource limits.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[allow(clippy::struct_field_names)]
 #[serde(deny_unknown_fields)]
 pub struct LimitConfig {

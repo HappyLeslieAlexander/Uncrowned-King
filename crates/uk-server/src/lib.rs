@@ -303,7 +303,10 @@ fn server_settings(config: &ServerConfig) -> Settings {
     settings.set(SettingKey::MaxStreams, config.max_streams());
     settings.set(SettingKey::MaxUdpFlows, config.max_udp_flows());
     settings.set(SettingKey::SupportsUdpDatagram, 0);
-    settings.set(SettingKey::SupportsUdpStreamFallback, 1);
+    settings.set(
+        SettingKey::SupportsUdpStreamFallback,
+        u64::from(config.max_udp_flows() != 0),
+    );
     settings.set(
         SettingKey::IdleTimeoutSeconds,
         config.idle_timeout_seconds(),
@@ -383,21 +386,11 @@ mod tests {
     fn server_settings_include_protocol_and_limits() {
         let mut config = minimal_config();
         config.limits = Some(LimitConfig {
-            max_pre_auth_bytes: None,
             max_frame_size: Some(32_768),
-            max_sessions: None,
             max_streams: Some(17),
             max_udp_flows: Some(11),
-            max_outbound_dials_per_session: None,
-            max_buffered_bytes_per_session: None,
             idle_timeout_seconds: Some(42),
-            max_buffered_bytes_per_flow: None,
-            handshake_timeout_seconds: None,
-            target_connect_timeout_seconds: None,
-            tcp_half_close_timeout_seconds: None,
-            udp_flow_idle_timeout_seconds: None,
-            replay_cache_window_seconds: None,
-            replay_cache_max_entries: None,
+            ..LimitConfig::default()
         });
 
         let settings = server_settings(&config);
@@ -409,6 +402,20 @@ mod tests {
         assert_eq!(settings.get(SettingKey::SupportsUdpDatagram), Some(0));
         assert_eq!(settings.get(SettingKey::SupportsUdpStreamFallback), Some(1));
         assert_eq!(settings.get(SettingKey::IdleTimeoutSeconds), Some(42));
+    }
+
+    #[test]
+    fn server_settings_disable_udp_stream_fallback_without_udp_flows() {
+        let mut config = minimal_config();
+        config.limits = Some(LimitConfig {
+            max_udp_flows: Some(0),
+            ..LimitConfig::default()
+        });
+
+        let settings = server_settings(&config);
+
+        assert_eq!(settings.get(SettingKey::MaxUdpFlows), Some(0));
+        assert_eq!(settings.get(SettingKey::SupportsUdpStreamFallback), Some(0));
     }
 
     #[test]

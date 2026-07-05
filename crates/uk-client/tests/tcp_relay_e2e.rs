@@ -149,6 +149,15 @@ async fn reports_udp_associate_failure_when_server_is_unavailable() -> Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejects_udp_associate_when_udp_flow_limit_is_zero() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_zero_udp_flow_limit_associate_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enforces_udp_flow_limit_per_session() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_udp_flow_limit_e2e()).await?
 }
@@ -597,6 +606,17 @@ async fn run_udp_associate_server_unavailable_e2e() -> Result<(), TestError> {
 
     client_task.abort();
     fs::remove_dir_all(&temp_dir)?;
+    Ok(())
+}
+
+async fn run_zero_udp_flow_limit_associate_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = RelayHarness::start_with_limits(None, test_limits_with_max_udp_flows(0)).await?;
+    let (mut socks_control, head) = open_socks_udp_associate_reply(harness.socks_addr).await?;
+    assert_eq!(head[1], SOCKS_REPLY_GENERAL_FAILURE);
+    let bound_addr = read_socks_reply_addr(&mut socks_control, head[3]).await?;
+    assert_eq!(bound_addr, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
     Ok(())
 }
 
