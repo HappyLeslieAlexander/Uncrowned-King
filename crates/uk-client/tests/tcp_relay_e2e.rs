@@ -39,7 +39,8 @@ use uk_client::{
 use uk_proto::{
     ALPN_PROTOCOL, ErrorCode, ErrorPayload, Frame, FrameHeader, FrameIoError, FrameLimits,
     FrameType, SettingKey, Settings, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE,
-    Target, TcpClose, TcpOpen, read_frame, validate_connection_frame, write_frame,
+    Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR, UdpClose, UdpOpen, read_frame,
+    validate_connection_frame, write_frame,
 };
 use uk_server::config::{CredentialConfig, LimitConfig, ServerConfig};
 
@@ -218,6 +219,11 @@ async fn reports_protocol_error_for_malformed_tcp_close() -> Result<(), TestErro
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closes_existing_flow_after_duplicate_tcp_open() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_duplicate_tcp_open_error_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closes_existing_udp_flow_after_duplicate_udp_open() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_duplicate_udp_open_error_e2e()).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1578,6 +1584,47 @@ async fn run_duplicate_tcp_open_error_e2e() -> Result<(), TestError> {
 
     let target_received = tokio::time::timeout(Duration::from_secs(3), target_task).await???;
     assert!(target_received.is_empty());
+    Ok(())
+}
+
+async fn run_duplicate_udp_open_error_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, target_task) = spawn_udp_echo_target().await?;
+    let harness = ServerHarness::start_with_policy(
+        test_limits(),
+        Some(allow_loopback_policy(target_addr.port())),
+    )
+    .await?;
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(harness.client_config(SECRET)).await?;
+
+    write_frame(&mut carrier, &udp_open_frame(1, target_addr)?).await?;
+    read_udp_open_ack(&mut carrier, 1).await?;
+
+    write_frame(&mut carrier, &udp_open_frame(1, target_addr)?).await?;
+    assert_flow_error(&mut carrier, 1, ErrorCode::Protocol).await?;
+
+    let close = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(close.header.frame_type, FrameType::UdpClose);
+    assert_eq!(close.header.id, 1);
+    let mut payload = close.payload;
+    assert_eq!(UdpClose::decode(&mut payload)?.close_code, UDP_CLOSE_ERROR);
+
+    let data = Frame::new(
+        FrameType::UdpData,
+        0,
+        1,
+        Bytes::from_static(b"duplicate udp open must close old slot"),
+    )?;
+    write_frame(&mut carrier, &data).await?;
+    assert_flow_error(&mut carrier, 1, ErrorCode::Protocol).await?;
+
+    target_task.abort();
     Ok(())
 }
 
@@ -3190,6 +3237,18 @@ fn tcp_open_frame(flow_id: u64, target_addr: SocketAddr) -> Result<Frame, TestEr
     )?)
 }
 
+fn udp_open_frame(flow_id: u64, target_addr: SocketAddr) -> Result<Frame, TestError> {
+    let open = UdpOpen::new(target_from_socket_addr(target_addr));
+    let mut payload = BytesMut::new();
+    open.encode(&mut payload)?;
+    Ok(Frame::new(
+        FrameType::UdpOpen,
+        0,
+        flow_id,
+        payload.freeze(),
+    )?)
+}
+
 fn tcp_close_frame(flow_id: u64, close_code: u16) -> Result<Frame, TestError> {
     let mut payload = BytesMut::new();
     TcpClose::new(close_code).encode(&mut payload)?;
@@ -3253,6 +3312,38 @@ async fn read_open_ack(
     assert_eq!(frame.header.frame_type, FrameType::TcpData);
     assert_eq!(frame.header.id, flow_id);
     assert!(frame.payload.is_empty());
+    Ok(())
+}
+
+async fn read_udp_open_ack(
+    carrier: &mut ClientTlsStream<TcpStream>,
+    flow_id: u64,
+) -> Result<(), TestError> {
+    let frame = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(frame.header.frame_type, FrameType::UdpData);
+    assert_eq!(frame.header.id, flow_id);
+    assert!(frame.payload.is_empty());
+    Ok(())
+}
+
+async fn assert_flow_error(
+    carrier: &mut ClientTlsStream<TcpStream>,
+    flow_id: u64,
+    expected: ErrorCode,
+) -> Result<(), TestError> {
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(response.header.frame_type, FrameType::Error);
+    assert_eq!(response.header.id, flow_id);
+    let mut payload = response.payload;
+    assert_eq!(ErrorPayload::decode(&mut payload)?.code, expected);
     Ok(())
 }
 
