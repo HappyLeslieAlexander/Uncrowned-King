@@ -103,12 +103,12 @@ const SOCKS_REPLY_SUCCEEDED: u8 = 0x00;
 const SOCKS_REPLY_GENERAL_FAILURE: u8 = 0x01;
 const SOCKS_REPLY_NOT_ALLOWED: u8 = 0x02;
 const SOCKS_REPLY_HOST_UNREACHABLE: u8 = 0x04;
-const HALF_CLOSE_REQUEST: &[u8] = b"uncrowned king half-close request";
-const HALF_CLOSE_RESPONSE: &[u8] = b"uncrowned king half-close response";
-const TARGET_HALF_CLOSE_GREETING: &[u8] = b"uncrowned king target half-close greeting";
-const TARGET_HALF_CLOSE_LATE_REQUEST: &[u8] = b"uncrowned king target half-close late request";
+const HALF_CLOSE_REQUEST: &[u8] = b"Uncrowned King half-close request";
+const HALF_CLOSE_RESPONSE: &[u8] = b"Uncrowned King half-close response";
+const TARGET_HALF_CLOSE_GREETING: &[u8] = b"Uncrowned King target half-close greeting";
+const TARGET_HALF_CLOSE_LATE_REQUEST: &[u8] = b"Uncrowned King target half-close late request";
 const TARGET_HALF_CLOSE_TIMEOUT_GREETING: &[u8] =
-    b"uncrowned king target half-close timeout greeting";
+    b"Uncrowned King target half-close timeout greeting";
 const LARGE_PAYLOAD_LEN: usize = 128 * 1024 + 123;
 const SMALL_FRAME_PAYLOAD_LEN: usize = 8 * 1024 + 37;
 const TEST_LOOPBACK_PORT_BASE: u16 = 20_000;
@@ -550,10 +550,10 @@ async fn run_tcp_relay_e2e() -> Result<(), TestError> {
     let (mut socks, connect_reply) = open_socks_connect(harness.socks_addr, target_addr).await?;
     assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
 
-    socks.write_all(b"uncrowned king e2e").await?;
-    let mut echoed = vec![0_u8; "uncrowned king e2e".len()];
+    socks.write_all(b"Uncrowned King e2e").await?;
+    let mut echoed = vec![0_u8; "Uncrowned King e2e".len()];
     socks.read_exact(&mut echoed).await?;
-    assert_eq!(echoed, b"uncrowned king e2e");
+    assert_eq!(echoed, b"Uncrowned King e2e");
 
     echo_task.await??;
     Ok(())
@@ -566,7 +566,7 @@ async fn run_udp_relay_e2e() -> Result<(), TestError> {
     let harness = RelayHarness::start(Some(allow_loopback_policy(target_addr.port()))).await?;
     let (_socks_control, udp_relay_addr) = open_socks_udp_associate(harness.socks_addr).await?;
     let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let payload = b"uncrowned king udp e2e";
+    let payload = b"Uncrowned King udp e2e";
 
     udp_client
         .send_to(&socks_udp_datagram(target_addr, payload), udp_relay_addr)
@@ -589,8 +589,8 @@ async fn run_multi_target_udp_relay_e2e() -> Result<(), TestError> {
     let harness = RelayHarness::start(Some(allow_loopback_any_port_policy())).await?;
     let (_socks_control, udp_relay_addr) = open_socks_udp_associate(harness.socks_addr).await?;
     let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let first_payload = b"uncrowned king udp first target";
-    let second_payload = b"uncrowned king udp second target";
+    let first_payload = b"Uncrowned King udp first target";
+    let second_payload = b"Uncrowned King udp second target";
 
     udp_client
         .send_to(
@@ -711,8 +711,8 @@ async fn run_udp_flow_limit_e2e() -> Result<(), TestError> {
     .await?;
     let (_socks_control, udp_relay_addr) = open_socks_udp_associate(harness.socks_addr).await?;
     let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let first_payload = b"uncrowned king udp allowed target";
-    let second_payload = b"uncrowned king udp limited target";
+    let first_payload = b"Uncrowned King udp allowed target";
+    let second_payload = b"Uncrowned King udp limited target";
 
     udp_client
         .send_to(
@@ -757,8 +757,8 @@ async fn run_udp_flow_idle_reuse_e2e() -> Result<(), TestError> {
     .await?;
     let (_socks_control, udp_relay_addr) = open_socks_udp_associate(harness.socks_addr).await?;
     let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let first_payload = b"uncrowned king udp idle first target";
-    let second_payload = b"uncrowned king udp idle second target";
+    let first_payload = b"Uncrowned King udp idle first target";
+    let second_payload = b"Uncrowned King udp idle second target";
 
     udp_client
         .send_to(
@@ -802,8 +802,8 @@ async fn run_server_udp_flow_idle_reuse_e2e() -> Result<(), TestError> {
     .await?;
     let (_socks_control, udp_relay_addr) = open_socks_udp_associate(harness.socks_addr).await?;
     let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let first_payload = b"uncrowned king server udp idle first";
-    let second_payload = b"uncrowned king server udp idle second";
+    let first_payload = b"Uncrowned King server udp idle first";
+    let second_payload = b"Uncrowned King server udp idle second";
 
     udp_client
         .send_to(
@@ -837,7 +837,7 @@ async fn run_server_udp_flow_idle_reuse_e2e() -> Result<(), TestError> {
 async fn run_early_socks_data_e2e() -> Result<(), TestError> {
     init_tracing();
 
-    let early_payload = b"uncrowned king early socks data";
+    let early_payload = b"Uncrowned King early socks data";
     let (target_addr, echo_task) = spawn_echo_target().await?;
     let harness = RelayHarness::start(Some(allow_loopback_policy(target_addr.port()))).await?;
 
@@ -998,7 +998,7 @@ async fn run_pending_open_cancel_after_early_socks_data_e2e() -> Result<(), Test
     let mut harness = PendingOpenCancelServerHarness::start().await?;
     let mut socks = TcpStream::connect(harness.socks_addr).await?;
     let mut request = socks_connect_request(SocketAddr::from((Ipv4Addr::LOCALHOST, 80)));
-    request.extend_from_slice(b"uncrowned king early data before open ack");
+    request.extend_from_slice(b"Uncrowned King early data before open ack");
     socks.write_all(&request).await?;
 
     let mut method_response = [0_u8; 2];
@@ -1424,10 +1424,10 @@ async fn run_domain_relay_e2e() -> Result<(), TestError> {
         open_socks_connect_domain(harness.socks_addr, "localhost", target_addr.port()).await?;
     assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
 
-    socks.write_all(b"uncrowned king domain e2e").await?;
-    let mut echoed = vec![0_u8; "uncrowned king domain e2e".len()];
+    socks.write_all(b"Uncrowned King domain e2e").await?;
+    let mut echoed = vec![0_u8; "Uncrowned King domain e2e".len()];
     socks.read_exact(&mut echoed).await?;
-    assert_eq!(echoed, b"uncrowned king domain e2e");
+    assert_eq!(echoed, b"Uncrowned King domain e2e");
 
     echo_task.await??;
     Ok(())
@@ -1445,10 +1445,10 @@ async fn run_policy_group_e2e() -> Result<(), TestError> {
     let (mut socks, connect_reply) = open_socks_connect(harness.socks_addr, target_addr).await?;
     assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
 
-    socks.write_all(b"uncrowned king policy group e2e").await?;
-    let mut echoed = vec![0_u8; "uncrowned king policy group e2e".len()];
+    socks.write_all(b"Uncrowned King policy group e2e").await?;
+    let mut echoed = vec![0_u8; "Uncrowned King policy group e2e".len()];
     socks.read_exact(&mut echoed).await?;
-    assert_eq!(echoed, b"uncrowned king policy group e2e");
+    assert_eq!(echoed, b"Uncrowned King policy group e2e");
 
     echo_task.await??;
     Ok(())
@@ -1477,10 +1477,10 @@ async fn run_ipv6_relay_e2e() -> Result<(), TestError> {
     let (mut socks, connect_reply) = open_socks_connect(harness.socks_addr, target_addr).await?;
     assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
 
-    socks.write_all(b"uncrowned king ipv6 e2e").await?;
-    let mut echoed = vec![0_u8; "uncrowned king ipv6 e2e".len()];
+    socks.write_all(b"Uncrowned King ipv6 e2e").await?;
+    let mut echoed = vec![0_u8; "Uncrowned King ipv6 e2e".len()];
     socks.read_exact(&mut echoed).await?;
-    assert_eq!(echoed, b"uncrowned king ipv6 e2e");
+    assert_eq!(echoed, b"Uncrowned King ipv6 e2e");
 
     echo_task.await??;
     Ok(())
