@@ -1143,6 +1143,7 @@ fn spawn_keepalive(session: Arc<ClientSession>, interval: Duration) {
                 Ok(nonce) => nonce,
                 Err(err) => {
                     debug!(event = "client.session.keepalive.error", error = %err);
+                    session.close().await;
                     return;
                 }
             };
