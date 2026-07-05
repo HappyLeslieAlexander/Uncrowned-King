@@ -478,6 +478,18 @@ handshake_timeout_secondz = 4
     }
 
     #[test]
+    fn parses_example_client_config() {
+        let config: ClientConfig = toml::from_str(include_str!("../../../examples/client.toml"))
+            .expect("example client config should parse");
+
+        assert_eq!(config.server_addr, "127.0.0.1:9443");
+        assert_eq!(config.server_endpoints(), vec!["127.0.0.1:9443"]);
+        assert!(config.validate_network_endpoints().is_ok());
+        assert!(config.validate_resource_limits().is_ok());
+        assert!(config.validate_auth_material().is_ok());
+    }
+
+    #[test]
     fn accepts_valid_auth_material() {
         assert!(minimal_config().validate_auth_material().is_ok());
     }

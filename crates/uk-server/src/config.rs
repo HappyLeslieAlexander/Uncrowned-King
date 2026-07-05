@@ -495,6 +495,18 @@ max_udp_flows = 3
     }
 
     #[test]
+    fn parses_example_server_config() {
+        let config: ServerConfig = toml::from_str(include_str!("../../../examples/server.toml"))
+            .expect("example server config should parse");
+
+        assert_eq!(config.listen, "127.0.0.1:9443");
+        assert_eq!(config.policy_path.as_deref(), Some("examples/policy.toml"));
+        assert!(config.validate_network_endpoints().is_ok());
+        assert!(config.validate_limits().is_ok());
+        assert_eq!(config.credentials().unwrap().len(), 1);
+    }
+
+    #[test]
     fn accepts_domain_listen_addr() {
         let mut config = minimal_config();
         config.listen = "localhost:9443".to_owned();
