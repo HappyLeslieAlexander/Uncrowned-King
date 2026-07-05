@@ -5,6 +5,7 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
+use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uk_proto::Target;
 
@@ -45,6 +46,13 @@ pub(crate) enum SocksEndpoint {
     Ipv4(Ipv4Addr, u16),
     Domain(String, u16),
     Ipv6(Ipv6Addr, u16),
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UdpDatagram {
+    pub target: Target,
+    pub payload: Bytes,
 }
 
 impl Reply {
@@ -110,6 +118,37 @@ where
     encode_endpoint(endpoint, &mut payload)?;
     stream.write_all(&payload).await?;
     stream.flush().await
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn encode_udp_datagram(target: &Target, payload: &[u8]) -> io::Result<Vec<u8>> {
+    validate_target(target)?;
+    let endpoint = endpoint_from_target(target);
+    let mut out = Vec::with_capacity(3 + encoded_endpoint_len(&endpoint) + payload.len());
+    out.extend_from_slice(&[0x00, 0x00, 0x00]);
+    encode_endpoint(&endpoint, &mut out)?;
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decode_udp_datagram(packet: &[u8]) -> io::Result<UdpDatagram> {
+    if packet.len() < 4 {
+        return Err(protocol_error("truncated socks udp header"));
+    }
+    if packet[0] != 0 || packet[1] != 0 {
+        return Err(protocol_error("invalid socks udp reserved bytes"));
+    }
+    if packet[2] != 0 {
+        return Err(protocol_error("socks udp fragmentation is not supported"));
+    }
+
+    let (endpoint, payload_offset) = decode_endpoint(&packet[4..], packet[3])?;
+    let target = target_from_endpoint(endpoint)?;
+    Ok(UdpDatagram {
+        target,
+        payload: Bytes::copy_from_slice(&packet[4 + payload_offset..]),
+    })
 }
 
 async fn read_greeting<S>(stream: &mut S) -> io::Result<()>
@@ -262,6 +301,48 @@ where
     }
 }
 
+fn decode_endpoint(src: &[u8], addr_type: u8) -> io::Result<(SocksEndpoint, usize)> {
+    match addr_type {
+        ATYP_IPV4 => {
+            if src.len() < 6 {
+                return Err(protocol_error("truncated socks ipv4 endpoint"));
+            }
+            let octets = [src[0], src[1], src[2], src[3]];
+            let port = u16::from_be_bytes([src[4], src[5]]);
+            Ok((SocksEndpoint::Ipv4(Ipv4Addr::from(octets), port), 6))
+        }
+        ATYP_DOMAIN => {
+            if src.is_empty() {
+                return Err(protocol_error("truncated socks domain endpoint"));
+            }
+            let domain_len = usize::from(src[0]);
+            let endpoint_len = 1 + domain_len + 2;
+            if src.len() < endpoint_len {
+                return Err(protocol_error("truncated socks domain endpoint"));
+            }
+            let domain_start = 1;
+            let domain_end = domain_start + domain_len;
+            let domain = std::str::from_utf8(&src[domain_start..domain_end])
+                .map_err(|_| protocol_error("socks domain is not utf-8"))?
+                .to_owned();
+            let port_offset = domain_end;
+            let port = u16::from_be_bytes([src[port_offset], src[port_offset + 1]]);
+            Ok((SocksEndpoint::Domain(domain, port), endpoint_len))
+        }
+        ATYP_IPV6 => {
+            if src.len() < 18 {
+                return Err(protocol_error("truncated socks ipv6 endpoint"));
+            }
+            let octets: [u8; 16] = src[..16]
+                .try_into()
+                .map_err(|_| protocol_error("truncated socks ipv6 endpoint"))?;
+            let port = u16::from_be_bytes([src[16], src[17]]);
+            Ok((SocksEndpoint::Ipv6(Ipv6Addr::from(octets), port), 18))
+        }
+        _ => Err(protocol_error("unsupported socks address type")),
+    }
+}
+
 async fn read_request_exact<S>(stream: &mut S, buf: &mut [u8]) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -291,6 +372,14 @@ fn target_from_endpoint(endpoint: SocksEndpoint) -> io::Result<Target> {
     };
     validate_target(&target)?;
     Ok(target)
+}
+
+fn endpoint_from_target(target: &Target) -> SocksEndpoint {
+    match target {
+        Target::Ipv4(addr, port) => SocksEndpoint::Ipv4(*addr, *port),
+        Target::Domain(domain, port) => SocksEndpoint::Domain(domain.clone(), *port),
+        Target::Ipv6(addr, port) => SocksEndpoint::Ipv6(*addr, *port),
+    }
 }
 
 fn validate_udp_associate_endpoint(endpoint: &SocksEndpoint) -> io::Result<()> {
@@ -335,6 +424,14 @@ fn encode_endpoint(endpoint: &SocksEndpoint, out: &mut Vec<u8>) -> io::Result<()
         }
     }
     Ok(())
+}
+
+fn encoded_endpoint_len(endpoint: &SocksEndpoint) -> usize {
+    match endpoint {
+        SocksEndpoint::Ipv4(_, _) => 1 + 4 + 2,
+        SocksEndpoint::Domain(domain, _) => 1 + 1 + domain.len() + 2,
+        SocksEndpoint::Ipv6(_, _) => 1 + 16 + 2,
+    }
 }
 
 fn protocol_error(message: impl Into<String>) -> io::Error {
@@ -546,6 +643,96 @@ mod tests {
             [0x05, 0x00, 0x00, ATYP_IPV4, 127, 0, 0, 1, 0x14, 0xe9]
         );
         server_task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn roundtrips_udp_datagram_ipv4() {
+        let target = Target::Ipv4(Ipv4Addr::LOCALHOST, 53);
+        let packet = encode_udp_datagram(&target, b"dns").unwrap();
+
+        assert_eq!(
+            packet,
+            [
+                0x00, 0x00, 0x00, ATYP_IPV4, 127, 0, 0, 1, 0x00, 0x35, b'd', b'n', b's'
+            ]
+        );
+        assert_eq!(
+            decode_udp_datagram(&packet).unwrap(),
+            UdpDatagram {
+                target,
+                payload: Bytes::from_static(b"dns")
+            }
+        );
+    }
+
+    #[test]
+    fn roundtrips_udp_datagram_domain() {
+        let target = Target::Domain("example.com".to_owned(), 443);
+        let packet = encode_udp_datagram(&target, b"payload").unwrap();
+
+        assert_eq!(
+            decode_udp_datagram(&packet).unwrap(),
+            UdpDatagram {
+                target,
+                payload: Bytes::from_static(b"payload")
+            }
+        );
+    }
+
+    #[test]
+    fn encodes_udp_datagram_ipv6_vector() {
+        let target = Target::Ipv6(Ipv6Addr::LOCALHOST, 5353);
+        let packet = encode_udp_datagram(&target, &[]).unwrap();
+
+        assert_eq!(
+            packet,
+            [
+                0x00, 0x00, 0x00, ATYP_IPV6, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x14, 0xe9,
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_udp_datagram_with_reserved_bytes() {
+        let packet = [0x00, 0x01, 0x00, ATYP_IPV4, 127, 0, 0, 1, 0x00, 0x35];
+
+        assert!(decode_udp_datagram(&packet).is_err());
+    }
+
+    #[test]
+    fn rejects_fragmented_udp_datagram() {
+        let packet = [0x00, 0x00, 0x01, ATYP_IPV4, 127, 0, 0, 1, 0x00, 0x35];
+
+        assert!(decode_udp_datagram(&packet).is_err());
+    }
+
+    #[test]
+    fn rejects_udp_datagram_with_zero_target_port() {
+        let packet = [0x00, 0x00, 0x00, ATYP_IPV4, 127, 0, 0, 1, 0x00, 0x00];
+
+        assert!(decode_udp_datagram(&packet).is_err());
+    }
+
+    #[test]
+    fn rejects_udp_datagram_with_unsupported_address_type() {
+        let packet = [0x00, 0x00, 0x00, 0x09];
+
+        assert!(decode_udp_datagram(&packet).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_udp_datagrams() {
+        assert!(decode_udp_datagram(&[0x00, 0x00, 0x00]).is_err());
+        assert!(decode_udp_datagram(&[0x00, 0x00, 0x00, ATYP_IPV4, 127]).is_err());
+        assert!(decode_udp_datagram(&[0x00, 0x00, 0x00, ATYP_DOMAIN, 3, b'f']).is_err());
+    }
+
+    #[test]
+    fn rejects_encoding_udp_datagram_with_invalid_target() {
+        let target = Target::Ipv4(Ipv4Addr::LOCALHOST, 0);
+
+        assert!(encode_udp_datagram(&target, b"payload").is_err());
     }
 
     #[tokio::test]
