@@ -958,6 +958,7 @@ async fn handle_tcp_open_frame(
         Err(OpenSlotRejection::DuplicateFlowId) => {
             send_error(context.carrier_writer, frame.header.id, ErrorCode::Protocol).await?;
             send_tcp_close(context.carrier_writer, frame.header.id, TCP_CLOSE_ERROR).await?;
+            remove_flow_slot(target_writers, frame.header.id);
             return Ok(());
         }
         Err(OpenSlotRejection::ResourceLimit) => {
@@ -1035,6 +1036,7 @@ async fn handle_udp_open_frame(
         Err(UdpOpenSlotRejection::DuplicateFlowId) => {
             send_error(context.carrier_writer, frame.header.id, ErrorCode::Protocol).await?;
             send_udp_close(context.carrier_writer, frame.header.id, UDP_CLOSE_ERROR).await?;
+            remove_flow_slot(target_writers, frame.header.id);
             return Ok(());
         }
         Err(UdpOpenSlotRejection::ResourceLimit | UdpOpenSlotRejection::UdpFlowLimit) => {

@@ -216,6 +216,11 @@ async fn reports_protocol_error_for_malformed_tcp_close() -> Result<(), TestErro
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closes_existing_flow_after_duplicate_tcp_open() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_duplicate_tcp_open_error_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reports_protocol_error_for_unexpected_session_frame() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -1531,6 +1536,51 @@ async fn run_malformed_tcp_close_error_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+async fn run_duplicate_tcp_open_error_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, target_task) = spawn_read_to_eof_target().await?;
+    let harness = ServerHarness::start_with_policy(
+        test_limits(),
+        Some(allow_loopback_policy(target_addr.port())),
+    )
+    .await?;
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(harness.client_config(SECRET)).await?;
+
+    write_frame(&mut carrier, &tcp_open_frame(1, target_addr)?).await?;
+    read_open_ack(&mut carrier, 1).await?;
+
+    write_frame(&mut carrier, &tcp_open_frame(1, target_addr)?).await?;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(response.header.frame_type, FrameType::Error);
+    assert_eq!(response.header.id, 1);
+    let mut payload = response.payload;
+    assert_eq!(
+        ErrorPayload::decode(&mut payload)?.code,
+        ErrorCode::Protocol
+    );
+
+    let close = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(close.header.frame_type, FrameType::TcpClose);
+    assert_eq!(close.header.id, 1);
+    let mut payload = close.payload;
+    assert_eq!(TcpClose::decode(&mut payload)?.close_code, TCP_CLOSE_ERROR);
+
+    let target_received = tokio::time::timeout(Duration::from_secs(3), target_task).await???;
+    assert!(target_received.is_empty());
+    Ok(())
+}
+
 async fn run_oversized_client_frame_error_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -2550,8 +2600,7 @@ async fn run_udp_stream_fallback_disabled_server(
     )
     .await
     {
-        Err(_) => Ok(()),
-        Ok(Err(FrameIoError::Closed)) => Ok(()),
+        Err(_) | Ok(Err(FrameIoError::Closed)) => Ok(()),
         Ok(Err(err)) => Err(err.into()),
         Ok(Ok(frame)) => Err(format!(
             "unexpected frame after disabled UDP stream fallback: {:?}",
