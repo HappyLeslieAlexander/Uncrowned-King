@@ -2068,6 +2068,7 @@ fn supports_udp_stream_fallback(settings: &uk_proto::Settings) -> bool {
         .get(SettingKey::SupportsUdpStreamFallback)
         .unwrap_or(1)
         != 0
+        && max_udp_flows(settings) != 0
 }
 
 fn keepalive_interval(settings: &uk_proto::Settings) -> Option<Duration> {
@@ -3133,6 +3134,16 @@ mod tests {
     fn udp_stream_fallback_can_be_disabled_by_settings() {
         let mut settings = uk_proto::Settings::default();
         settings.set(SettingKey::SupportsUdpStreamFallback, 0);
+
+        assert!(!supports_udp_stream_fallback(&settings));
+    }
+
+    #[test]
+    fn udp_stream_fallback_is_disabled_without_udp_flow_capacity() {
+        let mut settings = uk_proto::Settings::default();
+        settings.set(SettingKey::MaxStreams, 9);
+        settings.set(SettingKey::MaxUdpFlows, 0);
+        settings.set(SettingKey::SupportsUdpStreamFallback, 1);
 
         assert!(!supports_udp_stream_fallback(&settings));
     }

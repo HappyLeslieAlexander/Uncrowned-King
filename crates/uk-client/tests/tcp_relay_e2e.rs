@@ -143,6 +143,15 @@ async fn respects_disabled_udp_stream_fallback_setting() -> Result<(), TestError
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn treats_zero_udp_flow_capacity_as_disabled_fallback() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_udp_zero_flow_capacity_fallback_disabled_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reports_udp_associate_failure_when_server_is_unavailable() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -582,6 +591,19 @@ async fn run_udp_stream_fallback_disabled_e2e() -> Result<(), TestError> {
     init_tracing();
 
     let mut harness = UdpStreamFallbackDisabledServerHarness::start().await?;
+    let (mut socks_control, head) = open_socks_udp_associate_reply(harness.socks_addr).await?;
+    assert_eq!(head[1], SOCKS_REPLY_GENERAL_FAILURE);
+    let bound_addr = read_socks_reply_addr(&mut socks_control, head[3]).await?;
+    assert_eq!(bound_addr, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
+
+    harness.observed_no_udp_open().await?;
+    Ok(())
+}
+
+async fn run_udp_zero_flow_capacity_fallback_disabled_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let mut harness = UdpStreamFallbackDisabledServerHarness::start_zero_flow_capacity().await?;
     let (mut socks_control, head) = open_socks_udp_associate_reply(harness.socks_addr).await?;
     assert_eq!(head[1], SOCKS_REPLY_GENERAL_FAILURE);
     let bound_addr = read_socks_reply_addr(&mut socks_control, head[3]).await?;
@@ -2464,8 +2486,22 @@ struct UdpStreamFallbackDisabledServerHarness {
     client_task: JoinHandle<Result<(), TestError>>,
 }
 
+#[derive(Clone, Copy)]
+enum UdpFallbackSettingsScenario {
+    DisabledSupport,
+    ZeroFlowCapacity,
+}
+
 impl UdpStreamFallbackDisabledServerHarness {
     async fn start() -> Result<Self, TestError> {
+        Self::start_with_scenario(UdpFallbackSettingsScenario::DisabledSupport).await
+    }
+
+    async fn start_zero_flow_capacity() -> Result<Self, TestError> {
+        Self::start_with_scenario(UdpFallbackSettingsScenario::ZeroFlowCapacity).await
+    }
+
+    async fn start_with_scenario(scenario: UdpFallbackSettingsScenario) -> Result<Self, TestError> {
         let temp_dir = create_temp_dir()?;
         let cert_path = temp_dir.join("server-cert.pem");
         let key_path = temp_dir.join("server-key.pem");
@@ -2479,6 +2515,7 @@ impl UdpStreamFallbackDisabledServerHarness {
             server_listener,
             cert_path.clone(),
             key_path,
+            scenario,
         ));
         let mut client_task = tokio::spawn(run_socks5_listener(
             ClientConfig {
@@ -2838,9 +2875,18 @@ async fn run_udp_stream_fallback_disabled_server(
     listener: TcpListener,
     cert_path: PathBuf,
     key_path: PathBuf,
+    scenario: UdpFallbackSettingsScenario,
 ) -> Result<(), TestError> {
     let mut settings = fake_server_settings();
-    settings.set(SettingKey::SupportsUdpStreamFallback, 0);
+    match scenario {
+        UdpFallbackSettingsScenario::DisabledSupport => {
+            settings.set(SettingKey::SupportsUdpStreamFallback, 0);
+        }
+        UdpFallbackSettingsScenario::ZeroFlowCapacity => {
+            settings.set(SettingKey::MaxUdpFlows, 0);
+            settings.set(SettingKey::SupportsUdpStreamFallback, 1);
+        }
+    }
     let mut stream =
         accept_fake_server_session_with_settings(listener, cert_path, key_path, settings).await?;
 
