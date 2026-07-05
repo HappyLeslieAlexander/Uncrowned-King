@@ -125,6 +125,11 @@ async fn relays_udp_through_socks5_to_echo_target() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relays_multiple_udp_targets_over_one_socks5_association() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_multi_target_udp_relay_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relays_data_sent_before_socks_success_reply() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_early_socks_data_e2e()).await?
 }
@@ -434,15 +439,54 @@ async fn run_udp_relay_e2e() -> Result<(), TestError> {
         .send_to(&socks_udp_datagram(target_addr, payload), udp_relay_addr)
         .await?;
 
-    let mut buf = vec![0_u8; 1024];
-    let (read, peer) =
-        tokio::time::timeout(Duration::from_secs(3), udp_client.recv_from(&mut buf)).await??;
-    assert_eq!(peer, udp_relay_addr);
-    let (reply_target, reply_payload) = parse_socks_udp_datagram(&buf[..read])?;
+    let (reply_target, reply_payload) =
+        recv_socks_udp_datagram(&udp_client, udp_relay_addr).await?;
     assert_eq!(reply_target, target_addr);
     assert_eq!(reply_payload, payload);
 
     echo_task.await??;
+    Ok(())
+}
+
+async fn run_multi_target_udp_relay_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (first_target_addr, first_echo_task) = spawn_udp_echo_target().await?;
+    let (second_target_addr, second_echo_task) = spawn_udp_echo_target().await?;
+    let harness = RelayHarness::start(Some(allow_loopback_any_port_policy())).await?;
+    let (_socks_control, udp_relay_addr) = open_socks_udp_associate(harness.socks_addr).await?;
+    let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let first_payload = b"uncrowned king udp first target";
+    let second_payload = b"uncrowned king udp second target";
+
+    udp_client
+        .send_to(
+            &socks_udp_datagram(first_target_addr, first_payload),
+            udp_relay_addr,
+        )
+        .await?;
+    udp_client
+        .send_to(
+            &socks_udp_datagram(second_target_addr, second_payload),
+            udp_relay_addr,
+        )
+        .await?;
+
+    let mut responses = Vec::new();
+    for _ in 0..2 {
+        responses.push(recv_socks_udp_datagram(&udp_client, udp_relay_addr).await?);
+    }
+    responses.sort_by_key(|(target, _)| target.port());
+
+    let mut expected = vec![
+        (first_target_addr, first_payload.to_vec()),
+        (second_target_addr, second_payload.to_vec()),
+    ];
+    expected.sort_by_key(|(target, _)| target.port());
+    assert_eq!(responses, expected);
+
+    first_echo_task.await??;
+    second_echo_task.await??;
     Ok(())
 }
 
@@ -2907,6 +2951,17 @@ fn parse_socks_udp_datagram(datagram: &[u8]) -> Result<(SocketAddr, Vec<u8>), Te
         }
         other => Err(format!("unexpected socks udp address type: {other:#x}").into()),
     }
+}
+
+async fn recv_socks_udp_datagram(
+    udp_client: &UdpSocket,
+    udp_relay_addr: SocketAddr,
+) -> Result<(SocketAddr, Vec<u8>), TestError> {
+    let mut buf = vec![0_u8; 1024];
+    let (read, peer) =
+        tokio::time::timeout(Duration::from_secs(3), udp_client.recv_from(&mut buf)).await??;
+    assert_eq!(peer, udp_relay_addr);
+    parse_socks_udp_datagram(&buf[..read])
 }
 
 async fn assert_echo_roundtrip(
