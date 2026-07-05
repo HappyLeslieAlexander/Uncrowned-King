@@ -103,7 +103,9 @@ bounds waiting for a UK TCP open response from the server.
 `udp_flow_idle_timeout_seconds = 120` bounds how long a per-target UDP flow may
 sit idle in a local SOCKS UDP association before the client closes it. UDP flow
 activity is bidirectional: downstream target replies also refresh the idle
-timer.
+timer. SOCKS5 UDP ASSOCIATE honors the client-declared UDP source endpoint:
+declared non-zero addresses or ports must match incoming UDP datagrams, while
+an all-zero endpoint learns the first accepted peer.
 `max_pending_open_bytes = 65536` bounds local bytes buffered before that open
 response arrives.
 `max_socks_connections = 1024` bounds concurrent local SOCKS connections before

@@ -92,9 +92,15 @@ struct UdpAssociation {
     socket: Arc<UdpSocket>,
     idle_timeout: Option<Duration>,
     flow_event_tx: mpsc::UnboundedSender<UdpAssociationFlowEvent>,
-    client_endpoint: Option<SocketAddr>,
+    client_endpoint: UdpClientEndpoint,
     flows_by_target: HashMap<Target, UdpAssociationFlow>,
     flow_tasks: JoinSet<UdpFlowTaskResult>,
+}
+
+#[derive(Debug, Clone)]
+struct UdpClientEndpoint {
+    requested: socks5::SocksEndpoint,
+    learned: Option<SocketAddr>,
 }
 
 #[derive(Clone)]
@@ -1407,7 +1413,7 @@ async fn handle_socks_connection(
         socks5::Request::UdpAssociate(endpoint) => {
             debug!(event = "socks5.udp_associate", endpoint = ?endpoint);
             transition(&mut state, ClientConnectionState::Relaying);
-            let relay_result = relay_udp_association(local, sessions, shutdown_rx).await;
+            let relay_result = relay_udp_association(local, sessions, endpoint, shutdown_rx).await;
             if relay_result.is_err() {
                 transition(&mut state, ClientConnectionState::Closing);
             }
@@ -1475,6 +1481,7 @@ async fn negotiate_socks_request(
 async fn relay_udp_association(
     mut local: TcpStream,
     sessions: Arc<ClientSessionManager>,
+    client_endpoint: socks5::SocksEndpoint,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AnyError> {
     match sessions.supports_udp_stream_fallback().await {
@@ -1495,8 +1502,12 @@ async fn relay_udp_association(
     socks5::send_reply_with_endpoint(&mut local, socks5::Reply::Succeeded, &bound_endpoint).await?;
 
     let (flow_event_tx, mut flow_event_rx) = mpsc::unbounded_channel();
-    let mut association =
-        UdpAssociation::new(socket, sessions.udp_flow_idle_timeout(), flow_event_tx);
+    let mut association = UdpAssociation::new(
+        socket,
+        sessions.udp_flow_idle_timeout(),
+        flow_event_tx,
+        client_endpoint,
+    );
     let mut idle_interval = udp_idle_interval(association.idle_timeout);
     let mut udp_buf = vec![0_u8; UDP_ASSOCIATION_BUFFER_SIZE].into_boxed_slice();
     let mut tcp_buf = [0_u8; 1];
@@ -1545,12 +1556,13 @@ impl UdpAssociation {
         socket: Arc<UdpSocket>,
         idle_timeout: Option<Duration>,
         flow_event_tx: mpsc::UnboundedSender<UdpAssociationFlowEvent>,
+        client_endpoint: socks5::SocksEndpoint,
     ) -> Self {
         Self {
             socket,
             idle_timeout,
             flow_event_tx,
-            client_endpoint: None,
+            client_endpoint: UdpClientEndpoint::new(client_endpoint),
             flows_by_target: HashMap::new(),
             flow_tasks: JoinSet::new(),
         }
@@ -1586,12 +1598,7 @@ impl UdpAssociation {
     }
 
     fn accept_client_endpoint(&mut self, peer: SocketAddr) -> bool {
-        if let Some(endpoint) = self.client_endpoint {
-            endpoint == peer
-        } else {
-            self.client_endpoint = Some(peer);
-            true
-        }
+        self.client_endpoint.accepts(peer)
     }
 
     async fn flow_for_target(
@@ -1632,7 +1639,7 @@ impl UdpAssociation {
     ) {
         let socket = Arc::clone(&self.socket);
         let flow_event_tx = self.flow_event_tx.clone();
-        let Some(client_endpoint) = self.client_endpoint else {
+        let Some(client_endpoint) = self.client_endpoint.learned() else {
             warn!(
                 event = "client.udp_flow.missing_client_endpoint",
                 flow_id = flow.id,
@@ -1743,6 +1750,53 @@ impl UdpAssociation {
             }
         }
     }
+}
+
+impl UdpClientEndpoint {
+    fn new(requested: socks5::SocksEndpoint) -> Self {
+        Self {
+            requested,
+            learned: None,
+        }
+    }
+
+    fn accepts(&mut self, peer: SocketAddr) -> bool {
+        if !self.matches_requested(peer) {
+            return false;
+        }
+
+        if let Some(learned) = self.learned {
+            learned == peer
+        } else {
+            self.learned = Some(peer);
+            true
+        }
+    }
+
+    fn learned(&self) -> Option<SocketAddr> {
+        self.learned
+    }
+
+    fn matches_requested(&self, peer: SocketAddr) -> bool {
+        match &self.requested {
+            socks5::SocksEndpoint::Ipv4(addr, port) => {
+                matches_requested_ip_port(peer, IpAddr::V4(*addr), *port)
+            }
+            socks5::SocksEndpoint::Ipv6(addr, port) => {
+                matches_requested_ip_port(peer, IpAddr::V6(*addr), *port)
+            }
+            socks5::SocksEndpoint::Domain(_, port) => matches_requested_port(peer, *port),
+        }
+    }
+}
+
+fn matches_requested_ip_port(peer: SocketAddr, requested_ip: IpAddr, requested_port: u16) -> bool {
+    (requested_ip.is_unspecified() || peer.ip() == requested_ip)
+        && matches_requested_port(peer, requested_port)
+}
+
+fn matches_requested_port(peer: SocketAddr, requested_port: u16) -> bool {
+    requested_port == 0 || peer.port() == requested_port
 }
 
 impl UdpAssociationFlow {
@@ -2974,6 +3028,49 @@ mod tests {
         let bind_addr = udp_association_bind_addr(SocketAddr::from(([127, 0, 0, 1], 1080)));
 
         assert_eq!(bind_addr, SocketAddr::from(([127, 0, 0, 1], 0)));
+    }
+
+    #[test]
+    fn udp_client_endpoint_learns_unspecified_peer() {
+        let first_peer = SocketAddr::from(([127, 0, 0, 1], 41000));
+        let second_peer = SocketAddr::from(([127, 0, 0, 1], 41001));
+        let mut endpoint = UdpClientEndpoint::new(socks5::SocksEndpoint::Ipv4(
+            std::net::Ipv4Addr::UNSPECIFIED,
+            0,
+        ));
+
+        assert!(endpoint.accepts(first_peer));
+        assert_eq!(endpoint.learned(), Some(first_peer));
+        assert!(endpoint.accepts(first_peer));
+        assert!(!endpoint.accepts(second_peer));
+    }
+
+    #[test]
+    fn udp_client_endpoint_ignores_peer_that_misses_declared_port() {
+        let expected_peer = SocketAddr::from(([127, 0, 0, 1], 41000));
+        let wrong_peer = SocketAddr::from(([127, 0, 0, 1], 41001));
+        let mut endpoint = UdpClientEndpoint::new(socks5::SocksEndpoint::Ipv4(
+            std::net::Ipv4Addr::LOCALHOST,
+            expected_peer.port(),
+        ));
+
+        assert!(!endpoint.accepts(wrong_peer));
+        assert_eq!(endpoint.learned(), None);
+        assert!(endpoint.accepts(expected_peer));
+        assert_eq!(endpoint.learned(), Some(expected_peer));
+    }
+
+    #[test]
+    fn udp_client_endpoint_matches_declared_domain_port() {
+        let expected_peer = SocketAddr::from(([127, 0, 0, 1], 41000));
+        let wrong_peer = SocketAddr::from(([127, 0, 0, 1], 41001));
+        let mut endpoint = UdpClientEndpoint::new(socks5::SocksEndpoint::Domain(
+            "client.local".to_owned(),
+            41000,
+        ));
+
+        assert!(!endpoint.accepts(wrong_peer));
+        assert!(endpoint.accepts(expected_peer));
     }
 
     #[test]

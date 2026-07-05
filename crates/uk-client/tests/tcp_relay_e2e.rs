@@ -129,6 +129,15 @@ async fn relays_udp_through_socks5_to_echo_target() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enforces_declared_udp_associate_client_endpoint() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_declared_udp_client_endpoint_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relays_multiple_udp_targets_over_one_socks5_association() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_multi_target_udp_relay_e2e()).await?
 }
@@ -606,6 +615,37 @@ async fn run_udp_relay_e2e() -> Result<(), TestError> {
     let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let payload = b"Uncrowned King udp e2e";
 
+    udp_client
+        .send_to(&socks_udp_datagram(target_addr, payload), udp_relay_addr)
+        .await?;
+
+    let (reply_target, reply_payload) =
+        recv_socks_udp_datagram(&udp_client, udp_relay_addr).await?;
+    assert_eq!(reply_target, target_addr);
+    assert_eq!(reply_payload, payload);
+
+    echo_task.await??;
+    Ok(())
+}
+
+async fn run_declared_udp_client_endpoint_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, echo_task) = spawn_udp_echo_target().await?;
+    let harness = RelayHarness::start(Some(allow_loopback_policy(target_addr.port()))).await?;
+    let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let declared_endpoint = udp_client.local_addr()?;
+    let (_socks_control, udp_relay_addr) =
+        open_socks_udp_associate_from(harness.socks_addr, declared_endpoint).await?;
+    let unexpected_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let payload = b"Uncrowned King declared udp endpoint";
+
+    unexpected_client
+        .send_to(
+            &socks_udp_datagram(target_addr, b"unexpected udp source"),
+            udp_relay_addr,
+        )
+        .await?;
     udp_client
         .send_to(&socks_udp_datagram(target_addr, payload), udp_relay_addr)
         .await?;
@@ -3813,14 +3853,31 @@ async fn open_socks_udp_associate(
     Ok((socks, bound_addr))
 }
 
+async fn open_socks_udp_associate_from(
+    socks_addr: SocketAddr,
+    client_endpoint: SocketAddr,
+) -> Result<(TcpStream, SocketAddr), TestError> {
+    let (mut socks, head) =
+        open_socks_udp_associate_reply_from(socks_addr, client_endpoint).await?;
+    assert_eq!(head[1], SOCKS_REPLY_SUCCEEDED);
+    let bound_addr = read_socks_reply_addr(&mut socks, head[3]).await?;
+    Ok((socks, bound_addr))
+}
+
 async fn open_socks_udp_associate_reply(
     socks_addr: SocketAddr,
 ) -> Result<(TcpStream, [u8; 4]), TestError> {
+    open_socks_udp_associate_reply_from(socks_addr, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+        .await
+}
+
+async fn open_socks_udp_associate_reply_from(
+    socks_addr: SocketAddr,
+    client_endpoint: SocketAddr,
+) -> Result<(TcpStream, [u8; 4]), TestError> {
     let mut socks = TcpStream::connect(socks_addr).await?;
     socks
-        .write_all(&[
-            0x05, 0x01, 0x00, 0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0x00, 0x00,
-        ])
+        .write_all(&socks_udp_associate_request(client_endpoint))
         .await?;
 
     let mut method_response = [0_u8; 2];
@@ -3832,6 +3889,23 @@ async fn open_socks_udp_associate_reply(
     assert_eq!(head[0], 0x05);
     assert_eq!(head[2], 0x00);
     Ok((socks, head))
+}
+
+fn socks_udp_associate_request(client_endpoint: SocketAddr) -> Vec<u8> {
+    let port = client_endpoint.port();
+    let mut request = vec![0x05, 0x01, 0x00, 0x05, 0x03, 0x00];
+    match client_endpoint {
+        SocketAddr::V4(addr) => {
+            request.push(0x01);
+            request.extend_from_slice(&addr.ip().octets());
+        }
+        SocketAddr::V6(addr) => {
+            request.push(0x04);
+            request.extend_from_slice(&addr.ip().octets());
+        }
+    }
+    request.extend_from_slice(&port.to_be_bytes());
+    request
 }
 
 async fn read_socks_reply_addr(
