@@ -165,6 +165,12 @@ Target target
 
 `UDP_DATA` payload is one uninterpreted UDP datagram byte string.
 
+When a `UDP_OPEN` is accepted, the server sends a zero-length `UDP_DATA` on the
+same `id` as the open acknowledgement before forwarding target datagrams. A peer
+must not send `UDP_DATA` on a flow before receiving the zero-length
+acknowledgement; doing so is a protocol error. After acknowledgement,
+zero-length `UDP_DATA` frames are valid zero-length UDP datagrams.
+
 `UDP_CLOSE` payload:
 
 ```text

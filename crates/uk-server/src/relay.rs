@@ -6,7 +6,7 @@ use std::{
     fmt,
     future::Future,
     io,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::{
         Arc,
@@ -19,7 +19,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, WriteHalf},
     net::{
-        TcpStream, lookup_host,
+        TcpStream, UdpSocket, lookup_host,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
@@ -31,8 +31,9 @@ use uk_auth::Credential;
 use uk_policy::{PolicyContext, PolicyDecision, PolicySet};
 use uk_proto::{
     ErrorCode, ErrorPayload, Frame, FrameIoError, FrameLimits, FrameType, TCP_CLOSE_ERROR,
-    TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, is_client_initiated_flow_id,
-    read_frame, validate_connection_frame, write_frame,
+    TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR,
+    UDP_CLOSE_NORMAL, UdpClose, UdpOpen, is_client_initiated_flow_id, read_frame,
+    validate_connection_frame, write_frame,
 };
 
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
@@ -107,7 +108,13 @@ enum FlowEvent {
         target: Target,
         result: Result<TcpStream, OpenFailure>,
     },
+    UdpOpenCompleted {
+        flow_id: u64,
+        target: Target,
+        result: Result<UdpSocket, OpenFailure>,
+    },
     ReadClosed(u64),
+    UdpReadClosed(u64),
     HalfCloseDrainExpired {
         flow_id: u64,
         token: FlowToken,
@@ -148,7 +155,16 @@ enum EnqueueError {
 enum TcpDataDisposition {
     UnknownFlow,
     OpeningFlow,
+    OtherProtocolFlow,
     EmptyPayload,
+    ForwardPayload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UdpDataDisposition {
+    UnknownFlow,
+    OpeningFlow,
+    TcpFlow,
     ForwardPayload,
 }
 
@@ -193,8 +209,10 @@ struct OpenDialPermit {
 
 #[derive(Debug)]
 enum FlowSlot {
-    Opening(OpenFlowCancel),
+    OpeningTcp(OpenFlowCancel),
+    OpeningUdp(OpenFlowCancel),
     Tcp(TargetFlow),
+    Udp(UdpTargetFlow),
 }
 
 #[derive(Clone)]
@@ -210,6 +228,12 @@ struct TargetFlow {
     control: TargetFlowControl,
     target_to_client_open: bool,
     client_to_target_open: bool,
+}
+
+#[derive(Debug)]
+struct UdpTargetFlow {
+    socket: Arc<UdpSocket>,
+    control: TargetFlowControl,
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +255,18 @@ struct RelaySessionContext<'a> {
 }
 
 struct TargetOpenTask {
+    flow_id: u64,
+    target: Target,
+    credential: Credential,
+    policy_set: Arc<PolicySet>,
+    open_dial_limiter: OpenDialLimiter,
+    target_connect_timeout: Option<Duration>,
+    event_tx: mpsc::UnboundedSender<FlowEvent>,
+    shutdown: SessionShutdown,
+    cancel: OpenFlowCancel,
+}
+
+struct UdpOpenTask {
     flow_id: u64,
     target: Target,
     credential: Credential,
@@ -334,8 +370,19 @@ async fn handle_flow_event(
             target,
             result,
         }) => handle_tcp_open_completed(flow_id, target, result, context, target_writers).await?,
+        Some(FlowEvent::UdpOpenCompleted {
+            flow_id,
+            target,
+            result,
+        }) => handle_udp_open_completed(flow_id, target, result, context, target_writers).await?,
         Some(FlowEvent::ReadClosed(flow_id)) => {
             handle_target_read_closed(flow_id, context, target_writers);
+        }
+        Some(FlowEvent::UdpReadClosed(flow_id)) => {
+            if matches!(target_writers.get(&flow_id), Some(FlowSlot::Udp(_))) {
+                remove_flow_slot(target_writers, flow_id);
+                info!(event = "udp.closed", flow_id);
+            }
         }
         Some(FlowEvent::HalfCloseDrainExpired {
             flow_id,
@@ -503,6 +550,9 @@ async fn handle_session_frame(
         FrameType::TcpOpen => handle_tcp_open_frame(context, frame, target_writers).await,
         FrameType::TcpData => handle_tcp_data_frame(frame, context, target_writers).await,
         FrameType::TcpClose => handle_tcp_close_frame(frame, context, target_writers).await,
+        FrameType::UdpOpen => handle_udp_open_frame(context, frame, target_writers).await,
+        FrameType::UdpData => handle_udp_data_frame(frame, context, target_writers).await,
+        FrameType::UdpClose => handle_udp_close_frame(frame, context, target_writers).await,
         FrameType::Error | FrameType::PolicyDenied | FrameType::ResourceLimit => {
             handle_client_flow_status_frame(frame, context, target_writers).await
         }
@@ -566,7 +616,7 @@ async fn handle_tcp_data_frame(
         .await;
     }
     match tcp_data_disposition(flow_id, &frame.payload, target_writers) {
-        TcpDataDisposition::UnknownFlow => {
+        TcpDataDisposition::UnknownFlow | TcpDataDisposition::OtherProtocolFlow => {
             send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
         }
         TcpDataDisposition::OpeningFlow => {
@@ -643,8 +693,9 @@ async fn handle_tcp_close_frame(
             return Err(err.into());
         }
     };
+    let mut should_report_protocol_error = false;
     let should_remove = match target_writers.get_mut(&flow_id) {
-        Some(FlowSlot::Opening(_)) => true,
+        Some(FlowSlot::OpeningTcp(_)) => true,
         Some(FlowSlot::Tcp(target)) => {
             if close.close_code == TCP_CLOSE_NORMAL {
                 let should_start_drain_timer = target.target_to_client_open;
@@ -666,8 +717,15 @@ async fn handle_tcp_close_frame(
             }
             target.is_fully_closed()
         }
+        Some(FlowSlot::OpeningUdp(_) | FlowSlot::Udp(_)) => {
+            should_report_protocol_error = true;
+            false
+        }
         None => false,
     };
+    if should_report_protocol_error {
+        send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+    }
     if should_remove {
         remove_flow_slot(target_writers, flow_id);
     }
@@ -704,8 +762,12 @@ async fn handle_client_flow_status_frame(
 
 fn abort_client_flow(flow_id: u64, target_writers: &mut FlowTable) {
     let should_remove = match target_writers.get_mut(&flow_id) {
-        Some(FlowSlot::Opening(_)) => true,
+        Some(FlowSlot::OpeningTcp(_) | FlowSlot::OpeningUdp(_)) => true,
         Some(FlowSlot::Tcp(target)) => {
+            target.abort();
+            true
+        }
+        Some(FlowSlot::Udp(target)) => {
             target.abort();
             true
         }
@@ -749,7 +811,23 @@ async fn reject_invalid_client_relay_flow_id(
     }
 }
 
-fn check_tcp_open_slot(
+async fn reject_invalid_udp_relay_flow_id(
+    context: &RelaySessionContext<'_>,
+    flow_id: u64,
+    rejection: FlowIdRejection,
+    zero_id_error: &'static str,
+) -> Result<(), AnyError> {
+    send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+    match rejection {
+        FlowIdRejection::Zero => Err(zero_id_error.into()),
+        FlowIdRejection::Reserved => {
+            send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
+            Ok(())
+        }
+    }
+}
+
+fn check_open_slot(
     flow_id: u64,
     target_writers: &FlowTable,
     max_streams: u64,
@@ -783,7 +861,8 @@ fn tcp_data_disposition(
 ) -> TcpDataDisposition {
     match target_writers.get(&flow_id) {
         None => TcpDataDisposition::UnknownFlow,
-        Some(FlowSlot::Opening(_)) => TcpDataDisposition::OpeningFlow,
+        Some(FlowSlot::OpeningTcp(_)) => TcpDataDisposition::OpeningFlow,
+        Some(FlowSlot::OpeningUdp(_) | FlowSlot::Udp(_)) => TcpDataDisposition::OtherProtocolFlow,
         Some(FlowSlot::Tcp(_)) if payload.is_empty() => TcpDataDisposition::EmptyPayload,
         Some(FlowSlot::Tcp(_)) => TcpDataDisposition::ForwardPayload,
     }
@@ -794,7 +873,7 @@ async fn handle_tcp_open_frame(
     frame: Frame,
     target_writers: &mut FlowTable,
 ) -> Result<(), AnyError> {
-    match check_tcp_open_slot(frame.header.id, target_writers, context.limits.max_streams) {
+    match check_open_slot(frame.header.id, target_writers, context.limits.max_streams) {
         Ok(()) => {}
         Err(OpenSlotRejection::DuplicateFlowId) => {
             send_error(context.carrier_writer, frame.header.id, ErrorCode::Protocol).await?;
@@ -810,7 +889,7 @@ async fn handle_tcp_open_frame(
 
     if let Some((flow_id, target)) = validate_tcp_open_request(context, frame).await? {
         let cancel = OpenFlowCancel::default();
-        target_writers.insert(flow_id, FlowSlot::Opening(cancel.clone()));
+        target_writers.insert(flow_id, FlowSlot::OpeningTcp(cancel.clone()));
         spawn_target_open(TargetOpenTask {
             flow_id,
             target,
@@ -861,6 +940,185 @@ async fn validate_tcp_open_request(
     Ok(Some((flow_id, open.target)))
 }
 
+async fn handle_udp_open_frame(
+    context: &RelaySessionContext<'_>,
+    frame: Frame,
+    target_writers: &mut FlowTable,
+) -> Result<(), AnyError> {
+    match check_open_slot(frame.header.id, target_writers, context.limits.max_streams) {
+        Ok(()) => {}
+        Err(OpenSlotRejection::DuplicateFlowId) => {
+            send_error(context.carrier_writer, frame.header.id, ErrorCode::Protocol).await?;
+            send_udp_close(context.carrier_writer, frame.header.id, UDP_CLOSE_ERROR).await?;
+            return Ok(());
+        }
+        Err(OpenSlotRejection::ResourceLimit) => {
+            send_resource_limit(context.carrier_writer, frame.header.id).await?;
+            send_udp_close(context.carrier_writer, frame.header.id, UDP_CLOSE_ERROR).await?;
+            return Ok(());
+        }
+    }
+
+    if let Some((flow_id, target)) = validate_udp_open_request(context, frame).await? {
+        let cancel = OpenFlowCancel::default();
+        target_writers.insert(flow_id, FlowSlot::OpeningUdp(cancel.clone()));
+        spawn_udp_open(UdpOpenTask {
+            flow_id,
+            target,
+            credential: context.credential.clone(),
+            policy_set: Arc::clone(&context.policy_set),
+            open_dial_limiter: context.open_dial_limiter.clone(),
+            target_connect_timeout: context.limits.target_connect_timeout,
+            event_tx: context.event_tx.clone(),
+            shutdown: context.shutdown.clone(),
+            cancel,
+        });
+    }
+    Ok(())
+}
+
+async fn validate_udp_open_request(
+    context: &RelaySessionContext<'_>,
+    frame: Frame,
+) -> Result<Option<(u64, Target)>, AnyError> {
+    let flow_id = frame.header.id;
+    if flow_id == 0 {
+        send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+        return Err("udp flow id must be non-zero".into());
+    }
+    if !is_client_initiated_flow_id(flow_id) {
+        send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+        send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
+        warn!(event = "udp.open.reserved_flow_id", flow_id);
+        return Ok(None);
+    }
+
+    let mut payload = frame.payload;
+    let open = match UdpOpen::decode(&mut payload) {
+        Ok(open) => open,
+        Err(err) => {
+            send_error(
+                context.carrier_writer,
+                flow_id,
+                ErrorCode::from_protocol_error(&err),
+            )
+            .await?;
+            send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
+            warn!(event = "udp.open.invalid", flow_id, error = %err);
+            return Ok(None);
+        }
+    };
+
+    Ok(Some((flow_id, open.target)))
+}
+
+async fn handle_udp_data_frame(
+    frame: Frame,
+    context: &RelaySessionContext<'_>,
+    target_writers: &mut FlowTable,
+) -> Result<(), AnyError> {
+    let flow_id = frame.header.id;
+    if let Err(rejection) = validate_client_relay_flow_id(flow_id) {
+        return reject_invalid_udp_relay_flow_id(
+            context,
+            flow_id,
+            rejection,
+            "udp data flow id must be non-zero",
+        )
+        .await;
+    }
+    match udp_data_disposition(flow_id, target_writers) {
+        UdpDataDisposition::UnknownFlow | UdpDataDisposition::TcpFlow => {
+            send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+        }
+        UdpDataDisposition::OpeningFlow => {
+            send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+            send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
+            remove_flow_slot(target_writers, flow_id);
+        }
+        UdpDataDisposition::ForwardPayload => {
+            forward_udp_data_frame(flow_id, frame.payload, context, target_writers).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn forward_udp_data_frame(
+    flow_id: u64,
+    payload: Bytes,
+    context: &RelaySessionContext<'_>,
+    target_writers: &mut FlowTable,
+) -> Result<(), AnyError> {
+    let Some(target) = udp_target_flow_mut(target_writers, flow_id) else {
+        send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+        return Ok(());
+    };
+    if let Err(err) = target.socket.send(&payload).await {
+        warn!(event = "udp.target.write.error", flow_id, error = %err);
+        send_error(
+            context.carrier_writer,
+            flow_id,
+            ErrorCode::TargetUnavailable,
+        )
+        .await?;
+        send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
+        remove_flow_slot(target_writers, flow_id);
+    }
+    Ok(())
+}
+
+async fn handle_udp_close_frame(
+    frame: Frame,
+    context: &RelaySessionContext<'_>,
+    target_writers: &mut FlowTable,
+) -> Result<(), AnyError> {
+    let flow_id = frame.header.id;
+    if let Err(rejection) = validate_client_relay_flow_id(flow_id) {
+        return reject_invalid_udp_relay_flow_id(
+            context,
+            flow_id,
+            rejection,
+            "udp close flow id must be non-zero",
+        )
+        .await;
+    }
+    let mut payload = frame.payload;
+    let close = match UdpClose::decode(&mut payload) {
+        Ok(close) => close,
+        Err(err) => {
+            send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+            return Err(err.into());
+        }
+    };
+    let should_remove = match target_writers.get_mut(&flow_id) {
+        Some(FlowSlot::OpeningUdp(_)) => true,
+        Some(FlowSlot::Udp(target)) => {
+            if close.close_code != UDP_CLOSE_NORMAL {
+                target.abort();
+            }
+            true
+        }
+        Some(FlowSlot::OpeningTcp(_) | FlowSlot::Tcp(_)) => {
+            send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
+            false
+        }
+        None => false,
+    };
+    if should_remove {
+        remove_flow_slot(target_writers, flow_id);
+    }
+    Ok(())
+}
+
+fn udp_data_disposition(flow_id: u64, target_writers: &FlowTable) -> UdpDataDisposition {
+    match target_writers.get(&flow_id) {
+        None => UdpDataDisposition::UnknownFlow,
+        Some(FlowSlot::OpeningUdp(_)) => UdpDataDisposition::OpeningFlow,
+        Some(FlowSlot::OpeningTcp(_) | FlowSlot::Tcp(_)) => UdpDataDisposition::TcpFlow,
+        Some(FlowSlot::Udp(_)) => UdpDataDisposition::ForwardPayload,
+    }
+}
+
 fn spawn_target_open(task: TargetOpenTask) {
     tokio::spawn(async move {
         tokio::select! {
@@ -884,6 +1142,29 @@ fn spawn_target_open(task: TargetOpenTask) {
     });
 }
 
+fn spawn_udp_open(task: UdpOpenTask) {
+    tokio::spawn(async move {
+        tokio::select! {
+            result = connect_allowed_udp_target(
+                &task.target,
+                &task.credential,
+                &task.policy_set,
+                &task.open_dial_limiter,
+                task.target_connect_timeout,
+            ) => {
+                if !task.shutdown.is_closed() && !task.cancel.is_cancelled() {
+                    let _ = task.event_tx.send(FlowEvent::UdpOpenCompleted {
+                        flow_id: task.flow_id,
+                        target: task.target,
+                        result,
+                    });
+                }
+            }
+            () = task.cancel.cancelled() => {}
+        }
+    });
+}
+
 async fn handle_tcp_open_completed(
     flow_id: u64,
     target: Target,
@@ -891,7 +1172,7 @@ async fn handle_tcp_open_completed(
     context: &RelaySessionContext<'_>,
     target_writers: &mut FlowTable,
 ) -> Result<(), AnyError> {
-    if !matches!(target_writers.get(&flow_id), Some(FlowSlot::Opening(_))) {
+    if !matches!(target_writers.get(&flow_id), Some(FlowSlot::OpeningTcp(_))) {
         return Ok(());
     }
 
@@ -902,6 +1183,31 @@ async fn handle_tcp_open_completed(
         }
         Err(err) => {
             reject_open_failure(flow_id, &target, err, context).await?;
+            remove_flow_slot(target_writers, flow_id);
+        }
+    }
+    Ok(())
+}
+
+async fn handle_udp_open_completed(
+    flow_id: u64,
+    target: Target,
+    result: Result<UdpSocket, OpenFailure>,
+    context: &RelaySessionContext<'_>,
+    target_writers: &mut FlowTable,
+) -> Result<(), AnyError> {
+    if !matches!(target_writers.get(&flow_id), Some(FlowSlot::OpeningUdp(_))) {
+        return Ok(());
+    }
+
+    match result {
+        Ok(target_socket) => {
+            let target_flow =
+                accept_open_udp_target(flow_id, target, target_socket, context).await?;
+            target_writers.insert(flow_id, FlowSlot::Udp(target_flow));
+        }
+        Err(err) => {
+            reject_udp_open_failure(flow_id, &target, err, context).await?;
             remove_flow_slot(target_writers, flow_id);
         }
     }
@@ -942,6 +1248,29 @@ async fn accept_open_target(
     Ok(target_flow)
 }
 
+async fn accept_open_udp_target(
+    flow_id: u64,
+    target: Target,
+    target_socket: UdpSocket,
+    context: &RelaySessionContext<'_>,
+) -> Result<UdpTargetFlow, AnyError> {
+    let target_socket = Arc::new(target_socket);
+    let flow_control = TargetFlowControl::new(context.session_buffer.clone());
+    let target_flow = UdpTargetFlow::new(Arc::clone(&target_socket), flow_control.clone());
+    send_udp_data(context.carrier_writer, flow_id, Bytes::new()).await?;
+    spawn_udp_reader(
+        flow_id,
+        target_socket,
+        flow_control,
+        context.carrier_writer.clone(),
+        context.event_tx.clone(),
+        context.shutdown.clone(),
+        context.limits.data_frame_size,
+    );
+    info!(event = "udp.open", flow_id, target = ?target);
+    Ok(target_flow)
+}
+
 async fn reject_open_failure(
     flow_id: u64,
     target: &Target,
@@ -978,6 +1307,42 @@ async fn reject_open_failure(
     Ok(())
 }
 
+async fn reject_udp_open_failure(
+    flow_id: u64,
+    target: &Target,
+    failure: OpenFailure,
+    context: &RelaySessionContext<'_>,
+) -> Result<(), AnyError> {
+    match failure {
+        OpenFailure::PolicyDenied => {
+            warn!(event = "udp.policy.denied", flow_id, target = ?target);
+            send_policy_denied(context.carrier_writer, flow_id).await?;
+            send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_NORMAL).await?;
+        }
+        OpenFailure::ResourceLimit => {
+            warn!(event = "udp.open.dial_limit", flow_id, target = ?target);
+            send_resource_limit(context.carrier_writer, flow_id).await?;
+            send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
+        }
+        OpenFailure::TargetUnavailable(err) => {
+            warn!(event = "udp.target.unavailable", flow_id, target = ?target, error = %err);
+            send_error(
+                context.carrier_writer,
+                flow_id,
+                ErrorCode::TargetUnavailable,
+            )
+            .await?;
+            send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
+        }
+        OpenFailure::TargetTimeout => {
+            warn!(event = "udp.target.timeout", flow_id, target = ?target);
+            send_error(context.carrier_writer, flow_id, ErrorCode::TargetTimeout).await?;
+            send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
+        }
+    }
+    Ok(())
+}
+
 fn spawn_target_reader(
     flow_id: u64,
     target_reader: OwnedReadHalf,
@@ -1007,6 +1372,38 @@ fn spawn_target_reader(
             _ => {}
         }
         let _ = event_tx.send(FlowEvent::ReadClosed(flow_id));
+    });
+}
+
+fn spawn_udp_reader(
+    flow_id: u64,
+    target_socket: Arc<UdpSocket>,
+    flow_control: TargetFlowControl,
+    carrier_writer: CarrierWriter,
+    event_tx: mpsc::UnboundedSender<FlowEvent>,
+    shutdown: SessionShutdown,
+    data_frame_size: usize,
+) {
+    tokio::spawn(async move {
+        match relay_udp_target_to_client(
+            flow_id,
+            target_socket,
+            flow_control,
+            &carrier_writer,
+            &event_tx,
+            &shutdown,
+            data_frame_size,
+        )
+        .await
+        {
+            Err(err) if !shutdown.is_closed() => {
+                warn!(event = "udp.target.read.error", flow_id, error = %err);
+                let _ = send_error(&carrier_writer, flow_id, ErrorCode::TargetUnavailable).await;
+                let _ = send_udp_close(&carrier_writer, flow_id, UDP_CLOSE_ERROR).await;
+            }
+            _ => {}
+        }
+        let _ = event_tx.send(FlowEvent::UdpReadClosed(flow_id));
     });
 }
 
@@ -1492,16 +1889,39 @@ impl Drop for TargetFlow {
     }
 }
 
+impl UdpTargetFlow {
+    fn new(socket: Arc<UdpSocket>, control: TargetFlowControl) -> Self {
+        Self { socket, control }
+    }
+
+    fn abort(&self) {
+        self.control.abort();
+    }
+}
+
+impl Drop for UdpTargetFlow {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
 fn open_target_flow_mut(target_writers: &mut FlowTable, flow_id: u64) -> Option<&mut TargetFlow> {
     match target_writers.get_mut(&flow_id) {
         Some(FlowSlot::Tcp(target)) => Some(target),
-        Some(FlowSlot::Opening(_)) | None => None,
+        Some(FlowSlot::OpeningTcp(_) | FlowSlot::OpeningUdp(_) | FlowSlot::Udp(_)) | None => None,
+    }
+}
+
+fn udp_target_flow_mut(target_writers: &mut FlowTable, flow_id: u64) -> Option<&mut UdpTargetFlow> {
+    match target_writers.get_mut(&flow_id) {
+        Some(FlowSlot::Udp(target)) => Some(target),
+        Some(FlowSlot::OpeningTcp(_) | FlowSlot::OpeningUdp(_) | FlowSlot::Tcp(_)) | None => None,
     }
 }
 
 fn remove_flow_slot(target_writers: &mut FlowTable, flow_id: u64) -> Option<FlowSlot> {
     let slot = target_writers.remove(&flow_id);
-    if let Some(FlowSlot::Opening(cancel)) = &slot {
+    if let Some(FlowSlot::OpeningTcp(cancel) | FlowSlot::OpeningUdp(cancel)) = &slot {
         cancel.cancel();
     }
     slot
@@ -1543,11 +1963,44 @@ async fn relay_target_to_client(
     }
 }
 
+async fn relay_udp_target_to_client(
+    flow_id: u64,
+    target_socket: Arc<UdpSocket>,
+    flow_control: TargetFlowControl,
+    carrier_writer: &CarrierWriter,
+    event_tx: &mpsc::UnboundedSender<FlowEvent>,
+    shutdown: &SessionShutdown,
+    data_frame_size: usize,
+) -> Result<(), AnyError> {
+    let mut target_buf = vec![0_u8; data_frame_size].into_boxed_slice();
+    loop {
+        if shutdown.is_closed() || flow_control.is_aborted() {
+            return Ok(());
+        }
+        let read = tokio::select! {
+            read = target_socket.recv(target_buf.as_mut()) => read?,
+            () = shutdown.closed() => return Ok(()),
+            () = flow_control.aborted() => return Ok(()),
+        };
+        if shutdown.is_closed() || flow_control.is_aborted() {
+            return Ok(());
+        }
+        send_udp_data(
+            carrier_writer,
+            flow_id,
+            Bytes::copy_from_slice(&target_buf[..read]),
+        )
+        .await?;
+        let _ = event_tx.send(FlowEvent::Activity);
+    }
+}
+
 fn close_target_flows(target_writers: &mut FlowTable) {
     for slot in target_writers.drain().map(|(_, target)| target) {
         match slot {
-            FlowSlot::Opening(cancel) => cancel.cancel(),
+            FlowSlot::OpeningTcp(cancel) | FlowSlot::OpeningUdp(cancel) => cancel.cancel(),
             FlowSlot::Tcp(mut target) => target.close_client_to_target(),
+            FlowSlot::Udp(target) => target.abort(),
         }
     }
 }
@@ -1593,6 +2046,40 @@ async fn connect_allowed_target_inner(
     connect_socket_addrs(&addrs, open_dial_limiter).await
 }
 
+async fn connect_allowed_udp_target(
+    target: &Target,
+    credential: &Credential,
+    policy_set: &PolicySet,
+    open_dial_limiter: &OpenDialLimiter,
+    target_connect_timeout: Option<Duration>,
+) -> Result<UdpSocket, OpenFailure> {
+    with_optional_timeout(
+        target_connect_timeout,
+        connect_allowed_udp_target_inner(target, credential, policy_set, open_dial_limiter),
+    )
+    .await
+}
+
+async fn connect_allowed_udp_target_inner(
+    target: &Target,
+    credential: &Credential,
+    policy_set: &PolicySet,
+    open_dial_limiter: &OpenDialLimiter,
+) -> Result<UdpSocket, OpenFailure> {
+    let addrs = resolve_target(target).await?;
+    let resolved_ips = resolved_ips(target, &addrs);
+    let context = PolicyContext {
+        key_id: &credential.key_id,
+        policy_group: credential.policy_group.as_deref(),
+        target,
+        resolved_ips: &resolved_ips,
+    };
+    if policy_set.evaluate(&context) != PolicyDecision::Allow {
+        return Err(OpenFailure::PolicyDenied);
+    }
+    connect_udp_socket_addrs(&addrs, open_dial_limiter).await
+}
+
 async fn resolve_target(target: &Target) -> Result<Vec<SocketAddr>, OpenFailure> {
     let addrs = match target {
         Target::Domain(domain, port) => lookup_host((domain.as_str(), *port))
@@ -1627,8 +2114,20 @@ async fn connect_socket_addrs(
     connect_first_successful(addrs, &connector, open_dial_limiter).await
 }
 
+async fn connect_udp_socket_addrs(
+    addrs: &[SocketAddr],
+    open_dial_limiter: &OpenDialLimiter,
+) -> Result<UdpSocket, OpenFailure> {
+    let connector = udp_target_connector();
+    connect_first_successful(addrs, &connector, open_dial_limiter).await
+}
+
 fn target_connector() -> TargetConnector<TcpStream> {
     Arc::new(|addr| -> BoxedConnectFuture<TcpStream> { Box::pin(connect_socket_addr(addr)) })
+}
+
+fn udp_target_connector() -> TargetConnector<UdpSocket> {
+    Arc::new(|addr| -> BoxedConnectFuture<UdpSocket> { Box::pin(connect_udp_socket_addr(addr)) })
 }
 
 async fn connect_socket_addr(addr: SocketAddr) -> (SocketAddr, io::Result<TcpStream>) {
@@ -1636,6 +2135,20 @@ async fn connect_socket_addr(addr: SocketAddr) -> (SocketAddr, io::Result<TcpStr
         Ok(stream) => stream.set_nodelay(true).map(|()| stream),
         Err(err) => Err(err),
     };
+    (addr, result)
+}
+
+async fn connect_udp_socket_addr(addr: SocketAddr) -> (SocketAddr, io::Result<UdpSocket>) {
+    let bind_addr = match addr {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    };
+    let result = async {
+        let socket = UdpSocket::bind(bind_addr).await?;
+        socket.connect(addr).await?;
+        Ok(socket)
+    }
+    .await;
     (addr, result)
 }
 
@@ -1748,6 +2261,26 @@ async fn send_tcp_close(
     let mut payload = BytesMut::new();
     TcpClose::new(close_code).encode(&mut payload)?;
     let frame = Frame::new(FrameType::TcpClose, 0, flow_id, payload.freeze())?;
+    write_frame_locked(writer, &frame).await
+}
+
+async fn send_udp_data(
+    writer: &CarrierWriter,
+    flow_id: u64,
+    payload: Bytes,
+) -> Result<(), AnyError> {
+    let frame = Frame::new(FrameType::UdpData, 0, flow_id, payload)?;
+    write_frame_locked(writer, &frame).await
+}
+
+async fn send_udp_close(
+    writer: &CarrierWriter,
+    flow_id: u64,
+    close_code: u16,
+) -> Result<(), AnyError> {
+    let mut payload = BytesMut::new();
+    UdpClose::new(close_code).encode(&mut payload)?;
+    let frame = Frame::new(FrameType::UdpClose, 0, flow_id, payload.freeze())?;
     write_frame_locked(writer, &frame).await
 }
 
@@ -1877,7 +2410,12 @@ mod tests {
     }
 
     fn test_opening_flow_slot() -> FlowSlot {
-        FlowSlot::Opening(OpenFlowCancel::default())
+        FlowSlot::OpeningTcp(OpenFlowCancel::default())
+    }
+
+    async fn test_udp_flow() -> UdpTargetFlow {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        UdpTargetFlow::new(Arc::new(socket), TargetFlowControl::default())
     }
 
     fn control_frame(frame_type: FrameType, flow_id: u64) -> Frame {
@@ -2236,7 +2774,7 @@ mod tests {
         target_writers.insert(1, test_open_flow_slot());
 
         assert_eq!(
-            check_tcp_open_slot(1, &target_writers, 1),
+            check_open_slot(1, &target_writers, 1),
             Err(OpenSlotRejection::DuplicateFlowId)
         );
     }
@@ -2247,7 +2785,7 @@ mod tests {
         target_writers.insert(1, test_open_flow_slot());
 
         assert_eq!(
-            check_tcp_open_slot(3, &target_writers, 1),
+            check_open_slot(3, &target_writers, 1),
             Err(OpenSlotRejection::ResourceLimit)
         );
     }
@@ -2257,7 +2795,7 @@ mod tests {
         let mut target_writers = FlowTable::new();
         target_writers.insert(1, test_open_flow_slot());
 
-        assert_eq!(check_tcp_open_slot(2, &target_writers, 1), Ok(()));
+        assert_eq!(check_open_slot(2, &target_writers, 1), Ok(()));
     }
 
     #[test]
@@ -2320,7 +2858,7 @@ mod tests {
     fn client_flow_status_cancels_pending_open() {
         let cancel = OpenFlowCancel::default();
         let mut target_writers = FlowTable::new();
-        target_writers.insert(1, FlowSlot::Opening(cancel.clone()));
+        target_writers.insert(1, FlowSlot::OpeningTcp(cancel.clone()));
 
         abort_client_flow(1, &mut target_writers);
 
@@ -2388,13 +2926,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn classifies_tcp_data_for_udp_flow_as_other_protocol() {
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(1, FlowSlot::Udp(test_udp_flow().await));
+
+        assert_eq!(
+            tcp_data_disposition(1, &Bytes::from_static(b"data"), &target_writers),
+            TcpDataDisposition::OtherProtocolFlow
+        );
+    }
+
+    #[tokio::test]
+    async fn classifies_udp_data_for_flow_kinds() {
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(1, FlowSlot::Udp(test_udp_flow().await));
+        target_writers.insert(3, FlowSlot::OpeningUdp(OpenFlowCancel::default()));
+        target_writers.insert(5, test_open_flow_slot());
+        target_writers.insert(7, test_opening_flow_slot());
+
+        assert_eq!(
+            udp_data_disposition(9, &target_writers),
+            UdpDataDisposition::UnknownFlow
+        );
+        assert_eq!(
+            udp_data_disposition(1, &target_writers),
+            UdpDataDisposition::ForwardPayload
+        );
+        assert_eq!(
+            udp_data_disposition(3, &target_writers),
+            UdpDataDisposition::OpeningFlow
+        );
+        assert_eq!(
+            udp_data_disposition(5, &target_writers),
+            UdpDataDisposition::TcpFlow
+        );
+        assert_eq!(
+            udp_data_disposition(7, &target_writers),
+            UdpDataDisposition::TcpFlow
+        );
+    }
+
     #[test]
     fn pending_open_slot_counts_against_stream_limit() {
         let mut target_writers = FlowTable::new();
         target_writers.insert(1, test_opening_flow_slot());
 
         assert_eq!(
-            check_tcp_open_slot(3, &target_writers, 1),
+            check_open_slot(3, &target_writers, 1),
             Err(OpenSlotRejection::ResourceLimit)
         );
     }
@@ -2414,7 +2993,7 @@ mod tests {
     fn removing_pending_open_slot_cancels_connect_task() {
         let cancel = OpenFlowCancel::default();
         let mut target_writers = FlowTable::new();
-        target_writers.insert(1, FlowSlot::Opening(cancel.clone()));
+        target_writers.insert(1, FlowSlot::OpeningTcp(cancel.clone()));
 
         remove_flow_slot(&mut target_writers, 1);
 
@@ -2426,12 +3005,28 @@ mod tests {
     fn closing_session_cancels_pending_open_slots() {
         let cancel = OpenFlowCancel::default();
         let mut target_writers = FlowTable::new();
-        target_writers.insert(1, FlowSlot::Opening(cancel.clone()));
+        target_writers.insert(1, FlowSlot::OpeningTcp(cancel.clone()));
         target_writers.insert(3, test_open_flow_slot());
 
         close_target_flows(&mut target_writers);
 
         assert!(cancel.is_cancelled());
+        assert!(target_writers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closing_session_aborts_udp_flows_and_cancels_pending_udp_opens() {
+        let cancel = OpenFlowCancel::default();
+        let udp_flow = test_udp_flow().await;
+        let control = udp_flow.control.clone();
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(1, FlowSlot::OpeningUdp(cancel.clone()));
+        target_writers.insert(3, FlowSlot::Udp(udp_flow));
+
+        close_target_flows(&mut target_writers);
+
+        assert!(cancel.is_cancelled());
+        assert!(control.is_aborted());
         assert!(target_writers.is_empty());
     }
 
@@ -2540,6 +3135,18 @@ mod tests {
         assert_eq!(connected, second_addr);
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
         assert_eq!(limiter.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn udp_target_connect_binds_matching_ip_family() {
+        let target = SocketAddr::from(([127, 0, 0, 1], 9));
+
+        let (candidate, socket) = connect_udp_socket_addr(target).await;
+        let socket = socket.unwrap();
+
+        assert_eq!(candidate, target);
+        assert!(socket.local_addr().unwrap().is_ipv4());
+        assert_eq!(socket.peer_addr().unwrap(), target);
     }
 
     #[test]
