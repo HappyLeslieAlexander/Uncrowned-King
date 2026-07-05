@@ -61,6 +61,7 @@ struct ClientSession {
     limits: FrameLimits,
     data_frame_size: usize,
     max_streams: u64,
+    max_udp_flows: u64,
     max_pending_open_bytes: usize,
     max_buffered_bytes_per_session: usize,
     max_buffered_bytes_per_flow: usize,
@@ -564,6 +565,7 @@ impl ClientSession {
             limits,
             data_frame_size: tcp_data_frame_size(limits),
             max_streams: max_streams(&settings),
+            max_udp_flows: max_udp_flows(&settings),
             max_pending_open_bytes: usize_limit(config.max_pending_open_bytes())?,
             max_buffered_bytes_per_session: usize_limit(config.max_buffered_bytes_per_session())?,
             max_buffered_bytes_per_flow: usize_limit(config.max_buffered_bytes_per_flow())?,
@@ -825,6 +827,7 @@ impl ClientSession {
             &self.next_flow_id,
             sender,
             protocol,
+            self.max_udp_flows,
         )?
         else {
             return Ok(None);
@@ -953,8 +956,13 @@ fn reserve_flow_slot(
     next_flow_id: &AtomicU64,
     sender: mpsc::Sender<BufferedFlowFrame>,
     protocol: FlowProtocol,
+    max_udp_flows: u64,
 ) -> Result<Option<u64>, AnyError> {
     if flows.len() as u64 >= max_streams {
+        return Ok(None);
+    }
+    let max_udp_flows = usize::try_from(max_udp_flows).unwrap_or(usize::MAX);
+    if protocol == FlowProtocol::Udp && udp_route_count(flows) >= max_udp_flows {
         return Ok(None);
     }
 
@@ -973,6 +981,13 @@ fn reserve_flow_slot(
     }
 
     Err("no available client flow id".into())
+}
+
+fn udp_route_count(flows: &HashMap<u64, ClientFlowRoute>) -> usize {
+    flows
+        .values()
+        .filter(|route| route.protocol == FlowProtocol::Udp)
+        .count()
 }
 
 #[derive(Default)]
@@ -1902,6 +1917,12 @@ fn max_streams(settings: &uk_proto::Settings) -> u64 {
         .unwrap_or(DEFAULT_MAX_STREAMS)
 }
 
+fn max_udp_flows(settings: &uk_proto::Settings) -> u64 {
+    settings
+        .get(SettingKey::MaxUdpFlows)
+        .unwrap_or_else(|| max_streams(settings))
+}
+
 fn keepalive_interval(settings: &uk_proto::Settings) -> Option<Duration> {
     let idle_timeout_seconds = settings.get(SettingKey::IdleTimeoutSeconds)?;
     if idle_timeout_seconds == 0 {
@@ -2085,7 +2106,15 @@ mod tests {
         let (sender, _receiver) = mpsc::channel(1);
 
         assert_eq!(
-            reserve_flow_slot(&mut flows, 1, &next_flow_id, sender, FlowProtocol::Tcp).unwrap(),
+            reserve_flow_slot(
+                &mut flows,
+                1,
+                &next_flow_id,
+                sender,
+                FlowProtocol::Tcp,
+                u64::MAX,
+            )
+            .unwrap(),
             Some(FIRST_CLIENT_FLOW_ID)
         );
 
@@ -2108,11 +2137,71 @@ mod tests {
         let (sender, _receiver) = mpsc::channel(1);
 
         assert_eq!(
-            reserve_flow_slot(&mut flows, 1, &next_flow_id, sender, FlowProtocol::Tcp).unwrap(),
+            reserve_flow_slot(
+                &mut flows,
+                1,
+                &next_flow_id,
+                sender,
+                FlowProtocol::Tcp,
+                u64::MAX,
+            )
+            .unwrap(),
             None
         );
 
         assert_eq!(flows.len(), 1);
+        assert_eq!(next_flow_id.load(Ordering::Relaxed), FIRST_CLIENT_FLOW_ID);
+    }
+
+    #[test]
+    fn reserve_flow_slot_enforces_udp_flow_limit() {
+        let mut flows = HashMap::new();
+        let (existing_sender, _existing_receiver) = mpsc::channel(1);
+        flows.insert(
+            FLOW_ID,
+            ClientFlowRoute::new(existing_sender, FlowProtocol::Udp),
+        );
+        let next_flow_id = AtomicU64::new(FIRST_CLIENT_FLOW_ID);
+        let (sender, _receiver) = mpsc::channel(1);
+
+        assert_eq!(
+            reserve_flow_slot(&mut flows, 8, &next_flow_id, sender, FlowProtocol::Udp, 1,).unwrap(),
+            None
+        );
+
+        assert_eq!(flows.len(), 1);
+        assert_eq!(next_flow_id.load(Ordering::Relaxed), FIRST_CLIENT_FLOW_ID);
+    }
+
+    #[test]
+    fn reserve_flow_slot_allows_tcp_when_udp_limit_is_full() {
+        let mut flows = HashMap::new();
+        let (existing_sender, _existing_receiver) = mpsc::channel(1);
+        flows.insert(
+            FLOW_ID,
+            ClientFlowRoute::new(existing_sender, FlowProtocol::Udp),
+        );
+        let next_flow_id = AtomicU64::new(FIRST_CLIENT_FLOW_ID);
+        let (sender, _receiver) = mpsc::channel(1);
+
+        assert_eq!(
+            reserve_flow_slot(&mut flows, 8, &next_flow_id, sender, FlowProtocol::Tcp, 1,).unwrap(),
+            Some(FIRST_CLIENT_FLOW_ID + FLOW_ID_STEP)
+        );
+    }
+
+    #[test]
+    fn zero_udp_flow_limit_disables_client_udp_reservation() {
+        let mut flows = HashMap::new();
+        let next_flow_id = AtomicU64::new(FIRST_CLIENT_FLOW_ID);
+        let (sender, _receiver) = mpsc::channel(1);
+
+        assert_eq!(
+            reserve_flow_slot(&mut flows, 8, &next_flow_id, sender, FlowProtocol::Udp, 0,).unwrap(),
+            None
+        );
+
+        assert!(flows.is_empty());
         assert_eq!(next_flow_id.load(Ordering::Relaxed), FIRST_CLIENT_FLOW_ID);
     }
 
@@ -2800,6 +2889,23 @@ mod tests {
         settings.set(SettingKey::IdleTimeoutSeconds, 0);
 
         assert_eq!(keepalive_interval(&settings), None);
+    }
+
+    #[test]
+    fn max_udp_flows_defaults_to_max_streams_setting() {
+        let mut settings = uk_proto::Settings::default();
+        settings.set(SettingKey::MaxStreams, 9);
+
+        assert_eq!(max_udp_flows(&settings), 9);
+    }
+
+    #[test]
+    fn max_udp_flows_accepts_zero_to_disable_udp() {
+        let mut settings = uk_proto::Settings::default();
+        settings.set(SettingKey::MaxStreams, 9);
+        settings.set(SettingKey::MaxUdpFlows, 0);
+
+        assert_eq!(max_udp_flows(&settings), 0);
     }
 
     #[test]

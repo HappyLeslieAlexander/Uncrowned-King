@@ -275,6 +275,9 @@ If `max_frame_size` or `max_streams` is present, the value must be greater than
 zero. TCP relay implementations must reject `max_frame_size < 262`, the minimum
 needed to carry every valid v0.1 `TCP_OPEN` payload. Implementations must reject
 `max_frame_size > 16777216`.
+If `max_udp_flows` is absent, peers should treat it as equal to `max_streams`.
+`max_udp_flows = 0` disables new UDP relay flows; otherwise the value limits the
+number of concurrent UDP relay flows, including pending UDP opens.
 
 When `idle_timeout_seconds` is non-zero, a peer may send `PING` frames before
 the deadline to keep active relay flows alive. Implementations should avoid

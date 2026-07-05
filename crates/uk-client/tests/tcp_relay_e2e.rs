@@ -130,6 +130,11 @@ async fn relays_multiple_udp_targets_over_one_socks5_association() -> Result<(),
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enforces_udp_flow_limit_per_session() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_udp_flow_limit_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relays_data_sent_before_socks_success_reply() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_early_socks_data_e2e()).await?
 }
@@ -487,6 +492,51 @@ async fn run_multi_target_udp_relay_e2e() -> Result<(), TestError> {
 
     first_echo_task.await??;
     second_echo_task.await??;
+    Ok(())
+}
+
+async fn run_udp_flow_limit_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (first_target_addr, first_echo_task) = spawn_udp_echo_target().await?;
+    let (second_target_addr, second_echo_task) = spawn_udp_echo_target().await?;
+    let harness = RelayHarness::start_with_limits(
+        Some(allow_loopback_any_port_policy()),
+        test_limits_with_max_udp_flows(1),
+    )
+    .await?;
+    let (_socks_control, udp_relay_addr) = open_socks_udp_associate(harness.socks_addr).await?;
+    let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let first_payload = b"uncrowned king udp allowed target";
+    let second_payload = b"uncrowned king udp limited target";
+
+    udp_client
+        .send_to(
+            &socks_udp_datagram(first_target_addr, first_payload),
+            udp_relay_addr,
+        )
+        .await?;
+    let (reply_target, reply_payload) =
+        recv_socks_udp_datagram(&udp_client, udp_relay_addr).await?;
+    assert_eq!(reply_target, first_target_addr);
+    assert_eq!(reply_payload, first_payload);
+
+    udp_client
+        .send_to(
+            &socks_udp_datagram(second_target_addr, second_payload),
+            udp_relay_addr,
+        )
+        .await?;
+    let mut buf = [0_u8; 1024];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), udp_client.recv_from(&mut buf))
+            .await
+            .is_err(),
+        "second UDP target should be blocked by max_udp_flows"
+    );
+
+    first_echo_task.await??;
+    second_echo_task.abort();
     Ok(())
 }
 
@@ -2398,6 +2448,7 @@ fn fake_server_settings() -> Settings {
     settings.set(SettingKey::ProtocolRevision, 1);
     settings.set(SettingKey::MaxFrameSize, 65_536);
     settings.set(SettingKey::MaxStreams, 8);
+    settings.set(SettingKey::MaxUdpFlows, 8);
     settings.set(SettingKey::IdleTimeoutSeconds, 30);
     settings
 }
@@ -3013,6 +3064,7 @@ fn test_limits() -> LimitConfig {
         max_frame_size: Some(65_536),
         max_sessions: Some(32),
         max_streams: Some(8),
+        max_udp_flows: None,
         max_outbound_dials_per_session: Some(8),
         max_buffered_bytes_per_session: Some(4 * 1024 * 1024),
         idle_timeout_seconds: Some(30),
@@ -3028,6 +3080,12 @@ fn test_limits() -> LimitConfig {
 fn test_limits_with_max_streams(max_streams: u64) -> LimitConfig {
     let mut limits = test_limits();
     limits.max_streams = Some(max_streams);
+    limits
+}
+
+fn test_limits_with_max_udp_flows(max_udp_flows: u64) -> LimitConfig {
+    let mut limits = test_limits();
+    limits.max_udp_flows = Some(max_udp_flows);
     limits
 }
 

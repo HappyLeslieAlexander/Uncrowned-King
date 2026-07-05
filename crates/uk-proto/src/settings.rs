@@ -115,6 +115,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.set(SettingKey::MaxFrameSize, 65_536);
         settings.set(SettingKey::MaxStreams, 64);
+        settings.set(SettingKey::MaxUdpFlows, 64);
         settings.set(SettingKey::ProtocolRevision, 1);
 
         let mut out = Vec::new();
@@ -122,7 +123,7 @@ mod tests {
         assert_eq!(
             out,
             [
-                0x03, 0x01, 0x80, 0x01, 0x00, 0x00, 0x02, 0x40, 0x40, 0x07, 0x01
+                0x04, 0x01, 0x80, 0x01, 0x00, 0x00, 0x02, 0x40, 0x40, 0x03, 0x40, 0x40, 0x07, 0x01
             ]
         );
     }

@@ -91,11 +91,11 @@ Expected HMAC-SHA256 tag:
 
 ## 6. Settings
 
-`SETTINGS` payload with `max_frame_size = 65536`, `max_streams = 64`, and
-`protocol_revision = 1`:
+`SETTINGS` payload with `max_frame_size = 65536`, `max_streams = 64`,
+`max_udp_flows = 64`, and `protocol_revision = 1`:
 
 ```text
-03 01 80 01 00 00 02 40 40 07 01
+04 01 80 01 00 00 02 40 40 03 40 40 07 01
 ```
 
 ## 7. Error Frame

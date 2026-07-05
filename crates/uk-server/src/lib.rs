@@ -163,17 +163,18 @@ async fn handle_connection(
         stream,
         credential,
         policy_set,
-        relay::RelayLimits::new(
-            FrameLimits {
+        relay::RelayLimits::new(relay::RelayLimitConfig {
+            frame: FrameLimits {
                 max_frame_size: config.max_frame_size(),
             },
-            config.max_streams(),
-            usize_limit(config.max_outbound_dials_per_session()),
-            usize_limit(config.max_buffered_bytes_per_session()),
-            usize_limit(config.max_buffered_bytes_per_flow()),
-            target_connect_timeout(config.target_connect_timeout_seconds()),
-            tcp_half_close_timeout(config.tcp_half_close_timeout_seconds()),
-        ),
+            max_streams: config.max_streams(),
+            max_udp_flows: config.max_udp_flows(),
+            max_outbound_dials_per_session: usize_limit(config.max_outbound_dials_per_session()),
+            max_buffered_bytes_per_session: usize_limit(config.max_buffered_bytes_per_session()),
+            max_buffered_bytes_per_flow: usize_limit(config.max_buffered_bytes_per_flow()),
+            target_connect_timeout: target_connect_timeout(config.target_connect_timeout_seconds()),
+            tcp_half_close_timeout: tcp_half_close_timeout(config.tcp_half_close_timeout_seconds()),
+        }),
         idle_timeout(config.idle_timeout_seconds()),
         shutdown_rx,
     )
@@ -299,6 +300,7 @@ fn server_settings(config: &ServerConfig) -> Settings {
     settings.set(SettingKey::ProtocolRevision, 1);
     settings.set(SettingKey::MaxFrameSize, config.max_frame_size());
     settings.set(SettingKey::MaxStreams, config.max_streams());
+    settings.set(SettingKey::MaxUdpFlows, config.max_udp_flows());
     settings.set(
         SettingKey::IdleTimeoutSeconds,
         config.idle_timeout_seconds(),
@@ -378,6 +380,7 @@ mod tests {
             max_frame_size: Some(32_768),
             max_sessions: None,
             max_streams: Some(17),
+            max_udp_flows: Some(11),
             max_outbound_dials_per_session: None,
             max_buffered_bytes_per_session: None,
             idle_timeout_seconds: Some(42),
@@ -394,6 +397,7 @@ mod tests {
         assert_eq!(settings.get(SettingKey::ProtocolRevision), Some(1));
         assert_eq!(settings.get(SettingKey::MaxFrameSize), Some(32_768));
         assert_eq!(settings.get(SettingKey::MaxStreams), Some(17));
+        assert_eq!(settings.get(SettingKey::MaxUdpFlows), Some(11));
         assert_eq!(settings.get(SettingKey::IdleTimeoutSeconds), Some(42));
     }
 

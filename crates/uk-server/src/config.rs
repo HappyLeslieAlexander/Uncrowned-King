@@ -90,6 +90,7 @@ impl ServerConfig {
         )?;
         reject_zero_limit("max_sessions", self.max_sessions())?;
         reject_zero_limit("max_streams", self.max_streams())?;
+        reject_large_limit("max_udp_flows", self.max_udp_flows(), self.max_streams())?;
         reject_zero_limit(
             "max_outbound_dials_per_session",
             self.max_outbound_dials_per_session(),
@@ -156,6 +157,15 @@ impl ServerConfig {
             .as_ref()
             .and_then(|limits| limits.max_streams)
             .unwrap_or(64)
+    }
+
+    /// Configured maximum concurrent UDP flows per authenticated session.
+    /// Zero disables UDP relay.
+    pub fn max_udp_flows(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.max_udp_flows)
+            .unwrap_or_else(|| self.max_streams())
     }
 
     /// Configured maximum in-flight target socket dials per authenticated session.
@@ -276,6 +286,8 @@ pub struct LimitConfig {
     pub max_sessions: Option<u64>,
     /// Maximum concurrent TCP streams per authenticated session.
     pub max_streams: Option<u64>,
+    /// Maximum concurrent UDP flows per authenticated session. Zero disables UDP relay.
+    pub max_udp_flows: Option<u64>,
     /// Maximum in-flight target socket dials per authenticated session.
     pub max_outbound_dials_per_session: Option<u64>,
     /// Maximum queued client-to-target bytes across one authenticated session.
@@ -392,6 +404,71 @@ idle_timeout_seconds = 42
     #[test]
     fn defaults_buffered_bytes_per_flow_limit() {
         assert_eq!(minimal_config().max_buffered_bytes_per_flow(), 2_097_152);
+    }
+
+    #[test]
+    fn defaults_udp_flow_limit_to_stream_limit() {
+        assert_eq!(
+            minimal_config().max_udp_flows(),
+            minimal_config().max_streams()
+        );
+    }
+
+    #[test]
+    fn parses_udp_flow_limit() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_streams = 8
+max_udp_flows = 3
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.max_udp_flows(), 3);
+    }
+
+    #[test]
+    fn accepts_zero_udp_flow_limit_to_disable_udp() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_udp_flows = 0
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.max_udp_flows(), 0);
+        assert!(config.validate_limits().is_ok());
+    }
+
+    #[test]
+    fn rejects_udp_flow_limit_above_stream_limit() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_streams = 2
+max_udp_flows = 3
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate_limits().is_err());
     }
 
     #[test]

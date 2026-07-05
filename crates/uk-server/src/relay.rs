@@ -65,12 +65,25 @@ impl CarrierWriter {
 pub(crate) struct RelayLimits {
     frame: FrameLimits,
     max_streams: u64,
+    max_udp_flows: u64,
     max_outbound_dials_per_session: usize,
     data_frame_size: usize,
     max_buffered_bytes_per_session: usize,
     max_buffered_bytes_per_flow: usize,
     target_connect_timeout: Option<Duration>,
     tcp_half_close_timeout: Option<Duration>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RelayLimitConfig {
+    pub(crate) frame: FrameLimits,
+    pub(crate) max_streams: u64,
+    pub(crate) max_udp_flows: u64,
+    pub(crate) max_outbound_dials_per_session: usize,
+    pub(crate) max_buffered_bytes_per_session: usize,
+    pub(crate) max_buffered_bytes_per_flow: usize,
+    pub(crate) target_connect_timeout: Option<Duration>,
+    pub(crate) tcp_half_close_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +106,13 @@ enum OpenFailure {
 enum OpenSlotRejection {
     DuplicateFlowId,
     ResourceLimit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UdpOpenSlotRejection {
+    DuplicateFlowId,
+    ResourceLimit,
+    UdpFlowLimit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -945,14 +965,19 @@ async fn handle_udp_open_frame(
     frame: Frame,
     target_writers: &mut FlowTable,
 ) -> Result<(), AnyError> {
-    match check_open_slot(frame.header.id, target_writers, context.limits.max_streams) {
+    match check_udp_open_slot(
+        frame.header.id,
+        target_writers,
+        context.limits.max_streams,
+        context.limits.max_udp_flows,
+    ) {
         Ok(()) => {}
-        Err(OpenSlotRejection::DuplicateFlowId) => {
+        Err(UdpOpenSlotRejection::DuplicateFlowId) => {
             send_error(context.carrier_writer, frame.header.id, ErrorCode::Protocol).await?;
             send_udp_close(context.carrier_writer, frame.header.id, UDP_CLOSE_ERROR).await?;
             return Ok(());
         }
-        Err(OpenSlotRejection::ResourceLimit) => {
+        Err(UdpOpenSlotRejection::ResourceLimit | UdpOpenSlotRejection::UdpFlowLimit) => {
             send_resource_limit(context.carrier_writer, frame.header.id).await?;
             send_udp_close(context.carrier_writer, frame.header.id, UDP_CLOSE_ERROR).await?;
             return Ok(());
@@ -1117,6 +1142,30 @@ fn udp_data_disposition(flow_id: u64, target_writers: &FlowTable) -> UdpDataDisp
         Some(FlowSlot::OpeningTcp(_) | FlowSlot::Tcp(_)) => UdpDataDisposition::TcpFlow,
         Some(FlowSlot::Udp(_)) => UdpDataDisposition::ForwardPayload,
     }
+}
+
+fn check_udp_open_slot(
+    flow_id: u64,
+    target_writers: &FlowTable,
+    max_streams: u64,
+    max_udp_flows: u64,
+) -> Result<(), UdpOpenSlotRejection> {
+    check_open_slot(flow_id, target_writers, max_streams).map_err(|err| match err {
+        OpenSlotRejection::DuplicateFlowId => UdpOpenSlotRejection::DuplicateFlowId,
+        OpenSlotRejection::ResourceLimit => UdpOpenSlotRejection::ResourceLimit,
+    })?;
+    let max_udp_flows = usize::try_from(max_udp_flows).unwrap_or(usize::MAX);
+    if is_client_initiated_flow_id(flow_id) && udp_flow_count(target_writers) >= max_udp_flows {
+        return Err(UdpOpenSlotRejection::UdpFlowLimit);
+    }
+    Ok(())
+}
+
+fn udp_flow_count(target_writers: &FlowTable) -> usize {
+    target_writers
+        .values()
+        .filter(|slot| matches!(slot, FlowSlot::OpeningUdp(_) | FlowSlot::Udp(_)))
+        .count()
 }
 
 fn spawn_target_open(task: TargetOpenTask) {
@@ -1492,24 +1541,17 @@ async fn relay_client_to_target(
 }
 
 impl RelayLimits {
-    pub(crate) fn new(
-        frame: FrameLimits,
-        max_streams: u64,
-        max_outbound_dials_per_session: usize,
-        max_buffered_bytes_per_session: usize,
-        max_buffered_bytes_per_flow: usize,
-        target_connect_timeout: Option<Duration>,
-        tcp_half_close_timeout: Option<Duration>,
-    ) -> Self {
+    pub(crate) fn new(config: RelayLimitConfig) -> Self {
         Self {
-            frame,
-            max_streams,
-            max_outbound_dials_per_session,
-            data_frame_size: tcp_data_frame_size(frame),
-            max_buffered_bytes_per_session,
-            max_buffered_bytes_per_flow,
-            target_connect_timeout,
-            tcp_half_close_timeout,
+            frame: config.frame,
+            max_streams: config.max_streams,
+            max_udp_flows: config.max_udp_flows,
+            max_outbound_dials_per_session: config.max_outbound_dials_per_session,
+            data_frame_size: tcp_data_frame_size(config.frame),
+            max_buffered_bytes_per_session: config.max_buffered_bytes_per_session,
+            max_buffered_bytes_per_flow: config.max_buffered_bytes_per_flow,
+            target_connect_timeout: config.target_connect_timeout,
+            tcp_half_close_timeout: config.tcp_half_close_timeout,
         }
     }
 }
@@ -2413,6 +2455,10 @@ mod tests {
         FlowSlot::OpeningTcp(OpenFlowCancel::default())
     }
 
+    fn test_opening_udp_flow_slot() -> FlowSlot {
+        FlowSlot::OpeningUdp(OpenFlowCancel::default())
+    }
+
     async fn test_udp_flow() -> UdpTargetFlow {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         UdpTargetFlow::new(Arc::new(socket), TargetFlowControl::default())
@@ -2796,6 +2842,57 @@ mod tests {
         target_writers.insert(1, test_open_flow_slot());
 
         assert_eq!(check_open_slot(2, &target_writers, 1), Ok(()));
+    }
+
+    #[test]
+    fn udp_open_slot_rejects_duplicate_before_udp_limit() {
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(1, test_opening_udp_flow_slot());
+
+        assert_eq!(
+            check_udp_open_slot(1, &target_writers, 8, 0),
+            Err(UdpOpenSlotRejection::DuplicateFlowId)
+        );
+    }
+
+    #[test]
+    fn udp_open_slot_rejects_total_stream_limit() {
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(1, test_open_flow_slot());
+
+        assert_eq!(
+            check_udp_open_slot(3, &target_writers, 1, 8),
+            Err(UdpOpenSlotRejection::ResourceLimit)
+        );
+    }
+
+    #[test]
+    fn udp_open_slot_enforces_udp_flow_limit() {
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(1, test_opening_udp_flow_slot());
+        target_writers.insert(3, test_open_flow_slot());
+
+        assert_eq!(
+            check_udp_open_slot(5, &target_writers, 8, 1),
+            Err(UdpOpenSlotRejection::UdpFlowLimit)
+        );
+    }
+
+    #[test]
+    fn zero_udp_flow_limit_disables_new_udp_flows() {
+        let target_writers = FlowTable::new();
+
+        assert_eq!(
+            check_udp_open_slot(1, &target_writers, 8, 0),
+            Err(UdpOpenSlotRejection::UdpFlowLimit)
+        );
+    }
+
+    #[test]
+    fn reserved_udp_open_slot_is_left_for_protocol_validation() {
+        let target_writers = FlowTable::new();
+
+        assert_eq!(check_udp_open_slot(2, &target_writers, 8, 0), Ok(()));
     }
 
     #[test]

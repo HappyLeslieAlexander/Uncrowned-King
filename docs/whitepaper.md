@@ -370,7 +370,7 @@ In QUIC carrier mode, `UDP_DATA` should use QUIC DATAGRAM when available. If una
 Default UDP limits:
 
 ```text
-max_udp_flows_per_session = 128
+max_udp_flows = max_streams by default; 0 disables UDP relay
 udp_idle_timeout = 120s
 max_udp_payload = 65507 bytes, further limited by carrier MTU
 ```
@@ -404,8 +404,10 @@ max_buffered_bytes_per_flow
 max_outbound_dials_per_session
 ```
 
-Capacity limits must be greater than zero. Timeout fields may use zero only
-when the implementation explicitly documents zero as disabling that timeout.
+Capacity limits must be greater than zero, except `max_udp_flows` may be zero
+when the implementation explicitly documents zero as disabling UDP relay.
+Timeout fields may use zero only when the implementation explicitly documents
+zero as disabling that timeout.
 
 When limits are exceeded, the server returns `RESOURCE_LIMIT` or closes the offending flow.
 
