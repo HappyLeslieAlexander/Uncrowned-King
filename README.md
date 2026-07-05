@@ -97,7 +97,9 @@ When running the SOCKS5 listener, `socks_handshake_timeout_seconds = 10` bounds
 the local SOCKS greeting and CONNECT request. `tcp_open_timeout_seconds = 10`
 bounds waiting for a UK TCP open response from the server.
 `udp_flow_idle_timeout_seconds = 120` bounds how long a per-target UDP flow may
-sit idle in a local SOCKS UDP association before the client closes it.
+sit idle in a local SOCKS UDP association before the client closes it. UDP flow
+activity is bidirectional: downstream target replies also refresh the idle
+timer.
 `max_pending_open_bytes = 65536` bounds local bytes buffered before that open
 response arrives.
 `max_socks_connections = 1024` bounds concurrent local SOCKS connections before

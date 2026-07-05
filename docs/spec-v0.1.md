@@ -186,6 +186,11 @@ Known UDP close codes match TCP close codes:
 
 Decoders must reject unknown UDP close codes.
 
+Implementations may close idle UDP relay flows to release target sockets and
+flow capacity. A UDP flow counts as active when either direction relays a
+`UDP_DATA` datagram for that flow; idle cleanup must not be based only on
+client-to-target traffic.
+
 ## 6. Authentication Payloads
 
 The carrier supplies a 32-byte TLS/QUIC exporter binding. Until carriers are

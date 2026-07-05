@@ -375,7 +375,9 @@ udp_flow_idle_timeout_seconds = 120
 max_udp_payload = 65507 bytes, further limited by carrier MTU
 ```
 
-The server must close idle UDP flows and release sockets.
+The server must close idle UDP flows and release sockets. A UDP flow is active
+when either direction relays a UDP datagram, so downstream target replies must
+also refresh any per-flow idle timer.
 
 ## 11. Multiplexing
 
@@ -621,7 +623,7 @@ Required tests:
 - TCP relay success.
 - TCP half-close.
 - UDP flow success.
-- UDP idle cleanup.
+- UDP idle cleanup, including bidirectional UDP activity refresh.
 - Resource limit exceeded.
 - Carrier fallback.
 - Log escaping.

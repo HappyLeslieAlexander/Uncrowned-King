@@ -31,8 +31,9 @@ Both long-running commands stop gracefully on Ctrl+C or SIGTERM.
 Replace the example shared secret before using these configs anywhere outside a
 local throwaway environment.
 
-The example limits enable UDP relay with `max_udp_flows = 64` and close idle
-per-target UDP flows after `udp_flow_idle_timeout_seconds = 120` seconds.
+The example limits enable UDP relay with `max_udp_flows = 64` and close
+per-target UDP flows after `udp_flow_idle_timeout_seconds = 120` seconds with no
+datagrams relayed in either direction.
 
 The example policy denies private resolved addresses before allowing
 `example.com` traffic. Keep deny rules before broad allow rules when adapting it.
