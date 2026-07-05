@@ -120,6 +120,12 @@ enum UdpAssociationFlowEvent {
     Activity { flow_id: u64, target: Target },
 }
 
+enum UdpAssociationFlowLookup {
+    Open(UdpAssociationFlow),
+    NoFlow,
+    Cancelled,
+}
+
 enum OpenOutcome {
     Open(ClientFlow),
     Rejected(socks5::Reply),
@@ -135,6 +141,7 @@ enum OpenWaitOutcome {
 
 enum UdpOpenWaitOutcome {
     Frame(Frame),
+    Cancelled,
     TimedOut,
 }
 
@@ -478,11 +485,20 @@ impl ClientSessionManager {
         Err(last_error.unwrap_or_else(|| "failed to open uk flow".into()))
     }
 
-    async fn open_udp_flow(&self, target: Target) -> Result<OpenOutcome, AnyError> {
+    async fn open_udp_flow(
+        &self,
+        target: Target,
+        local: &mut TcpStream,
+        tcp_buf: &mut [u8; 1],
+        shutdown_rx: &mut watch::Receiver<bool>,
+    ) -> Result<OpenOutcome, AnyError> {
         let mut last_error = None;
         for attempt in 0..2 {
             let session = self.current_session().await?;
-            match session.open_udp_flow(target.clone()).await {
+            match session
+                .open_udp_flow(target.clone(), local, tcp_buf, shutdown_rx)
+                .await
+            {
                 Ok(outcome) => return Ok(outcome),
                 Err(err) => {
                     warn!(
@@ -682,7 +698,13 @@ impl ClientSession {
         }
     }
 
-    async fn open_udp_flow(self: &Arc<Self>, target: Target) -> Result<OpenOutcome, AnyError> {
+    async fn open_udp_flow(
+        self: &Arc<Self>,
+        target: Target,
+        local: &mut TcpStream,
+        tcp_buf: &mut [u8; 1],
+        shutdown_rx: &mut watch::Receiver<bool>,
+    ) -> Result<OpenOutcome, AnyError> {
         if self.is_closed() {
             return Err("uk session is closed".into());
         }
@@ -709,10 +731,11 @@ impl ClientSession {
             pending_local_data: Vec::new(),
         };
         let frame = match self
-            .wait_for_udp_open_frame(flow_id, &mut flow.frames)
+            .wait_for_udp_open_frame(flow_id, &mut flow.frames, local, tcp_buf, shutdown_rx)
             .await?
         {
             UdpOpenWaitOutcome::Frame(frame) => frame,
+            UdpOpenWaitOutcome::Cancelled => return Ok(OpenOutcome::Cancelled),
             UdpOpenWaitOutcome::TimedOut => {
                 return Ok(OpenOutcome::Rejected(socks5::Reply::GeneralFailure));
             }
@@ -761,10 +784,16 @@ impl ClientSession {
         &self,
         flow_id: u64,
         frames: &mut mpsc::Receiver<BufferedFlowFrame>,
+        local: &mut TcpStream,
+        tcp_buf: &mut [u8; 1],
+        shutdown_rx: &mut watch::Receiver<bool>,
     ) -> Result<UdpOpenWaitOutcome, AnyError> {
         if let Some(timeout) = self.open_timeout {
-            if let Ok(result) =
-                time::timeout(timeout, self.wait_for_udp_open_frame_inner(frames)).await
+            if let Ok(result) = time::timeout(
+                timeout,
+                self.wait_for_udp_open_frame_inner(flow_id, frames, local, tcp_buf, shutdown_rx),
+            )
+            .await
             {
                 result
             } else {
@@ -773,20 +802,42 @@ impl ClientSession {
                 Ok(UdpOpenWaitOutcome::TimedOut)
             }
         } else {
-            self.wait_for_udp_open_frame_inner(frames).await
+            self.wait_for_udp_open_frame_inner(flow_id, frames, local, tcp_buf, shutdown_rx)
+                .await
         }
     }
 
     async fn wait_for_udp_open_frame_inner(
         &self,
+        flow_id: u64,
         frames: &mut mpsc::Receiver<BufferedFlowFrame>,
+        local: &mut TcpStream,
+        tcp_buf: &mut [u8; 1],
+        shutdown_rx: &mut watch::Receiver<bool>,
     ) -> Result<UdpOpenWaitOutcome, AnyError> {
-        frames
-            .recv()
-            .await
-            .map(BufferedFlowFrame::into_frame)
-            .map(UdpOpenWaitOutcome::Frame)
-            .ok_or_else(|| "uk session closed while opening udp flow".into())
+        loop {
+            tokio::select! {
+                frame = frames.recv() => {
+                    return frame
+                        .map(BufferedFlowFrame::into_frame)
+                        .map(UdpOpenWaitOutcome::Frame)
+                        .ok_or_else(|| "uk session closed while opening udp flow".into());
+                }
+                read = local.read(tcp_buf) => {
+                    if read? == 0 {
+                        debug!(event = "client.udp_flow.open.cancelled", flow_id);
+                        self.cancel_pending_udp_open(flow_id).await;
+                        return Ok(UdpOpenWaitOutcome::Cancelled);
+                    }
+                    debug!(event = "socks5.udp_associate.control_data_ignored");
+                }
+                changed = shutdown_rx.changed() => {
+                    let _ = changed;
+                    self.cancel_pending_udp_open(flow_id).await;
+                    return Ok(UdpOpenWaitOutcome::Cancelled);
+                }
+            }
+        }
     }
 
     async fn wait_for_open_frame_inner(
@@ -1526,14 +1577,19 @@ async fn relay_udp_association(
             }
             received = association.socket.recv_from(udp_buf.as_mut()) => {
                 let (read, peer) = received?;
-                association
+                if !association
                     .handle_local_udp_datagram(
                         peer,
                         &udp_buf[..read],
+                        &mut local,
+                        &mut tcp_buf,
                         &sessions,
-                        &shutdown_rx,
+                        &mut shutdown_rx,
                     )
-                    .await?;
+                    .await?
+                {
+                    break;
+                }
             }
             joined = association.flow_tasks.join_next(), if !association.flow_tasks.is_empty() => {
                 association.handle_flow_task_result(joined);
@@ -1572,29 +1628,42 @@ impl UdpAssociation {
         &mut self,
         peer: SocketAddr,
         packet: &[u8],
+        local: &mut TcpStream,
+        tcp_buf: &mut [u8; 1],
         sessions: &Arc<ClientSessionManager>,
-        shutdown_rx: &watch::Receiver<bool>,
-    ) -> Result<(), AnyError> {
+        shutdown_rx: &mut watch::Receiver<bool>,
+    ) -> Result<bool, AnyError> {
         if !self.accept_client_endpoint(peer) {
             debug!(event = "socks5.udp_associate.peer_ignored", peer = %peer);
-            return Ok(());
+            return Ok(true);
         }
 
         let datagram = match socks5::decode_udp_datagram(packet) {
             Ok(datagram) => datagram,
             Err(err) => {
                 debug!(event = "socks5.udp.datagram.invalid", error = %err);
-                return Ok(());
+                return Ok(true);
             }
         };
 
-        let Some(flow) = self
-            .flow_for_target(datagram.target.clone(), sessions, shutdown_rx)
+        let flow = match self
+            .flow_for_target(
+                datagram.target.clone(),
+                local,
+                tcp_buf,
+                sessions,
+                shutdown_rx,
+            )
             .await?
-        else {
-            return Ok(());
+        {
+            UdpAssociationFlowLookup::Open(flow) => flow,
+            UdpAssociationFlowLookup::NoFlow => return Ok(true),
+            UdpAssociationFlowLookup::Cancelled => return Ok(false),
         };
-        flow.session.send_udp_data(flow.id, datagram.payload).await
+        flow.session
+            .send_udp_data(flow.id, datagram.payload)
+            .await?;
+        Ok(true)
     }
 
     fn accept_client_endpoint(&mut self, peer: SocketAddr) -> bool {
@@ -1604,21 +1673,26 @@ impl UdpAssociation {
     async fn flow_for_target(
         &mut self,
         target: Target,
+        local: &mut TcpStream,
+        tcp_buf: &mut [u8; 1],
         sessions: &Arc<ClientSessionManager>,
-        shutdown_rx: &watch::Receiver<bool>,
-    ) -> Result<Option<UdpAssociationFlow>, AnyError> {
+        shutdown_rx: &mut watch::Receiver<bool>,
+    ) -> Result<UdpAssociationFlowLookup, AnyError> {
         if let Some(flow) = self.flows_by_target.get_mut(&target) {
             flow.record_activity();
-            return Ok(Some(flow.clone()));
+            return Ok(UdpAssociationFlowLookup::Open(flow.clone()));
         }
 
-        let flow = match sessions.open_udp_flow(target.clone()).await? {
+        let flow = match sessions
+            .open_udp_flow(target.clone(), local, tcp_buf, shutdown_rx)
+            .await?
+        {
             OpenOutcome::Open(flow) => flow,
             OpenOutcome::Rejected(reply) => {
                 debug!(event = "client.udp_flow.open.rejected", target = ?target, reply = ?reply);
-                return Ok(None);
+                return Ok(UdpAssociationFlowLookup::NoFlow);
             }
-            OpenOutcome::Cancelled => return Ok(None),
+            OpenOutcome::Cancelled => return Ok(UdpAssociationFlowLookup::Cancelled),
         };
         let association_flow = UdpAssociationFlow {
             id: flow.id,
@@ -1628,7 +1702,7 @@ impl UdpAssociation {
         self.flows_by_target
             .insert(target.clone(), association_flow.clone());
         self.spawn_flow_task(flow, target, shutdown_rx.clone());
-        Ok(Some(association_flow))
+        Ok(UdpAssociationFlowLookup::Open(association_flow))
     }
 
     fn spawn_flow_task(
