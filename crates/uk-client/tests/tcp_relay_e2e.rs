@@ -335,6 +335,11 @@ async fn keeps_session_alive_after_unknown_tcp_data() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keeps_session_alive_after_unknown_udp_data() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_unknown_udp_data_error_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rejects_reserved_relay_flow_ids() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_reserved_flow_id_error_e2e()).await?
 }
@@ -2102,18 +2107,35 @@ async fn run_unknown_tcp_data_error_e2e() -> Result<(), TestError> {
     write_frame(&mut carrier, &data).await?;
     assert_flow_error(&mut carrier, 1, ErrorCode::Protocol).await?;
 
-    let payload = Bytes::from_static(b"session survives unknown flow");
-    let keepalive_probe = Frame::new(FrameType::Ping, 0, 0, payload.clone())?;
-    write_frame(&mut carrier, &keepalive_probe).await?;
-
-    let reply_frame = tokio::time::timeout(
-        Duration::from_secs(3),
-        read_frame(&mut carrier, FrameLimits::default()),
+    write_ping_expect_pong(
+        &mut carrier,
+        Bytes::from_static(b"session survives unknown tcp flow"),
     )
-    .await??;
-    assert_eq!(reply_frame.header.frame_type, FrameType::Pong);
-    assert_eq!(reply_frame.header.id, 0);
-    assert_eq!(reply_frame.payload, payload);
+    .await?;
+    Ok(())
+}
+
+async fn run_unknown_udp_data_error_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = ServerHarness::start(test_limits()).await?;
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(harness.client_config(SECRET)).await?;
+
+    let data = Frame::new(
+        FrameType::UdpData,
+        0,
+        1,
+        Bytes::from_static(b"orphan udp data"),
+    )?;
+    write_frame(&mut carrier, &data).await?;
+    assert_flow_error(&mut carrier, 1, ErrorCode::Protocol).await?;
+
+    write_ping_expect_pong(
+        &mut carrier,
+        Bytes::from_static(b"session survives unknown udp flow"),
+    )
+    .await?;
     Ok(())
 }
 
