@@ -191,7 +191,7 @@ struct OpenDialPermit {
     _permit: Arc<OwnedSemaphorePermit>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum FlowSlot {
     Opening(OpenFlowCancel),
     Open(TargetFlow),
@@ -203,7 +203,7 @@ struct OpenFlowCancel {
     notify: Arc<Notify>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct TargetFlow {
     token: FlowToken,
     commands: Option<mpsc::Sender<TargetCommand>>,
@@ -1481,6 +1481,17 @@ impl TargetFlow {
     }
 }
 
+impl Drop for TargetFlow {
+    fn drop(&mut self) {
+        if !self.is_fully_closed() {
+            self.target_to_client_open = false;
+            self.client_to_target_open = false;
+            self.control.abort();
+            self.commands = None;
+        }
+    }
+}
+
 fn open_target_flow_mut(target_writers: &mut FlowTable, flow_id: u64) -> Option<&mut TargetFlow> {
     match target_writers.get_mut(&flow_id) {
         Some(FlowSlot::Open(target)) => Some(target),
@@ -1920,6 +1931,28 @@ mod tests {
         assert!(!flow.target_to_client_open);
         assert!(flow.is_fully_closed());
         assert!(flow.control.is_aborted());
+    }
+
+    #[test]
+    fn dropping_open_target_flow_aborts_control() {
+        let flow = test_target_flow();
+        let control = flow.control.clone();
+
+        drop(flow);
+
+        assert!(control.is_aborted());
+    }
+
+    #[test]
+    fn dropping_fully_closed_target_flow_does_not_abort_control() {
+        let mut flow = test_target_flow();
+        let control = flow.control.clone();
+        flow.mark_target_to_client_closed();
+        flow.mark_client_to_target_closed();
+
+        drop(flow);
+
+        assert!(!control.is_aborted());
     }
 
     #[test]
