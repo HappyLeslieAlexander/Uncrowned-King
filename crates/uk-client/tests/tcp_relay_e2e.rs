@@ -8,7 +8,7 @@ use std::{
     process,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU16, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -111,7 +111,10 @@ const TARGET_HALF_CLOSE_TIMEOUT_GREETING: &[u8] =
     b"uncrowned king target half-close timeout greeting";
 const LARGE_PAYLOAD_LEN: usize = 128 * 1024 + 123;
 const SMALL_FRAME_PAYLOAD_LEN: usize = 8 * 1024 + 37;
+const TEST_LOOPBACK_PORT_BASE: u16 = 20_000;
+const TEST_LOOPBACK_PORT_SPAN: u16 = 10_000;
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_LOOPBACK_PORT_OFFSET: AtomicU16 = AtomicU16::new(0);
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -232,6 +235,15 @@ async fn reports_protocol_error_for_zero_id_tcp_close() -> Result<(), TestError>
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reports_protocol_error_for_malformed_tcp_close() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_malformed_tcp_close_error_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reports_protocol_error_for_malformed_tcp_open_flags() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_malformed_tcp_open_flags_error_e2e(),
+    )
+    .await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1602,6 +1614,21 @@ async fn run_malformed_tcp_close_error_e2e() -> Result<(), TestError> {
         ErrorPayload::decode(&mut payload)?.code,
         ErrorCode::Protocol
     );
+    Ok(())
+}
+
+async fn run_malformed_tcp_open_flags_error_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = ServerHarness::start(test_limits()).await?;
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(harness.client_config(SECRET)).await?;
+    let target_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+    let frame = malformed_tcp_open_flags_frame(1, target_addr)?;
+
+    write_frame(&mut carrier, &frame).await?;
+    assert_flow_error(&mut carrier, 1, ErrorCode::Protocol).await?;
+    assert_tcp_close(&mut carrier, 1, TCP_CLOSE_ERROR).await?;
     Ok(())
 }
 
@@ -3356,6 +3383,21 @@ fn tcp_open_frame(flow_id: u64, target_addr: SocketAddr) -> Result<Frame, TestEr
     )?)
 }
 
+fn malformed_tcp_open_flags_frame(
+    flow_id: u64,
+    target_addr: SocketAddr,
+) -> Result<Frame, TestError> {
+    let mut payload = BytesMut::new();
+    target_from_socket_addr(target_addr).encode(&mut payload)?;
+    payload.extend_from_slice(&1_u16.to_be_bytes());
+    Ok(Frame::new(
+        FrameType::TcpOpen,
+        0,
+        flow_id,
+        payload.freeze(),
+    )?)
+}
+
 fn udp_open_frame(flow_id: u64, target_addr: SocketAddr) -> Result<Frame, TestError> {
     let open = UdpOpen::new(target_from_socket_addr(target_addr));
     let mut payload = BytesMut::new();
@@ -3618,10 +3660,16 @@ async fn open_socks_connect_domain(
 }
 
 async fn unused_loopback_addr() -> Result<SocketAddr, TestError> {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let addr = listener.local_addr()?;
-    drop(listener);
-    Ok(addr)
+    for _ in 0..10_000 {
+        let offset = NEXT_LOOPBACK_PORT_OFFSET.fetch_add(1, Ordering::Relaxed);
+        let port = TEST_LOOPBACK_PORT_BASE + offset % TEST_LOOPBACK_PORT_SPAN;
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        if let Ok(listener) = TcpListener::bind(addr).await {
+            drop(listener);
+            return Ok(addr);
+        }
+    }
+    Err("no available loopback port in test range".into())
 }
 
 fn test_limits() -> LimitConfig {

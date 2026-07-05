@@ -1006,7 +1006,12 @@ async fn validate_tcp_open_request(
     let open = match TcpOpen::decode(&mut payload) {
         Ok(open) => open,
         Err(err) => {
-            send_error(context.carrier_writer, flow_id, ErrorCode::InvalidTarget).await?;
+            send_error(
+                context.carrier_writer,
+                flow_id,
+                ErrorCode::from_protocol_error(&err),
+            )
+            .await?;
             send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
             warn!(event = "tcp.open.invalid", flow_id, error = %err);
             return Ok(None);
