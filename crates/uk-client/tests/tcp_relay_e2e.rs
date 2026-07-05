@@ -285,6 +285,15 @@ async fn reports_protocol_error_for_malformed_server_relay_frame() -> Result<(),
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reports_protocol_error_for_wrong_protocol_server_frame() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_wrong_protocol_server_frame_error_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reports_protocol_error_for_non_empty_open_ack() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_non_empty_open_ack_error_e2e()).await?
 }
@@ -1833,6 +1842,21 @@ async fn run_malformed_server_relay_frame_error_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+async fn run_wrong_protocol_server_frame_error_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let mut harness = MalformedFrameServerHarness::start_wrong_protocol_frame().await?;
+    let (_socks, connect_reply) = open_socks_connect(
+        harness.socks_addr,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 80)),
+    )
+    .await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    assert_eq!(harness.received_error_code().await?, ErrorCode::Protocol);
+    Ok(())
+}
+
 async fn run_non_empty_open_ack_error_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -2276,6 +2300,7 @@ struct MalformedFrameServerHarness {
 #[derive(Clone, Copy)]
 enum MalformedFrameScenario {
     RelayFrameAfterOpen,
+    WrongProtocolFrameAfterOpen,
     NonEmptyOpenAck,
     OversizedFrameDuringOpen,
 }
@@ -2283,6 +2308,10 @@ enum MalformedFrameScenario {
 impl MalformedFrameServerHarness {
     async fn start() -> Result<Self, TestError> {
         Self::start_with_scenario(MalformedFrameScenario::RelayFrameAfterOpen).await
+    }
+
+    async fn start_wrong_protocol_frame() -> Result<Self, TestError> {
+        Self::start_with_scenario(MalformedFrameScenario::WrongProtocolFrameAfterOpen).await
     }
 
     async fn start_non_empty_open_ack() -> Result<Self, TestError> {
@@ -2681,6 +2710,18 @@ async fn run_malformed_frame_server(
             let malformed_close = Frame::new(FrameType::TcpClose, 0, flow_id, Bytes::new())?;
             write_frame(&mut stream, &malformed_close).await?;
         }
+        MalformedFrameScenario::WrongProtocolFrameAfterOpen => {
+            let ack = Frame::new(FrameType::TcpData, 0, flow_id, Bytes::new())?;
+            write_frame(&mut stream, &ack).await?;
+
+            let wrong_protocol = Frame::new(
+                FrameType::UdpData,
+                0,
+                flow_id,
+                Bytes::from_static(b"wrong protocol"),
+            )?;
+            write_frame(&mut stream, &wrong_protocol).await?;
+        }
         MalformedFrameScenario::NonEmptyOpenAck => {
             let malformed_ack = Frame::new(
                 FrameType::TcpData,
@@ -2701,9 +2742,32 @@ async fn run_malformed_frame_server(
     )
     .await??;
     assert_eq!(response.header.frame_type, FrameType::Error);
-    assert_eq!(response.header.id, 0);
+    let expected_error_id = match scenario {
+        MalformedFrameScenario::WrongProtocolFrameAfterOpen => flow_id,
+        MalformedFrameScenario::RelayFrameAfterOpen
+        | MalformedFrameScenario::NonEmptyOpenAck
+        | MalformedFrameScenario::OversizedFrameDuringOpen => 0,
+    };
+    assert_eq!(response.header.id, expected_error_id);
     let mut payload = response.payload;
-    Ok(ErrorPayload::decode(&mut payload)?.code)
+    let code = ErrorPayload::decode(&mut payload)?.code;
+
+    if matches!(
+        scenario,
+        MalformedFrameScenario::WrongProtocolFrameAfterOpen
+    ) {
+        let close = tokio::time::timeout(
+            Duration::from_secs(3),
+            read_frame(&mut stream, FrameLimits::default()),
+        )
+        .await??;
+        assert_eq!(close.header.frame_type, FrameType::TcpClose);
+        assert_eq!(close.header.id, flow_id);
+        let mut payload = close.payload;
+        assert_eq!(TcpClose::decode(&mut payload)?.close_code, TCP_CLOSE_ERROR);
+    }
+
+    Ok(code)
 }
 
 async fn run_client_buffered_limit_server(

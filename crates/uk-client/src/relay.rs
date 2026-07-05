@@ -144,6 +144,7 @@ enum OpenResponse {
 enum FlowFrameRoute {
     InvalidFlowId,
     UnknownFlow,
+    ProtocolMismatch,
     Enqueued,
     FlowClosed,
     FlowQueueFull,
@@ -1192,6 +1193,18 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
                     report_protocol_error(session).await;
                     return Err("invalid relay flow id from server".into());
                 }
+                FlowFrameRoute::ProtocolMismatch => {
+                    warn!(
+                        event = "client.flow.protocol_mismatch",
+                        flow_id,
+                        protocol = ?protocol,
+                        frame_type = ?frame_type
+                    );
+                    session
+                        .send_status_frame(FrameType::Error, flow_id, ErrorCode::Protocol)
+                        .await?;
+                    send_flow_error_close(session, flow_id, protocol, frame_type).await?;
+                }
                 FlowFrameRoute::FlowQueueFull => {
                     warn!(event = "client.flow.queue_full", flow_id);
                     session.send_resource_limit(flow_id).await?;
@@ -1307,6 +1320,10 @@ fn route_flow_frame(
     let sender = route.sender.clone();
     let flow_buffer = route.flow_buffer.clone();
     let protocol = route.protocol;
+    if !flow_frame_matches_protocol(protocol, frame.header.frame_type) {
+        flows.remove(&flow_id);
+        return (flow_id, Some(protocol), FlowFrameRoute::ProtocolMismatch);
+    }
 
     let buffered_frame = match BufferedFlowFrame::new(
         frame,
@@ -1338,6 +1355,27 @@ fn route_flow_frame(
         flows.remove(&flow_id);
     }
     (flow_id, Some(protocol), route)
+}
+
+fn flow_frame_matches_protocol(protocol: FlowProtocol, frame_type: FrameType) -> bool {
+    match protocol {
+        FlowProtocol::Tcp => matches!(
+            frame_type,
+            FrameType::TcpData
+                | FrameType::TcpClose
+                | FrameType::Error
+                | FrameType::PolicyDenied
+                | FrameType::ResourceLimit
+        ),
+        FlowProtocol::Udp => matches!(
+            frame_type,
+            FrameType::UdpData
+                | FrameType::UdpClose
+                | FrameType::Error
+                | FrameType::PolicyDenied
+                | FrameType::ResourceLimit
+        ),
+    }
 }
 
 async fn handle_socks_connection(
@@ -2332,6 +2370,72 @@ mod tests {
         let frame = receiver.try_recv().unwrap().into_frame();
         assert_eq!(frame.header.id, FLOW_ID);
         assert_eq!(frame.payload, Bytes::from_static(b"hello"));
+        assert!(flows.contains_key(&FLOW_ID));
+    }
+
+    #[test]
+    fn rejects_udp_frame_for_tcp_flow_before_queueing() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut flows = HashMap::new();
+        flows.insert(FLOW_ID, ClientFlowRoute::new(sender, FlowProtocol::Tcp));
+
+        assert_eq!(
+            route_flow_frame(
+                udp_data_frame(FLOW_ID, Bytes::from_static(b"wrong protocol")),
+                &mut flows,
+                ClientSessionBufferControl::default(),
+                usize::MAX,
+                usize::MAX,
+            ),
+            (
+                FLOW_ID,
+                Some(FlowProtocol::Tcp),
+                FlowFrameRoute::ProtocolMismatch
+            )
+        );
+
+        assert!(receiver.try_recv().is_err());
+        assert!(!flows.contains_key(&FLOW_ID));
+    }
+
+    #[test]
+    fn rejects_tcp_frame_for_udp_flow_before_queueing() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut flows = HashMap::new();
+        flows.insert(FLOW_ID, ClientFlowRoute::new(sender, FlowProtocol::Udp));
+
+        assert_eq!(
+            route_flow_frame(
+                data_frame(FLOW_ID, Bytes::from_static(b"wrong protocol")),
+                &mut flows,
+                ClientSessionBufferControl::default(),
+                usize::MAX,
+                usize::MAX,
+            ),
+            (
+                FLOW_ID,
+                Some(FlowProtocol::Udp),
+                FlowFrameRoute::ProtocolMismatch
+            )
+        );
+
+        assert!(receiver.try_recv().is_err());
+        assert!(!flows.contains_key(&FLOW_ID));
+    }
+
+    #[test]
+    fn routes_flow_status_to_udp_flow() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut flows = HashMap::new();
+        flows.insert(FLOW_ID, ClientFlowRoute::new(sender, FlowProtocol::Udp));
+
+        assert_eq!(
+            route_test_flow_frame(error_frame(ErrorCode::Protocol), &mut flows),
+            (FLOW_ID, FlowFrameRoute::Enqueued)
+        );
+
+        let frame = receiver.try_recv().unwrap().into_frame();
+        assert_eq!(frame.header.frame_type, FrameType::Error);
         assert!(flows.contains_key(&FLOW_ID));
     }
 
