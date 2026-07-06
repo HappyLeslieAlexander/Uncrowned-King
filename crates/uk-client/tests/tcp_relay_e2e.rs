@@ -452,6 +452,15 @@ async fn socks_udp_associate_stops_while_server_connect_is_pending() -> Result<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn socks_udp_datagram_stops_while_server_reconnect_is_pending() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_socks_udp_datagram_shutdown_during_reconnect_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relays_domain_socks_target_to_echo_target() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_domain_relay_e2e()).await?
 }
@@ -2656,6 +2665,84 @@ async fn run_socks_listener_shutdown_during_connect_with_request(
     Ok(())
 }
 
+async fn run_socks_udp_datagram_shutdown_during_reconnect_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    fs::write(&cert_path, CERT_PEM)?;
+    fs::write(&key_path, KEY_PEM)?;
+
+    let carrier_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let server_addr = carrier_listener.local_addr()?;
+    let server_cert_path = cert_path.clone();
+    let server_key_path = key_path.clone();
+    let (reconnect_tx, reconnect_rx) = oneshot::channel();
+    let silent_reconnect_server = tokio::spawn(async move {
+        let first = accept_fake_server_session_from_listener(
+            &carrier_listener,
+            &server_cert_path,
+            &server_key_path,
+            fake_server_settings(),
+        )
+        .await?;
+        drop(first);
+
+        let (_tcp, _) = carrier_listener.accept().await?;
+        let _ = reconnect_tx.send(());
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        Ok::<(), TestError>(())
+    });
+
+    let socks_addr = unused_loopback_addr().await?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut client_task = tokio::spawn(run_socks5_listener_until_shutdown(
+        ClientConfig {
+            server_addr: server_addr.to_string(),
+            server_addrs: None,
+            server_name: "localhost".to_owned(),
+            ca_cert_path: path_string(&cert_path),
+            key_id: KEY_ID.to_owned(),
+            secret: SECRET.to_owned(),
+            handshake_timeout_seconds: Some(30),
+            socks_handshake_timeout_seconds: Some(3),
+            tcp_open_timeout_seconds: Some(30),
+            udp_flow_idle_timeout_seconds: None,
+            max_pending_open_bytes: None,
+            max_socks_connections: None,
+            max_buffered_bytes_per_session: None,
+            max_buffered_bytes_per_flow: None,
+        },
+        socks_addr.to_string(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+    wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+
+    let (_socks_control, udp_relay_addr) = open_socks_udp_associate(socks_addr).await?;
+    let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    udp_client
+        .send_to(
+            &socks_udp_datagram(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 80)),
+                b"trigger udp reconnect",
+            ),
+            udp_relay_addr,
+        )
+        .await?;
+    tokio::time::timeout(Duration::from_secs(3), reconnect_rx).await??;
+
+    shutdown_tx
+        .send(())
+        .map_err(|()| "client shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(3), client_task).await???;
+    silent_reconnect_server.abort();
+    let _ = fs::remove_dir_all(&temp_dir);
+    Ok(())
+}
+
 struct ServerHarness {
     temp_dir: PathBuf,
     server_addr: SocketAddr,
@@ -3698,9 +3785,18 @@ async fn accept_fake_server_session_with_settings(
     key_path: PathBuf,
     settings: Settings,
 ) -> Result<ServerTlsStream<TcpStream>, TestError> {
+    accept_fake_server_session_from_listener(&listener, &cert_path, &key_path, settings).await
+}
+
+async fn accept_fake_server_session_from_listener(
+    listener: &TcpListener,
+    cert_path: &Path,
+    key_path: &Path,
+    settings: Settings,
+) -> Result<ServerTlsStream<TcpStream>, TestError> {
     let (tcp, _) = listener.accept().await?;
     tcp.set_nodelay(true)?;
-    let acceptor = TlsAcceptor::from(Arc::new(server_tls_config(&cert_path, &key_path)?));
+    let acceptor = TlsAcceptor::from(Arc::new(server_tls_config(cert_path, key_path)?));
     let mut stream = acceptor.accept(tcp).await?;
     if stream.get_ref().1.alpn_protocol() != Some(ALPN_PROTOCOL) {
         return Err("UK ALPN protocol was not negotiated".into());

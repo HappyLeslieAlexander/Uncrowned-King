@@ -494,7 +494,13 @@ impl ClientSessionManager {
     ) -> Result<OpenOutcome, AnyError> {
         let mut last_error = None;
         for attempt in 0..2 {
-            let session = self.current_session().await?;
+            let session = tokio::select! {
+                result = self.current_session() => result?,
+                changed = shutdown_rx.changed() => {
+                    let _ = changed;
+                    return Ok(OpenOutcome::Cancelled);
+                }
+            };
             match session
                 .open_udp_flow(target.clone(), local, tcp_buf, shutdown_rx)
                 .await
