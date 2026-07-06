@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU16, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -113,9 +113,10 @@ const TARGET_HALF_CLOSE_TIMEOUT_GREETING: &[u8] =
 const LARGE_PAYLOAD_LEN: usize = 128 * 1024 + 123;
 const SMALL_FRAME_PAYLOAD_LEN: usize = 8 * 1024 + 37;
 const TEST_LOOPBACK_PORT_BASE: u16 = 20_000;
-const TEST_LOOPBACK_PORT_SPAN: u16 = 10_000;
+const TEST_LOOPBACK_PORT_SPAN: u16 = 28_000;
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_LOOPBACK_PORT_OFFSET: AtomicU16 = AtomicU16::new(0);
+static TEST_LOOPBACK_START_OFFSET: OnceLock<u16> = OnceLock::new();
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -4696,9 +4697,9 @@ async fn open_socks_connect_domain(
 }
 
 async fn unused_loopback_addr() -> Result<SocketAddr, TestError> {
-    for _ in 0..10_000 {
-        let offset = NEXT_LOOPBACK_PORT_OFFSET.fetch_add(1, Ordering::Relaxed);
-        let port = TEST_LOOPBACK_PORT_BASE + offset % TEST_LOOPBACK_PORT_SPAN;
+    for _ in 0..TEST_LOOPBACK_PORT_SPAN {
+        let sequence = NEXT_LOOPBACK_PORT_OFFSET.fetch_add(1, Ordering::Relaxed);
+        let port = test_loopback_port(sequence);
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         if let Ok(listener) = TcpListener::bind(addr).await {
             drop(listener);
@@ -4706,6 +4707,42 @@ async fn unused_loopback_addr() -> Result<SocketAddr, TestError> {
         }
     }
     Err("no available loopback port in test range".into())
+}
+
+fn test_loopback_port(sequence: u16) -> u16 {
+    TEST_LOOPBACK_PORT_BASE
+        + (test_loopback_start_offset().wrapping_add(sequence) % TEST_LOOPBACK_PORT_SPAN)
+}
+
+fn test_loopback_start_offset() -> u16 {
+    *TEST_LOOPBACK_START_OFFSET.get_or_init(|| {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or_default();
+        let mut seed = u64::from(process::id()) ^ now.rotate_left(17);
+        seed ^= seed >> 33;
+        seed = seed.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        seed ^= seed >> 33;
+        (seed % u64::from(TEST_LOOPBACK_PORT_SPAN)) as u16
+    })
+}
+
+#[test]
+fn test_loopback_candidate_ports_stay_in_test_range() {
+    let upper_bound = TEST_LOOPBACK_PORT_BASE + TEST_LOOPBACK_PORT_SPAN;
+    assert!(test_loopback_start_offset() < TEST_LOOPBACK_PORT_SPAN);
+
+    for sequence in [
+        0,
+        1,
+        TEST_LOOPBACK_PORT_SPAN - 1,
+        TEST_LOOPBACK_PORT_SPAN,
+        TEST_LOOPBACK_PORT_SPAN + 1,
+    ] {
+        let port = test_loopback_port(sequence);
+        assert!((TEST_LOOPBACK_PORT_BASE..upper_bound).contains(&port));
+    }
 }
 
 fn test_limits() -> LimitConfig {
