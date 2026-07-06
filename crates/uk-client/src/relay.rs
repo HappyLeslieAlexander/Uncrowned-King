@@ -1020,10 +1020,10 @@ impl ClientSession {
 
     async fn wait_for_pong(&self, nonce: u64) -> bool {
         loop {
+            let notified = self.pong_notify.notified();
             if self.is_closed() {
                 return false;
             }
-            let notified = self.pong_notify.notified();
             if self.observed_pong_nonce() == nonce {
                 return true;
             }
