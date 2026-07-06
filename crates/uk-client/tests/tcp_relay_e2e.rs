@@ -443,6 +443,15 @@ async fn socks_listener_stops_while_server_connect_is_pending() -> Result<(), Te
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn socks_udp_associate_stops_while_server_connect_is_pending() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_socks_udp_associate_shutdown_during_connect_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relays_domain_socks_target_to_echo_target() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_domain_relay_e2e()).await?
 }
@@ -2574,6 +2583,22 @@ async fn run_socks_listener_shutdown_e2e() -> Result<(), TestError> {
 }
 
 async fn run_socks_listener_shutdown_during_connect_e2e() -> Result<(), TestError> {
+    run_socks_listener_shutdown_during_connect_with_request(socks_connect_request(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 80)),
+    ))
+    .await
+}
+
+async fn run_socks_udp_associate_shutdown_during_connect_e2e() -> Result<(), TestError> {
+    run_socks_listener_shutdown_during_connect_with_request(socks_udp_associate_request(
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+    ))
+    .await
+}
+
+async fn run_socks_listener_shutdown_during_connect_with_request(
+    request: Vec<u8>,
+) -> Result<(), TestError> {
     init_tracing();
 
     let temp_dir = create_temp_dir()?;
@@ -2617,7 +2642,6 @@ async fn run_socks_listener_shutdown_during_connect_e2e() -> Result<(), TestErro
     wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
 
     let mut socks = TcpStream::connect(socks_addr).await?;
-    let request = socks_connect_request(SocketAddr::from((Ipv4Addr::LOCALHOST, 80)));
     socks.write_all(&request).await?;
     let mut method_response = [0_u8; 2];
     socks.read_exact(&mut method_response).await?;

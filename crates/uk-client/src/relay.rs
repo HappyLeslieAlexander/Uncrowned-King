@@ -1554,7 +1554,18 @@ async fn relay_udp_association(
     client_endpoint: socks5::SocksEndpoint,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AnyError> {
-    match sessions.supports_udp_stream_fallback().await {
+    if *shutdown_rx.borrow() {
+        return Ok(());
+    }
+
+    let supports_udp_stream_fallback = tokio::select! {
+        result = sessions.supports_udp_stream_fallback() => result,
+        changed = shutdown_rx.changed() => {
+            let _ = changed;
+            return Ok(());
+        }
+    };
+    match supports_udp_stream_fallback {
         Ok(true) => {}
         Ok(false) => {
             socks5::send_reply(&mut local, socks5::Reply::GeneralFailure).await?;
