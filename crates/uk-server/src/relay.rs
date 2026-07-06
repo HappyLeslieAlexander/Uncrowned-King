@@ -598,7 +598,9 @@ fn flow_event_counts_as_session_activity(
 ) -> bool {
     match event {
         Some(FlowEvent::Activity) => true,
-        Some(FlowEvent::UdpActivity(flow_id)) => target_writers.contains_key(flow_id),
+        Some(FlowEvent::UdpActivity(flow_id)) => {
+            matches!(target_writers.get(flow_id), Some(FlowSlot::Udp(_)))
+        }
         _ => false,
     }
 }
@@ -3192,8 +3194,8 @@ mod tests {
         assert!(session_has_activity_flows(&target_writers));
     }
 
-    #[test]
-    fn target_data_events_count_as_session_activity() {
+    #[tokio::test]
+    async fn target_data_events_count_as_session_activity() {
         let mut target_writers = FlowTable::new();
         assert!(flow_event_counts_as_session_activity(
             Some(&FlowEvent::Activity),
@@ -3205,6 +3207,13 @@ mod tests {
         ));
 
         target_writers.insert(1, test_opening_udp_flow_slot());
+
+        assert!(!flow_event_counts_as_session_activity(
+            Some(&FlowEvent::UdpActivity(1)),
+            &target_writers
+        ));
+
+        target_writers.insert(1, FlowSlot::Udp(test_udp_flow().await));
 
         assert!(flow_event_counts_as_session_activity(
             Some(&FlowEvent::UdpActivity(1)),
