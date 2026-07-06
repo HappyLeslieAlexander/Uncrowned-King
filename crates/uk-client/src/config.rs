@@ -84,7 +84,8 @@ impl ClientConfig {
         let path = path.as_ref();
         validate_sensitive_file_permissions(path, "client config")?;
         let text = fs::read_to_string(path)?;
-        let config = toml::from_str(&text)?;
+        let mut config: Self = toml::from_str(&text)?;
+        config.resolve_paths(config_base_dir(path));
         Ok(config)
     }
 
@@ -208,6 +209,10 @@ impl ClientConfig {
         }
         Ok(())
     }
+
+    fn resolve_paths(&mut self, base_dir: &Path) {
+        self.ca_cert_path = resolve_config_relative_path(base_dir, &self.ca_cert_path);
+    }
 }
 
 /// Validates one `host:port` endpoint without resolving DNS.
@@ -241,6 +246,21 @@ fn validate_sensitive_file_permissions(
     _label: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
+}
+
+fn config_base_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn resolve_config_relative_path(base_dir: &Path, value: &str) -> String {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        value.to_owned()
+    } else {
+        base_dir.join(path).to_string_lossy().into_owned()
+    }
 }
 
 #[cfg(test)]
@@ -302,6 +322,23 @@ secret = "0123456789abcdef0123456789abcdef"
         let _ = fs::remove_file(&path);
 
         assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_resolves_ca_path_relative_to_config_file() {
+        let path = write_temp_client_config(0o600);
+        let expected_ca_path = path
+            .parent()
+            .unwrap()
+            .join("ca.pem")
+            .to_string_lossy()
+            .into_owned();
+
+        let config = ClientConfig::load(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(config.ca_cert_path, expected_ca_path);
     }
 
     #[cfg(unix)]

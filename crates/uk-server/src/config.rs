@@ -43,7 +43,8 @@ impl ServerConfig {
         let path = path.as_ref();
         validate_sensitive_file_permissions(path, "server config")?;
         let text = fs::read_to_string(path)?;
-        let config = toml::from_str(&text)?;
+        let mut config: Self = toml::from_str(&text)?;
+        config.resolve_paths(config_base_dir(path));
         Ok(config)
     }
 
@@ -273,6 +274,15 @@ impl ServerConfig {
             .and_then(|limits| limits.replay_cache_max_entries)
             .unwrap_or(DEFAULT_REPLAY_CACHE_MAX_ENTRIES as u64)
     }
+
+    fn resolve_paths(&mut self, base_dir: &Path) {
+        self.cert_path = resolve_config_relative_path(base_dir, &self.cert_path);
+        self.key_path = resolve_config_relative_path(base_dir, &self.key_path);
+        self.policy_path = self
+            .policy_path
+            .as_deref()
+            .map(|path| resolve_config_relative_path(base_dir, path));
+    }
 }
 
 fn reject_zero_limit(name: &str, value: u64) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -449,6 +459,21 @@ fn validate_sensitive_file_permissions(
     Ok(())
 }
 
+fn config_base_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn resolve_config_relative_path(base_dir: &Path, value: &str) -> String {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        value.to_owned()
+    } else {
+        base_dir.join(path).to_string_lossy().into_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,6 +544,40 @@ secret = "0123456789abcdef0123456789abcdef"
         let _ = fs::remove_file(&path);
 
         assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_resolves_file_paths_relative_to_config_file() {
+        let path = write_temp_file(
+            "config-with-policy",
+            "toml",
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+policy_path = "policy.toml"
+
+[[credentials]]
+key_id = "client"
+secret = "0123456789abcdef0123456789abcdef"
+"#,
+            0o600,
+        );
+        let base_dir = path.parent().unwrap();
+        let expected_cert_path = base_dir.join("cert.pem").to_string_lossy().into_owned();
+        let expected_key_path = base_dir.join("key.pem").to_string_lossy().into_owned();
+        let expected_policy_path = base_dir.join("policy.toml").to_string_lossy().into_owned();
+
+        let config = ServerConfig::load(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(config.cert_path, expected_cert_path);
+        assert_eq!(config.key_path, expected_key_path);
+        assert_eq!(
+            config.policy_path.as_deref(),
+            Some(expected_policy_path.as_str())
+        );
     }
 
     #[cfg(unix)]
@@ -696,7 +755,7 @@ max_udp_flows = 3
             .expect("example server config should parse");
 
         assert_eq!(config.listen, "127.0.0.1:9443");
-        assert_eq!(config.policy_path.as_deref(), Some("examples/policy.toml"));
+        assert_eq!(config.policy_path.as_deref(), Some("policy.toml"));
         assert!(config.validate_network_endpoints().is_ok());
         assert!(config.validate_limits().is_ok());
         assert_eq!(config.credentials().unwrap().len(), 1);

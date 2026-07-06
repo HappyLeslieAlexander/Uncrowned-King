@@ -20,6 +20,9 @@ uk-server --config examples/server.toml config-check
 uk-client --config examples/client.toml config-check
 ```
 
+Relative file paths inside these TOML files are resolved from the `examples/`
+directory because that is where the config files live.
+
 Start the local demo services in separate terminals:
 
 ```sh

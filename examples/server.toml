@@ -1,9 +1,9 @@
 # Example UK server configuration.
 
 listen = "127.0.0.1:9443"
-cert_path = "examples/server-cert.pem"
-key_path = "examples/server-key.pem"
-policy_path = "examples/policy.toml"
+cert_path = "server-cert.pem"
+key_path = "server-key.pem"
+policy_path = "policy.toml"
 auth_skew_seconds = 30
 
 [limits]
