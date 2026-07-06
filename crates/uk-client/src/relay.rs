@@ -1513,11 +1513,17 @@ async fn handle_socks_connection(
             return Err(err);
         }
     };
-    socks5::send_reply(&mut local, socks5::Reply::Succeeded).await?;
-
-    transition(&mut state, ClientConnectionState::Relaying);
     let flow_id = flow.id;
     let flow_session = Arc::clone(&flow.session);
+    if let Err(err) = socks5::send_reply(&mut local, socks5::Reply::Succeeded).await {
+        transition(&mut state, ClientConnectionState::Closing);
+        let _ = flow_session.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await;
+        flow_session.flows.lock().await.remove(&flow_id);
+        transition(&mut state, ClientConnectionState::Closed);
+        return Err(err.into());
+    }
+
+    transition(&mut state, ClientConnectionState::Relaying);
     let relay_result = relay_tcp(local, flow, shutdown_rx).await;
     if relay_result.is_err() {
         transition(&mut state, ClientConnectionState::Closing);

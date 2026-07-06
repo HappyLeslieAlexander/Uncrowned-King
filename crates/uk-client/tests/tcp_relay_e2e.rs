@@ -18,6 +18,7 @@ use rustls::{
     ClientConfig as RustlsClientConfig, RootCertStore, ServerConfig as RustlsServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer, ServerName},
 };
+use socket2::Socket;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -556,6 +557,15 @@ async fn closes_target_when_socks_client_disconnects() -> Result<(), TestError> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closes_open_flow_when_socks_success_reply_fails() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_socks_success_reply_failure_closes_open_flow_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closes_idle_socks_handshake_after_timeout() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_socks_handshake_timeout_e2e()).await?
 }
@@ -1006,6 +1016,26 @@ async fn run_client_disconnect_e2e() -> Result<(), TestError> {
 
     let target_received = target_task.await??;
     assert!(target_received.is_empty());
+    Ok(())
+}
+
+async fn run_socks_success_reply_failure_closes_open_flow_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let mut harness = AckGatedOpenServerHarness::start().await?;
+    let mut socks = TcpStream::connect(harness.socks_addr).await?;
+    let request = socks_connect_request(SocketAddr::from((Ipv4Addr::LOCALHOST, 80)));
+    socks.write_all(&request).await?;
+
+    let mut method_response = [0_u8; 2];
+    socks.read_exact(&mut method_response).await?;
+    assert_eq!(method_response, [0x05, 0x00]);
+
+    harness.observed_tcp_open().await?;
+    reset_tcp_stream(socks)?;
+    harness.release_open_ack()?;
+
+    assert_eq!(harness.received_close_code().await?, TCP_CLOSE_ERROR);
     Ok(())
 }
 
@@ -3001,6 +3031,104 @@ struct PendingOpenCancelServerHarness {
     client_task: JoinHandle<Result<(), TestError>>,
 }
 
+struct AckGatedOpenServerHarness {
+    temp_dir: PathBuf,
+    socks_addr: SocketAddr,
+    open_rx: Option<oneshot::Receiver<()>>,
+    ack_tx: Option<oneshot::Sender<()>>,
+    server_task: Option<JoinHandle<Result<u16, TestError>>>,
+    client_task: JoinHandle<Result<(), TestError>>,
+}
+
+impl AckGatedOpenServerHarness {
+    async fn start() -> Result<Self, TestError> {
+        let temp_dir = create_temp_dir()?;
+        let cert_path = temp_dir.join("server-cert.pem");
+        let key_path = temp_dir.join("server-key.pem");
+        fs::write(&cert_path, CERT_PEM)?;
+        fs::write(&key_path, KEY_PEM)?;
+
+        let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let server_addr = server_listener.local_addr()?;
+        let socks_addr = unused_loopback_addr().await?;
+        let (open_tx, open_rx) = oneshot::channel();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let server_task = tokio::spawn(run_ack_gated_open_server(
+            server_listener,
+            cert_path.clone(),
+            key_path,
+            open_tx,
+            ack_rx,
+        ));
+        let mut client_task = tokio::spawn(run_socks5_listener(
+            ClientConfig {
+                server_addr: server_addr.to_string(),
+                server_addrs: None,
+                server_name: "localhost".to_owned(),
+                ca_cert_path: path_string(&cert_path),
+                key_id: KEY_ID.to_owned(),
+                secret: SECRET.to_owned(),
+                handshake_timeout_seconds: Some(3),
+                socks_handshake_timeout_seconds: Some(3),
+                tcp_open_timeout_seconds: Some(30),
+                udp_flow_idle_timeout_seconds: None,
+                max_pending_open_bytes: None,
+                max_socks_connections: None,
+                max_buffered_bytes_per_session: None,
+                max_buffered_bytes_per_flow: None,
+            },
+            socks_addr.to_string(),
+        ));
+        wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+
+        Ok(Self {
+            temp_dir,
+            socks_addr,
+            open_rx: Some(open_rx),
+            ack_tx: Some(ack_tx),
+            server_task: Some(server_task),
+            client_task,
+        })
+    }
+
+    async fn observed_tcp_open(&mut self) -> Result<(), TestError> {
+        let open_rx = self
+            .open_rx
+            .take()
+            .ok_or("ack-gated open signal was already awaited")?;
+        tokio::time::timeout(Duration::from_secs(3), open_rx).await??;
+        Ok(())
+    }
+
+    fn release_open_ack(&mut self) -> Result<(), TestError> {
+        let ack_tx = self
+            .ack_tx
+            .take()
+            .ok_or("ack-gated open ack was already released")?;
+        ack_tx
+            .send(())
+            .map_err(|()| "ack-gated server stopped before ack release".into())
+    }
+
+    async fn received_close_code(&mut self) -> Result<u16, TestError> {
+        let task = self
+            .server_task
+            .take()
+            .ok_or("ack-gated open server task was already awaited")?;
+        tokio::time::timeout(Duration::from_secs(3), task).await??
+    }
+}
+
+impl Drop for AckGatedOpenServerHarness {
+    fn drop(&mut self) {
+        self.client_task.abort();
+        if let Some(task) = self.server_task.take() {
+            task.abort();
+        }
+        let _ = fs::remove_dir_all(&self.temp_dir);
+    }
+}
+
 impl PendingOpenCancelServerHarness {
     async fn start() -> Result<Self, TestError> {
         Self::start_with_tcp_open_timeout(30).await
@@ -3359,6 +3487,36 @@ async fn run_client_buffered_limit_server(
     assert_eq!(close.header.id, flow_id);
     let mut close_payload = close.payload;
     Ok(TcpClose::decode(&mut close_payload)?.close_code)
+}
+
+async fn run_ack_gated_open_server(
+    listener: TcpListener,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    open_tx: oneshot::Sender<()>,
+    ack_rx: oneshot::Receiver<()>,
+) -> Result<u16, TestError> {
+    let mut stream = accept_fake_server_session(listener, cert_path, key_path).await?;
+    let open_frame = read_frame(&mut stream, FrameLimits::default()).await?;
+    assert_eq!(open_frame.header.frame_type, FrameType::TcpOpen);
+    let flow_id = open_frame.header.id;
+    let mut open_payload = open_frame.payload;
+    TcpOpen::decode(&mut open_payload)?;
+    let _ = open_tx.send(());
+
+    tokio::time::timeout(Duration::from_secs(3), ack_rx).await??;
+    let ack = Frame::new(FrameType::TcpData, 0, flow_id, Bytes::new())?;
+    write_frame(&mut stream, &ack).await?;
+
+    let close_frame = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut stream, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(close_frame.header.frame_type, FrameType::TcpClose);
+    assert_eq!(close_frame.header.id, flow_id);
+    let mut payload = close_frame.payload;
+    Ok(TcpClose::decode(&mut payload)?.close_code)
 }
 
 async fn run_pending_open_cancel_server(
@@ -4305,6 +4463,14 @@ fn socks_connect_request(target_addr: SocketAddr) -> Vec<u8> {
     }
     request.extend_from_slice(&port.to_be_bytes());
     request
+}
+
+fn reset_tcp_stream(stream: TcpStream) -> io::Result<()> {
+    let stream = stream.into_std()?;
+    let socket = Socket::from(stream);
+    socket.set_linger(Some(Duration::ZERO))?;
+    drop(socket);
+    Ok(())
 }
 
 fn socks_udp_datagram(target_addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
