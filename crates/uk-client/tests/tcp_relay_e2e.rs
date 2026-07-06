@@ -1404,6 +1404,15 @@ async fn run_server_session_limit_e2e() -> Result<(), TestError> {
 
     let harness = ServerHarness::start(test_limits_with_max_sessions(1)).await?;
     let _held_carrier = connect_tls_carrier_after_probe(&harness).await?;
+    let mut rejected = TcpStream::connect(harness.server_addr).await?;
+    let mut buf = [0_u8; 1];
+    let bytes_read =
+        tokio::time::timeout(Duration::from_secs(3), rejected.read(&mut buf)).await??;
+    assert_eq!(
+        bytes_read, 0,
+        "server should close over-limit TCP sessions cleanly"
+    );
+
     let result = run_handshake(harness.client_config(SECRET)).await;
 
     assert!(

@@ -9,6 +9,7 @@ use std::{future, future::Future, io, sync::Arc, time::Duration};
 
 use bytes::BytesMut;
 use tokio::{
+    io::AsyncWriteExt,
     net::TcpListener,
     sync::{Mutex, Semaphore, watch},
     task::JoinSet,
@@ -65,9 +66,16 @@ where
                 break;
             }
             accepted = listener.accept() => {
-                let (tcp, peer) = accepted?;
+                let (mut tcp, peer) = accepted?;
                 let Ok(session_permit) = Arc::clone(&session_permits).try_acquire_owned() else {
                     warn!(event = "server.session.limit", peer = %peer, max_sessions);
+                    if let Err(err) = tcp.shutdown().await {
+                        debug!(
+                            event = "server.session.limit_shutdown_error",
+                            peer = %peer,
+                            error = %err
+                        );
+                    }
                     continue;
                 };
                 let acceptor = acceptor.clone();
