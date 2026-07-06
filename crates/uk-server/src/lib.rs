@@ -40,6 +40,7 @@ where
 {
     config.validate_network_endpoints()?;
     config.validate_limits()?;
+    config.validate_sensitive_paths()?;
     let credentials = Arc::new(config.credentials()?);
     let policy_set = Arc::new(config.policy_set()?);
     let replay_cache = Arc::new(Mutex::new(ReplayCache::with_max_entries(
@@ -194,6 +195,7 @@ async fn handle_connection(
 pub fn check_config(config: &ServerConfig) -> Result<(), AnyError> {
     config.validate_network_endpoints()?;
     config.validate_limits()?;
+    config.validate_sensitive_paths()?;
     let _credentials = config.credentials()?;
     let _policy_set = config.policy_set()?;
     let _tls_config = tls::server_config(&config.cert_path, &config.key_path)?;

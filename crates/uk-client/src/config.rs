@@ -2,6 +2,9 @@
 
 use std::{collections::HashSet, error::Error, fmt, fs, path::Path};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use serde::Deserialize;
 use uk_auth::{AuthError, validate_key_id, validate_shared_secret};
 use uk_proto::{MAX_FRAME_PAYLOAD_SIZE, validate_host_port_endpoint};
@@ -77,6 +80,8 @@ impl fmt::Debug for ClientConfig {
 impl ClientConfig {
     /// Loads a client config from disk.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let path = path.as_ref();
+        validate_sensitive_file_permissions(path, "client config")?;
         let text = fs::read_to_string(path)?;
         let config = toml::from_str(&text)?;
         Ok(config)
@@ -206,6 +211,30 @@ pub fn validate_endpoint(
     Ok(())
 }
 
+#[cfg(unix)]
+fn validate_sensitive_file_permissions(
+    path: &Path,
+    label: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(format!("{label} must be a regular file").into());
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(format!("{label} must not be accessible by group or other users").into());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_sensitive_file_permissions(
+    _path: &Path,
+    _label: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +256,56 @@ mod tests {
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
         }
+    }
+
+    #[cfg(unix)]
+    fn write_temp_client_config(mode: u32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "uk-client-config-test-{}-{now}.toml",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"
+server_addr = "127.0.0.1:443"
+server_name = "localhost"
+ca_cert_path = "ca.pem"
+key_id = "client"
+secret = "0123456789abcdef0123456789abcdef"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_accepts_owner_only_config_file() {
+        let path = write_temp_client_config(0o600);
+
+        let result = ClientConfig::load(&path);
+        let _ = fs::remove_file(&path);
+
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_group_readable_config_file() {
+        let path = write_temp_client_config(0o644);
+
+        let error = ClientConfig::load(&path).unwrap_err().to_string();
+        let _ = fs::remove_file(&path);
+
+        assert!(error.contains("client config"));
+        assert!(error.contains("group or other"));
     }
 
     #[test]

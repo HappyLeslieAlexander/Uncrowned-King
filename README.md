@@ -114,8 +114,15 @@ and during relay. `max_buffered_bytes_per_session = 16777216` and
 per UK session and per flow.
 
 Example configs live under `examples/`; see `examples/README.md` for local
-certificate generation. Validate configs without opening listeners or outbound
-sessions:
+certificate generation. Client and server TOML files contain shared secrets,
+and the server private key is sensitive; on Unix-like systems they must not be
+accessible by group or other users. For local examples:
+
+```sh
+chmod 600 examples/server-key.pem examples/server.toml examples/client.toml
+```
+
+Validate configs without opening listeners or outbound sessions:
 
 ```sh
 uk-server --config examples/server.toml config-check

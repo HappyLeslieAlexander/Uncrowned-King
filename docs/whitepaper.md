@@ -513,6 +513,8 @@ Important requirements:
 - No plaintext UK.
 - No 0-RTT UK data.
 - Authentication bound to TLS exporter.
+- Local files containing shared secrets or private keys must not be readable,
+  writable, or executable by group or other users on Unix-like systems.
 - Replay cache for recent nonce pairs.
 - Constant-time HMAC comparison.
 - Strict frame length checks.

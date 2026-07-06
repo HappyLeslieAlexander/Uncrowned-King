@@ -2,6 +2,9 @@
 
 use std::{collections::HashSet, error::Error, fmt, fs, path::Path};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use serde::Deserialize;
 use uk_auth::{
     AuthError, Credential, CredentialStatus, DEFAULT_REPLAY_CACHE_MAX_ENTRIES,
@@ -36,6 +39,8 @@ pub struct ServerConfig {
 impl ServerConfig {
     /// Loads a server config from disk.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let path = path.as_ref();
+        validate_sensitive_file_permissions(path, "server config")?;
         let text = fs::read_to_string(path)?;
         let config = toml::from_str(&text)?;
         Ok(config)
@@ -127,6 +132,12 @@ impl ServerConfig {
     /// Validates configured network endpoints without resolving DNS.
     pub fn validate_network_endpoints(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         validate_host_port_endpoint("listen", &self.listen)?;
+        Ok(())
+    }
+
+    /// Validates local files that contain private material.
+    pub fn validate_sensitive_paths(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        validate_sensitive_file_permissions(Path::new(&self.key_path), "private key")?;
         Ok(())
     }
 
@@ -394,6 +405,30 @@ fn invalid_policy_group(group: &str) -> bool {
     group.is_empty() || group.bytes().any(|byte| byte.is_ascii_control())
 }
 
+#[cfg(unix)]
+fn validate_sensitive_file_permissions(
+    path: &Path,
+    label: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(format!("{label} must be a regular file").into());
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(format!("{label} must not be accessible by group or other users").into());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_sensitive_file_permissions(
+    _path: &Path,
+    _label: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +443,101 @@ mod tests {
             policy_path: None,
             credentials: Vec::new(),
         }
+    }
+
+    #[cfg(unix)]
+    fn temp_path(label: &str, extension: &str) -> std::path::PathBuf {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "uk-server-{label}-test-{}-{now}.{extension}",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(unix)]
+    fn write_temp_file(
+        label: &str,
+        extension: &str,
+        contents: &str,
+        mode: u32,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_path(label, extension);
+        fs::write(&path, contents).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn write_temp_server_config(mode: u32) -> std::path::PathBuf {
+        write_temp_file(
+            "config",
+            "toml",
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+
+[[credentials]]
+key_id = "client"
+secret = "0123456789abcdef0123456789abcdef"
+"#,
+            mode,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_accepts_owner_only_config_file() {
+        let path = write_temp_server_config(0o600);
+
+        let result = ServerConfig::load(&path);
+        let _ = fs::remove_file(&path);
+
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_group_readable_config_file() {
+        let path = write_temp_server_config(0o644);
+
+        let error = ServerConfig::load(&path).unwrap_err().to_string();
+        let _ = fs::remove_file(&path);
+
+        assert!(error.contains("server config"));
+        assert!(error.contains("group or other"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validates_owner_only_private_key_file() {
+        let path = write_temp_file("key", "pem", "private key", 0o600);
+        let mut config = minimal_config();
+        config.key_path = path.to_string_lossy().into_owned();
+
+        let result = config.validate_sensitive_paths();
+        let _ = fs::remove_file(&path);
+
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_group_readable_private_key_file() {
+        let path = write_temp_file("key", "pem", "private key", 0o644);
+        let mut config = minimal_config();
+        config.key_path = path.to_string_lossy().into_owned();
+
+        let error = config.validate_sensitive_paths().unwrap_err().to_string();
+        let _ = fs::remove_file(&path);
+
+        assert!(error.contains("private key"));
+        assert!(error.contains("group or other"));
     }
 
     #[test]

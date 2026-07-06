@@ -13,6 +13,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use bytes::{Bytes, BytesMut};
 use rustls::{
     ClientConfig as RustlsClientConfig, RootCertStore, ServerConfig as RustlsServerConfig,
@@ -2454,7 +2457,7 @@ async fn run_server_listener_shutdown_e2e() -> Result<(), TestError> {
     let cert_path = temp_dir.join("server-cert.pem");
     let key_path = temp_dir.join("server-key.pem");
     fs::write(&cert_path, CERT_PEM)?;
-    fs::write(&key_path, KEY_PEM)?;
+    write_private_key(&key_path)?;
     let server_addr = unused_loopback_addr().await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let mut server_task = tokio::spawn(uk_server::run_until_shutdown(
@@ -2494,7 +2497,7 @@ async fn run_server_active_session_shutdown_e2e() -> Result<(), TestError> {
     let cert_path = temp_dir.join("server-cert.pem");
     let key_path = temp_dir.join("server-key.pem");
     fs::write(&cert_path, CERT_PEM)?;
-    fs::write(&key_path, KEY_PEM)?;
+    write_private_key(&key_path)?;
     let server_addr = unused_loopback_addr().await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let mut server_task = tokio::spawn(uk_server::run_until_shutdown(
@@ -2673,7 +2676,7 @@ async fn run_socks_udp_datagram_shutdown_during_reconnect_e2e() -> Result<(), Te
     let cert_path = temp_dir.join("server-cert.pem");
     let key_path = temp_dir.join("server-key.pem");
     fs::write(&cert_path, CERT_PEM)?;
-    fs::write(&key_path, KEY_PEM)?;
+    write_private_key(&key_path)?;
 
     let carrier_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let server_addr = carrier_listener.local_addr()?;
@@ -2772,7 +2775,7 @@ impl ServerHarness {
         let cert_path = temp_dir.join("server-cert.pem");
         let key_path = temp_dir.join("server-key.pem");
         fs::write(&cert_path, CERT_PEM)?;
-        fs::write(&key_path, KEY_PEM)?;
+        write_private_key(&key_path)?;
         let policy_path = if let Some(policy_toml) = policy_toml {
             let policy_path = temp_dir.join("policy.toml");
             fs::write(&policy_path, policy_toml)?;
@@ -2929,7 +2932,7 @@ impl MalformedFrameServerHarness {
         let cert_path = temp_dir.join("server-cert.pem");
         let key_path = temp_dir.join("server-key.pem");
         fs::write(&cert_path, CERT_PEM)?;
-        fs::write(&key_path, KEY_PEM)?;
+        write_private_key(&key_path)?;
 
         let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let server_addr = server_listener.local_addr()?;
@@ -3001,7 +3004,7 @@ impl ClientBufferedLimitServerHarness {
         let cert_path = temp_dir.join("server-cert.pem");
         let key_path = temp_dir.join("server-key.pem");
         fs::write(&cert_path, CERT_PEM)?;
-        fs::write(&key_path, KEY_PEM)?;
+        write_private_key(&key_path)?;
 
         let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let server_addr = server_listener.local_addr()?;
@@ -3086,7 +3089,7 @@ impl UdpStreamFallbackDisabledServerHarness {
         let cert_path = temp_dir.join("server-cert.pem");
         let key_path = temp_dir.join("server-key.pem");
         fs::write(&cert_path, CERT_PEM)?;
-        fs::write(&key_path, KEY_PEM)?;
+        write_private_key(&key_path)?;
 
         let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let server_addr = server_listener.local_addr()?;
@@ -3167,7 +3170,7 @@ impl AckGatedOpenServerHarness {
         let cert_path = temp_dir.join("server-cert.pem");
         let key_path = temp_dir.join("server-key.pem");
         fs::write(&cert_path, CERT_PEM)?;
-        fs::write(&key_path, KEY_PEM)?;
+        write_private_key(&key_path)?;
 
         let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let server_addr = server_listener.local_addr()?;
@@ -3260,7 +3263,7 @@ impl PendingOpenCancelServerHarness {
         let cert_path = temp_dir.join("server-cert.pem");
         let key_path = temp_dir.join("server-key.pem");
         fs::write(&cert_path, CERT_PEM)?;
-        fs::write(&key_path, KEY_PEM)?;
+        write_private_key(&key_path)?;
 
         let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let server_addr = server_listener.local_addr()?;
@@ -3332,7 +3335,7 @@ impl PendingUdpOpenCancelServerHarness {
         let cert_path = temp_dir.join("server-cert.pem");
         let key_path = temp_dir.join("server-key.pem");
         fs::write(&cert_path, CERT_PEM)?;
-        fs::write(&key_path, KEY_PEM)?;
+        write_private_key(&key_path)?;
 
         let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let server_addr = server_listener.local_addr()?;
@@ -3429,7 +3432,7 @@ impl MissingPongServerHarness {
         let cert_path = temp_dir.join("server-cert.pem");
         let key_path = temp_dir.join("server-key.pem");
         fs::write(&cert_path, CERT_PEM)?;
-        fs::write(&key_path, KEY_PEM)?;
+        write_private_key(&key_path)?;
 
         let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let server_addr = server_listener.local_addr()?;
@@ -3946,7 +3949,7 @@ impl RelayHarness {
         let cert_path = temp_dir.join("server-cert.pem");
         let key_path = temp_dir.join("server-key.pem");
         fs::write(&cert_path, CERT_PEM)?;
-        fs::write(&key_path, KEY_PEM)?;
+        write_private_key(&key_path)?;
 
         let policy_path = if let Some(policy_toml) = policy_toml {
             let policy_path = temp_dir.join("policy.toml");
@@ -4827,6 +4830,21 @@ fn create_temp_dir() -> Result<PathBuf, TestError> {
     let dir = std::env::temp_dir().join(format!("uk-e2e-{}-{now}-{id}", process::id()));
     fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+fn write_private_key(path: &Path) -> io::Result<()> {
+    fs::write(path, KEY_PEM)?;
+    restrict_private_key_permissions(path)
+}
+
+#[cfg(unix)]
+fn restrict_private_key_permissions(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_private_key_permissions(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn allow_loopback_policy(port: u16) -> String {
