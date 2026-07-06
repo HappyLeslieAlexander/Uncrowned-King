@@ -6,6 +6,7 @@ use std::{collections::HashSet, error::Error, fmt, fs, path::Path};
 use std::os::unix::fs::PermissionsExt;
 
 use serde::Deserialize;
+use tokio::sync::Semaphore;
 use uk_auth::{
     AuthError, Credential, CredentialStatus, DEFAULT_REPLAY_CACHE_MAX_ENTRIES,
     DEFAULT_REPLAY_CACHE_WINDOW_SECONDS, MIN_AUTH_RESPONSE_PAYLOAD_SIZE,
@@ -97,9 +98,14 @@ impl ServerConfig {
             MAX_FRAME_PAYLOAD_SIZE,
         )?;
         reject_zero_limit("max_sessions", self.max_sessions())?;
+        reject_semaphore_permit_limit("max_sessions", self.max_sessions())?;
         reject_zero_limit("max_streams", self.max_streams())?;
         reject_large_limit("max_udp_flows", self.max_udp_flows(), self.max_streams())?;
         reject_zero_limit(
+            "max_outbound_dials_per_session",
+            self.max_outbound_dials_per_session(),
+        )?;
+        reject_semaphore_permit_limit(
             "max_outbound_dials_per_session",
             self.max_outbound_dials_per_session(),
         )?;
@@ -126,6 +132,7 @@ impl ServerConfig {
             self.replay_cache_window_seconds(),
         )?;
         reject_zero_limit("replay_cache_max_entries", self.replay_cache_max_entries())?;
+        reject_usize_limit("replay_cache_max_entries", self.replay_cache_max_entries())?;
         Ok(())
     }
 
@@ -298,6 +305,19 @@ fn reject_large_limit(
     } else {
         Ok(())
     }
+}
+
+fn reject_semaphore_permit_limit(
+    name: &str,
+    value: u64,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    reject_large_limit(name, value, Semaphore::MAX_PERMITS as u64)
+}
+
+fn reject_usize_limit(name: &str, value: u64) -> Result<(), Box<dyn Error + Send + Sync>> {
+    usize::try_from(value)
+        .map(|_| ())
+        .map_err(|_| format!("{name} is too large for this platform").into())
 }
 
 /// Server resource limits.
@@ -1131,6 +1151,25 @@ max_sessions = 0
     }
 
     #[test]
+    fn rejects_session_limit_above_semaphore_capacity() {
+        let config: ServerConfig = toml::from_str(&format!(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_sessions = {}
+"#,
+            Semaphore::MAX_PERMITS as u64 + 1
+        ))
+        .unwrap();
+
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
     fn rejects_zero_outbound_dials_limit() {
         let config: ServerConfig = toml::from_str(
             r#"
@@ -1143,6 +1182,25 @@ credentials = []
 max_outbound_dials_per_session = 0
 "#,
         )
+        .unwrap();
+
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_outbound_dials_limit_above_semaphore_capacity() {
+        let config: ServerConfig = toml::from_str(&format!(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_outbound_dials_per_session = {}
+"#,
+            Semaphore::MAX_PERMITS as u64 + 1
+        ))
         .unwrap();
 
         assert!(config.validate_limits().is_err());

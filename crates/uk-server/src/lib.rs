@@ -45,12 +45,15 @@ where
     let policy_set = Arc::new(config.policy_set()?);
     let replay_cache = Arc::new(Mutex::new(ReplayCache::with_max_entries(
         Duration::from_secs(config.replay_cache_window_seconds()),
-        usize_limit(config.replay_cache_max_entries()),
+        usize_limit(
+            "replay_cache_max_entries",
+            config.replay_cache_max_entries(),
+        )?,
     )));
     let tls_config = tls::server_config(&config.cert_path, &config.key_path)?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
     let listener = TcpListener::bind(&config.listen).await?;
-    let max_sessions = usize_limit(config.max_sessions());
+    let max_sessions = usize_limit("max_sessions", config.max_sessions())?;
     let session_permits = Arc::new(Semaphore::new(max_sessions));
 
     info!(event = "server.listen", listen = %config.listen);
@@ -178,9 +181,18 @@ async fn handle_connection(
             },
             max_streams: config.max_streams(),
             max_udp_flows: config.max_udp_flows(),
-            max_outbound_dials_per_session: usize_limit(config.max_outbound_dials_per_session()),
-            max_buffered_bytes_per_session: usize_limit(config.max_buffered_bytes_per_session()),
-            max_buffered_bytes_per_flow: usize_limit(config.max_buffered_bytes_per_flow()),
+            max_outbound_dials_per_session: usize_limit(
+                "max_outbound_dials_per_session",
+                config.max_outbound_dials_per_session(),
+            )?,
+            max_buffered_bytes_per_session: usize_limit(
+                "max_buffered_bytes_per_session",
+                config.max_buffered_bytes_per_session(),
+            )?,
+            max_buffered_bytes_per_flow: usize_limit(
+                "max_buffered_bytes_per_flow",
+                config.max_buffered_bytes_per_flow(),
+            )?,
             target_connect_timeout: target_connect_timeout(config.target_connect_timeout_seconds()),
             tcp_half_close_timeout: tcp_half_close_timeout(config.tcp_half_close_timeout_seconds()),
             udp_flow_idle_timeout: udp_flow_idle_timeout(config.udp_flow_idle_timeout_seconds()),
@@ -364,8 +376,8 @@ fn is_tls_handshake_eof(error: &io::Error) -> bool {
     error.to_string() == "tls handshake eof"
 }
 
-fn usize_limit(value: u64) -> usize {
-    usize::try_from(value).unwrap_or(usize::MAX)
+fn usize_limit(name: &str, value: u64) -> Result<usize, AnyError> {
+    usize::try_from(value).map_err(|_| format!("{name} is too large for this platform").into())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
