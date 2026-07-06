@@ -225,7 +225,7 @@ impl AuthChallenge {
 }
 
 /// Client authentication response data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AuthResponse {
     /// Opaque key id.
     pub key_id: Vec<u8>,
@@ -237,6 +237,19 @@ pub struct AuthResponse {
     pub client_capabilities: Vec<u8>,
     /// 32-byte HMAC tag.
     pub tag: [u8; 32],
+}
+
+impl fmt::Debug for AuthResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthResponse")
+            .field("key_id", &self.key_id)
+            .field("client_nonce", &self.client_nonce)
+            .field("client_time", &self.client_time)
+            .field("client_capabilities", &self.client_capabilities)
+            .field("tag", &"<redacted>")
+            .finish()
+    }
 }
 
 impl AuthResponse {
@@ -615,6 +628,16 @@ mod tests {
 
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("0123456789abcdef"));
+    }
+
+    #[test]
+    fn auth_response_debug_redacts_tag() {
+        let (_, _, _, response) = fixture();
+
+        let debug = format!("{response:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(&format!("{:?}", response.tag)));
     }
 
     #[test]
