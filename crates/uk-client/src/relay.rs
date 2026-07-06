@@ -38,6 +38,7 @@ use crate::{
 
 const FLOW_ID_ALLOCATION_ATTEMPTS: usize = 1024;
 const FLOW_FRAME_QUEUE_CAPACITY: usize = 32;
+const UDP_ASSOCIATION_EVENT_QUEUE_CAPACITY: usize = 128;
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const UDP_ASSOCIATION_BUFFER_SIZE: usize = 65_536;
 
@@ -91,7 +92,7 @@ struct ClientFlow {
 struct UdpAssociation {
     socket: Arc<UdpSocket>,
     idle_timeout: Option<Duration>,
-    flow_event_tx: mpsc::UnboundedSender<UdpAssociationFlowEvent>,
+    flow_event_tx: mpsc::Sender<UdpAssociationFlowEvent>,
     client_endpoint: UdpClientEndpoint,
     flows_by_target: HashMap<Target, UdpAssociationFlow>,
     flow_tasks: JoinSet<UdpFlowTaskResult>,
@@ -1588,7 +1589,7 @@ async fn relay_udp_association(
     let bound_endpoint = socks5::SocksEndpoint::from(socket.local_addr()?);
     socks5::send_reply_with_endpoint(&mut local, socks5::Reply::Succeeded, &bound_endpoint).await?;
 
-    let (flow_event_tx, mut flow_event_rx) = mpsc::unbounded_channel();
+    let (flow_event_tx, mut flow_event_rx) = mpsc::channel(UDP_ASSOCIATION_EVENT_QUEUE_CAPACITY);
     let mut association = UdpAssociation::new(
         socket,
         sessions.udp_flow_idle_timeout(),
@@ -1647,7 +1648,7 @@ impl UdpAssociation {
     fn new(
         socket: Arc<UdpSocket>,
         idle_timeout: Option<Duration>,
-        flow_event_tx: mpsc::UnboundedSender<UdpAssociationFlowEvent>,
+        flow_event_tx: mpsc::Sender<UdpAssociationFlowEvent>,
         client_endpoint: socks5::SocksEndpoint,
     ) -> Self {
         Self {
@@ -1925,7 +1926,7 @@ async fn relay_udp_flow_to_client(
     socket: Arc<UdpSocket>,
     client_endpoint: SocketAddr,
     shutdown_rx: watch::Receiver<bool>,
-    flow_event_tx: mpsc::UnboundedSender<UdpAssociationFlowEvent>,
+    flow_event_tx: mpsc::Sender<UdpAssociationFlowEvent>,
 ) -> UdpFlowTaskResult {
     let flow_id = flow.id;
     let session = Arc::clone(&flow.session);
@@ -1952,7 +1953,7 @@ async fn relay_udp_flow_to_client_inner(
     socket: Arc<UdpSocket>,
     client_endpoint: SocketAddr,
     mut shutdown_rx: watch::Receiver<bool>,
-    flow_event_tx: mpsc::UnboundedSender<UdpAssociationFlowEvent>,
+    flow_event_tx: mpsc::Sender<UdpAssociationFlowEvent>,
 ) -> Result<(), AnyError> {
     let flow_id = flow.id;
     loop {
@@ -1969,10 +1970,7 @@ async fn relay_udp_flow_to_client_inner(
                     FrameType::UdpData => {
                         let packet = socks5::encode_udp_datagram(&target, &frame.payload)?;
                         socket.send_to(&packet, client_endpoint).await?;
-                        let _ = flow_event_tx.send(UdpAssociationFlowEvent::Activity {
-                            flow_id,
-                            target: target.clone(),
-                        });
+                        try_record_udp_association_activity(&flow_event_tx, flow_id, &target);
                     }
                     FrameType::UdpClose => {
                         let mut payload = frame.payload;
@@ -1995,6 +1993,17 @@ fn udp_association_bind_addr(tcp_local_addr: SocketAddr) -> SocketAddr {
         IpAddr::V4(ip) => SocketAddr::new(IpAddr::V4(ip), 0),
         IpAddr::V6(ip) => SocketAddr::new(IpAddr::V6(ip), 0),
     }
+}
+
+fn try_record_udp_association_activity(
+    flow_event_tx: &mpsc::Sender<UdpAssociationFlowEvent>,
+    flow_id: u64,
+    target: &Target,
+) {
+    let _ = flow_event_tx.try_send(UdpAssociationFlowEvent::Activity {
+        flow_id,
+        target: target.clone(),
+    });
 }
 
 fn udp_idle_interval(idle_timeout: Option<Duration>) -> Option<time::Interval> {
@@ -3254,6 +3263,25 @@ mod tests {
             .unwrap_err();
         let io_error = err.downcast_ref::<io::Error>().unwrap();
         assert_eq!(io_error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn udp_association_activity_events_are_lossy_when_queue_is_full() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let first_target = Target::Domain("first.example".to_owned(), 53);
+        let second_target = Target::Domain("second.example".to_owned(), 53);
+
+        try_record_udp_association_activity(&event_tx, 1, &first_target);
+        try_record_udp_association_activity(&event_tx, 3, &second_target);
+
+        match event_rx.recv().await {
+            Some(UdpAssociationFlowEvent::Activity { flow_id, target }) => {
+                assert_eq!(flow_id, 1);
+                assert_eq!(target, first_target);
+            }
+            None => panic!("activity event should be queued"),
+        }
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[test]
