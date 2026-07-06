@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -91,7 +92,7 @@ pub enum CredentialStatus {
 }
 
 /// Server-side credential record.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Credential {
     /// Opaque key id sent by the client.
     pub key_id: Vec<u8>,
@@ -105,6 +106,20 @@ pub struct Credential {
     pub not_after: Option<u64>,
     /// Optional policy group name.
     pub policy_group: Option<String>,
+}
+
+impl fmt::Debug for Credential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Credential")
+            .field("key_id", &self.key_id)
+            .field("secret", &"<redacted>")
+            .field("status", &self.status)
+            .field("not_before", &self.not_before)
+            .field("not_after", &self.not_after)
+            .field("policy_group", &self.policy_group)
+            .finish()
+    }
 }
 
 impl Credential {
@@ -586,6 +601,20 @@ mod tests {
             Credential::active(b"client-a".to_vec(), b"too-short".to_vec()),
             Err(AuthError::SecretTooShort)
         );
+    }
+
+    #[test]
+    fn credential_debug_redacts_secret() {
+        let credential = Credential::active(
+            b"client-a".to_vec(),
+            b"0123456789abcdef0123456789abcdef".to_vec(),
+        )
+        .unwrap();
+
+        let debug = format!("{credential:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("0123456789abcdef"));
     }
 
     #[test]

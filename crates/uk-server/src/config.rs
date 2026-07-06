@@ -1,6 +1,6 @@
 //! Server configuration.
 
-use std::{collections::HashSet, error::Error, fs, path::Path};
+use std::{collections::HashSet, error::Error, fmt, fs, path::Path};
 
 use serde::Deserialize;
 use uk_auth::{
@@ -327,7 +327,7 @@ pub struct LimitConfig {
 }
 
 /// One configured credential.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialConfig {
     /// Opaque key id.
@@ -342,6 +342,20 @@ pub struct CredentialConfig {
     pub not_after: Option<u64>,
     /// Optional policy group.
     pub policy_group: Option<String>,
+}
+
+impl fmt::Debug for CredentialConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CredentialConfig")
+            .field("key_id", &self.key_id)
+            .field("secret", &"<redacted>")
+            .field("status", &self.status)
+            .field("not_before", &self.not_before)
+            .field("not_after", &self.not_after)
+            .field("policy_group", &self.policy_group)
+            .finish()
+    }
 }
 
 impl CredentialConfig {
@@ -1155,6 +1169,23 @@ secret = "0123456789abcdef0123456789abcdef"
         .unwrap();
 
         assert_eq!(config.credentials(), Err(AuthError::InvalidKeyIdLength));
+    }
+
+    #[test]
+    fn credential_config_debug_redacts_secret() {
+        let credential = CredentialConfig {
+            key_id: "client".to_owned(),
+            secret: "0123456789abcdef0123456789abcdef".to_owned(),
+            status: Some("active".to_owned()),
+            not_before: None,
+            not_after: None,
+            policy_group: Some("default".to_owned()),
+        };
+
+        let debug = format!("{credential:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("0123456789abcdef"));
     }
 
     #[test]

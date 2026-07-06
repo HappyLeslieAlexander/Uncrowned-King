@@ -1,13 +1,13 @@
 //! Client configuration.
 
-use std::{collections::HashSet, error::Error, fs, path::Path};
+use std::{collections::HashSet, error::Error, fmt, fs, path::Path};
 
 use serde::Deserialize;
 use uk_auth::{AuthError, validate_key_id, validate_shared_secret};
 use uk_proto::{MAX_FRAME_PAYLOAD_SIZE, validate_host_port_endpoint};
 
 /// Client TOML configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     /// UK server socket address.
@@ -38,6 +38,40 @@ pub struct ClientConfig {
     pub max_buffered_bytes_per_session: Option<u64>,
     /// Optional maximum queued server-to-local bytes per TCP flow.
     pub max_buffered_bytes_per_flow: Option<u64>,
+}
+
+impl fmt::Debug for ClientConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClientConfig")
+            .field("server_addr", &self.server_addr)
+            .field("server_addrs", &self.server_addrs)
+            .field("server_name", &self.server_name)
+            .field("ca_cert_path", &self.ca_cert_path)
+            .field("key_id", &self.key_id)
+            .field("secret", &"<redacted>")
+            .field("handshake_timeout_seconds", &self.handshake_timeout_seconds)
+            .field(
+                "socks_handshake_timeout_seconds",
+                &self.socks_handshake_timeout_seconds,
+            )
+            .field("tcp_open_timeout_seconds", &self.tcp_open_timeout_seconds)
+            .field(
+                "udp_flow_idle_timeout_seconds",
+                &self.udp_flow_idle_timeout_seconds,
+            )
+            .field("max_pending_open_bytes", &self.max_pending_open_bytes)
+            .field("max_socks_connections", &self.max_socks_connections)
+            .field(
+                "max_buffered_bytes_per_session",
+                &self.max_buffered_bytes_per_session,
+            )
+            .field(
+                "max_buffered_bytes_per_flow",
+                &self.max_buffered_bytes_per_flow,
+            )
+            .finish()
+    }
 }
 
 impl ClientConfig {
@@ -198,6 +232,14 @@ mod tests {
     #[test]
     fn defaults_handshake_timeout() {
         assert_eq!(minimal_config().handshake_timeout_seconds(), 10);
+    }
+
+    #[test]
+    fn debug_redacts_secret() {
+        let debug = format!("{:?}", minimal_config());
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("0123456789abcdef"));
     }
 
     #[test]
