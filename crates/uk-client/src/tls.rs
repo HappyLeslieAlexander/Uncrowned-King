@@ -56,10 +56,14 @@ fn ensure_alpn(protocol: Option<&[u8]>) -> Result<(), TlsError> {
 }
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, TlsError> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+    let mut reader = BufReader::new(
+        File::open(path).map_err(|err| format!("failed to open CA certificate {path}: {err}"))?,
+    );
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("invalid CA certificate {path}: {err}"))?;
     if certs.is_empty() {
-        Err("missing certificate".into())
+        Err(format!("missing CA certificate in {path}").into())
     } else {
         Ok(certs)
     }
@@ -98,6 +102,15 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    #[test]
+    fn missing_ca_error_includes_path() {
+        let path = temp_missing_file("missing-ca");
+
+        let error = load_certs(&path).unwrap_err().to_string();
+
+        assert!(error.contains(&path));
+    }
+
     fn temp_file(name: &str, contents: &[u8]) -> String {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -106,5 +119,16 @@ mod tests {
         let path = std::env::temp_dir().join(format!("uk-client-tls-{name}-{now}.pem"));
         fs::write(&path, contents).unwrap();
         path.to_string_lossy().into_owned()
+    }
+
+    fn temp_missing_file(name: &str) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("uk-client-tls-{name}-{now}.pem"))
+            .to_string_lossy()
+            .into_owned()
     }
 }

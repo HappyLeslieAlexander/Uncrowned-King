@@ -46,18 +46,27 @@ fn ensure_alpn(protocol: Option<&[u8]>) -> Result<(), TlsError> {
 }
 
 fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, TlsError> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+    let mut reader = BufReader::new(
+        File::open(path)
+            .map_err(|err| format!("failed to open certificate chain {path}: {err}"))?,
+    );
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("invalid certificate chain {path}: {err}"))?;
     if certs.is_empty() {
-        Err("missing certificate".into())
+        Err(format!("missing certificate in {path}").into())
     } else {
         Ok(certs)
     }
 }
 
 fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>, TlsError> {
-    let mut reader = BufReader::new(File::open(path)?);
-    rustls_pemfile::private_key(&mut reader)?.ok_or_else(|| "missing private key".into())
+    let mut reader = BufReader::new(
+        File::open(path).map_err(|err| format!("failed to open private key {path}: {err}"))?,
+    );
+    rustls_pemfile::private_key(&mut reader)
+        .map_err(|err| format!("invalid private key {path}: {err}"))?
+        .ok_or_else(|| format!("missing private key in {path}").into())
 }
 
 #[cfg(test)]
@@ -102,6 +111,24 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    #[test]
+    fn missing_cert_error_includes_path() {
+        let path = temp_missing_file("missing-cert");
+
+        let error = load_certs(&path).unwrap_err().to_string();
+
+        assert!(error.contains(&path));
+    }
+
+    #[test]
+    fn missing_private_key_error_includes_path() {
+        let path = temp_missing_file("missing-key");
+
+        let error = load_private_key(&path).unwrap_err().to_string();
+
+        assert!(error.contains(&path));
+    }
+
     fn temp_file(name: &str, contents: &[u8]) -> String {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -110,5 +137,16 @@ mod tests {
         let path = std::env::temp_dir().join(format!("uk-server-tls-{name}-{now}.pem"));
         fs::write(&path, contents).unwrap();
         path.to_string_lossy().into_owned()
+    }
+
+    fn temp_missing_file(name: &str) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("uk-server-tls-{name}-{now}.pem"))
+            .to_string_lossy()
+            .into_owned()
     }
 }

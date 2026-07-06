@@ -70,7 +70,8 @@ impl ServerConfig {
         let Some(path) = &self.policy_path else {
             return Ok(PolicySet::default());
         };
-        let text = fs::read_to_string(path)?;
+        let text = fs::read_to_string(path)
+            .map_err(|err| format!("failed to read policy file {path}: {err}"))?;
         Ok(PolicySet::from_toml(&text)?)
     }
 
@@ -759,6 +760,25 @@ max_udp_flows = 3
         assert!(config.validate_network_endpoints().is_ok());
         assert!(config.validate_limits().is_ok());
         assert_eq!(config.credentials().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn missing_policy_file_error_includes_path() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "uk-server-missing-policy-test-{}-{now}.toml",
+            std::process::id()
+        ));
+        let path = path.to_string_lossy().into_owned();
+        let mut config = minimal_config();
+        config.policy_path = Some(path.clone());
+
+        let error = config.policy_set().unwrap_err().to_string();
+
+        assert!(error.contains(&path));
     }
 
     #[test]
