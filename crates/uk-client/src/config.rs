@@ -6,6 +6,7 @@ use std::{collections::HashSet, error::Error, fmt, fs, path::Path};
 use std::os::unix::fs::PermissionsExt;
 
 use serde::Deserialize;
+use tokio::sync::Semaphore;
 use uk_auth::{AuthError, validate_key_id, validate_shared_secret};
 use uk_proto::{MAX_FRAME_PAYLOAD_SIZE, validate_host_port_endpoint};
 
@@ -169,6 +170,13 @@ impl ClientConfig {
         }
         usize::try_from(max_socks_connections)
             .map_err(|_| "max_socks_connections is too large for this platform")?;
+        if max_socks_connections > Semaphore::MAX_PERMITS as u64 {
+            return Err(format!(
+                "max_socks_connections must be at most {}",
+                Semaphore::MAX_PERMITS
+            )
+            .into());
+        }
         let max_pending_open_bytes = self.max_pending_open_bytes();
         if max_pending_open_bytes == 0 {
             return Err("max_pending_open_bytes must be greater than zero".into());
@@ -468,6 +476,14 @@ max_socks_connections = 7
     fn rejects_zero_max_socks_connections() {
         let mut config = minimal_config();
         config.max_socks_connections = Some(0);
+
+        assert!(config.validate_resource_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_max_socks_connections_above_semaphore_capacity() {
+        let mut config = minimal_config();
+        config.max_socks_connections = Some(Semaphore::MAX_PERMITS as u64 + 1);
 
         assert!(config.validate_resource_limits().is_err());
     }
