@@ -1451,7 +1451,7 @@ async fn accept_open_target(
         context.event_tx.clone(),
         context.shutdown.clone(),
     );
-    info!(event = "tcp.open", flow_id, target = ?target);
+    info!(event = "tcp.open", flow_id, target = %target.log_safe());
     Ok(target_flow)
 }
 
@@ -1474,7 +1474,7 @@ async fn accept_open_udp_target(
         context.shutdown.clone(),
         context.limits.data_frame_size,
     );
-    info!(event = "udp.open", flow_id, target = ?target);
+    info!(event = "udp.open", flow_id, target = %target.log_safe());
     Ok(target_flow)
 }
 
@@ -1486,17 +1486,22 @@ async fn reject_open_failure(
 ) -> Result<(), AnyError> {
     match failure {
         OpenFailure::PolicyDenied => {
-            warn!(event = "policy.denied", flow_id, target = ?target);
+            warn!(event = "policy.denied", flow_id, target = %target.log_safe());
             send_policy_denied(context.carrier_writer, flow_id).await?;
             send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_NORMAL).await?;
         }
         OpenFailure::ResourceLimit => {
-            warn!(event = "tcp.open.dial_limit", flow_id, target = ?target);
+            warn!(event = "tcp.open.dial_limit", flow_id, target = %target.log_safe());
             send_resource_limit(context.carrier_writer, flow_id).await?;
             send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
         }
         OpenFailure::TargetUnavailable(err) => {
-            warn!(event = "target.unavailable", flow_id, target = ?target, error = %err);
+            warn!(
+                event = "target.unavailable",
+                flow_id,
+                target = %target.log_safe(),
+                error = %err
+            );
             send_error(
                 context.carrier_writer,
                 flow_id,
@@ -1506,7 +1511,7 @@ async fn reject_open_failure(
             send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
         }
         OpenFailure::TargetTimeout => {
-            warn!(event = "target.timeout", flow_id, target = ?target);
+            warn!(event = "target.timeout", flow_id, target = %target.log_safe());
             send_error(context.carrier_writer, flow_id, ErrorCode::TargetTimeout).await?;
             send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
         }
@@ -1522,17 +1527,22 @@ async fn reject_udp_open_failure(
 ) -> Result<(), AnyError> {
     match failure {
         OpenFailure::PolicyDenied => {
-            warn!(event = "udp.policy.denied", flow_id, target = ?target);
+            warn!(event = "udp.policy.denied", flow_id, target = %target.log_safe());
             send_policy_denied(context.carrier_writer, flow_id).await?;
             send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_NORMAL).await?;
         }
         OpenFailure::ResourceLimit => {
-            warn!(event = "udp.open.dial_limit", flow_id, target = ?target);
+            warn!(event = "udp.open.dial_limit", flow_id, target = %target.log_safe());
             send_resource_limit(context.carrier_writer, flow_id).await?;
             send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
         }
         OpenFailure::TargetUnavailable(err) => {
-            warn!(event = "udp.target.unavailable", flow_id, target = ?target, error = %err);
+            warn!(
+                event = "udp.target.unavailable",
+                flow_id,
+                target = %target.log_safe(),
+                error = %err
+            );
             send_error(
                 context.carrier_writer,
                 flow_id,
@@ -1542,7 +1552,7 @@ async fn reject_udp_open_failure(
             send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
         }
         OpenFailure::TargetTimeout => {
-            warn!(event = "udp.target.timeout", flow_id, target = ?target);
+            warn!(event = "udp.target.timeout", flow_id, target = %target.log_safe());
             send_error(context.carrier_writer, flow_id, ErrorCode::TargetTimeout).await?;
             send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
         }

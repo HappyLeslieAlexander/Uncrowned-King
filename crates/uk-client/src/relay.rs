@@ -1725,7 +1725,11 @@ impl UdpAssociation {
         {
             OpenOutcome::Open(flow) => flow,
             OpenOutcome::Rejected(reply) => {
-                debug!(event = "client.udp_flow.open.rejected", target = ?target, reply = ?reply);
+                debug!(
+                    event = "client.udp_flow.open.rejected",
+                    target = %target.log_safe(),
+                    reply = ?reply
+                );
                 return Ok(UdpAssociationFlowLookup::NoFlow);
             }
             OpenOutcome::Cancelled => return Ok(UdpAssociationFlowLookup::Cancelled),
@@ -1753,7 +1757,7 @@ impl UdpAssociation {
             warn!(
                 event = "client.udp_flow.missing_client_endpoint",
                 flow_id = flow.id,
-                target = ?target
+                target = %target.log_safe()
             );
             self.spawn_udp_flow_cleanup(flow, target);
             return;
@@ -1803,7 +1807,7 @@ impl UdpAssociation {
                     warn!(
                         event = "client.udp_flow.task_error",
                         flow_id = result.flow_id,
-                        target = ?result.target,
+                        target = %result.target.log_safe(),
                         error = %err
                     );
                 }
@@ -1853,7 +1857,7 @@ impl UdpAssociation {
                 debug!(
                     event = "client.udp_flow.idle_timeout",
                     flow_id = flow.id,
-                    target = ?target
+                    target = %target.log_safe()
                 );
                 let _ = flow.session.send_udp_close(flow.id, UDP_CLOSE_NORMAL).await;
                 flow.session.flows.lock().await.remove(&flow.id);

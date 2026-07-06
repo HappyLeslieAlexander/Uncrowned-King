@@ -29,6 +29,15 @@ impl Target {
         }
     }
 
+    /// Returns a stable, escaped target string suitable for logs.
+    pub fn log_safe(&self) -> String {
+        match self {
+            Self::Domain(domain, port) => format!("domain:{}:{port}", domain.escape_debug()),
+            Self::Ipv4(addr, port) => format!("ipv4:{addr}:{port}"),
+            Self::Ipv6(addr, port) => format!("ipv6:[{addr}]:{port}"),
+        }
+    }
+
     /// Encodes this target into `dst`.
     pub fn encode(&self, dst: &mut impl BufMut) -> ProtocolResult<()> {
         validate_port(self.port())?;
@@ -169,6 +178,29 @@ mod tests {
         target.encode(&mut out).unwrap();
         let mut bytes = Bytes::from(out);
         assert_eq!(Target::decode(&mut bytes).unwrap(), target);
+    }
+
+    #[test]
+    fn log_safe_formats_targets_with_type_prefixes() {
+        assert_eq!(
+            Target::Domain("api.example.com".to_owned(), 443).log_safe(),
+            "domain:api.example.com:443"
+        );
+        assert_eq!(
+            Target::Ipv4(Ipv4Addr::LOCALHOST, 8080).log_safe(),
+            "ipv4:127.0.0.1:8080"
+        );
+        assert_eq!(
+            Target::Ipv6(Ipv6Addr::LOCALHOST, 5353).log_safe(),
+            "ipv6:[::1]:5353"
+        );
+    }
+
+    #[test]
+    fn log_safe_escapes_domain_text() {
+        let target = Target::Domain("quote\"slash\\".to_owned(), 443);
+
+        assert_eq!(target.log_safe(), "domain:quote\\\"slash\\\\:443");
     }
 
     #[test]
