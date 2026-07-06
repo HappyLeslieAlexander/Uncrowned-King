@@ -141,7 +141,10 @@ enum FlowEvent {
         target: Target,
         result: Result<UdpSocket, OpenFailure>,
     },
-    ReadClosed(u64),
+    ReadClosed {
+        flow_id: u64,
+        token: FlowToken,
+    },
     UdpReadClosed(u64),
     UdpActivity(u64),
     HalfCloseDrainExpired {
@@ -149,7 +152,10 @@ enum FlowEvent {
         token: FlowToken,
         closed_side: HalfCloseSide,
     },
-    WriteClosed(u64),
+    WriteClosed {
+        flow_id: u64,
+        token: FlowToken,
+    },
     Activity,
 }
 
@@ -231,6 +237,12 @@ struct FlowTokenAllocator {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FlowToken(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TargetFlowIdentity {
+    flow_id: u64,
+    token: FlowToken,
+}
 
 #[derive(Clone)]
 struct OpenDialPermit {
@@ -422,8 +434,14 @@ async fn handle_flow_event(
             target,
             result,
         }) => handle_udp_open_completed(flow_id, target, result, context, target_writers).await?,
-        Some(FlowEvent::ReadClosed(flow_id)) => {
-            handle_target_read_closed(flow_id, context, target_writers);
+        Some(FlowEvent::ReadClosed { flow_id, token }) => {
+            handle_target_read_closed(
+                flow_id,
+                token,
+                context.limits.tcp_half_close_timeout,
+                context.event_tx,
+                target_writers,
+            );
         }
         Some(FlowEvent::UdpReadClosed(flow_id)) => {
             if matches!(target_writers.get(&flow_id), Some(FlowSlot::Udp(_))) {
@@ -444,8 +462,8 @@ async fn handle_flow_event(
             handle_half_close_drain_expired(flow_id, token, closed_side, context, target_writers)
                 .await?;
         }
-        Some(FlowEvent::WriteClosed(flow_id)) => {
-            handle_target_write_closed(flow_id, target_writers);
+        Some(FlowEvent::WriteClosed { flow_id, token }) => {
+            handle_target_write_closed(flow_id, token, target_writers);
         }
         Some(FlowEvent::Activity) | None => {}
     }
@@ -454,21 +472,25 @@ async fn handle_flow_event(
 
 fn handle_target_read_closed(
     flow_id: u64,
-    context: &RelaySessionContext<'_>,
+    token: FlowToken,
+    tcp_half_close_timeout: Option<Duration>,
+    event_tx: &mpsc::UnboundedSender<FlowEvent>,
     target_writers: &mut FlowTable,
 ) {
     if let Some(target) = open_target_flow_mut(target_writers, flow_id) {
-        let token = target.token;
+        if target.token != token {
+            return;
+        }
         target.mark_target_to_client_closed();
         info!(event = "tcp.target_read_closed", flow_id);
         if target.client_to_target_open {
-            if let Some(timeout) = context.limits.tcp_half_close_timeout {
+            if let Some(timeout) = tcp_half_close_timeout {
                 spawn_half_close_timer(
                     flow_id,
                     token,
                     HalfCloseSide::TargetToClient,
                     timeout,
-                    context.event_tx.clone(),
+                    event_tx.clone(),
                 );
             }
         }
@@ -542,8 +564,11 @@ enum HalfCloseDrainDecision {
     ClosePeer { remove: bool },
 }
 
-fn handle_target_write_closed(flow_id: u64, target_writers: &mut FlowTable) {
+fn handle_target_write_closed(flow_id: u64, token: FlowToken, target_writers: &mut FlowTable) {
     if let Some(target) = open_target_flow_mut(target_writers, flow_id) {
+        if target.token != token {
+            return;
+        }
         target.mark_client_to_target_closed();
         if target.is_fully_closed() {
             remove_flow_slot(target_writers, flow_id);
@@ -1405,10 +1430,11 @@ async fn accept_open_target(
     let (target_writer_tx, target_writer_rx) = mpsc::channel(TARGET_WRITE_QUEUE_CAPACITY);
     let flow_control = TargetFlowControl::new(context.session_buffer.clone());
     let token = context.flow_tokens.next();
+    let identity = TargetFlowIdentity { flow_id, token };
     let target_flow = TargetFlow::new(token, target_writer_tx, flow_control.clone());
     send_tcp_data(context.carrier_writer, flow_id, Bytes::new()).await?;
     spawn_target_reader(
-        flow_id,
+        identity,
         target_reader,
         flow_control.clone(),
         context.carrier_writer.clone(),
@@ -1417,7 +1443,7 @@ async fn accept_open_target(
         context.limits.data_frame_size,
     );
     spawn_target_writer(
-        flow_id,
+        identity,
         target_writer,
         target_writer_rx,
         flow_control,
@@ -1525,7 +1551,7 @@ async fn reject_udp_open_failure(
 }
 
 fn spawn_target_reader(
-    flow_id: u64,
+    identity: TargetFlowIdentity,
     target_reader: OwnedReadHalf,
     flow_control: TargetFlowControl,
     carrier_writer: CarrierWriter,
@@ -1534,6 +1560,7 @@ fn spawn_target_reader(
     data_frame_size: usize,
 ) {
     tokio::spawn(async move {
+        let flow_id = identity.flow_id;
         match relay_target_to_client(
             flow_id,
             target_reader,
@@ -1552,7 +1579,10 @@ fn spawn_target_reader(
             }
             _ => {}
         }
-        let _ = event_tx.send(FlowEvent::ReadClosed(flow_id));
+        let _ = event_tx.send(FlowEvent::ReadClosed {
+            flow_id,
+            token: identity.token,
+        });
     });
 }
 
@@ -1589,7 +1619,7 @@ fn spawn_udp_reader(
 }
 
 fn spawn_target_writer(
-    flow_id: u64,
+    identity: TargetFlowIdentity,
     target_writer: OwnedWriteHalf,
     commands: mpsc::Receiver<TargetCommand>,
     flow_control: TargetFlowControl,
@@ -1598,6 +1628,7 @@ fn spawn_target_writer(
     shutdown: SessionShutdown,
 ) {
     tokio::spawn(async move {
+        let flow_id = identity.flow_id;
         match relay_client_to_target(target_writer, commands, flow_control, &event_tx, &shutdown)
             .await
         {
@@ -1608,7 +1639,10 @@ fn spawn_target_writer(
             }
             _ => {}
         }
-        let _ = event_tx.send(FlowEvent::WriteClosed(flow_id));
+        let _ = event_tx.send(FlowEvent::WriteClosed {
+            flow_id,
+            token: identity.token,
+        });
     });
 }
 
@@ -2753,6 +2787,74 @@ mod tests {
     }
 
     #[test]
+    fn stale_target_read_close_does_not_affect_reused_flow_id() {
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(
+            1,
+            FlowSlot::Tcp(test_target_flow_with_token(TEST_FLOW_TOKEN)),
+        );
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+
+        handle_target_read_closed(
+            1,
+            STALE_FLOW_TOKEN,
+            Some(Duration::from_secs(1)),
+            &event_tx,
+            &mut target_writers,
+        );
+
+        let target = open_target_flow_mut(&mut target_writers, 1).expect("flow should remain open");
+        assert!(target.target_to_client_open);
+        assert!(target.client_to_target_open);
+    }
+
+    #[test]
+    fn matching_target_read_close_updates_original_flow() {
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(
+            1,
+            FlowSlot::Tcp(test_target_flow_with_token(TEST_FLOW_TOKEN)),
+        );
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+
+        handle_target_read_closed(1, TEST_FLOW_TOKEN, None, &event_tx, &mut target_writers);
+
+        let target = open_target_flow_mut(&mut target_writers, 1).expect("flow should remain open");
+        assert!(!target.target_to_client_open);
+        assert!(target.client_to_target_open);
+    }
+
+    #[test]
+    fn stale_target_write_close_does_not_affect_reused_flow_id() {
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(
+            1,
+            FlowSlot::Tcp(test_target_flow_with_token(TEST_FLOW_TOKEN)),
+        );
+
+        handle_target_write_closed(1, STALE_FLOW_TOKEN, &mut target_writers);
+
+        let target = open_target_flow_mut(&mut target_writers, 1).expect("flow should remain open");
+        assert!(target.target_to_client_open);
+        assert!(target.client_to_target_open);
+    }
+
+    #[test]
+    fn matching_target_write_close_updates_original_flow() {
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(
+            1,
+            FlowSlot::Tcp(test_target_flow_with_token(TEST_FLOW_TOKEN)),
+        );
+
+        handle_target_write_closed(1, TEST_FLOW_TOKEN, &mut target_writers);
+
+        let target = open_target_flow_mut(&mut target_writers, 1).expect("flow should remain open");
+        assert!(target.target_to_client_open);
+        assert!(!target.client_to_target_open);
+    }
+
+    #[test]
     fn matching_half_close_timer_closes_original_flow() {
         let mut target_writers = FlowTable::new();
         let mut flow = test_target_flow_with_token(TEST_FLOW_TOKEN);
@@ -3226,7 +3328,10 @@ mod tests {
         let target_writers = FlowTable::new();
 
         assert!(!flow_event_counts_as_session_activity(
-            Some(&FlowEvent::ReadClosed(1)),
+            Some(&FlowEvent::ReadClosed {
+                flow_id: 1,
+                token: TEST_FLOW_TOKEN,
+            }),
             &target_writers
         ));
         assert!(!flow_event_counts_as_session_activity(
