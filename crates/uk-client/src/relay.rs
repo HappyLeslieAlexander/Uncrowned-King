@@ -326,9 +326,11 @@ impl BufferedFlowFrame {
         })
     }
 
-    fn into_frame(mut self) -> Frame {
+    fn into_frame(mut self) -> Result<Frame, AnyError> {
         self.release();
-        self.frame.take().expect("buffered frame missing")
+        self.frame
+            .take()
+            .ok_or_else(|| "buffered frame missing".into())
     }
 
     fn release(&mut self) {
@@ -865,10 +867,10 @@ impl ClientSession {
         loop {
             tokio::select! {
                 frame = frames.recv() => {
-                    return frame
-                        .map(BufferedFlowFrame::into_frame)
-                        .map(UdpOpenWaitOutcome::Frame)
-                        .ok_or_else(|| "uk session closed while opening udp flow".into());
+                    let Some(frame) = frame else {
+                        return Err("uk session closed while opening udp flow".into());
+                    };
+                    return Ok(UdpOpenWaitOutcome::Frame(frame.into_frame()?));
                 }
                 read = local.read(tcp_buf) => {
                     match read {
@@ -911,10 +913,10 @@ impl ClientSession {
         loop {
             tokio::select! {
                 frame = frames.recv() => {
-                    return frame
-                        .map(BufferedFlowFrame::into_frame)
-                        .map(OpenWaitOutcome::Frame)
-                        .ok_or_else(|| "uk session closed while opening flow".into());
+                    let Some(frame) = frame else {
+                        return Err("uk session closed while opening flow".into());
+                    };
+                    return Ok(OpenWaitOutcome::Frame(frame.into_frame()?));
                 }
                 read = pending_local_data.read_from(
                     local,
@@ -2004,9 +2006,10 @@ async fn relay_udp_flow_to_client_inner(
                 return Ok(());
             }
             frame = flow.frames.recv() => {
-                let Some(frame) = frame.map(BufferedFlowFrame::into_frame) else {
+                let Some(frame) = frame else {
                     return Ok(());
                 };
+                let frame = frame.into_frame()?;
                 match frame.header.frame_type {
                     FrameType::UdpData => {
                         let packet = socks5::encode_udp_datagram(&target, &frame.payload)?;
@@ -2095,12 +2098,13 @@ async fn relay_tcp(
                 }
             }
             frame = flow.frames.recv(), if local_to_remote_open || remote_to_local_open => {
-                let Some(frame) = frame.map(BufferedFlowFrame::into_frame) else {
+                let Some(frame) = frame else {
                     local.shutdown().await?;
                     local_to_remote_open = false;
                     remote_to_local_open = false;
                     continue;
                 };
+                let frame = frame.into_frame()?;
                 match frame.header.frame_type {
                     FrameType::TcpData => {
                         if !remote_to_local_open {
@@ -2635,7 +2639,7 @@ mod tests {
             (FLOW_ID, FlowFrameRoute::Enqueued)
         );
 
-        let frame = receiver.try_recv().unwrap().into_frame();
+        let frame = receiver.try_recv().unwrap().into_frame().unwrap();
         assert_eq!(frame.header.id, FLOW_ID);
         assert_eq!(frame.payload, Bytes::from_static(b"hello"));
         assert!(flows.contains_key(&FLOW_ID));
@@ -2702,7 +2706,7 @@ mod tests {
             (FLOW_ID, FlowFrameRoute::Enqueued)
         );
 
-        let frame = receiver.try_recv().unwrap().into_frame();
+        let frame = receiver.try_recv().unwrap().into_frame().unwrap();
         assert_eq!(frame.header.frame_type, FrameType::Error);
         assert!(flows.contains_key(&FLOW_ID));
     }
@@ -2775,7 +2779,7 @@ mod tests {
         );
         assert!(!flows.contains_key(&FLOW_ID));
         assert_eq!(
-            receiver.try_recv().unwrap().into_frame().payload,
+            receiver.try_recv().unwrap().into_frame().unwrap().payload,
             Bytes::from_static(b"queued")
         );
     }
@@ -2865,9 +2869,34 @@ mod tests {
         )
         .unwrap();
 
-        let frame = buffered.into_frame();
+        let frame = buffered.into_frame().unwrap();
 
         assert_eq!(frame.payload, Bytes::from_static(b"queued"));
+        assert_eq!(flow_buffer.buffered_bytes(), 0);
+        assert_eq!(session_buffer.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn buffered_flow_frame_missing_inner_frame_returns_error_after_release() {
+        let flow_buffer = ClientFlowBufferControl::default();
+        let session_buffer = ClientSessionBufferControl::default();
+        let mut buffered = BufferedFlowFrame::new(
+            data_frame(FLOW_ID, Bytes::from_static(b"queued")),
+            flow_buffer.clone(),
+            session_buffer.clone(),
+            16,
+            16,
+        )
+        .unwrap();
+
+        let removed = buffered.frame.take();
+        assert!(removed.is_some());
+        assert_eq!(flow_buffer.buffered_bytes(), 6);
+        assert_eq!(session_buffer.buffered_bytes(), 6);
+
+        let error = buffered.into_frame().unwrap_err();
+
+        assert_eq!(error.to_string(), "buffered frame missing");
         assert_eq!(flow_buffer.buffered_bytes(), 0);
         assert_eq!(session_buffer.buffered_bytes(), 0);
     }
