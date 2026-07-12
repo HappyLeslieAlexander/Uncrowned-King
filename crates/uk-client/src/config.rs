@@ -83,8 +83,10 @@ impl ClientConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let path = path.as_ref();
         validate_sensitive_file_permissions(path, "client config")?;
-        let text = fs::read_to_string(path)?;
-        let mut config: Self = toml::from_str(&text)?;
+        let text = fs::read_to_string(path)
+            .map_err(|err| format!("failed to read client config {}: {err}", path.display()))?;
+        let mut config: Self = toml::from_str(&text)
+            .map_err(|err| format!("invalid client config {}: {err}", path.display()))?;
         config.resolve_paths(config_base_dir(path));
         Ok(config)
     }
@@ -229,7 +231,8 @@ fn validate_sensitive_file_permissions(
     path: &Path,
     label: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let metadata = fs::metadata(path)?;
+    let metadata = fs::metadata(path)
+        .map_err(|err| format!("failed to read {label} metadata {}: {err}", path.display()))?;
     if !metadata.is_file() {
         return Err(format!("{label} must be a regular file").into());
     }
@@ -287,17 +290,22 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_temp_client_config(mode: u32) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn temp_path(label: &str, extension: &str) -> std::path::PathBuf {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "uk-client-config-test-{}-{now}.toml",
+        std::env::temp_dir().join(format!(
+            "uk-client-{label}-test-{}-{now}.{extension}",
             std::process::id()
-        ));
+        ))
+    }
+
+    #[cfg(unix)]
+    fn write_temp_client_config(mode: u32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_path("config", "toml");
         fs::write(
             &path,
             r#"
@@ -339,6 +347,33 @@ secret = "0123456789abcdef0123456789abcdef"
         let _ = fs::remove_file(&path);
 
         assert_eq!(config.ca_cert_path, expected_ca_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_config_file_error_includes_path() {
+        let path = temp_path("missing-config", "toml");
+        let path_text = path.to_string_lossy().into_owned();
+
+        let error = ClientConfig::load(&path).unwrap_err().to_string();
+
+        assert!(error.contains(&path_text));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_config_toml_error_includes_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_path("invalid-config", "toml");
+        fs::write(&path, "not = [valid").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let path_text = path.to_string_lossy().into_owned();
+
+        let error = ClientConfig::load(&path).unwrap_err().to_string();
+        let _ = fs::remove_file(&path);
+
+        assert!(error.contains(&path_text));
     }
 
     #[cfg(unix)]

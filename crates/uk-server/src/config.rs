@@ -42,8 +42,10 @@ impl ServerConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let path = path.as_ref();
         validate_sensitive_file_permissions(path, "server config")?;
-        let text = fs::read_to_string(path)?;
-        let mut config: Self = toml::from_str(&text)?;
+        let text = fs::read_to_string(path)
+            .map_err(|err| format!("failed to read server config {}: {err}", path.display()))?;
+        let mut config: Self = toml::from_str(&text)
+            .map_err(|err| format!("invalid server config {}: {err}", path.display()))?;
         config.resolve_paths(config_base_dir(path));
         Ok(config)
     }
@@ -441,7 +443,8 @@ fn validate_sensitive_file_permissions(
     path: &Path,
     label: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let metadata = fs::metadata(path)?;
+    let metadata = fs::metadata(path)
+        .map_err(|err| format!("failed to read {label} metadata {}: {err}", path.display()))?;
     if !metadata.is_file() {
         return Err(format!("{label} must be a regular file").into());
     }
@@ -579,6 +582,29 @@ secret = "0123456789abcdef0123456789abcdef"
             config.policy_path.as_deref(),
             Some(expected_policy_path.as_str())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_config_file_error_includes_path() {
+        let path = temp_path("missing-config", "toml");
+        let path_text = path.to_string_lossy().into_owned();
+
+        let error = ServerConfig::load(&path).unwrap_err().to_string();
+
+        assert!(error.contains(&path_text));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_config_toml_error_includes_path() {
+        let path = write_temp_file("invalid-config", "toml", "not = [valid", 0o600);
+        let path_text = path.to_string_lossy().into_owned();
+
+        let error = ServerConfig::load(&path).unwrap_err().to_string();
+        let _ = fs::remove_file(&path);
+
+        assert!(error.contains(&path_text));
     }
 
     #[cfg(unix)]
