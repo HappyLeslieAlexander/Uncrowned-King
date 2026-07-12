@@ -5,7 +5,9 @@ pub mod config;
 mod relay;
 mod tls;
 
-use std::{future, future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    error::Error, fmt, future, future::Future, io, net::SocketAddr, sync::Arc, time::Duration,
+};
 
 use bytes::BytesMut;
 use tokio::{
@@ -26,7 +28,25 @@ use uk_proto::{
 use crate::config::ServerConfig;
 
 /// Server error type.
-pub type AnyError = Box<dyn std::error::Error + Send + Sync>;
+pub type AnyError = Box<dyn Error + Send + Sync>;
+
+#[derive(Debug)]
+struct HandshakePhaseError {
+    phase: &'static str,
+    source: AnyError,
+}
+
+impl fmt::Display for HandshakePhaseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} failed: {}", self.phase, self.source)
+    }
+}
+
+impl Error for HandshakePhaseError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
 
 struct ServerRuntime {
     config: ServerConfig,
@@ -335,15 +355,23 @@ async fn complete_handshake(
     replay_cache: Arc<Mutex<ReplayCache>>,
     config: &ServerConfig,
 ) -> Result<(TlsStream<tokio::net::TcpStream>, uk_auth::Credential), AnyError> {
-    let mut stream = acceptor.accept(tcp).await?;
-    tls::verify_alpn(&stream)?;
-    let exporter = tls::exporter(&stream)?;
+    let mut stream = acceptor
+        .accept(tcp)
+        .await
+        .map_err(|err| phase_error("tls accept", err))?;
+    tls::verify_alpn(&stream).map_err(|err| phase_error("tls alpn verify", err))?;
+    let exporter = tls::exporter(&stream).map_err(|err| phase_error("tls exporter", err))?;
     let challenge = AuthChallenge::generate(unix_now());
 
     let mut payload = BytesMut::new();
-    challenge.encode(&mut payload)?;
-    let challenge_frame = Frame::new(FrameType::AuthChallenge, 0, 0, payload.freeze())?;
-    write_frame(&mut stream, &challenge_frame).await?;
+    challenge
+        .encode(&mut payload)
+        .map_err(|err| phase_error("encode auth challenge", err))?;
+    let challenge_frame = Frame::new(FrameType::AuthChallenge, 0, 0, payload.freeze())
+        .map_err(|err| phase_error("build auth challenge frame", err))?;
+    write_frame(&mut stream, &challenge_frame)
+        .await
+        .map_err(|err| phase_error("write auth challenge", err))?;
 
     let response_frame = match read_frame(
         &mut stream,
@@ -356,13 +384,13 @@ async fn complete_handshake(
         Ok(frame) => frame,
         Err(err) => {
             report_handshake_frame_io_error(&mut stream, &err).await;
-            return Err(err.into());
+            return Err(phase_error("read auth response", err));
         }
     };
 
     if let Err(err) = validate_connection_frame(&response_frame, FrameType::AuthResponse) {
         let _ = write_connection_error(&mut stream, ErrorCode::Protocol).await;
-        return Err(err.into());
+        return Err(phase_error("validate auth response", err));
     }
 
     let mut response_payload = response_frame.payload;
@@ -370,7 +398,7 @@ async fn complete_handshake(
         Ok(response) => response,
         Err(err) => {
             let _ = write_connection_error(&mut stream, ErrorCode::AuthFailed).await;
-            return Err(err.into());
+            return Err(phase_error("decode auth response", err));
         }
     };
     let now = unix_now();
@@ -390,7 +418,7 @@ async fn complete_handshake(
         Ok(credential) => credential,
         Err(err) => {
             let _ = write_connection_error(&mut stream, ErrorCode::AuthFailed).await;
-            return Err(err.into());
+            return Err(phase_error("verify auth response", err));
         }
     };
 
@@ -408,9 +436,14 @@ async fn write_server_settings(
 ) -> Result<(), AnyError> {
     let settings = server_settings(config);
     let mut settings_payload = BytesMut::new();
-    settings.encode(&mut settings_payload)?;
-    let settings_frame = Frame::new(FrameType::Settings, 0, 0, settings_payload.freeze())?;
-    write_frame(stream, &settings_frame).await?;
+    settings
+        .encode(&mut settings_payload)
+        .map_err(|err| phase_error("encode server settings", err))?;
+    let settings_frame = Frame::new(FrameType::Settings, 0, 0, settings_payload.freeze())
+        .map_err(|err| phase_error("build server settings frame", err))?;
+    write_frame(stream, &settings_frame)
+        .await
+        .map_err(|err| phase_error("write server settings", err))?;
     Ok(())
 }
 
@@ -480,20 +513,37 @@ fn listener_shutdown_timeout(seconds: u64) -> Option<Duration> {
     (seconds != 0).then(|| Duration::from_secs(seconds))
 }
 
+fn phase_error<E>(phase: &'static str, source: E) -> AnyError
+where
+    E: Into<AnyError>,
+{
+    Box::new(HandshakePhaseError {
+        phase,
+        source: source.into(),
+    })
+}
+
 fn is_clean_tls_handshake_disconnect(error: &AnyError) -> bool {
-    error
-        .as_ref()
-        .downcast_ref::<io::Error>()
-        .is_some_and(|error| {
-            matches!(
-                error.kind(),
-                io::ErrorKind::UnexpectedEof
-                    | io::ErrorKind::ConnectionReset
-                    | io::ErrorKind::BrokenPipe
-                    | io::ErrorKind::NotConnected
-            ) || is_tls_handshake_eof(error)
-        })
-        || error.to_string() == "tls handshake eof"
+    find_io_error(error.as_ref()).is_some_and(|error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::NotConnected
+        ) || is_tls_handshake_eof(error)
+    }) || error.to_string() == "tls handshake eof"
+}
+
+fn find_io_error<'a>(error: &'a (dyn Error + 'static)) -> Option<&'a io::Error> {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(error) = error.downcast_ref::<io::Error>() {
+            return Some(error);
+        }
+        current = error.source();
+    }
+    None
 }
 
 fn is_tls_handshake_eof(error: &io::Error) -> bool {
@@ -614,6 +664,24 @@ mod tests {
         assert!(is_clean_tls_handshake_disconnect(&not_connected));
         assert!(is_clean_tls_handshake_disconnect(&rustls_eof));
         assert!(!is_clean_tls_handshake_disconnect(&protocol_error));
+    }
+
+    #[test]
+    fn handshake_phase_error_reports_phase_and_source() {
+        let error = phase_error("tls accept", "client closed");
+
+        assert_eq!(error.to_string(), "tls accept failed: client closed");
+        assert!(error.source().is_some());
+    }
+
+    #[test]
+    fn classifies_clean_disconnects_through_handshake_phase_error() {
+        let error = phase_error(
+            "tls accept",
+            io::Error::new(io::ErrorKind::UnexpectedEof, "client closed"),
+        );
+
+        assert!(is_clean_tls_handshake_disconnect(&error));
     }
 
     #[tokio::test]
