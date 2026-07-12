@@ -59,3 +59,23 @@ where
 {
     relay::run_socks5_listener_until_shutdown(config, listen, shutdown).await
 }
+
+/// Starts a local SOCKS5 service on an already-bound listener.
+pub async fn run_socks5_listener_on(
+    config: ClientConfig,
+    listener: tokio::net::TcpListener,
+) -> Result<(), AnyError> {
+    run_socks5_listener_on_until_shutdown(config, listener, future::pending()).await
+}
+
+/// Starts a local SOCKS5 service on an already-bound listener until `shutdown` resolves.
+pub async fn run_socks5_listener_on_until_shutdown<F>(
+    config: ClientConfig,
+    listener: tokio::net::TcpListener,
+    shutdown: F,
+) -> Result<(), AnyError>
+where
+    F: Future<Output = ()> + Send,
+{
+    relay::run_socks5_listener_on_until_shutdown(config, listener, shutdown).await
+}

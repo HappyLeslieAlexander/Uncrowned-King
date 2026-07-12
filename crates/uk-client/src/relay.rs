@@ -356,11 +356,24 @@ where
 {
     crate::check_config(&config)?;
     validate_endpoint("socks listen", &listen)?;
+    let listener = TcpListener::bind(&listen).await?;
+    run_socks5_listener_on_until_shutdown(config, listener, shutdown).await
+}
+
+pub(crate) async fn run_socks5_listener_on_until_shutdown<F>(
+    config: ClientConfig,
+    listener: TcpListener,
+    shutdown: F,
+) -> Result<(), AnyError>
+where
+    F: Future<Output = ()> + Send,
+{
+    crate::check_config(&config)?;
+    let listen = listener.local_addr()?;
     let socks_handshake_timeout = timeout(config.socks_handshake_timeout_seconds());
     let max_socks_connections = usize_limit(config.max_socks_connections())?;
     let sessions = Arc::new(ClientSessionManager::new(config));
     let connection_slots = Arc::new(Semaphore::new(max_socks_connections));
-    let listener = TcpListener::bind(&listen).await?;
     info!(event = "socks5.listen", listen = %listen);
 
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);

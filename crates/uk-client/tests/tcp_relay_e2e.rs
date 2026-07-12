@@ -37,7 +37,7 @@ use uk_auth::{
     verify_auth_response,
 };
 use uk_client::{
-    config::ClientConfig, connect_authenticated_carrier, run_handshake, run_socks5_listener,
+    config::ClientConfig, connect_authenticated_carrier, run_handshake, run_socks5_listener_on,
     run_socks5_listener_until_shutdown,
 };
 use uk_proto::{
@@ -777,27 +777,23 @@ async fn run_udp_associate_server_unavailable_e2e() -> Result<(), TestError> {
     let cert_path = temp_dir.join("server-cert.pem");
     fs::write(&cert_path, CERT_PEM)?;
     let server_addr = unused_loopback_addr().await?;
-    let socks_addr = unused_loopback_addr().await?;
-    let mut client_task = tokio::spawn(run_socks5_listener(
-        ClientConfig {
-            server_addr: server_addr.to_string(),
-            server_addrs: None,
-            server_name: "localhost".to_owned(),
-            ca_cert_path: path_string(&cert_path),
-            key_id: KEY_ID.to_owned(),
-            secret: SECRET.to_owned(),
-            handshake_timeout_seconds: Some(1),
-            socks_handshake_timeout_seconds: Some(3),
-            tcp_open_timeout_seconds: Some(3),
-            udp_flow_idle_timeout_seconds: None,
-            max_pending_open_bytes: None,
-            max_socks_connections: None,
-            max_buffered_bytes_per_session: None,
-            max_buffered_bytes_per_flow: None,
-        },
-        socks_addr.to_string(),
-    ));
-    wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+    let (socks_addr, client_task) = start_socks5_listener(ClientConfig {
+        server_addr: server_addr.to_string(),
+        server_addrs: None,
+        server_name: "localhost".to_owned(),
+        ca_cert_path: path_string(&cert_path),
+        key_id: KEY_ID.to_owned(),
+        secret: SECRET.to_owned(),
+        handshake_timeout_seconds: Some(1),
+        socks_handshake_timeout_seconds: Some(3),
+        tcp_open_timeout_seconds: Some(3),
+        udp_flow_idle_timeout_seconds: None,
+        max_pending_open_bytes: None,
+        max_socks_connections: None,
+        max_buffered_bytes_per_session: None,
+        max_buffered_bytes_per_flow: None,
+    })
+    .await?;
 
     let (mut socks_control, head) = open_socks_udp_associate_reply(socks_addr).await?;
     assert_eq!(head[1], SOCKS_REPLY_GENERAL_FAILURE);
@@ -2938,33 +2934,29 @@ impl MalformedFrameServerHarness {
 
         let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let server_addr = server_listener.local_addr()?;
-        let socks_addr = unused_loopback_addr().await?;
         let server_task = tokio::spawn(run_malformed_frame_server(
             server_listener,
             cert_path.clone(),
             key_path,
             scenario,
         ));
-        let mut client_task = tokio::spawn(run_socks5_listener(
-            ClientConfig {
-                server_addr: server_addr.to_string(),
-                server_addrs: None,
-                server_name: "localhost".to_owned(),
-                ca_cert_path: path_string(&cert_path),
-                key_id: KEY_ID.to_owned(),
-                secret: SECRET.to_owned(),
-                handshake_timeout_seconds: Some(3),
-                socks_handshake_timeout_seconds: Some(3),
-                tcp_open_timeout_seconds: Some(3),
-                udp_flow_idle_timeout_seconds: None,
-                max_pending_open_bytes: None,
-                max_socks_connections: None,
-                max_buffered_bytes_per_session: None,
-                max_buffered_bytes_per_flow: None,
-            },
-            socks_addr.to_string(),
-        ));
-        wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+        let (socks_addr, client_task) = start_socks5_listener(ClientConfig {
+            server_addr: server_addr.to_string(),
+            server_addrs: None,
+            server_name: "localhost".to_owned(),
+            ca_cert_path: path_string(&cert_path),
+            key_id: KEY_ID.to_owned(),
+            secret: SECRET.to_owned(),
+            handshake_timeout_seconds: Some(3),
+            socks_handshake_timeout_seconds: Some(3),
+            tcp_open_timeout_seconds: Some(3),
+            udp_flow_idle_timeout_seconds: None,
+            max_pending_open_bytes: None,
+            max_socks_connections: None,
+            max_buffered_bytes_per_session: None,
+            max_buffered_bytes_per_flow: None,
+        })
+        .await?;
 
         Ok(Self {
             temp_dir,
@@ -3010,32 +3002,28 @@ impl ClientBufferedLimitServerHarness {
 
         let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let server_addr = server_listener.local_addr()?;
-        let socks_addr = unused_loopback_addr().await?;
         let server_task = tokio::spawn(run_client_buffered_limit_server(
             server_listener,
             cert_path.clone(),
             key_path,
         ));
-        let mut client_task = tokio::spawn(run_socks5_listener(
-            ClientConfig {
-                server_addr: server_addr.to_string(),
-                server_addrs: None,
-                server_name: "localhost".to_owned(),
-                ca_cert_path: path_string(&cert_path),
-                key_id: KEY_ID.to_owned(),
-                secret: SECRET.to_owned(),
-                handshake_timeout_seconds: Some(3),
-                socks_handshake_timeout_seconds: Some(3),
-                tcp_open_timeout_seconds: Some(3),
-                udp_flow_idle_timeout_seconds: None,
-                max_pending_open_bytes: None,
-                max_socks_connections: None,
-                max_buffered_bytes_per_session: None,
-                max_buffered_bytes_per_flow: Some(1),
-            },
-            socks_addr.to_string(),
-        ));
-        wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+        let (socks_addr, client_task) = start_socks5_listener(ClientConfig {
+            server_addr: server_addr.to_string(),
+            server_addrs: None,
+            server_name: "localhost".to_owned(),
+            ca_cert_path: path_string(&cert_path),
+            key_id: KEY_ID.to_owned(),
+            secret: SECRET.to_owned(),
+            handshake_timeout_seconds: Some(3),
+            socks_handshake_timeout_seconds: Some(3),
+            tcp_open_timeout_seconds: Some(3),
+            udp_flow_idle_timeout_seconds: None,
+            max_pending_open_bytes: None,
+            max_socks_connections: None,
+            max_buffered_bytes_per_session: None,
+            max_buffered_bytes_per_flow: Some(1),
+        })
+        .await?;
 
         Ok(Self {
             temp_dir,
@@ -3095,33 +3083,29 @@ impl UdpStreamFallbackDisabledServerHarness {
 
         let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let server_addr = server_listener.local_addr()?;
-        let socks_addr = unused_loopback_addr().await?;
         let server_task = tokio::spawn(run_udp_stream_fallback_disabled_server(
             server_listener,
             cert_path.clone(),
             key_path,
             scenario,
         ));
-        let mut client_task = tokio::spawn(run_socks5_listener(
-            ClientConfig {
-                server_addr: server_addr.to_string(),
-                server_addrs: None,
-                server_name: "localhost".to_owned(),
-                ca_cert_path: path_string(&cert_path),
-                key_id: KEY_ID.to_owned(),
-                secret: SECRET.to_owned(),
-                handshake_timeout_seconds: Some(3),
-                socks_handshake_timeout_seconds: Some(3),
-                tcp_open_timeout_seconds: Some(3),
-                udp_flow_idle_timeout_seconds: None,
-                max_pending_open_bytes: None,
-                max_socks_connections: None,
-                max_buffered_bytes_per_session: None,
-                max_buffered_bytes_per_flow: None,
-            },
-            socks_addr.to_string(),
-        ));
-        wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+        let (socks_addr, client_task) = start_socks5_listener(ClientConfig {
+            server_addr: server_addr.to_string(),
+            server_addrs: None,
+            server_name: "localhost".to_owned(),
+            ca_cert_path: path_string(&cert_path),
+            key_id: KEY_ID.to_owned(),
+            secret: SECRET.to_owned(),
+            handshake_timeout_seconds: Some(3),
+            socks_handshake_timeout_seconds: Some(3),
+            tcp_open_timeout_seconds: Some(3),
+            udp_flow_idle_timeout_seconds: None,
+            max_pending_open_bytes: None,
+            max_socks_connections: None,
+            max_buffered_bytes_per_session: None,
+            max_buffered_bytes_per_flow: None,
+        })
+        .await?;
 
         Ok(Self {
             temp_dir,
@@ -3176,7 +3160,6 @@ impl AckGatedOpenServerHarness {
 
         let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let server_addr = server_listener.local_addr()?;
-        let socks_addr = unused_loopback_addr().await?;
         let (open_tx, open_rx) = oneshot::channel();
         let (ack_tx, ack_rx) = oneshot::channel();
         let server_task = tokio::spawn(run_ack_gated_open_server(
@@ -3186,26 +3169,23 @@ impl AckGatedOpenServerHarness {
             open_tx,
             ack_rx,
         ));
-        let mut client_task = tokio::spawn(run_socks5_listener(
-            ClientConfig {
-                server_addr: server_addr.to_string(),
-                server_addrs: None,
-                server_name: "localhost".to_owned(),
-                ca_cert_path: path_string(&cert_path),
-                key_id: KEY_ID.to_owned(),
-                secret: SECRET.to_owned(),
-                handshake_timeout_seconds: Some(3),
-                socks_handshake_timeout_seconds: Some(3),
-                tcp_open_timeout_seconds: Some(30),
-                udp_flow_idle_timeout_seconds: None,
-                max_pending_open_bytes: None,
-                max_socks_connections: None,
-                max_buffered_bytes_per_session: None,
-                max_buffered_bytes_per_flow: None,
-            },
-            socks_addr.to_string(),
-        ));
-        wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+        let (socks_addr, client_task) = start_socks5_listener(ClientConfig {
+            server_addr: server_addr.to_string(),
+            server_addrs: None,
+            server_name: "localhost".to_owned(),
+            ca_cert_path: path_string(&cert_path),
+            key_id: KEY_ID.to_owned(),
+            secret: SECRET.to_owned(),
+            handshake_timeout_seconds: Some(3),
+            socks_handshake_timeout_seconds: Some(3),
+            tcp_open_timeout_seconds: Some(30),
+            udp_flow_idle_timeout_seconds: None,
+            max_pending_open_bytes: None,
+            max_socks_connections: None,
+            max_buffered_bytes_per_session: None,
+            max_buffered_bytes_per_flow: None,
+        })
+        .await?;
 
         Ok(Self {
             temp_dir,
@@ -3269,32 +3249,28 @@ impl PendingOpenCancelServerHarness {
 
         let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let server_addr = server_listener.local_addr()?;
-        let socks_addr = unused_loopback_addr().await?;
         let server_task = tokio::spawn(run_pending_open_cancel_server(
             server_listener,
             cert_path.clone(),
             key_path,
         ));
-        let mut client_task = tokio::spawn(run_socks5_listener(
-            ClientConfig {
-                server_addr: server_addr.to_string(),
-                server_addrs: None,
-                server_name: "localhost".to_owned(),
-                ca_cert_path: path_string(&cert_path),
-                key_id: KEY_ID.to_owned(),
-                secret: SECRET.to_owned(),
-                handshake_timeout_seconds: Some(3),
-                socks_handshake_timeout_seconds: Some(3),
-                tcp_open_timeout_seconds: Some(tcp_open_timeout_seconds),
-                udp_flow_idle_timeout_seconds: None,
-                max_pending_open_bytes: None,
-                max_socks_connections: None,
-                max_buffered_bytes_per_session: None,
-                max_buffered_bytes_per_flow: None,
-            },
-            socks_addr.to_string(),
-        ));
-        wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+        let (socks_addr, client_task) = start_socks5_listener(ClientConfig {
+            server_addr: server_addr.to_string(),
+            server_addrs: None,
+            server_name: "localhost".to_owned(),
+            ca_cert_path: path_string(&cert_path),
+            key_id: KEY_ID.to_owned(),
+            secret: SECRET.to_owned(),
+            handshake_timeout_seconds: Some(3),
+            socks_handshake_timeout_seconds: Some(3),
+            tcp_open_timeout_seconds: Some(tcp_open_timeout_seconds),
+            udp_flow_idle_timeout_seconds: None,
+            max_pending_open_bytes: None,
+            max_socks_connections: None,
+            max_buffered_bytes_per_session: None,
+            max_buffered_bytes_per_flow: None,
+        })
+        .await?;
 
         Ok(Self {
             temp_dir,
@@ -3341,7 +3317,6 @@ impl PendingUdpOpenCancelServerHarness {
 
         let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let server_addr = server_listener.local_addr()?;
-        let socks_addr = unused_loopback_addr().await?;
         let (open_tx, open_rx) = oneshot::channel();
         let server_task = tokio::spawn(run_pending_udp_open_cancel_server(
             server_listener,
@@ -3349,26 +3324,23 @@ impl PendingUdpOpenCancelServerHarness {
             key_path,
             open_tx,
         ));
-        let mut client_task = tokio::spawn(run_socks5_listener(
-            ClientConfig {
-                server_addr: server_addr.to_string(),
-                server_addrs: None,
-                server_name: "localhost".to_owned(),
-                ca_cert_path: path_string(&cert_path),
-                key_id: KEY_ID.to_owned(),
-                secret: SECRET.to_owned(),
-                handshake_timeout_seconds: Some(3),
-                socks_handshake_timeout_seconds: Some(3),
-                tcp_open_timeout_seconds: Some(30),
-                udp_flow_idle_timeout_seconds: None,
-                max_pending_open_bytes: None,
-                max_socks_connections: None,
-                max_buffered_bytes_per_session: None,
-                max_buffered_bytes_per_flow: None,
-            },
-            socks_addr.to_string(),
-        ));
-        wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+        let (socks_addr, client_task) = start_socks5_listener(ClientConfig {
+            server_addr: server_addr.to_string(),
+            server_addrs: None,
+            server_name: "localhost".to_owned(),
+            ca_cert_path: path_string(&cert_path),
+            key_id: KEY_ID.to_owned(),
+            secret: SECRET.to_owned(),
+            handshake_timeout_seconds: Some(3),
+            socks_handshake_timeout_seconds: Some(3),
+            tcp_open_timeout_seconds: Some(30),
+            udp_flow_idle_timeout_seconds: None,
+            max_pending_open_bytes: None,
+            max_socks_connections: None,
+            max_buffered_bytes_per_session: None,
+            max_buffered_bytes_per_flow: None,
+        })
+        .await?;
 
         Ok(Self {
             temp_dir,
@@ -3438,33 +3410,29 @@ impl MissingPongServerHarness {
 
         let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let server_addr = server_listener.local_addr()?;
-        let socks_addr = unused_loopback_addr().await?;
         let server_task = tokio::spawn(run_missing_pong_server(
             server_listener,
             cert_path.clone(),
             key_path,
             pong_behavior,
         ));
-        let mut client_task = tokio::spawn(run_socks5_listener(
-            ClientConfig {
-                server_addr: server_addr.to_string(),
-                server_addrs: None,
-                server_name: "localhost".to_owned(),
-                ca_cert_path: path_string(&cert_path),
-                key_id: KEY_ID.to_owned(),
-                secret: SECRET.to_owned(),
-                handshake_timeout_seconds: Some(3),
-                socks_handshake_timeout_seconds: Some(3),
-                tcp_open_timeout_seconds: Some(3),
-                udp_flow_idle_timeout_seconds: None,
-                max_pending_open_bytes: None,
-                max_socks_connections: None,
-                max_buffered_bytes_per_session: None,
-                max_buffered_bytes_per_flow: None,
-            },
-            socks_addr.to_string(),
-        ));
-        wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+        let (socks_addr, client_task) = start_socks5_listener(ClientConfig {
+            server_addr: server_addr.to_string(),
+            server_addrs: None,
+            server_name: "localhost".to_owned(),
+            ca_cert_path: path_string(&cert_path),
+            key_id: KEY_ID.to_owned(),
+            secret: SECRET.to_owned(),
+            handshake_timeout_seconds: Some(3),
+            socks_handshake_timeout_seconds: Some(3),
+            tcp_open_timeout_seconds: Some(3),
+            udp_flow_idle_timeout_seconds: None,
+            max_pending_open_bytes: None,
+            max_socks_connections: None,
+            max_buffered_bytes_per_session: None,
+            max_buffered_bytes_per_flow: None,
+        })
+        .await?;
 
         Ok(Self {
             temp_dir,
@@ -3962,7 +3930,6 @@ impl RelayHarness {
         };
 
         let server_addr = unused_loopback_addr().await?;
-        let socks_addr = unused_loopback_addr().await?;
         let mut server_task = tokio::spawn(uk_server::run(ServerConfig {
             listen: server_addr.to_string(),
             cert_path: path_string(&cert_path),
@@ -3981,26 +3948,23 @@ impl RelayHarness {
         }));
         wait_for_listener("uk-server", server_addr, &mut server_task).await?;
 
-        let mut client_task = tokio::spawn(run_socks5_listener(
-            ClientConfig {
-                server_addr: server_addr.to_string(),
-                server_addrs: None,
-                server_name: "localhost".to_owned(),
-                ca_cert_path: path_string(&cert_path),
-                key_id: KEY_ID.to_owned(),
-                secret: SECRET.to_owned(),
-                handshake_timeout_seconds: Some(3),
-                socks_handshake_timeout_seconds: Some(socks_handshake_timeout_seconds),
-                tcp_open_timeout_seconds: Some(3),
-                udp_flow_idle_timeout_seconds,
-                max_pending_open_bytes: None,
-                max_socks_connections,
-                max_buffered_bytes_per_session: None,
-                max_buffered_bytes_per_flow: None,
-            },
-            socks_addr.to_string(),
-        ));
-        wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+        let (socks_addr, client_task) = start_socks5_listener(ClientConfig {
+            server_addr: server_addr.to_string(),
+            server_addrs: None,
+            server_name: "localhost".to_owned(),
+            ca_cert_path: path_string(&cert_path),
+            key_id: KEY_ID.to_owned(),
+            secret: SECRET.to_owned(),
+            handshake_timeout_seconds: Some(3),
+            socks_handshake_timeout_seconds: Some(socks_handshake_timeout_seconds),
+            tcp_open_timeout_seconds: Some(3),
+            udp_flow_idle_timeout_seconds,
+            max_pending_open_bytes: None,
+            max_socks_connections,
+            max_buffered_bytes_per_session: None,
+            max_buffered_bytes_per_flow: None,
+        })
+        .await?;
 
         Ok(Self {
             temp_dir,
@@ -4257,6 +4221,17 @@ async fn wait_for_listener(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     Err(format!("listener did not start at {addr}").into())
+}
+
+async fn start_socks5_listener(
+    config: ClientConfig,
+) -> Result<(SocketAddr, JoinHandle<Result<(), TestError>>), TestError> {
+    uk_client::check_config(&config)?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let socks_addr = listener.local_addr()?;
+    let mut client_task = tokio::spawn(run_socks5_listener_on(config, listener));
+    wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+    Ok((socks_addr, client_task))
 }
 
 async fn open_socks_connect(
