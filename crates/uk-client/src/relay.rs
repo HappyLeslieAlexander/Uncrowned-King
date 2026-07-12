@@ -88,7 +88,7 @@ struct ClientSessionManager {
 #[derive(Clone, Debug)]
 struct CachedConnectFailure {
     message: Arc<str>,
-    expires_at: time::Instant,
+    expires_at: Option<time::Instant>,
 }
 
 #[derive(Debug)]
@@ -663,12 +663,14 @@ impl ClientSessionManager {
     async fn recent_connect_failure_if_active(&self) -> Option<CachedConnectFailure> {
         let mut recent = self.recent_connect_failure.lock().await;
         let failure = recent.as_ref()?;
-        if time::Instant::now() < failure.expires_at {
-            return Some(failure.clone());
+        if let Some(expires_at) = failure.expires_at {
+            if time::Instant::now() >= expires_at {
+                *recent = None;
+                return None;
+            }
         }
 
-        *recent = None;
-        None
+        Some(failure.clone())
     }
 
     async fn remember_connect_failure(&self, error: &AnyError) {
@@ -678,7 +680,7 @@ impl ClientSessionManager {
         let mut recent = self.recent_connect_failure.lock().await;
         *recent = Some(CachedConnectFailure {
             message: Arc::from(error.to_string()),
-            expires_at: time::Instant::now() + delay,
+            expires_at: retry_delay_expires_at(delay),
         });
     }
 
@@ -2478,6 +2480,10 @@ fn retry_delay(milliseconds: u64) -> Option<Duration> {
     (milliseconds != 0).then(|| Duration::from_millis(milliseconds))
 }
 
+fn retry_delay_expires_at(delay: Duration) -> Option<time::Instant> {
+    time::Instant::now().checked_add(delay)
+}
+
 fn cached_connect_failure_error(failure: CachedConnectFailure) -> AnyError {
     Box::new(CachedConnectFailureError {
         message: failure.message,
@@ -3586,11 +3592,16 @@ mod tests {
         let manager = ClientSessionManager::new(minimal_config());
         *manager.recent_connect_failure.lock().await = Some(CachedConnectFailure {
             message: Arc::from("old failure"),
-            expires_at: time::Instant::now() - Duration::from_millis(1),
+            expires_at: Some(time::Instant::now() - Duration::from_millis(1)),
         });
 
         assert!(manager.recent_connect_failure_if_active().await.is_none());
         assert!(manager.recent_connect_failure.lock().await.is_none());
+    }
+
+    #[test]
+    fn unrepresentable_retry_delay_expiry_is_treated_as_non_expiring() {
+        assert_eq!(retry_delay_expires_at(Duration::MAX), None);
     }
 
     #[test]

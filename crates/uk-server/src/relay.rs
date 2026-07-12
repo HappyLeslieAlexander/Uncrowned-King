@@ -2671,7 +2671,7 @@ fn spawn_target_connects<T>(
 }
 
 fn target_connect_deadline(duration: Option<Duration>) -> Option<time::Instant> {
-    duration.map(|duration| time::Instant::now() + duration)
+    duration.and_then(|duration| time::Instant::now().checked_add(duration))
 }
 
 async fn with_target_connect_deadline<T, F>(
@@ -3812,6 +3812,11 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(OpenFailure::TargetTimeout)));
+    }
+
+    #[test]
+    fn unrepresentable_target_connect_deadline_disables_timeout() {
+        assert_eq!(target_connect_deadline(Some(Duration::MAX)), None);
     }
 
     #[tokio::test]
