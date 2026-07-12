@@ -26,7 +26,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{Barrier, oneshot},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
 };
 use tokio_rustls::{
     TlsAcceptor, TlsConnector, client::TlsStream as ClientTlsStream,
@@ -584,6 +584,11 @@ async fn enforces_server_handshake_limit() -> Result<(), TestError> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relays_concurrent_socks_flows_over_one_session() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_concurrent_multiplex_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relays_many_concurrent_socks_flows_over_one_session() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(20), run_many_concurrent_multiplex_e2e()).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1657,6 +1662,43 @@ async fn run_concurrent_multiplex_e2e() -> Result<(), TestError> {
     second_socks.shutdown().await?;
     assert_eq!(first_target_task.await??, first_payload);
     assert_eq!(second_target_task.await??, second_payload);
+    Ok(())
+}
+
+async fn run_many_concurrent_multiplex_e2e() -> Result<(), TestError> {
+    const FLOW_COUNT: usize = 32;
+
+    init_tracing();
+
+    let barrier = Arc::new(Barrier::new(FLOW_COUNT));
+    let mut targets = Vec::with_capacity(FLOW_COUNT);
+    for index in 0..FLOW_COUNT {
+        let mut payload = patterned_payload(1024 + index * 37);
+        payload[0] = u8::try_from(index)?;
+        let (addr, task) = spawn_barrier_echo_target(payload.len(), Arc::clone(&barrier)).await?;
+        targets.push((addr, task, payload));
+    }
+
+    let mut limits = test_limits_with_max_streams(FLOW_COUNT as u64);
+    limits.max_outbound_dials_per_session = Some(FLOW_COUNT as u64);
+    let harness =
+        RelayHarness::start_with_limits(Some(allow_loopback_any_port_policy()), limits).await?;
+
+    let mut client_tasks = JoinSet::new();
+    for (target_addr, _, payload) in &targets {
+        let socks_addr = harness.socks_addr;
+        let target_addr = *target_addr;
+        let payload = payload.clone();
+        client_tasks
+            .spawn(async move { assert_echo_roundtrip(socks_addr, target_addr, &payload).await });
+    }
+    while let Some(result) = client_tasks.join_next().await {
+        result??;
+    }
+
+    for (_, target_task, payload) in targets {
+        assert_eq!(target_task.await??, payload);
+    }
     Ok(())
 }
 
