@@ -5,13 +5,13 @@ pub mod config;
 mod relay;
 mod tls;
 
-use std::{future, future::Future, io, sync::Arc, time::Duration};
+use std::{future, future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::BytesMut;
 use tokio::{
     io::AsyncWriteExt,
     net::TcpListener,
-    sync::{Mutex, Semaphore, watch},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch},
     task::JoinSet,
     time,
 };
@@ -34,6 +34,18 @@ struct ServerRuntime {
     policy_set: Arc<uk_policy::PolicySet>,
     replay_cache: Arc<Mutex<ReplayCache>>,
     acceptor: TlsAcceptor,
+    max_sessions: usize,
+    max_handshakes: usize,
+}
+
+#[derive(Clone)]
+struct ConnectionRuntime {
+    acceptor: TlsAcceptor,
+    credentials: Arc<Vec<uk_auth::Credential>>,
+    policy_set: Arc<uk_policy::PolicySet>,
+    replay_cache: Arc<Mutex<ReplayCache>>,
+    session_permits: Arc<Semaphore>,
+    config: ServerConfig,
     max_sessions: usize,
 }
 
@@ -86,9 +98,11 @@ where
         replay_cache,
         acceptor,
         max_sessions,
+        max_handshakes,
     } = runtime;
     let listen = listener.local_addr()?;
     let session_permits = Arc::new(Semaphore::new(max_sessions));
+    let handshake_permits = Arc::new(Semaphore::new(max_handshakes));
     let shutdown_timeout = listener_shutdown_timeout(config.shutdown_timeout_seconds());
 
     info!(event = "server.listen", listen = %listen);
@@ -106,37 +120,32 @@ where
             }
             accepted = listener.accept() => {
                 let (mut tcp, peer) = accepted?;
-                let Ok(session_permit) = Arc::clone(&session_permits).try_acquire_owned() else {
-                    warn!(event = "server.session.limit", peer = %peer, max_sessions);
+                let Ok(handshake_permit) = Arc::clone(&handshake_permits).try_acquire_owned() else {
+                    warn!(event = "server.handshake.limit", peer = %peer, max_handshakes);
                     if let Err(err) = tcp.shutdown().await {
                         debug!(
-                            event = "server.session.limit_shutdown_error",
+                            event = "server.handshake.limit_shutdown_error",
                             peer = %peer,
                             error = %err
                         );
                     }
                     continue;
                 };
-                let acceptor = acceptor.clone();
-                let credentials = Arc::clone(&credentials);
-                let policy_set = Arc::clone(&policy_set);
-                let replay_cache = Arc::clone(&replay_cache);
-                let config = config.clone();
+                let connection_runtime = ConnectionRuntime {
+                    acceptor: acceptor.clone(),
+                    credentials: Arc::clone(&credentials),
+                    policy_set: Arc::clone(&policy_set),
+                    replay_cache: Arc::clone(&replay_cache),
+                    session_permits: Arc::clone(&session_permits),
+                    config: config.clone(),
+                    max_sessions,
+                };
                 let shutdown_rx = shutdown_tx.subscribe();
 
                 connections.spawn(async move {
-                    let _session_permit = session_permit;
                     if let Err(err) =
-                        handle_connection(
-                            acceptor,
-                            tcp,
-                            credentials,
-                            policy_set,
-                            replay_cache,
-                            config,
-                            shutdown_rx,
-                        )
-                        .await
+                        handle_connection(connection_runtime, tcp, handshake_permit, peer, shutdown_rx)
+                            .await
                     {
                         if is_clean_tls_handshake_disconnect(&err) {
                             debug!(event = "tls.handshake.closed", peer = %peer);
@@ -173,6 +182,7 @@ fn prepare_server_runtime(config: ServerConfig) -> Result<ServerRuntime, AnyErro
     let tls_config = tls::server_config(&config.cert_path, &config.key_path)?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
     let max_sessions = usize_limit("max_sessions", config.max_sessions())?;
+    let max_handshakes = usize_limit("max_handshakes", config.max_handshakes())?;
 
     Ok(ServerRuntime {
         config,
@@ -181,6 +191,7 @@ fn prepare_server_runtime(config: ServerConfig) -> Result<ServerRuntime, AnyErro
         replay_cache,
         acceptor,
         max_sessions,
+        max_handshakes,
     })
 }
 
@@ -216,14 +227,21 @@ async fn join_connection_tasks(connections: &mut JoinSet<()>) {
 }
 
 async fn handle_connection(
-    acceptor: TlsAcceptor,
+    runtime: ConnectionRuntime,
     tcp: tokio::net::TcpStream,
-    credentials: Arc<Vec<uk_auth::Credential>>,
-    policy_set: Arc<uk_policy::PolicySet>,
-    replay_cache: Arc<Mutex<ReplayCache>>,
-    config: ServerConfig,
+    handshake_permit: OwnedSemaphorePermit,
+    peer: SocketAddr,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AnyError> {
+    let ConnectionRuntime {
+        acceptor,
+        credentials,
+        policy_set,
+        replay_cache,
+        session_permits,
+        config,
+        max_sessions,
+    } = runtime;
     tcp.set_nodelay(true)?;
     if *shutdown_rx.borrow() {
         return Ok(());
@@ -245,16 +263,27 @@ async fn handle_connection(
         }
     };
 
-    let (stream, credential) = tokio::select! {
+    let (mut stream, credential) = tokio::select! {
         result = handshake => result?,
         changed = shutdown_rx.changed() => {
             let _ = changed;
             return Ok(());
         }
     };
+    drop(handshake_permit);
     if *shutdown_rx.borrow() {
         return Ok(());
     }
+
+    let Ok(session_permit) = session_permits.try_acquire_owned() else {
+        warn!(event = "server.session.limit", peer = %peer, max_sessions);
+        let _ = write_connection_error(&mut stream, ErrorCode::ResourceLimit).await;
+        let _ = stream.shutdown().await;
+        return Err("authenticated session limit exceeded".into());
+    };
+    let _session_permit = session_permit;
+
+    write_server_settings(&mut stream, &config).await?;
 
     relay::relay_session(
         stream,
@@ -370,13 +399,19 @@ async fn complete_handshake(
         key_id_hex = %hex_encode(&credential.key_id)
     );
 
+    Ok((stream, credential))
+}
+
+async fn write_server_settings(
+    stream: &mut TlsStream<tokio::net::TcpStream>,
+    config: &ServerConfig,
+) -> Result<(), AnyError> {
     let settings = server_settings(config);
     let mut settings_payload = BytesMut::new();
     settings.encode(&mut settings_payload)?;
     let settings_frame = Frame::new(FrameType::Settings, 0, 0, settings_payload.freeze())?;
-    write_frame(&mut stream, &settings_frame).await?;
-
-    Ok((stream, credential))
+    write_frame(stream, &settings_frame).await?;
+    Ok(())
 }
 
 async fn write_connection_error(

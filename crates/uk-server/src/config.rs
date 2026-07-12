@@ -104,6 +104,8 @@ impl ServerConfig {
         )?;
         reject_zero_limit("max_sessions", self.max_sessions())?;
         reject_semaphore_permit_limit("max_sessions", self.max_sessions())?;
+        reject_zero_limit("max_handshakes", self.max_handshakes())?;
+        reject_semaphore_permit_limit("max_handshakes", self.max_handshakes())?;
         reject_zero_limit("max_streams", self.max_streams())?;
         reject_large_limit("max_udp_flows", self.max_udp_flows(), self.max_streams())?;
         reject_zero_limit(
@@ -180,6 +182,14 @@ impl ServerConfig {
             .as_ref()
             .and_then(|limits| limits.max_sessions)
             .unwrap_or(1024)
+    }
+
+    /// Configured maximum concurrent unauthenticated TLS/auth handshakes.
+    pub fn max_handshakes(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.max_handshakes)
+            .unwrap_or_else(|| self.max_sessions())
     }
 
     /// Configured maximum concurrent TCP streams per authenticated session.
@@ -353,6 +363,8 @@ pub struct LimitConfig {
     pub max_frame_size: Option<u64>,
     /// Maximum concurrent carrier sessions accepted by the server.
     pub max_sessions: Option<u64>,
+    /// Maximum concurrent unauthenticated TLS/auth handshakes.
+    pub max_handshakes: Option<u64>,
     /// Maximum concurrent TCP streams per authenticated session.
     pub max_streams: Option<u64>,
     /// Maximum concurrent UDP flows per authenticated session. Zero disables UDP relay.
@@ -947,6 +959,36 @@ max_sessions = 128
     }
 
     #[test]
+    fn defaults_max_handshakes_limit_to_session_limit() {
+        let mut config = minimal_config();
+        config.limits = Some(LimitConfig {
+            max_sessions: Some(17),
+            ..LimitConfig::default()
+        });
+
+        assert_eq!(config.max_handshakes(), 17);
+    }
+
+    #[test]
+    fn parses_max_handshakes_limit() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_sessions = 128
+max_handshakes = 12
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.max_handshakes(), 12);
+    }
+
+    #[test]
     fn defaults_outbound_dials_limit() {
         assert_eq!(minimal_config().max_outbound_dials_per_session(), 16);
     }
@@ -1331,6 +1373,43 @@ credentials = []
 
 [limits]
 max_sessions = {}
+"#,
+            Semaphore::MAX_PERMITS as u64 + 1
+        ))
+        .unwrap();
+
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_handshake_limit() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_handshakes = 0
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_handshake_limit_above_semaphore_capacity() {
+        let config: ServerConfig = toml::from_str(&format!(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_handshakes = {}
 "#,
             Semaphore::MAX_PERMITS as u64 + 1
         ))

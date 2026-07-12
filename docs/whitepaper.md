@@ -216,6 +216,7 @@ Default limits:
 max_frame_size = 65536 bytes
 max_pre_auth_bytes = 4096 bytes
 max_sessions = 1024 carrier sessions
+max_handshakes = 1024 unauthenticated TLS/auth handshakes
 max_outbound_dials_per_session = 16 target socket dials
 max_buffered_bytes_per_session = 16777216 bytes
 max_target_host_len = 255 bytes

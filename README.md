@@ -52,9 +52,10 @@ ordered rules are evaluated, including `169.254.169.254`, `100.100.100.200`,
 and `fd00:ec2::254`.
 
 Server limits can advertise and enforce the maximum frame size, concurrent
-carrier sessions, concurrent TCP streams per authenticated session, in-flight
-target socket dials per session, concurrent UDP relay flows, queued
-client-to-target bytes per session and per flow, plus idle timeouts:
+carrier sessions, concurrent unauthenticated handshakes, concurrent TCP streams
+per authenticated session, in-flight target socket dials per session, concurrent
+UDP relay flows, queued client-to-target bytes per session and per flow, plus
+idle timeouts:
 
 ```toml
 auth_skew_seconds = 30
@@ -63,6 +64,7 @@ auth_skew_seconds = 30
 max_pre_auth_bytes = 4096
 max_frame_size = 65536
 max_sessions = 1024
+max_handshakes = 1024
 max_streams = 64
 max_udp_flows = 64
 max_outbound_dials_per_session = 16

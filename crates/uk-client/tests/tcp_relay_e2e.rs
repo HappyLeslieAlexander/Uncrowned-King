@@ -572,6 +572,11 @@ async fn enforces_server_session_limit() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enforces_server_handshake_limit() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_server_handshake_limit_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relays_concurrent_socks_flows_over_one_session() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_concurrent_multiplex_e2e()).await?
 }
@@ -1542,21 +1547,32 @@ async fn run_server_session_limit_e2e() -> Result<(), TestError> {
     init_tracing();
 
     let harness = ServerHarness::start(test_limits_with_max_sessions(1)).await?;
-    let _held_carrier = connect_tls_carrier_after_probe(&harness).await?;
+    let _held_carrier = connect_authenticated_carrier(harness.client_config(SECRET)).await?;
+    let error = run_handshake(harness.client_config(SECRET))
+        .await
+        .expect_err("second authenticated carrier should fail while max_sessions is exhausted");
+    let text = error.to_string();
+
+    assert!(
+        text.contains("ResourceLimit"),
+        "session limit error should report ResourceLimit, got: {text}"
+    );
+    Ok(())
+}
+
+async fn run_server_handshake_limit_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = ServerHarness::start(test_limits_with_max_handshakes(1)).await?;
+    let _held_handshake = connect_tls_carrier_after_probe(&harness).await?;
+
     let mut rejected = TcpStream::connect(harness.server_addr).await?;
     let mut buf = [0_u8; 1];
     let bytes_read =
         tokio::time::timeout(Duration::from_secs(3), rejected.read(&mut buf)).await??;
     assert_eq!(
         bytes_read, 0,
-        "server should close over-limit TCP sessions cleanly"
-    );
-
-    let result = run_handshake(harness.client_config(SECRET)).await;
-
-    assert!(
-        result.is_err(),
-        "second carrier should fail while max_sessions is exhausted"
+        "server should close over-limit handshake TCP connections cleanly"
     );
     Ok(())
 }
@@ -5122,6 +5138,7 @@ fn test_limits() -> LimitConfig {
         max_pre_auth_bytes: Some(4096),
         max_frame_size: Some(65_536),
         max_sessions: Some(32),
+        max_handshakes: Some(32),
         max_streams: Some(8),
         max_udp_flows: None,
         max_outbound_dials_per_session: Some(8),
@@ -5159,6 +5176,12 @@ fn test_limits_with_udp_idle_timeout(udp_flow_idle_timeout_seconds: u64) -> Limi
 fn test_limits_with_max_sessions(max_sessions: u64) -> LimitConfig {
     let mut limits = test_limits();
     limits.max_sessions = Some(max_sessions);
+    limits
+}
+
+fn test_limits_with_max_handshakes(max_handshakes: u64) -> LimitConfig {
+    let mut limits = test_limits();
+    limits.max_handshakes = Some(max_handshakes);
     limits
 }
 
