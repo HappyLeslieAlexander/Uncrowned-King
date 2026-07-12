@@ -43,12 +43,21 @@ pub async fn connect_authenticated_carrier(
     session::connect_authenticated(&config).await
 }
 
-/// Starts a local SOCKS5 listener backed by UK TCP and UDP relay.
+/// Starts a SOCKS5 listener backed by UK TCP and UDP relay.
+///
+/// This library API does not add SOCKS authentication or restrict the listen
+/// address. Callers should use loopback or enforce separate network access
+/// controls. The `uk-client` binary requires an explicit override for
+/// non-loopback addresses.
 pub async fn run_socks5_listener(config: ClientConfig, listen: String) -> Result<(), AnyError> {
     run_socks5_listener_until_shutdown(config, listen, future::pending()).await
 }
 
-/// Starts a local SOCKS5 listener until `shutdown` resolves.
+/// Starts a SOCKS5 listener until `shutdown` resolves.
+///
+/// This library API does not add SOCKS authentication or restrict the listen
+/// address. Callers should use loopback or enforce separate network access
+/// controls.
 pub async fn run_socks5_listener_until_shutdown<F>(
     config: ClientConfig,
     listen: String,
@@ -60,7 +69,10 @@ where
     relay::run_socks5_listener_until_shutdown(config, listen, shutdown).await
 }
 
-/// Starts a local SOCKS5 service on an already-bound listener.
+/// Starts a SOCKS5 service on an already-bound listener.
+///
+/// The caller owns listener exposure and access control. SOCKS authentication
+/// is not provided by this API.
 pub async fn run_socks5_listener_on(
     config: ClientConfig,
     listener: tokio::net::TcpListener,
@@ -68,7 +80,10 @@ pub async fn run_socks5_listener_on(
     run_socks5_listener_on_until_shutdown(config, listener, future::pending()).await
 }
 
-/// Starts a local SOCKS5 service on an already-bound listener until `shutdown` resolves.
+/// Starts a SOCKS5 service on an already-bound listener until `shutdown` resolves.
+///
+/// The caller owns listener exposure and access control. SOCKS authentication
+/// is not provided by this API.
 pub async fn run_socks5_listener_on_until_shutdown<F>(
     config: ClientConfig,
     listener: tokio::net::TcpListener,

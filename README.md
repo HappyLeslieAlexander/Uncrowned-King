@@ -154,6 +154,11 @@ uk-server --config examples/server.toml serve
 uk-client --config examples/client.toml socks5 --listen 127.0.0.1:1080
 ```
 
+The `uk-client` binary refuses to expose its unauthenticated SOCKS5 listener on
+a non-loopback address by default. Controlled LAN deployments must explicitly
+acknowledge that exposure with `--allow-non-loopback` and provide host firewall
+or network access controls.
+
 Both long-running listeners stop gracefully on Ctrl+C or SIGTERM.
 
 Configured endpoints use `host:port` syntax. IPv6 literals must be bracketed,

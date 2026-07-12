@@ -30,6 +30,11 @@ uk-server --config examples/server.toml serve
 uk-client --config examples/client.toml socks5 --listen 127.0.0.1:1080
 ```
 
+The client rejects non-loopback SOCKS5 listen addresses unless
+`--allow-non-loopback` is set. Because the local SOCKS5 endpoint has no user
+authentication, use that override only with separate firewall or network
+access controls.
+
 Both long-running commands stop gracefully on Ctrl+C or SIGTERM.
 
 Replace the example shared secret before using these configs anywhere outside a
