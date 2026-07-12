@@ -136,6 +136,24 @@ async fn relays_udp_through_socks5_to_echo_target() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drops_oversized_socks_udp_datagram_without_closing_session() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_oversized_socks_udp_datagram_drop_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drops_oversized_target_udp_datagram_without_closing_flow() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_oversized_target_udp_datagram_drop_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enforces_declared_udp_associate_client_endpoint() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -705,6 +723,68 @@ async fn run_udp_relay_e2e() -> Result<(), TestError> {
     assert_eq!(reply_payload, payload);
 
     echo_task.await??;
+    Ok(())
+}
+
+async fn run_oversized_socks_udp_datagram_drop_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, echo_task) = spawn_udp_echo_target().await?;
+    let harness = RelayHarness::start_with_limits(
+        Some(allow_loopback_policy(target_addr.port())),
+        test_limits_with_max_frame_size(512),
+    )
+    .await?;
+    let (_socks_control, udp_relay_addr) = open_socks_udp_associate(harness.socks_addr).await?;
+    let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let oversized = vec![0x42; 900];
+    let small = b"Uncrowned King udp survives oversized upstream";
+
+    udp_client
+        .send_to(&socks_udp_datagram(target_addr, &oversized), udp_relay_addr)
+        .await?;
+    assert_no_socks_udp_datagram(&udp_client).await?;
+
+    udp_client
+        .send_to(&socks_udp_datagram(target_addr, small), udp_relay_addr)
+        .await?;
+    let (reply_target, reply_payload) =
+        recv_socks_udp_datagram(&udp_client, udp_relay_addr).await?;
+    assert_eq!(reply_target, target_addr);
+    assert_eq!(reply_payload, small);
+
+    echo_task.await??;
+    Ok(())
+}
+
+async fn run_oversized_target_udp_datagram_drop_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, target_task) = spawn_udp_oversized_then_echo_target(900).await?;
+    let harness = RelayHarness::start_with_limits(
+        Some(allow_loopback_policy(target_addr.port())),
+        test_limits_with_max_frame_size(512),
+    )
+    .await?;
+    let (_socks_control, udp_relay_addr) = open_socks_udp_associate(harness.socks_addr).await?;
+    let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let first = b"Uncrowned King trigger oversized downstream";
+    let second = b"Uncrowned King udp survives oversized downstream";
+
+    udp_client
+        .send_to(&socks_udp_datagram(target_addr, first), udp_relay_addr)
+        .await?;
+    assert_no_socks_udp_datagram(&udp_client).await?;
+
+    udp_client
+        .send_to(&socks_udp_datagram(target_addr, second), udp_relay_addr)
+        .await?;
+    let (reply_target, reply_payload) =
+        recv_socks_udp_datagram(&udp_client, udp_relay_addr).await?;
+    assert_eq!(reply_target, target_addr);
+    assert_eq!(reply_payload, second);
+
+    target_task.await??;
     Ok(())
 }
 
@@ -4233,6 +4313,24 @@ async fn spawn_udp_echo_target()
     Ok((addr, task))
 }
 
+async fn spawn_udp_oversized_then_echo_target(
+    oversized_len: usize,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<Result<(), TestError>>), TestError> {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = socket.local_addr()?;
+    let task = tokio::spawn(async move {
+        let mut buf = [0_u8; 1024];
+        let (_read, peer) = socket.recv_from(&mut buf).await?;
+        let oversized = vec![0x5a; oversized_len];
+        socket.send_to(&oversized, peer).await?;
+
+        let (read, peer) = socket.recv_from(&mut buf).await?;
+        socket.send_to(&buf[..read], peer).await?;
+        Ok(())
+    });
+    Ok((addr, task))
+}
+
 async fn spawn_udp_downstream_activity_target()
 -> Result<(SocketAddr, tokio::task::JoinHandle<Result<(), TestError>>), TestError> {
     let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -4921,6 +5019,17 @@ async fn recv_socks_udp_datagram(
         tokio::time::timeout(Duration::from_secs(3), udp_client.recv_from(&mut buf)).await??;
     assert_eq!(peer, udp_relay_addr);
     parse_socks_udp_datagram(&buf[..read])
+}
+
+async fn assert_no_socks_udp_datagram(udp_client: &UdpSocket) -> Result<(), TestError> {
+    let mut buf = [0_u8; 2048];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), udp_client.recv_from(&mut buf))
+            .await
+            .is_err(),
+        "unexpected SOCKS UDP datagram"
+    );
+    Ok(())
 }
 
 async fn assert_echo_roundtrip(

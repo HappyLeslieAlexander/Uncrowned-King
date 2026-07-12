@@ -1832,6 +1832,11 @@ impl UdpAssociation {
             UdpAssociationFlowLookup::NoFlow => return Ok(true),
             UdpAssociationFlowLookup::Cancelled => return Ok(false),
         };
+        let max_payload_len = flow.session.data_frame_size;
+        if udp_payload_exceeds_frame_limit(datagram.payload.len(), max_payload_len) {
+            warn_oversized_udp_datagram(&datagram.target, datagram.payload.len(), max_payload_len);
+            return Ok(true);
+        }
         flow.session
             .send_udp_data(flow.id, datagram.payload)
             .await?;
@@ -2047,6 +2052,19 @@ fn matches_requested_ip_port(peer: SocketAddr, requested_ip: IpAddr, requested_p
 
 fn matches_requested_port(peer: SocketAddr, requested_port: u16) -> bool {
     requested_port == 0 || peer.port() == requested_port
+}
+
+fn udp_payload_exceeds_frame_limit(payload_len: usize, max_payload_len: usize) -> bool {
+    payload_len > max_payload_len
+}
+
+fn warn_oversized_udp_datagram(target: &Target, payload_len: usize, max_payload_len: usize) {
+    warn!(
+        event = "client.udp.datagram.too_large",
+        target = %target.log_safe(),
+        payload_len,
+        max_payload_len
+    );
 }
 
 impl UdpAssociationFlow {
@@ -3605,6 +3623,12 @@ mod tests {
             }),
             RELAY_BUFFER_SIZE
         );
+    }
+
+    #[test]
+    fn udp_payload_frame_limit_allows_boundary_only() {
+        assert!(!udp_payload_exceeds_frame_limit(512, 512));
+        assert!(udp_payload_exceeds_frame_limit(513, 512));
     }
 
     #[test]

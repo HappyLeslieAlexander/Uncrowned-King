@@ -44,6 +44,7 @@ const TARGET_WRITE_QUEUE_CAPACITY: usize = 32;
 const SESSION_EVENT_QUEUE_BASE_CAPACITY: usize = 64;
 const SESSION_EVENT_QUEUE_PER_FLOW_CAPACITY: usize = 4;
 const SESSION_EVENT_QUEUE_MAX_CAPACITY: usize = 4096;
+const UDP_TARGET_BUFFER_SIZE: usize = 65_536;
 
 type AnyError = Box<dyn Error + Send + Sync>;
 type FlowTable = HashMap<u64, FlowSlot>;
@@ -2295,7 +2296,7 @@ async fn relay_udp_target_to_client(
     shutdown: &SessionShutdown,
     data_frame_size: usize,
 ) -> Result<(), AnyError> {
-    let mut target_buf = vec![0_u8; data_frame_size].into_boxed_slice();
+    let mut target_buf = vec![0_u8; UDP_TARGET_BUFFER_SIZE].into_boxed_slice();
     loop {
         if shutdown.is_closed() || flow_control.is_aborted() {
             return Ok(());
@@ -2308,6 +2309,15 @@ async fn relay_udp_target_to_client(
         if shutdown.is_closed() || flow_control.is_aborted() {
             return Ok(());
         }
+        if udp_payload_exceeds_frame_limit(read, data_frame_size) {
+            warn!(
+                event = "udp.target.datagram.too_large",
+                flow_id,
+                payload_len = read,
+                max_payload_len = data_frame_size
+            );
+            continue;
+        }
         send_udp_data(
             carrier_writer,
             flow_id,
@@ -2316,6 +2326,10 @@ async fn relay_udp_target_to_client(
         .await?;
         try_record_flow_activity(event_tx, FlowEvent::UdpActivity(flow_id));
     }
+}
+
+fn udp_payload_exceeds_frame_limit(payload_len: usize, max_payload_len: usize) -> bool {
+    payload_len > max_payload_len
 }
 
 fn close_target_flows(target_writers: &mut FlowTable) {
@@ -4017,6 +4031,12 @@ mod tests {
             }),
             RELAY_BUFFER_SIZE
         );
+    }
+
+    #[test]
+    fn udp_payload_frame_limit_allows_boundary_only() {
+        assert!(!udp_payload_exceeds_frame_limit(512, 512));
+        assert!(udp_payload_exceeds_frame_limit(513, 512));
     }
 
     #[test]
