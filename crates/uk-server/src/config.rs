@@ -74,7 +74,8 @@ impl ServerConfig {
         };
         let text = fs::read_to_string(path)
             .map_err(|err| format!("failed to read policy file {path}: {err}"))?;
-        Ok(PolicySet::from_toml(&text)?)
+        PolicySet::from_toml(&text)
+            .map_err(|err| format!("invalid policy file {path}: {err}").into())
     }
 
     /// Validates configured resource limits.
@@ -811,6 +812,27 @@ max_udp_flows = 3
         config.policy_path = Some(path.clone());
 
         let error = config.policy_set().unwrap_err().to_string();
+
+        assert!(error.contains(&path));
+    }
+
+    #[test]
+    fn invalid_policy_file_error_includes_path() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "uk-server-invalid-policy-test-{}-{now}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, "not = [valid").unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let mut config = minimal_config();
+        config.policy_path = Some(path.clone());
+
+        let error = config.policy_set().unwrap_err().to_string();
+        let _ = fs::remove_file(&path);
 
         assert!(error.contains(&path));
     }

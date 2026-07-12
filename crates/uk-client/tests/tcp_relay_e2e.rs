@@ -116,7 +116,9 @@ const TARGET_HALF_CLOSE_TIMEOUT_GREETING: &[u8] =
 const LARGE_PAYLOAD_LEN: usize = 128 * 1024 + 123;
 const SMALL_FRAME_PAYLOAD_LEN: usize = 8 * 1024 + 37;
 const TEST_LOOPBACK_PORT_BASE: u16 = 20_000;
-const TEST_LOOPBACK_PORT_SPAN: u16 = 28_000;
+// Keep hand-picked test ports below Linux's default ephemeral range
+// (32768+) so parallel bind(127.0.0.1:0) tests do not race with them.
+const TEST_LOOPBACK_PORT_SPAN: u16 = 12_000;
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_LOOPBACK_PORT_OFFSET: AtomicU16 = AtomicU16::new(0);
 static TEST_LOOPBACK_START_OFFSET: OnceLock<u16> = OnceLock::new();
