@@ -2342,11 +2342,8 @@ async fn connect_allowed_target(
     open_dial_limiter: &OpenDialLimiter,
     target_connect_timeout: Option<Duration>,
 ) -> Result<TcpStream, OpenFailure> {
-    with_optional_timeout(
-        target_connect_timeout,
-        connect_allowed_target_inner(target, credential, policy_set, open_dial_limiter),
-    )
-    .await
+    let deadline = target_connect_deadline(target_connect_timeout);
+    connect_allowed_target_inner(target, credential, policy_set, open_dial_limiter, deadline).await
 }
 
 async fn connect_allowed_target_inner(
@@ -2354,8 +2351,10 @@ async fn connect_allowed_target_inner(
     credential: &Credential,
     policy_set: &PolicySet,
     open_dial_limiter: &OpenDialLimiter,
+    target_connect_deadline: Option<time::Instant>,
 ) -> Result<TcpStream, OpenFailure> {
-    let addrs = resolve_target(target).await?;
+    let addrs =
+        with_target_connect_deadline(target_connect_deadline, resolve_target(target)).await?;
     let resolved_ips = resolved_ips(target, &addrs);
     let context = PolicyContext {
         key_id: &credential.key_id,
@@ -2366,7 +2365,7 @@ async fn connect_allowed_target_inner(
     if policy_set.evaluate(&context) != PolicyDecision::Allow {
         return Err(OpenFailure::PolicyDenied);
     }
-    connect_socket_addrs(&addrs, open_dial_limiter).await
+    connect_socket_addrs(&addrs, open_dial_limiter, target_connect_deadline).await
 }
 
 async fn connect_allowed_udp_target(
@@ -2376,11 +2375,9 @@ async fn connect_allowed_udp_target(
     open_dial_limiter: &OpenDialLimiter,
     target_connect_timeout: Option<Duration>,
 ) -> Result<UdpSocket, OpenFailure> {
-    with_optional_timeout(
-        target_connect_timeout,
-        connect_allowed_udp_target_inner(target, credential, policy_set, open_dial_limiter),
-    )
-    .await
+    let deadline = target_connect_deadline(target_connect_timeout);
+    connect_allowed_udp_target_inner(target, credential, policy_set, open_dial_limiter, deadline)
+        .await
 }
 
 async fn connect_allowed_udp_target_inner(
@@ -2388,8 +2385,10 @@ async fn connect_allowed_udp_target_inner(
     credential: &Credential,
     policy_set: &PolicySet,
     open_dial_limiter: &OpenDialLimiter,
+    target_connect_deadline: Option<time::Instant>,
 ) -> Result<UdpSocket, OpenFailure> {
-    let addrs = resolve_target(target).await?;
+    let addrs =
+        with_target_connect_deadline(target_connect_deadline, resolve_target(target)).await?;
     let resolved_ips = resolved_ips(target, &addrs);
     let context = PolicyContext {
         key_id: &credential.key_id,
@@ -2400,7 +2399,7 @@ async fn connect_allowed_udp_target_inner(
     if policy_set.evaluate(&context) != PolicyDecision::Allow {
         return Err(OpenFailure::PolicyDenied);
     }
-    connect_udp_socket_addrs(&addrs, open_dial_limiter).await
+    connect_udp_socket_addrs(&addrs, open_dial_limiter, target_connect_deadline).await
 }
 
 async fn resolve_target(target: &Target) -> Result<Vec<SocketAddr>, OpenFailure> {
@@ -2448,17 +2447,31 @@ fn resolved_ips(target: &Target, addrs: &[SocketAddr]) -> Vec<IpAddr> {
 async fn connect_socket_addrs(
     addrs: &[SocketAddr],
     open_dial_limiter: &OpenDialLimiter,
+    target_connect_deadline: Option<time::Instant>,
 ) -> Result<TcpStream, OpenFailure> {
     let connector = target_connector();
-    connect_first_successful(addrs, &connector, open_dial_limiter).await
+    connect_first_successful(
+        addrs,
+        &connector,
+        open_dial_limiter,
+        target_connect_deadline,
+    )
+    .await
 }
 
 async fn connect_udp_socket_addrs(
     addrs: &[SocketAddr],
     open_dial_limiter: &OpenDialLimiter,
+    target_connect_deadline: Option<time::Instant>,
 ) -> Result<UdpSocket, OpenFailure> {
     let connector = udp_target_connector();
-    connect_first_successful(addrs, &connector, open_dial_limiter).await
+    connect_first_successful(
+        addrs,
+        &connector,
+        open_dial_limiter,
+        target_connect_deadline,
+    )
+    .await
 }
 
 fn target_connector() -> TargetConnector<TcpStream> {
@@ -2544,6 +2557,7 @@ async fn connect_first_successful<T>(
     addrs: &[SocketAddr],
     connector: &TargetConnector<T>,
     open_dial_limiter: &OpenDialLimiter,
+    target_connect_deadline: Option<time::Instant>,
 ) -> Result<T, OpenFailure>
 where
     T: Send + 'static,
@@ -2553,6 +2567,10 @@ where
 
     let mut last_error = None;
     loop {
+        if target_connect_deadline.is_some_and(|deadline| deadline <= time::Instant::now()) {
+            abort_connect_tasks(&mut tasks).await;
+            return Err(OpenFailure::TargetTimeout);
+        }
         spawn_target_connects(
             addrs,
             &mut next_index,
@@ -2567,7 +2585,8 @@ where
             break;
         }
 
-        let Some(result) = tasks.join_next().await else {
+        let result = join_next_connect_task(&mut tasks, target_connect_deadline).await?;
+        let Some(result) = result else {
             break;
         };
         match result {
@@ -2589,6 +2608,26 @@ where
     Err(OpenFailure::TargetUnavailable(last_error.unwrap_or_else(
         || io::Error::new(io::ErrorKind::NotFound, "target has no socket addresses"),
     )))
+}
+
+async fn join_next_connect_task<T>(
+    tasks: &mut ConnectTasks<T>,
+    target_connect_deadline: Option<time::Instant>,
+) -> Result<Option<Result<(SocketAddr, io::Result<T>), tokio::task::JoinError>>, OpenFailure>
+where
+    T: Send + 'static,
+{
+    if let Some(deadline) = target_connect_deadline {
+        tokio::select! {
+            result = tasks.join_next() => Ok(result),
+            () = time::sleep_until(deadline) => {
+                abort_connect_tasks(tasks).await;
+                Err(OpenFailure::TargetTimeout)
+            }
+        }
+    } else {
+        Ok(tasks.join_next().await)
+    }
 }
 
 async fn abort_connect_tasks<T>(tasks: &mut ConnectTasks<T>)
@@ -2617,15 +2656,19 @@ fn spawn_target_connects<T>(
     }
 }
 
-async fn with_optional_timeout<T, F>(
-    duration: Option<Duration>,
+fn target_connect_deadline(duration: Option<Duration>) -> Option<time::Instant> {
+    duration.map(|duration| time::Instant::now() + duration)
+}
+
+async fn with_target_connect_deadline<T, F>(
+    deadline: Option<time::Instant>,
     future: F,
 ) -> Result<T, OpenFailure>
 where
     F: Future<Output = Result<T, OpenFailure>>,
 {
-    if let Some(duration) = duration {
-        tokio::time::timeout(duration, future)
+    if let Some(deadline) = deadline {
+        tokio::time::timeout_at(deadline, future)
             .await
             .map_err(|_| OpenFailure::TargetTimeout)?
     } else {
@@ -3746,8 +3789,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn optional_timeout_maps_elapsed_to_target_timeout() {
-        let result = with_optional_timeout(Some(Duration::from_millis(1)), async {
+    async fn target_connect_deadline_maps_elapsed_to_target_timeout() {
+        let deadline = time::Instant::now() + Duration::from_millis(1);
+        let result = with_target_connect_deadline(Some(deadline), async {
             tokio::time::sleep(Duration::from_millis(50)).await;
             Ok(())
         })
@@ -3758,25 +3802,60 @@ mod tests {
 
     #[tokio::test]
     async fn target_connect_timeout_releases_candidate_permits() {
+        struct ActiveCandidateGuard {
+            active: Arc<AtomicUsize>,
+        }
+
+        impl Drop for ActiveCandidateGuard {
+            fn drop(&mut self) {
+                self.active.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
         let first_addr = SocketAddr::from(([127, 0, 0, 1], 10_001));
         let second_addr = SocketAddr::from(([127, 0, 0, 1], 10_002));
         let addrs = [first_addr, second_addr];
         let limiter = OpenDialLimiter::new(2);
-        let connector: TargetConnector<SocketAddr> =
+        let active = Arc::new(AtomicUsize::new(0));
+        let (started_tx, mut started_rx) = mpsc::channel(2);
+        let connector: TargetConnector<SocketAddr> = {
+            let active = Arc::clone(&active);
             Arc::new(move |addr| -> BoxedConnectFuture<SocketAddr> {
+                let active = Arc::clone(&active);
+                let started_tx = started_tx.clone();
                 Box::pin(async move {
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _guard = ActiveCandidateGuard { active };
+                    let _ = started_tx.send(addr).await;
                     std::future::pending::<()>().await;
                     (addr, Ok(addr))
                 })
-            });
+            })
+        };
 
-        let result = with_optional_timeout(
-            Some(Duration::from_millis(1)),
-            connect_first_successful(&addrs, &connector, &limiter),
-        )
-        .await;
+        let deadline = time::Instant::now() + Duration::from_millis(50);
+        let connector_for_task = Arc::clone(&connector);
+        let limiter_for_task = limiter.clone();
+        let result_task = tokio::spawn(async move {
+            connect_first_successful(
+                &addrs,
+                &connector_for_task,
+                &limiter_for_task,
+                Some(deadline),
+            )
+            .await
+        });
+
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let result = result_task.await.unwrap();
 
         assert!(matches!(result, Err(OpenFailure::TargetTimeout)));
+        assert_eq!(active.load(Ordering::SeqCst), 0);
         assert_eq!(limiter.available_permits(), 2);
     }
 
@@ -3802,7 +3881,7 @@ mod tests {
 
         let connected = tokio::time::timeout(
             Duration::from_millis(100),
-            connect_first_successful(&addrs, &connector, &limiter),
+            connect_first_successful(&addrs, &connector, &limiter, None),
         )
         .await
         .expect("later candidate should complete before the first candidate")
@@ -3829,7 +3908,7 @@ mod tests {
             })
         };
 
-        let result = connect_first_successful(&addrs, &connector, &limiter).await;
+        let result = connect_first_successful(&addrs, &connector, &limiter, None).await;
 
         assert!(matches!(result, Err(OpenFailure::ResourceLimit)));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -3901,7 +3980,7 @@ mod tests {
 
         let connected = tokio::time::timeout(
             Duration::from_secs(1),
-            connect_first_successful(&addrs, &connector, &limiter),
+            connect_first_successful(&addrs, &connector, &limiter, None),
         )
         .await
         .expect("connect should not hang")
