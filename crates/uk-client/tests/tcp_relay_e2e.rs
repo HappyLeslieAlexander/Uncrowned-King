@@ -450,6 +450,15 @@ async fn socks_listener_stops_on_shutdown_signal() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn socks_listener_cancels_pending_open_on_shutdown_signal() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_socks_listener_shutdown_cancels_pending_open_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn socks_listener_stops_while_server_connect_is_pending() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -2605,6 +2614,69 @@ async fn run_socks_listener_shutdown_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+async fn run_socks_listener_shutdown_cancels_pending_open_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    fs::write(&cert_path, CERT_PEM)?;
+    write_private_key(&key_path)?;
+
+    let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let server_addr = server_listener.local_addr()?;
+    let (open_tx, open_rx) = oneshot::channel();
+    let server_task = tokio::spawn(run_pending_open_cancel_server_with_signal(
+        server_listener,
+        cert_path.clone(),
+        key_path,
+        Some(open_tx),
+    ));
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (socks_addr, client_task) = start_socks5_listener_until_shutdown(
+        ClientConfig {
+            server_addr: server_addr.to_string(),
+            server_addrs: None,
+            server_name: "localhost".to_owned(),
+            ca_cert_path: path_string(&cert_path),
+            key_id: KEY_ID.to_owned(),
+            secret: SECRET.to_owned(),
+            handshake_timeout_seconds: Some(3),
+            socks_handshake_timeout_seconds: Some(3),
+            tcp_open_timeout_seconds: Some(30),
+            udp_flow_idle_timeout_seconds: None,
+            max_pending_open_bytes: None,
+            max_socks_connections: None,
+            max_buffered_bytes_per_session: None,
+            max_buffered_bytes_per_flow: None,
+        },
+        async {
+            let _ = shutdown_rx.await;
+        },
+    )
+    .await?;
+
+    let mut socks = TcpStream::connect(socks_addr).await?;
+    let request = socks_connect_request(SocketAddr::from((Ipv4Addr::LOCALHOST, 80)));
+    socks.write_all(&request).await?;
+    let mut method_response = [0_u8; 2];
+    socks.read_exact(&mut method_response).await?;
+    assert_eq!(method_response, [0x05, 0x00]);
+    tokio::time::timeout(Duration::from_secs(3), open_rx).await??;
+
+    shutdown_tx
+        .send(())
+        .map_err(|()| "client shutdown receiver dropped")?;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), server_task).await???,
+        TCP_CLOSE_ERROR
+    );
+    tokio::time::timeout(Duration::from_secs(3), client_task).await???;
+    let _ = fs::remove_dir_all(&temp_dir);
+    Ok(())
+}
+
 async fn run_socks_listener_shutdown_during_connect_e2e() -> Result<(), TestError> {
     run_socks_listener_shutdown_during_connect_with_request(socks_connect_request(
         SocketAddr::from((Ipv4Addr::LOCALHOST, 80)),
@@ -3617,12 +3689,24 @@ async fn run_pending_open_cancel_server(
     cert_path: PathBuf,
     key_path: PathBuf,
 ) -> Result<u16, TestError> {
+    run_pending_open_cancel_server_with_signal(listener, cert_path, key_path, None).await
+}
+
+async fn run_pending_open_cancel_server_with_signal(
+    listener: TcpListener,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    open_tx: Option<oneshot::Sender<()>>,
+) -> Result<u16, TestError> {
     let mut stream = accept_fake_server_session(listener, cert_path, key_path).await?;
     let open_frame = read_frame(&mut stream, FrameLimits::default()).await?;
     assert_eq!(open_frame.header.frame_type, FrameType::TcpOpen);
     let flow_id = open_frame.header.id;
     let mut open_payload = open_frame.payload;
     TcpOpen::decode(&mut open_payload)?;
+    if let Some(open_tx) = open_tx {
+        let _ = open_tx.send(());
+    }
 
     let close_frame = tokio::time::timeout(
         Duration::from_secs(3),

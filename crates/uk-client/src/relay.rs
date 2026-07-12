@@ -384,7 +384,6 @@ where
         tokio::select! {
             () = &mut shutdown => {
                 info!(event = "socks5.shutdown");
-                sessions.shutdown().await;
                 let _ = shutdown_tx.send(true);
                 break;
             }
@@ -435,6 +434,7 @@ where
     while let Some(joined) = connections.join_next().await {
         log_socks_task_result(Some(joined));
     }
+    sessions.shutdown().await;
 
     Ok(())
 }
@@ -474,13 +474,23 @@ impl ClientSessionManager {
         &self,
         target: Target,
         local: &mut TcpStream,
+        shutdown_rx: &mut watch::Receiver<bool>,
     ) -> Result<OpenOutcome, AnyError> {
+        if *shutdown_rx.borrow() {
+            return Ok(OpenOutcome::Cancelled);
+        }
         let mut pending_local_data = PendingOpenLocalData::default();
         let mut last_error = None;
         for attempt in 0..2 {
-            let session = self.current_session().await?;
+            let session = tokio::select! {
+                result = self.current_session() => result?,
+                changed = shutdown_rx.changed() => {
+                    let _ = changed;
+                    return Ok(OpenOutcome::Cancelled);
+                }
+            };
             match session
-                .open_flow(target.clone(), local, &mut pending_local_data)
+                .open_flow(target.clone(), local, &mut pending_local_data, shutdown_rx)
                 .await
             {
                 Ok(outcome) => return Ok(outcome),
@@ -508,6 +518,9 @@ impl ClientSessionManager {
     ) -> Result<OpenOutcome, AnyError> {
         let mut last_error = None;
         for attempt in 0..2 {
+            if *shutdown_rx.borrow() {
+                return Ok(OpenOutcome::Cancelled);
+            }
             let session = tokio::select! {
                 result = self.current_session() => result?,
                 changed = shutdown_rx.changed() => {
@@ -667,6 +680,7 @@ impl ClientSession {
         target: Target,
         local: &mut TcpStream,
         pending_local_data: &mut PendingOpenLocalData,
+        shutdown_rx: &mut watch::Receiver<bool>,
     ) -> Result<OpenOutcome, AnyError> {
         if self.is_closed() {
             return Err("uk session is closed".into());
@@ -692,7 +706,13 @@ impl ClientSession {
             pending_local_data: Vec::new(),
         };
         let frame = match self
-            .wait_for_open_frame(flow_id, &mut flow.frames, local, pending_local_data)
+            .wait_for_open_frame(
+                flow_id,
+                &mut flow.frames,
+                local,
+                pending_local_data,
+                shutdown_rx,
+            )
             .await?
         {
             OpenWaitOutcome::Frame(frame) => frame,
@@ -780,11 +800,18 @@ impl ClientSession {
         frames: &mut mpsc::Receiver<BufferedFlowFrame>,
         local: &mut TcpStream,
         pending_local_data: &mut PendingOpenLocalData,
+        shutdown_rx: &mut watch::Receiver<bool>,
     ) -> Result<OpenWaitOutcome, AnyError> {
         if let Some(timeout) = self.open_timeout {
             if let Ok(result) = time::timeout(
                 timeout,
-                self.wait_for_open_frame_inner(flow_id, frames, local, pending_local_data),
+                self.wait_for_open_frame_inner(
+                    flow_id,
+                    frames,
+                    local,
+                    pending_local_data,
+                    shutdown_rx,
+                ),
             )
             .await
             {
@@ -795,7 +822,7 @@ impl ClientSession {
                 Ok(OpenWaitOutcome::TimedOut)
             }
         } else {
-            self.wait_for_open_frame_inner(flow_id, frames, local, pending_local_data)
+            self.wait_for_open_frame_inner(flow_id, frames, local, pending_local_data, shutdown_rx)
                 .await
         }
     }
@@ -879,6 +906,7 @@ impl ClientSession {
         frames: &mut mpsc::Receiver<BufferedFlowFrame>,
         local: &mut TcpStream,
         pending_local_data: &mut PendingOpenLocalData,
+        shutdown_rx: &mut watch::Receiver<bool>,
     ) -> Result<OpenWaitOutcome, AnyError> {
         loop {
             tokio::select! {
@@ -910,6 +938,11 @@ impl ClientSession {
                             return Ok(OpenWaitOutcome::LocalResourceLimit);
                         }
                     }
+                }
+                changed = shutdown_rx.changed() => {
+                    let _ = changed;
+                    self.cancel_pending_open(flow_id).await;
+                    return Ok(OpenWaitOutcome::Cancelled);
                 }
             }
         }
@@ -1507,14 +1540,9 @@ async fn handle_socks_connection(
     };
 
     transition(&mut state, ClientConnectionState::Opening);
-    let open_result = tokio::select! {
-        result = sessions.open_flow(target, &mut local) => result,
-        changed = shutdown_rx.changed() => {
-            let _ = changed;
-            transition(&mut state, ClientConnectionState::Closed);
-            return Ok(());
-        }
-    };
+    let open_result = sessions
+        .open_flow(target, &mut local, &mut shutdown_rx)
+        .await;
     let flow = match open_result {
         Ok(OpenOutcome::Open(flow)) => flow,
         Ok(OpenOutcome::Rejected(reply)) => {
