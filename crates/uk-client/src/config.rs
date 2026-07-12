@@ -28,6 +28,8 @@ pub struct ClientConfig {
     pub secret: String,
     /// Optional server connection and authentication timeout in seconds.
     pub handshake_timeout_seconds: Option<u64>,
+    /// Optional cooldown after a failed server connection attempt in milliseconds.
+    pub server_connect_retry_delay_millis: Option<u64>,
     /// Optional SOCKS5 greeting/request timeout in seconds.
     pub socks_handshake_timeout_seconds: Option<u64>,
     /// Optional timeout for waiting on TCP open acknowledgement in seconds.
@@ -57,6 +59,10 @@ impl fmt::Debug for ClientConfig {
             .field("key_id", &self.key_id)
             .field("secret", &"<redacted>")
             .field("handshake_timeout_seconds", &self.handshake_timeout_seconds)
+            .field(
+                "server_connect_retry_delay_millis",
+                &self.server_connect_retry_delay_millis,
+            )
             .field(
                 "socks_handshake_timeout_seconds",
                 &self.socks_handshake_timeout_seconds,
@@ -97,6 +103,11 @@ impl ClientConfig {
     /// Server connection and authentication timeout in seconds. Zero disables it.
     pub fn handshake_timeout_seconds(&self) -> u64 {
         self.handshake_timeout_seconds.unwrap_or(10)
+    }
+
+    /// Cooldown after a failed server connection attempt in milliseconds. Zero disables it.
+    pub fn server_connect_retry_delay_millis(&self) -> u64 {
+        self.server_connect_retry_delay_millis.unwrap_or(250)
     }
 
     /// SOCKS5 greeting/request timeout in seconds. Zero disables it.
@@ -291,6 +302,7 @@ mod tests {
             key_id: "client".to_owned(),
             secret: "0123456789abcdef0123456789abcdef".to_owned(),
             handshake_timeout_seconds: None,
+            server_connect_retry_delay_millis: None,
             socks_handshake_timeout_seconds: None,
             tcp_open_timeout_seconds: None,
             udp_flow_idle_timeout_seconds: None,
@@ -431,6 +443,28 @@ handshake_timeout_seconds = 4
         .unwrap();
 
         assert_eq!(config.handshake_timeout_seconds(), 4);
+    }
+
+    #[test]
+    fn defaults_server_connect_retry_delay() {
+        assert_eq!(minimal_config().server_connect_retry_delay_millis(), 250);
+    }
+
+    #[test]
+    fn parses_server_connect_retry_delay() {
+        let config: ClientConfig = toml::from_str(
+            r#"
+server_addr = "127.0.0.1:443"
+server_name = "localhost"
+ca_cert_path = "ca.pem"
+key_id = "client"
+secret = "secret"
+server_connect_retry_delay_millis = 75
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.server_connect_retry_delay_millis(), 75);
     }
 
     #[test]
@@ -686,6 +720,7 @@ ca_cert_path = "ca.pem"
 key_id = "client"
 secret = "secret"
 handshake_timeout_seconds = 0
+server_connect_retry_delay_millis = 0
 socks_handshake_timeout_seconds = 0
 tcp_open_timeout_seconds = 0
 udp_flow_idle_timeout_seconds = 0
@@ -699,6 +734,7 @@ max_buffered_bytes_per_flow = 1024
         .unwrap();
 
         assert_eq!(config.handshake_timeout_seconds(), 0);
+        assert_eq!(config.server_connect_retry_delay_millis(), 0);
         assert_eq!(config.socks_handshake_timeout_seconds(), 0);
         assert_eq!(config.tcp_open_timeout_seconds(), 0);
         assert_eq!(config.udp_flow_idle_timeout_seconds(), 0);

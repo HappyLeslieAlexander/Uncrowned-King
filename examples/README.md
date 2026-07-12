@@ -37,6 +37,8 @@ local throwaway environment.
 
 Client `server_addrs` entries are tried after `server_addr`; each configured
 server endpoint gets its own `handshake_timeout_seconds` budget.
+`server_connect_retry_delay_millis = 250` briefly suppresses repeated server
+connect attempts after a failure burst.
 
 The example limits enable UDP relay with `max_udp_flows = 64` and close
 per-target UDP flows after `udp_flow_idle_timeout_seconds = 120` seconds with no

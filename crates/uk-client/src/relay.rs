@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
     error::Error,
+    fmt,
     future::Future,
     io,
     net::{IpAddr, SocketAddr},
@@ -79,8 +80,33 @@ struct ClientSessionManager {
     config: ClientConfig,
     current: Mutex<Option<Arc<ClientSession>>>,
     connect_lock: Mutex<()>,
+    recent_connect_failure: Mutex<Option<CachedConnectFailure>>,
+    connect_retry_delay: Option<Duration>,
     closed: AtomicBool,
 }
+
+#[derive(Clone, Debug)]
+struct CachedConnectFailure {
+    message: Arc<str>,
+    expires_at: time::Instant,
+}
+
+#[derive(Debug)]
+struct CachedConnectFailureError {
+    message: Arc<str>,
+}
+
+impl fmt::Display for CachedConnectFailureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "recent UK session connect failed; retry cooldown active: {}",
+            self.message
+        )
+    }
+}
+
+impl Error for CachedConnectFailureError {}
 
 struct ClientFlow {
     id: u64,
@@ -488,10 +514,13 @@ fn is_clean_socks_disconnect(error: &AnyError) -> bool {
 
 impl ClientSessionManager {
     fn new(config: ClientConfig) -> Self {
+        let connect_retry_delay = retry_delay(config.server_connect_retry_delay_millis());
         Self {
             config,
             current: Mutex::new(None),
             connect_lock: Mutex::new(()),
+            recent_connect_failure: Mutex::new(None),
+            connect_retry_delay,
             closed: AtomicBool::new(false),
         }
     }
@@ -581,6 +610,9 @@ impl ClientSessionManager {
         if let Some(session) = self.current_session_if_live().await {
             return Ok(session);
         }
+        if let Some(failure) = self.recent_connect_failure_if_active().await {
+            return Err(cached_connect_failure_error(failure));
+        }
 
         let _connect_guard = self.connect_lock.lock().await;
         if self.is_closed() {
@@ -589,9 +621,19 @@ impl ClientSessionManager {
         if let Some(session) = self.current_session_if_live().await {
             return Ok(session);
         }
+        if let Some(failure) = self.recent_connect_failure_if_active().await {
+            return Err(cached_connect_failure_error(failure));
+        }
 
         info!(event = "client.session.connect");
-        let session = ClientSession::connect(&self.config).await?;
+        let session = match ClientSession::connect(&self.config).await {
+            Ok(session) => session,
+            Err(err) => {
+                self.remember_connect_failure(&err).await;
+                return Err(err);
+            }
+        };
+        self.clear_connect_failure().await;
         if self.is_closed() {
             session.close().await;
             return Err("client session manager is shutting down".into());
@@ -616,6 +658,32 @@ impl ClientSessionManager {
 
         *current = None;
         None
+    }
+
+    async fn recent_connect_failure_if_active(&self) -> Option<CachedConnectFailure> {
+        let mut recent = self.recent_connect_failure.lock().await;
+        let failure = recent.as_ref()?;
+        if time::Instant::now() < failure.expires_at {
+            return Some(failure.clone());
+        }
+
+        *recent = None;
+        None
+    }
+
+    async fn remember_connect_failure(&self, error: &AnyError) {
+        let Some(delay) = self.connect_retry_delay else {
+            return;
+        };
+        let mut recent = self.recent_connect_failure.lock().await;
+        *recent = Some(CachedConnectFailure {
+            message: Arc::from(error.to_string()),
+            expires_at: time::Instant::now() + delay,
+        });
+    }
+
+    async fn clear_connect_failure(&self) {
+        *self.recent_connect_failure.lock().await = None;
     }
 
     async fn invalidate(&self, session: &Arc<ClientSession>) {
@@ -2415,6 +2483,16 @@ fn timeout(seconds: u64) -> Option<Duration> {
     (seconds != 0).then(|| Duration::from_secs(seconds))
 }
 
+fn retry_delay(milliseconds: u64) -> Option<Duration> {
+    (milliseconds != 0).then(|| Duration::from_millis(milliseconds))
+}
+
+fn cached_connect_failure_error(failure: CachedConnectFailure) -> AnyError {
+    Box::new(CachedConnectFailureError {
+        message: failure.message,
+    })
+}
+
 fn transition(state: &mut ClientConnectionState, next: ClientConnectionState) {
     let from = *state;
     debug_assert!(
@@ -2466,6 +2544,7 @@ mod tests {
             key_id: "client".to_owned(),
             secret: "0123456789abcdef0123456789abcdef".to_owned(),
             handshake_timeout_seconds: None,
+            server_connect_retry_delay_millis: None,
             socks_handshake_timeout_seconds: None,
             tcp_open_timeout_seconds: None,
             udp_flow_idle_timeout_seconds: None,
@@ -2479,6 +2558,13 @@ mod tests {
 
     fn boxed_io_error(kind: io::ErrorKind) -> AnyError {
         io::Error::new(kind, "test error").into()
+    }
+
+    fn expect_session_error(result: Result<Arc<ClientSession>, AnyError>) -> AnyError {
+        match result {
+            Ok(_) => panic!("session connect unexpectedly succeeded"),
+            Err(err) => err,
+        }
     }
 
     fn status_payload(code: ErrorCode) -> Bytes {
@@ -3462,6 +3548,47 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn session_manager_reuses_recent_connect_failure_during_retry_delay() {
+        let mut config = minimal_config();
+        config.server_connect_retry_delay_millis = Some(250);
+        let manager = ClientSessionManager::new(config);
+
+        let first = expect_session_error(manager.current_session().await);
+        assert!(!first.to_string().contains("retry cooldown active"));
+
+        let second = expect_session_error(manager.current_session().await);
+        let text = second.to_string();
+
+        assert!(text.contains("retry cooldown active"));
+        assert!(text.contains("missing-ca.pem"));
+    }
+
+    #[tokio::test]
+    async fn session_manager_can_disable_connect_failure_retry_delay() {
+        let mut config = minimal_config();
+        config.server_connect_retry_delay_millis = Some(0);
+        let manager = ClientSessionManager::new(config);
+
+        let first = expect_session_error(manager.current_session().await);
+        let second = expect_session_error(manager.current_session().await);
+
+        assert!(!first.to_string().contains("retry cooldown active"));
+        assert!(!second.to_string().contains("retry cooldown active"));
+    }
+
+    #[tokio::test]
+    async fn expired_session_connect_failure_cache_is_cleared() {
+        let manager = ClientSessionManager::new(minimal_config());
+        *manager.recent_connect_failure.lock().await = Some(CachedConnectFailure {
+            message: Arc::from("old failure"),
+            expires_at: time::Instant::now() - Duration::from_millis(1),
+        });
+
+        assert!(manager.recent_connect_failure_if_active().await.is_none());
+        assert!(manager.recent_connect_failure.lock().await.is_none());
     }
 
     #[test]

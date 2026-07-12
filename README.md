@@ -99,8 +99,11 @@ Client configs may also set `handshake_timeout_seconds = 10` to bound each
 server endpoint attempt, including TCP connect, TLS handshake, authentication
 exchange, and SETTINGS read. Set `server_addrs = ["backup.example.com:443"]`
 to try fallback server endpoints after `server_addr`; each endpoint receives
-its own handshake timeout budget. Fallback endpoints must not duplicate
-`server_addr` or each other.
+its own handshake timeout budget. After all endpoints fail,
+`server_connect_retry_delay_millis = 250` briefly reuses the recent failure for
+other waiting SOCKS requests instead of immediately dialing the same failed
+endpoints again. Set it to `0` to disable this cooldown. Fallback endpoints must
+not duplicate `server_addr` or each other.
 When running the SOCKS5 listener, `socks_handshake_timeout_seconds = 10` bounds
 the local SOCKS greeting and CONNECT request. `tcp_open_timeout_seconds = 10`
 bounds waiting for a UK TCP open response from the server.
