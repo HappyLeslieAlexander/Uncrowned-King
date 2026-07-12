@@ -27,7 +27,7 @@ use tokio::{
     time,
 };
 use tokio_rustls::server::TlsStream;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, Span, debug, info, warn};
 use uk_auth::AuthenticatedIdentity;
 use uk_policy::{PolicyContext, PolicyDecision, PolicySet};
 use uk_proto::{
@@ -93,10 +93,14 @@ impl SessionTasks {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let handle = self.tasks.spawn(async move {
-            task.await;
-            kind
-        });
+        let span = Span::current();
+        let handle = self.tasks.spawn(
+            async move {
+                task.await;
+                kind
+            }
+            .instrument(span),
+        );
         self.kinds.insert(handle.id(), kind);
     }
 

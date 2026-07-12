@@ -164,7 +164,9 @@ Both long-running listeners stop gracefully on Ctrl+C or SIGTERM.
 
 Both binaries accept global `--log-format text|json` output selection and use
 `RUST_LOG` for filtering. JSON mode preserves structured event fields for log
-collection systems:
+collection systems. Server connections, local SOCKS connections, and client UK
+sessions carry process-local correlation IDs; these IDs contain no protocol
+nonce or authentication secret.
 
 ```sh
 RUST_LOG=info uk-server --config examples/server.toml --log-format json serve

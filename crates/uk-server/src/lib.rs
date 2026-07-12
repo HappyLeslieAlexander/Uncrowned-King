@@ -6,7 +6,16 @@ mod relay;
 mod tls;
 
 use std::{
-    error::Error, fmt, future, future::Future, io, net::SocketAddr, sync::Arc, time::Duration,
+    error::Error,
+    fmt, future,
+    future::Future,
+    io,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use bytes::BytesMut;
@@ -18,7 +27,7 @@ use tokio::{
     time,
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, info_span, warn};
 use uk_auth::{
     AuthChallenge, AuthResponse, AuthenticatedIdentity, ReplayCache, unix_now,
     verify_auth_response_identity,
@@ -36,6 +45,7 @@ pub type AnyError = Box<dyn Error + Send + Sync>;
 
 const ACCEPT_RETRY_BASE_MILLIS: u64 = 10;
 const ACCEPT_RETRY_MAX_MILLIS: u64 = 1_000;
+static NEXT_CONNECTION_CORRELATION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Default)]
 struct ListenerAcceptBackoff {
@@ -205,8 +215,10 @@ where
                     max_sessions,
                 };
                 let shutdown_rx = shutdown_tx.subscribe();
+                let connection_id =
+                    NEXT_CONNECTION_CORRELATION_ID.fetch_add(1, Ordering::Relaxed);
 
-                connections.spawn(async move {
+                let connection = async move {
                     if let Err(err) =
                         handle_connection(connection_runtime, tcp, handshake_permit, peer, shutdown_rx)
                             .await
@@ -217,7 +229,12 @@ where
                             warn!(event = "protocol.error", peer = %peer, error = %err);
                         }
                     }
-                });
+                };
+                connections.spawn(connection.instrument(info_span!(
+                    "server.connection",
+                    connection_id,
+                    peer = %peer
+                )));
             }
             joined = connections.join_next(), if !connections.is_empty() => {
                 log_connection_task_result(joined);

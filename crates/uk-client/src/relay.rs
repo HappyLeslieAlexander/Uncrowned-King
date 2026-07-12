@@ -23,7 +23,7 @@ use tokio::{
     time,
 };
 use tokio_rustls::client::TlsStream;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, info_span, warn};
 use uk_proto::{
     ErrorCode, ErrorPayload, FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, Frame, FrameIoError, FrameLimits,
     FrameType, NegotiatedSettings, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target,
@@ -45,6 +45,8 @@ const RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const UDP_ASSOCIATION_BUFFER_SIZE: usize = 65_536;
 const ACCEPT_RETRY_BASE_MILLIS: u64 = 10;
 const ACCEPT_RETRY_MAX_MILLIS: u64 = 1_000;
+static NEXT_SOCKS_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_CLIENT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 type AnyError = Box<dyn Error + Send + Sync>;
 type CarrierWriter = Arc<Mutex<WriteHalf<TlsStream<TcpStream>>>>;
@@ -88,6 +90,7 @@ enum KeepalivePong {
 }
 
 struct ClientSession {
+    correlation_id: u64,
     writer: CarrierWriter,
     flows: FlowTable,
     limits: FrameLimits,
@@ -552,7 +555,8 @@ where
                 };
                 let sessions = Arc::clone(&sessions);
                 let shutdown_rx = shutdown_tx.subscribe();
-                connections.spawn(async move {
+                let connection_id = NEXT_SOCKS_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+                let connection = async move {
                     let _permit = permit;
                     if let Err(err) =
                         handle_socks_connection(
@@ -569,7 +573,12 @@ where
                             warn!(event = "socks5.connection.error", peer = %peer, error = %err);
                         }
                     }
-                });
+                };
+                connections.spawn(connection.instrument(info_span!(
+                    "socks5.connection",
+                    connection_id,
+                    peer = %peer
+                )));
             }
             joined = connections.join_next(), if !connections.is_empty() => {
                 log_socks_task_result(joined);
@@ -885,7 +894,9 @@ impl ClientSession {
         let limits = negotiated.frame_limits();
         let (carrier_reader, carrier_writer) = tokio::io::split(carrier);
         let session_buffer = ClientSessionBufferControl::default();
+        let correlation_id = NEXT_CLIENT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let session = Arc::new(Self {
+            correlation_id,
             writer: Arc::new(Mutex::new(carrier_writer)),
             flows: Arc::new(Mutex::new(HashMap::new())),
             limits,
@@ -907,6 +918,7 @@ impl ClientSession {
             last_pong_nonce: AtomicU64::new(0),
             pong_notify: Notify::new(),
         });
+        info!(event = "client.session.established", correlation_id);
         spawn_carrier_reader(carrier_reader, Arc::clone(&session)).await;
         if let Some(interval) = keepalive_interval(negotiated) {
             spawn_keepalive(Arc::clone(&session), interval).await;
@@ -1534,76 +1546,78 @@ async fn spawn_carrier_reader(
     mut carrier_reader: ReadHalf<TlsStream<TcpStream>>,
     session: Arc<ClientSession>,
 ) {
+    let correlation_id = session.correlation_id;
     let task_session = Arc::clone(&session);
-    session
-        .tasks
-        .lock()
-        .await
-        .spawn(ClientSessionTaskKind::CarrierReader, async move {
-            loop {
-                let frame = tokio::select! {
-                    frame = read_frame(&mut carrier_reader, task_session.limits) => frame,
-                    () = task_session.shutdown.closed() => return,
-                };
-                match frame {
-                    Ok(frame) => {
-                        if let Err(err) = handle_carrier_frame(&task_session, frame).await {
-                            warn!(event = "client.session.frame.error", error = %err);
-                            close_session(&task_session).await;
-                            return;
-                        }
-                    }
-                    Err(err) => {
-                        if !matches!(err, FrameIoError::Closed) {
-                            warn!(event = "client.session.read.error", error = %err);
-                            report_frame_io_error(&task_session, &err).await;
-                        }
+    let task = async move {
+        loop {
+            let frame = tokio::select! {
+                frame = read_frame(&mut carrier_reader, task_session.limits) => frame,
+                () = task_session.shutdown.closed() => return,
+            };
+            match frame {
+                Ok(frame) => {
+                    if let Err(err) = handle_carrier_frame(&task_session, frame).await {
+                        warn!(event = "client.session.frame.error", error = %err);
                         close_session(&task_session).await;
                         return;
                     }
                 }
+                Err(err) => {
+                    if !matches!(err, FrameIoError::Closed) {
+                        warn!(event = "client.session.read.error", error = %err);
+                        report_frame_io_error(&task_session, &err).await;
+                    }
+                    close_session(&task_session).await;
+                    return;
+                }
             }
-        });
+        }
+    };
+    session.tasks.lock().await.spawn(
+        ClientSessionTaskKind::CarrierReader,
+        task.instrument(info_span!("client.session", correlation_id)),
+    );
 }
 
 async fn spawn_keepalive(session: Arc<ClientSession>, interval: Duration) {
+    let correlation_id = session.correlation_id;
     let task_session = Arc::clone(&session);
-    session
-        .tasks
-        .lock()
-        .await
-        .spawn(ClientSessionTaskKind::Keepalive, async move {
-            loop {
-                tokio::select! {
-                    () = time::sleep(interval) => {}
-                    () = task_session.shutdown.closed() => return,
+    let task = async move {
+        loop {
+            tokio::select! {
+                () = time::sleep(interval) => {}
+                () = task_session.shutdown.closed() => return,
+            }
+            if !task_session.has_open_flows().await {
+                continue;
+            }
+            let nonce = match task_session.write_ping().await {
+                Ok(nonce) => nonce,
+                Err(err) => {
+                    debug!(event = "client.session.keepalive.error", error = %err);
+                    task_session.close().await;
+                    return;
                 }
-                if !task_session.has_open_flows().await {
-                    continue;
-                }
-                let nonce = match task_session.write_ping().await {
-                    Ok(nonce) => nonce,
-                    Err(err) => {
-                        debug!(event = "client.session.keepalive.error", error = %err);
+            };
+            let pong_result = time::timeout(interval, task_session.wait_for_pong(nonce)).await;
+            task_session.clear_outstanding_ping(nonce);
+            match pong_result {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(_) => {
+                    if !task_session.is_closed() {
+                        warn!(event = "client.session.keepalive.timeout");
                         task_session.close().await;
-                        return;
                     }
-                };
-                let pong_result = time::timeout(interval, task_session.wait_for_pong(nonce)).await;
-                task_session.clear_outstanding_ping(nonce);
-                match pong_result {
-                    Ok(true) => {}
-                    Ok(false) => return,
-                    Err(_) => {
-                        if !task_session.is_closed() {
-                            warn!(event = "client.session.keepalive.timeout");
-                            task_session.close().await;
-                        }
-                        return;
-                    }
+                    return;
                 }
             }
-        });
+        }
+    };
+    session.tasks.lock().await.spawn(
+        ClientSessionTaskKind::Keepalive,
+        task.instrument(info_span!("client.session", correlation_id)),
+    );
 }
 
 async fn close_session(session: &ClientSession) {
