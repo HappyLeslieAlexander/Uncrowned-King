@@ -459,6 +459,15 @@ async fn socks_listener_cancels_pending_open_on_shutdown_signal() -> Result<(), 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn socks_listener_cancels_pending_udp_open_on_shutdown_signal() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_socks_listener_shutdown_cancels_pending_udp_open_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn socks_listener_stops_while_server_connect_is_pending() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -2671,6 +2680,74 @@ async fn run_socks_listener_shutdown_cancels_pending_open_e2e() -> Result<(), Te
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(3), server_task).await???,
         TCP_CLOSE_ERROR
+    );
+    tokio::time::timeout(Duration::from_secs(3), client_task).await???;
+    let _ = fs::remove_dir_all(&temp_dir);
+    Ok(())
+}
+
+async fn run_socks_listener_shutdown_cancels_pending_udp_open_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    fs::write(&cert_path, CERT_PEM)?;
+    write_private_key(&key_path)?;
+
+    let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let server_addr = server_listener.local_addr()?;
+    let (open_tx, open_rx) = oneshot::channel();
+    let server_task = tokio::spawn(run_pending_udp_open_cancel_server(
+        server_listener,
+        cert_path.clone(),
+        key_path,
+        open_tx,
+    ));
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (socks_addr, client_task) = start_socks5_listener_until_shutdown(
+        ClientConfig {
+            server_addr: server_addr.to_string(),
+            server_addrs: None,
+            server_name: "localhost".to_owned(),
+            ca_cert_path: path_string(&cert_path),
+            key_id: KEY_ID.to_owned(),
+            secret: SECRET.to_owned(),
+            handshake_timeout_seconds: Some(3),
+            socks_handshake_timeout_seconds: Some(3),
+            tcp_open_timeout_seconds: Some(30),
+            udp_flow_idle_timeout_seconds: None,
+            max_pending_open_bytes: None,
+            max_socks_connections: None,
+            max_buffered_bytes_per_session: None,
+            max_buffered_bytes_per_flow: None,
+        },
+        async {
+            let _ = shutdown_rx.await;
+        },
+    )
+    .await?;
+
+    let (_socks_control, udp_relay_addr) = open_socks_udp_associate(socks_addr).await?;
+    let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    udp_client
+        .send_to(
+            &socks_udp_datagram(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
+                b"pending udp open before shutdown",
+            ),
+            udp_relay_addr,
+        )
+        .await?;
+    tokio::time::timeout(Duration::from_secs(3), open_rx).await??;
+
+    shutdown_tx
+        .send(())
+        .map_err(|()| "client shutdown receiver dropped")?;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), server_task).await???,
+        UDP_CLOSE_ERROR
     );
     tokio::time::timeout(Duration::from_secs(3), client_task).await???;
     let _ = fs::remove_dir_all(&temp_dir);
