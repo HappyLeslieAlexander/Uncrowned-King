@@ -40,9 +40,14 @@ use uk_proto::{
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const TARGET_CONNECT_PARALLELISM: usize = 4;
 const TARGET_WRITE_QUEUE_CAPACITY: usize = 32;
+const SESSION_EVENT_QUEUE_BASE_CAPACITY: usize = 64;
+const SESSION_EVENT_QUEUE_PER_FLOW_CAPACITY: usize = 4;
+const SESSION_EVENT_QUEUE_MAX_CAPACITY: usize = 4096;
 
 type AnyError = Box<dyn Error + Send + Sync>;
 type FlowTable = HashMap<u64, FlowSlot>;
+type FlowEventSender = mpsc::Sender<FlowEvent>;
+type FlowEventReceiver = mpsc::Receiver<FlowEvent>;
 type BoxedConnectFuture<T> =
     Pin<Box<dyn Future<Output = (SocketAddr, io::Result<T>)> + Send + 'static>>;
 type TargetConnector<T> = Arc<dyn Fn(SocketAddr) -> BoxedConnectFuture<T> + Send + Sync + 'static>;
@@ -289,7 +294,7 @@ struct RelaySessionContext<'a> {
     credential: Credential,
     policy_set: Arc<PolicySet>,
     carrier_writer: &'a CarrierWriter,
-    event_tx: &'a mpsc::UnboundedSender<FlowEvent>,
+    event_tx: &'a FlowEventSender,
     limits: RelayLimits,
     shutdown: SessionShutdown,
     session_buffer: SessionBufferControl,
@@ -304,7 +309,7 @@ struct TargetOpenTask {
     policy_set: Arc<PolicySet>,
     open_dial_limiter: OpenDialLimiter,
     target_connect_timeout: Option<Duration>,
-    event_tx: mpsc::UnboundedSender<FlowEvent>,
+    event_tx: FlowEventSender,
     shutdown: SessionShutdown,
     cancel: OpenFlowCancel,
 }
@@ -316,7 +321,7 @@ struct UdpOpenTask {
     policy_set: Arc<PolicySet>,
     open_dial_limiter: OpenDialLimiter,
     target_connect_timeout: Option<Duration>,
-    event_tx: mpsc::UnboundedSender<FlowEvent>,
+    event_tx: FlowEventSender,
     shutdown: SessionShutdown,
     cancel: OpenFlowCancel,
 }
@@ -333,7 +338,7 @@ pub(crate) async fn relay_session(
     transition(&mut state, ServerSessionState::Relaying);
 
     let (mut carrier_reader, carrier_writer) = tokio::io::split(carrier);
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) = mpsc::channel(session_event_queue_capacity(limits));
     let mut target_writers = FlowTable::new();
     let shutdown = SessionShutdown::default();
     let session_buffer = SessionBufferControl::default();
@@ -440,6 +445,7 @@ async fn handle_flow_event(
                 token,
                 context.limits.tcp_half_close_timeout,
                 context.event_tx,
+                &context.shutdown,
                 target_writers,
             );
         }
@@ -474,7 +480,8 @@ fn handle_target_read_closed(
     flow_id: u64,
     token: FlowToken,
     tcp_half_close_timeout: Option<Duration>,
-    event_tx: &mpsc::UnboundedSender<FlowEvent>,
+    event_tx: &FlowEventSender,
+    shutdown: &SessionShutdown,
     target_writers: &mut FlowTable,
 ) {
     if let Some(target) = open_target_flow_mut(target_writers, flow_id) {
@@ -491,6 +498,7 @@ fn handle_target_read_closed(
                     HalfCloseSide::TargetToClient,
                     timeout,
                     event_tx.clone(),
+                    shutdown.clone(),
                 );
             }
         }
@@ -579,7 +587,7 @@ fn handle_target_write_closed(flow_id: u64, token: FlowToken, target_writers: &m
 
 async fn next_session_event(
     carrier_reader: &mut tokio::io::ReadHalf<TlsStream<TcpStream>>,
-    event_rx: &mut mpsc::UnboundedReceiver<FlowEvent>,
+    event_rx: &mut FlowEventReceiver,
     limits: FrameLimits,
     idle_deadline: Option<time::Instant>,
     udp_idle_interval: &mut Option<time::Interval>,
@@ -615,6 +623,39 @@ async fn next_session_event(
             }
         }
     }
+}
+
+fn session_event_queue_capacity(limits: RelayLimits) -> usize {
+    let stream_capacity = usize::try_from(limits.max_streams)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(SESSION_EVENT_QUEUE_PER_FLOW_CAPACITY);
+    SESSION_EVENT_QUEUE_BASE_CAPACITY
+        .saturating_add(stream_capacity)
+        .min(SESSION_EVENT_QUEUE_MAX_CAPACITY)
+}
+
+async fn send_flow_event_or_shutdown(
+    event_tx: &FlowEventSender,
+    event: FlowEvent,
+    shutdown: &SessionShutdown,
+) {
+    if shutdown.is_closed() {
+        return;
+    }
+    tokio::select! {
+        result = event_tx.send(event) => {
+            let _ = result;
+        }
+        () = shutdown.closed() => {}
+    }
+}
+
+fn try_record_flow_activity(event_tx: &FlowEventSender, event: FlowEvent) {
+    debug_assert!(matches!(
+        &event,
+        FlowEvent::Activity | FlowEvent::UdpActivity(_)
+    ));
+    let _ = event_tx.try_send(event);
 }
 
 fn flow_event_counts_as_session_activity(
@@ -837,6 +878,7 @@ async fn handle_tcp_close_frame(
                             HalfCloseSide::ClientToTarget,
                             timeout,
                             context.event_tx.clone(),
+                            context.shutdown.clone(),
                         );
                     }
                 }
@@ -1336,11 +1378,11 @@ fn spawn_target_open(task: TargetOpenTask) {
                 task.target_connect_timeout,
             ) => {
                 if !task.shutdown.is_closed() && !task.cancel.is_cancelled() {
-                    let _ = task.event_tx.send(FlowEvent::OpenCompleted {
+                    send_flow_event_or_shutdown(&task.event_tx, FlowEvent::OpenCompleted {
                         flow_id: task.flow_id,
                         target: task.target,
                         result,
-                    });
+                    }, &task.shutdown).await;
                 }
             }
             () = task.cancel.cancelled() => {}
@@ -1359,11 +1401,11 @@ fn spawn_udp_open(task: UdpOpenTask) {
                 task.target_connect_timeout,
             ) => {
                 if !task.shutdown.is_closed() && !task.cancel.is_cancelled() {
-                    let _ = task.event_tx.send(FlowEvent::UdpOpenCompleted {
+                    send_flow_event_or_shutdown(&task.event_tx, FlowEvent::UdpOpenCompleted {
                         flow_id: task.flow_id,
                         target: task.target,
                         result,
-                    });
+                    }, &task.shutdown).await;
                 }
             }
             () = task.cancel.cancelled() => {}
@@ -1565,7 +1607,7 @@ fn spawn_target_reader(
     target_reader: OwnedReadHalf,
     flow_control: TargetFlowControl,
     carrier_writer: CarrierWriter,
-    event_tx: mpsc::UnboundedSender<FlowEvent>,
+    event_tx: FlowEventSender,
     shutdown: SessionShutdown,
     data_frame_size: usize,
 ) {
@@ -1589,10 +1631,15 @@ fn spawn_target_reader(
             }
             _ => {}
         }
-        let _ = event_tx.send(FlowEvent::ReadClosed {
-            flow_id,
-            token: identity.token,
-        });
+        send_flow_event_or_shutdown(
+            &event_tx,
+            FlowEvent::ReadClosed {
+                flow_id,
+                token: identity.token,
+            },
+            &shutdown,
+        )
+        .await;
     });
 }
 
@@ -1601,7 +1648,7 @@ fn spawn_udp_reader(
     target_socket: Arc<UdpSocket>,
     flow_control: TargetFlowControl,
     carrier_writer: CarrierWriter,
-    event_tx: mpsc::UnboundedSender<FlowEvent>,
+    event_tx: FlowEventSender,
     shutdown: SessionShutdown,
     data_frame_size: usize,
 ) {
@@ -1624,7 +1671,7 @@ fn spawn_udp_reader(
             }
             _ => {}
         }
-        let _ = event_tx.send(FlowEvent::UdpReadClosed(flow_id));
+        send_flow_event_or_shutdown(&event_tx, FlowEvent::UdpReadClosed(flow_id), &shutdown).await;
     });
 }
 
@@ -1634,7 +1681,7 @@ fn spawn_target_writer(
     commands: mpsc::Receiver<TargetCommand>,
     flow_control: TargetFlowControl,
     carrier_writer: CarrierWriter,
-    event_tx: mpsc::UnboundedSender<FlowEvent>,
+    event_tx: FlowEventSender,
     shutdown: SessionShutdown,
 ) {
     tokio::spawn(async move {
@@ -1649,10 +1696,15 @@ fn spawn_target_writer(
             }
             _ => {}
         }
-        let _ = event_tx.send(FlowEvent::WriteClosed {
-            flow_id,
-            token: identity.token,
-        });
+        send_flow_event_or_shutdown(
+            &event_tx,
+            FlowEvent::WriteClosed {
+                flow_id,
+                token: identity.token,
+            },
+            &shutdown,
+        )
+        .await;
     });
 }
 
@@ -1661,15 +1713,25 @@ fn spawn_half_close_timer(
     token: FlowToken,
     closed_side: HalfCloseSide,
     timeout: Duration,
-    event_tx: mpsc::UnboundedSender<FlowEvent>,
+    event_tx: FlowEventSender,
+    shutdown: SessionShutdown,
 ) {
     tokio::spawn(async move {
-        tokio::time::sleep(timeout).await;
-        let _ = event_tx.send(FlowEvent::HalfCloseDrainExpired {
-            flow_id,
-            token,
-            closed_side,
-        });
+        tokio::select! {
+            () = tokio::time::sleep(timeout) => {
+                send_flow_event_or_shutdown(
+                    &event_tx,
+                    FlowEvent::HalfCloseDrainExpired {
+                        flow_id,
+                        token,
+                        closed_side,
+                    },
+                    &shutdown,
+                )
+                .await;
+            }
+            () = shutdown.closed() => {}
+        }
     });
 }
 
@@ -1677,7 +1739,7 @@ async fn relay_client_to_target(
     mut target_writer: OwnedWriteHalf,
     mut commands: mpsc::Receiver<TargetCommand>,
     flow_control: TargetFlowControl,
-    event_tx: &mpsc::UnboundedSender<FlowEvent>,
+    event_tx: &FlowEventSender,
     shutdown: &SessionShutdown,
 ) -> Result<(), AnyError> {
     loop {
@@ -1701,7 +1763,7 @@ async fn relay_client_to_target(
                     () = flow_control.aborted() => return Ok(()),
                 };
                 write_result?;
-                let _ = event_tx.send(FlowEvent::Activity);
+                try_record_flow_activity(event_tx, FlowEvent::Activity);
             }
             TargetCommand::Close => {
                 flow_control.close();
@@ -2159,7 +2221,7 @@ async fn relay_target_to_client(
     mut target_reader: OwnedReadHalf,
     flow_control: TargetFlowControl,
     carrier_writer: &CarrierWriter,
-    event_tx: &mpsc::UnboundedSender<FlowEvent>,
+    event_tx: &FlowEventSender,
     shutdown: &SessionShutdown,
     data_frame_size: usize,
 ) -> Result<(), AnyError> {
@@ -2186,7 +2248,7 @@ async fn relay_target_to_client(
             Bytes::copy_from_slice(&target_buf[..read]),
         )
         .await?;
-        let _ = event_tx.send(FlowEvent::Activity);
+        try_record_flow_activity(event_tx, FlowEvent::Activity);
     }
 }
 
@@ -2195,7 +2257,7 @@ async fn relay_udp_target_to_client(
     target_socket: Arc<UdpSocket>,
     flow_control: TargetFlowControl,
     carrier_writer: &CarrierWriter,
-    event_tx: &mpsc::UnboundedSender<FlowEvent>,
+    event_tx: &FlowEventSender,
     shutdown: &SessionShutdown,
     data_frame_size: usize,
 ) -> Result<(), AnyError> {
@@ -2218,7 +2280,7 @@ async fn relay_udp_target_to_client(
             Bytes::copy_from_slice(&target_buf[..read]),
         )
         .await?;
-        let _ = event_tx.send(FlowEvent::UdpActivity(flow_id));
+        try_record_flow_activity(event_tx, FlowEvent::UdpActivity(flow_id));
     }
 }
 
@@ -2699,6 +2761,22 @@ mod tests {
         UdpTargetFlow::new(Arc::new(socket), TargetFlowControl::default())
     }
 
+    fn test_relay_limits(max_streams: u64) -> RelayLimits {
+        let frame = FrameLimits::default();
+        RelayLimits {
+            frame,
+            max_streams,
+            max_udp_flows: max_streams,
+            max_outbound_dials_per_session: 1,
+            data_frame_size: tcp_data_frame_size(frame),
+            max_buffered_bytes_per_session: 1024,
+            max_buffered_bytes_per_flow: 1024,
+            target_connect_timeout: None,
+            tcp_half_close_timeout: None,
+            udp_flow_idle_timeout: None,
+        }
+    }
+
     fn control_frame(frame_type: FrameType, flow_id: u64) -> Frame {
         Frame::new(frame_type, 0, flow_id, Bytes::new()).unwrap()
     }
@@ -2803,13 +2881,15 @@ mod tests {
             1,
             FlowSlot::Tcp(test_target_flow_with_token(TEST_FLOW_TOKEN)),
         );
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let shutdown = SessionShutdown::default();
 
         handle_target_read_closed(
             1,
             STALE_FLOW_TOKEN,
             Some(Duration::from_secs(1)),
             &event_tx,
+            &shutdown,
             &mut target_writers,
         );
 
@@ -2825,9 +2905,17 @@ mod tests {
             1,
             FlowSlot::Tcp(test_target_flow_with_token(TEST_FLOW_TOKEN)),
         );
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let shutdown = SessionShutdown::default();
 
-        handle_target_read_closed(1, TEST_FLOW_TOKEN, None, &event_tx, &mut target_writers);
+        handle_target_read_closed(
+            1,
+            TEST_FLOW_TOKEN,
+            None,
+            &event_tx,
+            &shutdown,
+            &mut target_writers,
+        );
 
         let target = open_target_flow_mut(&mut target_writers, 1).expect("flow should remain open");
         assert!(!target.target_to_client_open);
@@ -3053,7 +3141,7 @@ mod tests {
         let (_target_peer, _) = listener.accept().await.unwrap();
         let (_target_reader, target_writer) = target_stream.into_split();
         let (_commands_tx, commands_rx) = mpsc::channel(1);
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = mpsc::channel(1);
         let flow_control = TargetFlowControl::default();
         let shutdown = SessionShutdown::default();
         let shutdown_handle = shutdown.clone();
@@ -3085,7 +3173,7 @@ mod tests {
         let (mut target_peer, _) = listener.accept().await.unwrap();
         let (_target_reader, target_writer) = target_stream.into_split();
         let (commands_tx, commands_rx) = mpsc::channel(1);
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::channel(1);
         let flow_control = TargetFlowControl::default();
         let shutdown = SessionShutdown::default();
         let payload = Bytes::from_static(b"writer activity");
@@ -3331,6 +3419,54 @@ mod tests {
             Some(&FlowEvent::UdpActivity(1)),
             &target_writers
         ));
+    }
+
+    #[test]
+    fn session_event_queue_capacity_scales_with_stream_limit_and_caps() {
+        assert_eq!(
+            session_event_queue_capacity(test_relay_limits(1)),
+            SESSION_EVENT_QUEUE_BASE_CAPACITY + SESSION_EVENT_QUEUE_PER_FLOW_CAPACITY
+        );
+        assert_eq!(
+            session_event_queue_capacity(test_relay_limits(64)),
+            SESSION_EVENT_QUEUE_BASE_CAPACITY + 64 * SESSION_EVENT_QUEUE_PER_FLOW_CAPACITY
+        );
+        assert_eq!(
+            session_event_queue_capacity(test_relay_limits(u64::MAX)),
+            SESSION_EVENT_QUEUE_MAX_CAPACITY
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_events_are_lossy_when_session_event_queue_is_full() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+
+        try_record_flow_activity(&event_tx, FlowEvent::Activity);
+        try_record_flow_activity(&event_tx, FlowEvent::UdpActivity(1));
+
+        assert!(matches!(event_rx.recv().await, Some(FlowEvent::Activity)));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn reliable_flow_event_send_exits_on_session_shutdown() {
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        event_tx.try_send(FlowEvent::Activity).unwrap();
+        let shutdown = SessionShutdown::default();
+        let shutdown_handle = shutdown.clone();
+
+        let sender = tokio::spawn(async move {
+            send_flow_event_or_shutdown(&event_tx, FlowEvent::UdpReadClosed(1), &shutdown).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!sender.is_finished());
+
+        shutdown_handle.close();
+
+        tokio::time::timeout(Duration::from_secs(1), sender)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
