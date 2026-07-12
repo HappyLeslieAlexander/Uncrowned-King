@@ -108,6 +108,24 @@ pub struct Credential {
     pub policy_group: Option<String>,
 }
 
+/// Authenticated identity safe to retain after secret verification completes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedIdentity {
+    /// Opaque authenticated key id.
+    pub key_id: Vec<u8>,
+    /// Optional policy group associated with the credential.
+    pub policy_group: Option<String>,
+}
+
+impl From<&Credential> for AuthenticatedIdentity {
+    fn from(credential: &Credential) -> Self {
+        Self {
+            key_id: credential.key_id.clone(),
+            policy_group: credential.policy_group.clone(),
+        }
+    }
+}
+
 impl fmt::Debug for Credential {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -461,6 +479,49 @@ pub fn verify_auth_response(
     allowed_skew: Duration,
     replay_cache: &mut ReplayCache,
 ) -> AuthResult<Credential> {
+    verify_auth_response_credential(
+        credentials,
+        exporter_32,
+        challenge,
+        response,
+        now,
+        allowed_skew,
+        replay_cache,
+    )
+    .cloned()
+}
+
+/// Verifies an authentication response and returns identity data without secret material.
+pub fn verify_auth_response_identity(
+    credentials: &[Credential],
+    exporter_32: &[u8; 32],
+    challenge: &AuthChallenge,
+    response: &AuthResponse,
+    now: u64,
+    allowed_skew: Duration,
+    replay_cache: &mut ReplayCache,
+) -> AuthResult<AuthenticatedIdentity> {
+    verify_auth_response_credential(
+        credentials,
+        exporter_32,
+        challenge,
+        response,
+        now,
+        allowed_skew,
+        replay_cache,
+    )
+    .map(AuthenticatedIdentity::from)
+}
+
+fn verify_auth_response_credential<'a>(
+    credentials: &'a [Credential],
+    exporter_32: &[u8; 32],
+    challenge: &AuthChallenge,
+    response: &AuthResponse,
+    now: u64,
+    allowed_skew: Duration,
+    replay_cache: &mut ReplayCache,
+) -> AuthResult<&'a Credential> {
     let credential = credentials
         .iter()
         .find(|credential| credential.key_id == response.key_id)
@@ -490,7 +551,7 @@ pub fn verify_auth_response(
     .map_err(|_| AuthError::InvalidTag)?;
 
     replay_cache.check_and_insert(now, challenge.server_nonce, response.client_nonce)?;
-    Ok(credential.clone())
+    Ok(credential)
 }
 
 fn auth_mac(
@@ -855,6 +916,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(verified.key_id, b"client-a");
+    }
+
+    #[test]
+    fn returns_authenticated_identity_without_cloning_secret() {
+        let (mut credential, exporter, challenge, response) = fixture();
+        credential.policy_group = Some("production".to_owned());
+        let mut replay_cache = ReplayCache::default();
+
+        let identity = verify_auth_response_identity(
+            &[credential],
+            &exporter,
+            &challenge,
+            &response,
+            1_700_000_001,
+            Duration::from_secs(30),
+            &mut replay_cache,
+        )
+        .unwrap();
+
+        assert_eq!(
+            identity,
+            AuthenticatedIdentity {
+                key_id: b"client-a".to_vec(),
+                policy_group: Some("production".to_owned()),
+            }
+        );
     }
 
     #[test]

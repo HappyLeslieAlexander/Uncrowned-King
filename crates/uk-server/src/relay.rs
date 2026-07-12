@@ -28,7 +28,7 @@ use tokio::{
 };
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, info, warn};
-use uk_auth::Credential;
+use uk_auth::AuthenticatedIdentity;
 use uk_policy::{PolicyContext, PolicyDecision, PolicySet};
 use uk_proto::{
     ErrorCode, ErrorPayload, Frame, FrameIoError, FrameLimits, FrameType, TCP_CLOSE_ERROR,
@@ -367,7 +367,7 @@ struct SessionShutdown {
 }
 
 struct RelaySessionContext<'a> {
-    credential: Credential,
+    identity: AuthenticatedIdentity,
     policy_set: Arc<PolicySet>,
     carrier_writer: &'a CarrierWriter,
     event_tx: &'a FlowEventSender,
@@ -381,7 +381,7 @@ struct RelaySessionContext<'a> {
 struct TargetOpenTask {
     flow_id: u64,
     target: Target,
-    credential: Credential,
+    identity: AuthenticatedIdentity,
     policy_set: Arc<PolicySet>,
     open_dial_limiter: OpenDialLimiter,
     target_connect_timeout: Option<Duration>,
@@ -393,7 +393,7 @@ struct TargetOpenTask {
 struct UdpOpenTask {
     flow_id: u64,
     target: Target,
-    credential: Credential,
+    identity: AuthenticatedIdentity,
     policy_set: Arc<PolicySet>,
     open_dial_limiter: OpenDialLimiter,
     target_connect_timeout: Option<Duration>,
@@ -434,7 +434,7 @@ struct TargetWriterTask {
 
 pub(crate) async fn relay_session(
     carrier: TlsStream<TcpStream>,
-    credential: Credential,
+    identity: AuthenticatedIdentity,
     policy_set: Arc<PolicySet>,
     limits: RelayLimits,
     idle_timeout: Option<Duration>,
@@ -453,7 +453,7 @@ pub(crate) async fn relay_session(
     let flow_tokens = FlowTokenAllocator::default();
     let carrier_writer = CarrierWriter::new(carrier_writer, shutdown.clone());
     let context = RelaySessionContext {
-        credential,
+        identity,
         policy_set,
         carrier_writer: &carrier_writer,
         event_tx: &event_tx,
@@ -1249,7 +1249,7 @@ async fn handle_tcp_open_frame(
             TargetOpenTask {
                 flow_id,
                 target,
-                credential: context.credential.clone(),
+                identity: context.identity.clone(),
                 policy_set: Arc::clone(&context.policy_set),
                 open_dial_limiter: context.open_dial_limiter.clone(),
                 target_connect_timeout: context.limits.target_connect_timeout,
@@ -1336,7 +1336,7 @@ async fn handle_udp_open_frame(
             UdpOpenTask {
                 flow_id,
                 target,
-                credential: context.credential.clone(),
+                identity: context.identity.clone(),
                 policy_set: Arc::clone(&context.policy_set),
                 open_dial_limiter: context.open_dial_limiter.clone(),
                 target_connect_timeout: context.limits.target_connect_timeout,
@@ -1557,7 +1557,7 @@ fn spawn_target_open(session_tasks: &mut SessionTasks, task: TargetOpenTask) {
         let result = wait_for_open_task(
             connect_allowed_target(
                 &task.target,
-                &task.credential,
+                &task.identity,
                 &task.policy_set,
                 &task.open_dial_limiter,
                 task.target_connect_timeout,
@@ -1589,7 +1589,7 @@ fn spawn_udp_open(session_tasks: &mut SessionTasks, task: UdpOpenTask) {
         let result = wait_for_open_task(
             connect_allowed_udp_target(
                 &task.target,
-                &task.credential,
+                &task.identity,
                 &task.policy_set,
                 &task.open_dial_limiter,
                 task.target_connect_timeout,
@@ -2542,18 +2542,18 @@ async fn shutdown_carrier_writer(carrier_writer: &CarrierWriter) {
 
 async fn connect_allowed_target(
     target: &Target,
-    credential: &Credential,
+    identity: &AuthenticatedIdentity,
     policy_set: &PolicySet,
     open_dial_limiter: &OpenDialLimiter,
     target_connect_timeout: Option<Duration>,
 ) -> Result<TcpStream, OpenFailure> {
     let deadline = target_connect_deadline(target_connect_timeout);
-    connect_allowed_target_inner(target, credential, policy_set, open_dial_limiter, deadline).await
+    connect_allowed_target_inner(target, identity, policy_set, open_dial_limiter, deadline).await
 }
 
 async fn connect_allowed_target_inner(
     target: &Target,
-    credential: &Credential,
+    identity: &AuthenticatedIdentity,
     policy_set: &PolicySet,
     open_dial_limiter: &OpenDialLimiter,
     target_connect_deadline: Option<time::Instant>,
@@ -2562,8 +2562,8 @@ async fn connect_allowed_target_inner(
         with_target_connect_deadline(target_connect_deadline, resolve_target(target)).await?;
     let resolved_ips = resolved_ips(target, &addrs);
     let context = PolicyContext {
-        key_id: &credential.key_id,
-        policy_group: credential.policy_group.as_deref(),
+        key_id: &identity.key_id,
+        policy_group: identity.policy_group.as_deref(),
         target,
         resolved_ips: &resolved_ips,
     };
@@ -2575,19 +2575,19 @@ async fn connect_allowed_target_inner(
 
 async fn connect_allowed_udp_target(
     target: &Target,
-    credential: &Credential,
+    identity: &AuthenticatedIdentity,
     policy_set: &PolicySet,
     open_dial_limiter: &OpenDialLimiter,
     target_connect_timeout: Option<Duration>,
 ) -> Result<UdpSocket, OpenFailure> {
     let deadline = target_connect_deadline(target_connect_timeout);
-    connect_allowed_udp_target_inner(target, credential, policy_set, open_dial_limiter, deadline)
+    connect_allowed_udp_target_inner(target, identity, policy_set, open_dial_limiter, deadline)
         .await
 }
 
 async fn connect_allowed_udp_target_inner(
     target: &Target,
-    credential: &Credential,
+    identity: &AuthenticatedIdentity,
     policy_set: &PolicySet,
     open_dial_limiter: &OpenDialLimiter,
     target_connect_deadline: Option<time::Instant>,
@@ -2596,8 +2596,8 @@ async fn connect_allowed_udp_target_inner(
         with_target_connect_deadline(target_connect_deadline, resolve_target(target)).await?;
     let resolved_ips = resolved_ips(target, &addrs);
     let context = PolicyContext {
-        key_id: &credential.key_id,
-        policy_group: credential.policy_group.as_deref(),
+        key_id: &identity.key_id,
+        policy_group: identity.policy_group.as_deref(),
         target,
         resolved_ips: &resolved_ips,
     };

@@ -19,7 +19,10 @@ use tokio::{
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tracing::{debug, info, warn};
-use uk_auth::{AuthChallenge, AuthResponse, ReplayCache, unix_now, verify_auth_response};
+use uk_auth::{
+    AuthChallenge, AuthResponse, AuthenticatedIdentity, ReplayCache, unix_now,
+    verify_auth_response_identity,
+};
 use uk_proto::{
     ErrorCode, ErrorPayload, Frame, FrameIoError, FrameLimits, FrameType, SettingKey, Settings,
     read_frame, validate_connection_frame, write_frame,
@@ -49,7 +52,7 @@ impl Error for HandshakePhaseError {
 }
 
 struct ServerRuntime {
-    config: ServerConfig,
+    config: Arc<ServerConfig>,
     credentials: Arc<Vec<uk_auth::Credential>>,
     policy_set: Arc<uk_policy::PolicySet>,
     replay_cache: Arc<Mutex<ReplayCache>>,
@@ -65,7 +68,7 @@ struct ConnectionRuntime {
     policy_set: Arc<uk_policy::PolicySet>,
     replay_cache: Arc<Mutex<ReplayCache>>,
     session_permits: Arc<Semaphore>,
-    config: ServerConfig,
+    config: Arc<ServerConfig>,
     max_sessions: usize,
 }
 
@@ -157,7 +160,7 @@ where
                     policy_set: Arc::clone(&policy_set),
                     replay_cache: Arc::clone(&replay_cache),
                     session_permits: Arc::clone(&session_permits),
-                    config: config.clone(),
+                    config: Arc::clone(&config),
                     max_sessions,
                 };
                 let shutdown_rx = shutdown_tx.subscribe();
@@ -205,7 +208,7 @@ fn prepare_server_runtime(config: ServerConfig) -> Result<ServerRuntime, AnyErro
     let max_handshakes = usize_limit("max_handshakes", config.max_handshakes())?;
 
     Ok(ServerRuntime {
-        config,
+        config: Arc::new(config),
         credentials,
         policy_set,
         replay_cache,
@@ -283,7 +286,7 @@ async fn handle_connection(
         }
     };
 
-    let (mut stream, credential) = tokio::select! {
+    let (mut stream, identity) = tokio::select! {
         result = handshake => result?,
         changed = shutdown_rx.changed() => {
             let _ = changed;
@@ -307,7 +310,7 @@ async fn handle_connection(
 
     relay::relay_session(
         stream,
-        credential,
+        identity,
         policy_set,
         relay::RelayLimits::new(relay::RelayLimitConfig {
             frame: FrameLimits {
@@ -357,7 +360,7 @@ async fn complete_handshake(
     credentials: Arc<Vec<uk_auth::Credential>>,
     replay_cache: Arc<Mutex<ReplayCache>>,
     config: &ServerConfig,
-) -> Result<(TlsStream<tokio::net::TcpStream>, uk_auth::Credential), AnyError> {
+) -> Result<(TlsStream<tokio::net::TcpStream>, AuthenticatedIdentity), AnyError> {
     let mut stream = acceptor
         .accept(tcp)
         .await
@@ -407,7 +410,7 @@ async fn complete_handshake(
     let now = unix_now();
     let verification = {
         let mut replay_cache = replay_cache.lock().await;
-        verify_auth_response(
+        verify_auth_response_identity(
             &credentials,
             &exporter,
             &challenge,
@@ -417,8 +420,8 @@ async fn complete_handshake(
             &mut replay_cache,
         )
     };
-    let credential = match verification {
-        Ok(credential) => credential,
+    let identity = match verification {
+        Ok(identity) => identity,
         Err(err) => {
             let _ = write_connection_error(&mut stream, ErrorCode::AuthFailed).await;
             return Err(phase_error("verify auth response", err));
@@ -427,10 +430,10 @@ async fn complete_handshake(
 
     info!(
         event = "auth.success",
-        key_id_hex = %hex_encode(&credential.key_id)
+        key_id_hex = %hex_encode(&identity.key_id)
     );
 
-    Ok((stream, credential))
+    Ok((stream, identity))
 }
 
 async fn write_server_settings(
