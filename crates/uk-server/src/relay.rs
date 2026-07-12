@@ -39,6 +39,7 @@ use uk_proto::{
 
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const TARGET_CONNECT_PARALLELISM: usize = 4;
+const TARGET_RESOLUTION_ADDR_LIMIT: usize = 64;
 const TARGET_WRITE_QUEUE_CAPACITY: usize = 32;
 const SESSION_EVENT_QUEUE_BASE_CAPACITY: usize = 64;
 const SESSION_EVENT_QUEUE_PER_FLOW_CAPACITY: usize = 4;
@@ -2370,18 +2371,34 @@ async fn connect_allowed_udp_target_inner(
 }
 
 async fn resolve_target(target: &Target) -> Result<Vec<SocketAddr>, OpenFailure> {
-    let addrs = match target {
-        Target::Domain(domain, port) => lookup_host((domain.as_str(), *port))
-            .await
-            .map_err(OpenFailure::TargetUnavailable)?
-            .collect(),
-        Target::Ipv4(ip, port) => vec![SocketAddr::new(IpAddr::V4(*ip), *port)],
-        Target::Ipv6(ip, port) => vec![SocketAddr::new(IpAddr::V6(*ip), *port)],
-    };
+    match target {
+        Target::Domain(domain, port) => {
+            let addrs = lookup_host((domain.as_str(), *port))
+                .await
+                .map_err(OpenFailure::TargetUnavailable)?;
+            collect_resolved_addrs(addrs)
+        }
+        Target::Ipv4(ip, port) => Ok(vec![SocketAddr::new(IpAddr::V4(*ip), *port)]),
+        Target::Ipv6(ip, port) => Ok(vec![SocketAddr::new(IpAddr::V6(*ip), *port)]),
+    }
+}
+
+fn collect_resolved_addrs(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+) -> Result<Vec<SocketAddr>, OpenFailure> {
+    let addrs = addrs
+        .into_iter()
+        .take(TARGET_RESOLUTION_ADDR_LIMIT + 1)
+        .collect::<Vec<_>>();
     if addrs.is_empty() {
         Err(OpenFailure::TargetUnavailable(io::Error::new(
             io::ErrorKind::NotFound,
             "target resolved to no addresses",
+        )))
+    } else if addrs.len() > TARGET_RESOLUTION_ADDR_LIMIT {
+        Err(OpenFailure::TargetUnavailable(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("target resolved to more than {TARGET_RESOLUTION_ADDR_LIMIT} addresses"),
         )))
     } else {
         Ok(addrs)
@@ -3737,6 +3754,41 @@ mod tests {
 
         assert!(matches!(result, Err(OpenFailure::ResourceLimit)));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn accepts_resolved_target_address_limit() {
+        let addrs = (0..TARGET_RESOLUTION_ADDR_LIMIT)
+            .map(|index| SocketAddr::from(([127, 0, 0, 1], 10_000 + index as u16)));
+
+        let resolved = collect_resolved_addrs(addrs).unwrap();
+
+        assert_eq!(resolved.len(), TARGET_RESOLUTION_ADDR_LIMIT);
+    }
+
+    #[test]
+    fn rejects_excessive_resolved_target_addresses() {
+        let addrs = (0..=TARGET_RESOLUTION_ADDR_LIMIT)
+            .map(|index| SocketAddr::from(([127, 0, 0, 1], 10_000 + index as u16)));
+
+        let error = collect_resolved_addrs(addrs).unwrap_err();
+
+        assert!(matches!(
+            error,
+            OpenFailure::TargetUnavailable(ref err)
+                if err.kind() == io::ErrorKind::InvalidData
+                    && err.to_string().contains("more than")
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_resolved_target_addresses() {
+        let error = collect_resolved_addrs(std::iter::empty()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            OpenFailure::TargetUnavailable(ref err) if err.kind() == io::ErrorKind::NotFound
+        ));
     }
 
     #[tokio::test]
