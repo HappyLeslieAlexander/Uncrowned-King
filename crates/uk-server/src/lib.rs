@@ -28,6 +28,15 @@ use crate::config::ServerConfig;
 /// Server error type.
 pub type AnyError = Box<dyn std::error::Error + Send + Sync>;
 
+struct ServerRuntime {
+    config: ServerConfig,
+    credentials: Arc<Vec<uk_auth::Credential>>,
+    policy_set: Arc<uk_policy::PolicySet>,
+    replay_cache: Arc<Mutex<ReplayCache>>,
+    acceptor: TlsAcceptor,
+    max_sessions: usize,
+}
+
 /// Runs the UK server listener until the task is cancelled or the listener fails.
 pub async fn run(config: ServerConfig) -> Result<(), AnyError> {
     run_until_shutdown(config, future::pending()).await
@@ -38,25 +47,50 @@ pub async fn run_until_shutdown<F>(config: ServerConfig, shutdown: F) -> Result<
 where
     F: Future<Output = ()> + Send,
 {
-    config.validate_network_endpoints()?;
-    config.validate_limits()?;
-    config.validate_sensitive_paths()?;
-    let credentials = Arc::new(config.credentials()?);
-    let policy_set = Arc::new(config.policy_set()?);
-    let replay_cache = Arc::new(Mutex::new(ReplayCache::with_max_entries(
-        Duration::from_secs(config.replay_cache_window_seconds()),
-        usize_limit(
-            "replay_cache_max_entries",
-            config.replay_cache_max_entries(),
-        )?,
-    )));
-    let tls_config = tls::server_config(&config.cert_path, &config.key_path)?;
-    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
-    let listener = TcpListener::bind(&config.listen).await?;
-    let max_sessions = usize_limit("max_sessions", config.max_sessions())?;
+    let runtime = prepare_server_runtime(config)?;
+    let listener = TcpListener::bind(&runtime.config.listen).await?;
+    run_on_listener_inner(runtime, listener, shutdown).await
+}
+
+/// Runs the UK server on an already-bound listener until the task is cancelled or the listener fails.
+pub async fn run_on_listener(config: ServerConfig, listener: TcpListener) -> Result<(), AnyError> {
+    run_on_listener_until_shutdown(config, listener, future::pending()).await
+}
+
+/// Runs the UK server on an already-bound listener until `shutdown` resolves or the listener fails.
+pub async fn run_on_listener_until_shutdown<F>(
+    mut config: ServerConfig,
+    listener: TcpListener,
+    shutdown: F,
+) -> Result<(), AnyError>
+where
+    F: Future<Output = ()> + Send,
+{
+    config.listen = listener.local_addr()?.to_string();
+    let runtime = prepare_server_runtime(config)?;
+    run_on_listener_inner(runtime, listener, shutdown).await
+}
+
+async fn run_on_listener_inner<F>(
+    runtime: ServerRuntime,
+    listener: TcpListener,
+    shutdown: F,
+) -> Result<(), AnyError>
+where
+    F: Future<Output = ()> + Send,
+{
+    let ServerRuntime {
+        config,
+        credentials,
+        policy_set,
+        replay_cache,
+        acceptor,
+        max_sessions,
+    } = runtime;
+    let listen = listener.local_addr()?;
     let session_permits = Arc::new(Semaphore::new(max_sessions));
 
-    info!(event = "server.listen", listen = %config.listen);
+    info!(event = "server.listen", listen = %listen);
 
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
     let mut connections = JoinSet::new();
@@ -122,6 +156,33 @@ where
     }
 
     Ok(())
+}
+
+fn prepare_server_runtime(config: ServerConfig) -> Result<ServerRuntime, AnyError> {
+    config.validate_network_endpoints()?;
+    config.validate_limits()?;
+    config.validate_sensitive_paths()?;
+    let credentials = Arc::new(config.credentials()?);
+    let policy_set = Arc::new(config.policy_set()?);
+    let replay_cache = Arc::new(Mutex::new(ReplayCache::with_max_entries(
+        Duration::from_secs(config.replay_cache_window_seconds()),
+        usize_limit(
+            "replay_cache_max_entries",
+            config.replay_cache_max_entries(),
+        )?,
+    )));
+    let tls_config = tls::server_config(&config.cert_path, &config.key_path)?;
+    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    let max_sessions = usize_limit("max_sessions", config.max_sessions())?;
+
+    Ok(ServerRuntime {
+        config,
+        credentials,
+        policy_set,
+        replay_cache,
+        acceptor,
+        max_sessions,
+    })
 }
 
 fn log_connection_task_result(result: Option<Result<(), tokio::task::JoinError>>) {

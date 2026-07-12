@@ -37,8 +37,8 @@ use uk_auth::{
     verify_auth_response,
 };
 use uk_client::{
-    config::ClientConfig, connect_authenticated_carrier, run_handshake, run_socks5_listener_on,
-    run_socks5_listener_until_shutdown,
+    config::ClientConfig, connect_authenticated_carrier, run_handshake,
+    run_socks5_listener_on_until_shutdown,
 };
 use uk_proto::{
     ALPN_PROTOCOL, ErrorCode, ErrorPayload, Frame, FrameHeader, FrameIoError, FrameLimits,
@@ -2456,30 +2456,21 @@ async fn run_server_listener_shutdown_e2e() -> Result<(), TestError> {
     let key_path = temp_dir.join("server-key.pem");
     fs::write(&cert_path, CERT_PEM)?;
     write_private_key(&key_path)?;
-    let server_addr = unused_loopback_addr().await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let mut server_task = tokio::spawn(uk_server::run_until_shutdown(
-        ServerConfig {
-            listen: server_addr.to_string(),
-            cert_path: path_string(&cert_path),
-            key_path: path_string(&key_path),
-            auth_skew_seconds: Some(30),
-            limits: Some(test_limits()),
-            policy_path: None,
-            credentials: vec![CredentialConfig {
-                key_id: KEY_ID.to_owned(),
-                secret: SECRET.to_owned(),
-                status: Some("active".to_owned()),
-                not_before: None,
-                not_after: None,
-                policy_group: Some("default".to_owned()),
-            }],
-        },
+    let (_server_addr, server_task) = start_uk_server_until_shutdown(
+        test_server_config(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            &cert_path,
+            &key_path,
+            test_limits(),
+            None,
+            30,
+        ),
         async {
             let _ = shutdown_rx.await;
         },
-    ));
-    wait_for_listener("uk-server", server_addr, &mut server_task).await?;
+    )
+    .await?;
 
     shutdown_tx
         .send(())
@@ -2496,30 +2487,21 @@ async fn run_server_active_session_shutdown_e2e() -> Result<(), TestError> {
     let key_path = temp_dir.join("server-key.pem");
     fs::write(&cert_path, CERT_PEM)?;
     write_private_key(&key_path)?;
-    let server_addr = unused_loopback_addr().await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let mut server_task = tokio::spawn(uk_server::run_until_shutdown(
-        ServerConfig {
-            listen: server_addr.to_string(),
-            cert_path: path_string(&cert_path),
-            key_path: path_string(&key_path),
-            auth_skew_seconds: Some(30),
-            limits: Some(test_limits()),
-            policy_path: None,
-            credentials: vec![CredentialConfig {
-                key_id: KEY_ID.to_owned(),
-                secret: SECRET.to_owned(),
-                status: Some("active".to_owned()),
-                not_before: None,
-                not_after: None,
-                policy_group: Some("default".to_owned()),
-            }],
-        },
+    let (server_addr, server_task) = start_uk_server_until_shutdown(
+        test_server_config(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            &cert_path,
+            &key_path,
+            test_limits(),
+            None,
+            30,
+        ),
         async {
             let _ = shutdown_rx.await;
         },
-    ));
-    wait_for_listener("uk-server", server_addr, &mut server_task).await?;
+    )
+    .await?;
 
     let mut carrier = connect_authenticated_carrier(ClientConfig {
         server_addr: server_addr.to_string(),
@@ -2560,9 +2542,8 @@ async fn run_socks_listener_shutdown_e2e() -> Result<(), TestError> {
     let cert_path = temp_dir.join("server-cert.pem");
     fs::write(&cert_path, CERT_PEM)?;
     let server_addr = unused_loopback_addr().await?;
-    let socks_addr = unused_loopback_addr().await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let mut client_task = tokio::spawn(run_socks5_listener_until_shutdown(
+    let (_socks_addr, client_task) = start_socks5_listener_until_shutdown(
         ClientConfig {
             server_addr: server_addr.to_string(),
             server_addrs: None,
@@ -2579,12 +2560,11 @@ async fn run_socks_listener_shutdown_e2e() -> Result<(), TestError> {
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
         },
-        socks_addr.to_string(),
         async {
             let _ = shutdown_rx.await;
         },
-    ));
-    wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+    )
+    .await?;
 
     shutdown_tx
         .send(())
@@ -2626,9 +2606,8 @@ async fn run_socks_listener_shutdown_during_connect_with_request(
         Ok::<(), TestError>(())
     });
 
-    let socks_addr = unused_loopback_addr().await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let mut client_task = tokio::spawn(run_socks5_listener_until_shutdown(
+    let (socks_addr, client_task) = start_socks5_listener_until_shutdown(
         ClientConfig {
             server_addr: server_addr.to_string(),
             server_addrs: None,
@@ -2645,12 +2624,11 @@ async fn run_socks_listener_shutdown_during_connect_with_request(
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
         },
-        socks_addr.to_string(),
         async {
             let _ = shutdown_rx.await;
         },
-    ));
-    wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+    )
+    .await?;
 
     let mut socks = TcpStream::connect(socks_addr).await?;
     socks.write_all(&request).await?;
@@ -2697,9 +2675,8 @@ async fn run_socks_udp_datagram_shutdown_during_reconnect_e2e() -> Result<(), Te
         Ok::<(), TestError>(())
     });
 
-    let socks_addr = unused_loopback_addr().await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let mut client_task = tokio::spawn(run_socks5_listener_until_shutdown(
+    let (socks_addr, client_task) = start_socks5_listener_until_shutdown(
         ClientConfig {
             server_addr: server_addr.to_string(),
             server_addrs: None,
@@ -2716,12 +2693,11 @@ async fn run_socks_udp_datagram_shutdown_during_reconnect_e2e() -> Result<(), Te
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
         },
-        socks_addr.to_string(),
         async {
             let _ = shutdown_rx.await;
         },
-    ));
-    wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
+    )
+    .await?;
 
     let (_socks_control, udp_relay_addr) = open_socks_udp_associate(socks_addr).await?;
     let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -2781,24 +2757,15 @@ impl ServerHarness {
         } else {
             None
         };
-        let server_addr = unused_loopback_addr().await?;
-        let mut server_task = tokio::spawn(uk_server::run(ServerConfig {
-            listen: server_addr.to_string(),
-            cert_path: path_string(&cert_path),
-            key_path: path_string(&key_path),
-            auth_skew_seconds: Some(auth_skew_seconds),
-            limits: Some(limits),
-            policy_path: policy_path.as_deref().map(path_string),
-            credentials: vec![CredentialConfig {
-                key_id: KEY_ID.to_owned(),
-                secret: SECRET.to_owned(),
-                status: Some("active".to_owned()),
-                not_before: None,
-                not_after: None,
-                policy_group: Some("default".to_owned()),
-            }],
-        }));
-        wait_for_listener("uk-server", server_addr, &mut server_task).await?;
+        let (server_addr, server_task) = start_uk_server(test_server_config(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            &cert_path,
+            &key_path,
+            limits,
+            policy_path.as_deref(),
+            auth_skew_seconds,
+        ))
+        .await?;
 
         Ok(Self {
             temp_dir,
@@ -3929,24 +3896,15 @@ impl RelayHarness {
             None
         };
 
-        let server_addr = unused_loopback_addr().await?;
-        let mut server_task = tokio::spawn(uk_server::run(ServerConfig {
-            listen: server_addr.to_string(),
-            cert_path: path_string(&cert_path),
-            key_path: path_string(&key_path),
-            auth_skew_seconds: Some(30),
-            limits: Some(limits),
-            policy_path: policy_path.as_deref().map(path_string),
-            credentials: vec![CredentialConfig {
-                key_id: KEY_ID.to_owned(),
-                secret: SECRET.to_owned(),
-                status: Some("active".to_owned()),
-                not_before: None,
-                not_after: None,
-                policy_group: Some("default".to_owned()),
-            }],
-        }));
-        wait_for_listener("uk-server", server_addr, &mut server_task).await?;
+        let (server_addr, server_task) = start_uk_server(test_server_config(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            &cert_path,
+            &key_path,
+            limits,
+            policy_path.as_deref(),
+            30,
+        ))
+        .await?;
 
         let (socks_addr, client_task) = start_socks5_listener(ClientConfig {
             server_addr: server_addr.to_string(),
@@ -4223,13 +4181,73 @@ async fn wait_for_listener(
     Err(format!("listener did not start at {addr}").into())
 }
 
+fn test_server_config(
+    listen: SocketAddr,
+    cert_path: &Path,
+    key_path: &Path,
+    limits: LimitConfig,
+    policy_path: Option<&Path>,
+    auth_skew_seconds: u64,
+) -> ServerConfig {
+    ServerConfig {
+        listen: listen.to_string(),
+        cert_path: path_string(cert_path),
+        key_path: path_string(key_path),
+        auth_skew_seconds: Some(auth_skew_seconds),
+        limits: Some(limits),
+        policy_path: policy_path.map(path_string),
+        credentials: vec![CredentialConfig {
+            key_id: KEY_ID.to_owned(),
+            secret: SECRET.to_owned(),
+            status: Some("active".to_owned()),
+            not_before: None,
+            not_after: None,
+            policy_group: Some("default".to_owned()),
+        }],
+    }
+}
+
+async fn start_uk_server(
+    config: ServerConfig,
+) -> Result<(SocketAddr, JoinHandle<Result<(), TestError>>), TestError> {
+    start_uk_server_until_shutdown(config, std::future::pending()).await
+}
+
+async fn start_uk_server_until_shutdown<F>(
+    config: ServerConfig,
+    shutdown: F,
+) -> Result<(SocketAddr, JoinHandle<Result<(), TestError>>), TestError>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let server_addr = listener.local_addr()?;
+    let mut server_task = tokio::spawn(uk_server::run_on_listener_until_shutdown(
+        config, listener, shutdown,
+    ));
+    wait_for_listener("uk-server", server_addr, &mut server_task).await?;
+    Ok((server_addr, server_task))
+}
+
 async fn start_socks5_listener(
     config: ClientConfig,
 ) -> Result<(SocketAddr, JoinHandle<Result<(), TestError>>), TestError> {
+    start_socks5_listener_until_shutdown(config, std::future::pending()).await
+}
+
+async fn start_socks5_listener_until_shutdown<F>(
+    config: ClientConfig,
+    shutdown: F,
+) -> Result<(SocketAddr, JoinHandle<Result<(), TestError>>), TestError>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     uk_client::check_config(&config)?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let socks_addr = listener.local_addr()?;
-    let mut client_task = tokio::spawn(run_socks5_listener_on(config, listener));
+    let mut client_task = tokio::spawn(run_socks5_listener_on_until_shutdown(
+        config, listener, shutdown,
+    ));
     wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
     Ok((socks_addr, client_task))
 }
