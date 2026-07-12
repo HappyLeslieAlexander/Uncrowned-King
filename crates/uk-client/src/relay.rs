@@ -40,6 +40,7 @@ use crate::{
 const FLOW_ID_ALLOCATION_ATTEMPTS: usize = 1024;
 const FLOW_FRAME_QUEUE_CAPACITY: usize = 32;
 const UDP_ASSOCIATION_EVENT_QUEUE_CAPACITY: usize = 128;
+const UDP_SEND_ATTEMPTS: usize = 2;
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const UDP_ASSOCIATION_BUFFER_SIZE: usize = 65_536;
 
@@ -2005,29 +2006,53 @@ impl UdpAssociation {
             }
         };
 
-        let flow = match self
-            .flow_for_target(
-                datagram.target.clone(),
-                local,
-                tcp_buf,
-                sessions,
-                shutdown_rx,
-            )
-            .await?
-        {
-            UdpAssociationFlowLookup::Open(flow) => flow,
-            UdpAssociationFlowLookup::NoFlow => return Ok(true),
-            UdpAssociationFlowLookup::Cancelled => return Ok(false),
-        };
-        let max_payload_len = flow.session.data_frame_size;
-        if udp_payload_exceeds_frame_limit(datagram.payload.len(), max_payload_len) {
-            warn_oversized_udp_datagram(&datagram.target, datagram.payload.len(), max_payload_len);
-            return Ok(true);
+        let mut last_error = None;
+        for attempt in 0..UDP_SEND_ATTEMPTS {
+            let flow = match self
+                .flow_for_target(
+                    datagram.target.clone(),
+                    local,
+                    tcp_buf,
+                    sessions,
+                    shutdown_rx,
+                )
+                .await?
+            {
+                UdpAssociationFlowLookup::Open(flow) => flow,
+                UdpAssociationFlowLookup::NoFlow => return Ok(true),
+                UdpAssociationFlowLookup::Cancelled => return Ok(false),
+            };
+            let max_payload_len = flow.session.data_frame_size;
+            if udp_payload_exceeds_frame_limit(datagram.payload.len(), max_payload_len) {
+                warn_oversized_udp_datagram(
+                    &datagram.target,
+                    datagram.payload.len(),
+                    max_payload_len,
+                );
+                return Ok(true);
+            }
+            match flow
+                .session
+                .send_udp_data(flow.id, datagram.payload.clone())
+                .await
+            {
+                Ok(()) => return Ok(true),
+                Err(err) => {
+                    warn!(
+                        event = "client.udp_flow.send.error",
+                        flow_id = flow.id,
+                        target = %datagram.target.log_safe(),
+                        attempt,
+                        error = %err
+                    );
+                    self.remove_flow_if_matches(&datagram.target, flow.id);
+                    flow.session.flows.lock().await.remove(&flow.id);
+                    last_error = Some(err);
+                }
+            }
         }
-        flow.session
-            .send_udp_data(flow.id, datagram.payload)
-            .await?;
-        Ok(true)
+
+        Err(last_error.unwrap_or_else(|| "failed to send uk udp datagram".into()))
     }
 
     fn accept_client_endpoint(&mut self, peer: SocketAddr) -> bool {
@@ -2130,7 +2155,7 @@ impl UdpAssociation {
         };
         match joined {
             Ok(result) => {
-                self.flows_by_target.remove(&result.target);
+                self.remove_flow_if_matches(&result.target, result.flow_id);
                 if let Err(err) = result.outcome {
                     warn!(
                         event = "client.udp_flow.task_error",
@@ -2143,6 +2168,16 @@ impl UdpAssociation {
             Err(err) => {
                 warn!(event = "client.udp_flow.join_error", error = %err);
             }
+        }
+    }
+
+    fn remove_flow_if_matches(&mut self, target: &Target, flow_id: u64) -> bool {
+        let current_flow_id = self.flows_by_target.get(target).map(|flow| flow.id);
+        if udp_flow_id_matches(current_flow_id, flow_id) {
+            self.flows_by_target.remove(target);
+            true
+        } else {
+            false
         }
     }
 
@@ -2192,6 +2227,10 @@ impl UdpAssociation {
             }
         }
     }
+}
+
+fn udp_flow_id_matches(current_flow_id: Option<u64>, candidate_flow_id: u64) -> bool {
+    current_flow_id == Some(candidate_flow_id)
 }
 
 impl UdpClientEndpoint {
@@ -3876,6 +3915,13 @@ mod tests {
     fn udp_payload_frame_limit_allows_boundary_only() {
         assert!(!udp_payload_exceeds_frame_limit(512, 512));
         assert!(udp_payload_exceeds_frame_limit(513, 512));
+    }
+
+    #[test]
+    fn late_udp_flow_completion_does_not_match_replacement() {
+        assert!(!udp_flow_id_matches(Some(3), 1));
+        assert!(udp_flow_id_matches(Some(3), 3));
+        assert!(!udp_flow_id_matches(None, 3));
     }
 
     #[test]

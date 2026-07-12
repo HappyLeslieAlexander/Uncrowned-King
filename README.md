@@ -16,6 +16,7 @@ The repository currently focuses on the first runnable v0.1 TLS/TCP carrier:
 - TLS/TCP authenticated server sessions in `uk-server`
 - SOCKS5 CONNECT and UDP ASSOCIATE entry points in `uk-client`
 - multiplexed TCP relay and UDP relay over the TLS/TCP carrier
+- bounded UDP flow recovery after a carrier disconnect without closing the SOCKS association
 - graceful Ctrl+C/SIGTERM shutdown for long-running client and server listeners
 - nonce-matched PING/PONG keepalive for active relay flows
 - negotiated UDP flow limits and idle UDP flow cleanup on both client and server
@@ -113,7 +114,10 @@ bounds waiting for a UK TCP open response from the server.
 `udp_flow_idle_timeout_seconds = 120` bounds how long a per-target UDP flow may
 sit idle in a local SOCKS UDP association before the client closes it. UDP flow
 activity is bidirectional: downstream target replies also refresh the idle
-timer. SOCKS5 UDP ASSOCIATE honors the client-declared UDP source endpoint:
+timer. A failed carrier send removes only the matching stale UDP flow and makes
+one bounded attempt to reconnect the UK session and resend the datagram; the
+SOCKS UDP association remains open when recovery succeeds. SOCKS5 UDP ASSOCIATE
+honors the client-declared UDP source endpoint:
 declared non-zero addresses or ports must match incoming UDP datagrams, while
 an all-zero endpoint learns the first accepted peer.
 `shutdown_timeout_seconds = 30` bounds how long the local SOCKS listener waits

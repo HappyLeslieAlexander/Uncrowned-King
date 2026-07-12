@@ -168,6 +168,11 @@ async fn relays_multiple_udp_targets_over_one_socks5_association() -> Result<(),
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovers_udp_association_after_carrier_disconnect() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_udp_carrier_recovery_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn respects_disabled_udp_stream_fallback_setting() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -3085,6 +3090,84 @@ async fn run_socks_udp_datagram_shutdown_during_reconnect_e2e() -> Result<(), Te
     Ok(())
 }
 
+async fn run_udp_carrier_recovery_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    fs::write(&cert_path, CERT_PEM)?;
+    write_private_key(&key_path)?;
+
+    let carrier_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let server_addr = carrier_listener.local_addr()?;
+    let (first_closed_tx, first_closed_rx) = oneshot::channel();
+    let server_task = tokio::spawn(run_udp_reconnect_server(
+        carrier_listener,
+        cert_path.clone(),
+        key_path,
+        first_closed_tx,
+    ));
+    let (socks_addr, client_task) = start_socks5_listener(ClientConfig {
+        server_addr: server_addr.to_string(),
+        server_addrs: None,
+        server_name: "localhost".to_owned(),
+        ca_cert_path: path_string(&cert_path),
+        key_id: KEY_ID.to_owned(),
+        secret: SECRET.to_owned(),
+        handshake_timeout_seconds: Some(3),
+        server_connect_retry_delay_millis: Some(0),
+        socks_handshake_timeout_seconds: Some(3),
+        tcp_open_timeout_seconds: Some(3),
+        udp_flow_idle_timeout_seconds: None,
+        shutdown_timeout_seconds: None,
+        max_pending_open_bytes: None,
+        max_socks_connections: None,
+        max_buffered_bytes_per_session: None,
+        max_buffered_bytes_per_flow: None,
+    })
+    .await?;
+
+    let (_socks_control, udp_relay_addr) = open_socks_udp_associate(socks_addr).await?;
+    let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let target = SocketAddr::from((Ipv4Addr::LOCALHOST, 53));
+    udp_client
+        .send_to(
+            &socks_udp_datagram(target, b"first carrier"),
+            udp_relay_addr,
+        )
+        .await?;
+    tokio::time::timeout(Duration::from_secs(3), first_closed_rx).await??;
+
+    let recovered_payload = b"recovered carrier";
+    let mut recovered = None;
+    for _ in 0..20 {
+        udp_client
+            .send_to(
+                &socks_udp_datagram(target, recovered_payload),
+                udp_relay_addr,
+            )
+            .await?;
+        if let Ok(result) = tokio::time::timeout(
+            Duration::from_millis(100),
+            recv_socks_udp_datagram(&udp_client, udp_relay_addr),
+        )
+        .await
+        {
+            recovered = Some(result?);
+            break;
+        }
+    }
+    let (reply_target, reply_payload) = recovered.ok_or("UDP association did not recover")?;
+    assert_eq!(reply_target, target);
+    assert_eq!(reply_payload, recovered_payload);
+
+    tokio::time::timeout(Duration::from_secs(3), server_task).await???;
+    client_task.abort();
+    let _ = fs::remove_dir_all(&temp_dir);
+    Ok(())
+}
+
 struct ServerHarness {
     temp_dir: PathBuf,
     server_addr: SocketAddr,
@@ -4121,6 +4204,76 @@ async fn run_missing_pong_server(
         .into()),
         Ok(Err(err)) => Err(err.into()),
         Err(_) => Err("client did not close session after unanswered ping".into()),
+    }
+}
+
+async fn run_udp_reconnect_server(
+    listener: TcpListener,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    first_closed_tx: oneshot::Sender<()>,
+) -> Result<(), TestError> {
+    let mut first = accept_fake_server_session_from_listener(
+        &listener,
+        &cert_path,
+        &key_path,
+        fake_server_settings(),
+    )
+    .await?;
+    let (first_flow_id, first_target) = accept_fake_udp_flow(&mut first).await?;
+    let first_data = read_fake_udp_data(&mut first, first_flow_id).await?;
+    assert_eq!(first_data, Bytes::from_static(b"first carrier"));
+    drop(first);
+    let _ = first_closed_tx.send(());
+
+    let mut second = accept_fake_server_session_from_listener(
+        &listener,
+        &cert_path,
+        &key_path,
+        fake_server_settings(),
+    )
+    .await?;
+    let (second_flow_id, second_target) = accept_fake_udp_flow(&mut second).await?;
+    assert_eq!(second_target, first_target);
+    let second_data = read_fake_udp_data(&mut second, second_flow_id).await?;
+    assert_eq!(second_data, Bytes::from_static(b"recovered carrier"));
+    let reply = Frame::new(FrameType::UdpData, 0, second_flow_id, second_data)?;
+    write_frame(&mut second, &reply).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    Ok(())
+}
+
+async fn accept_fake_udp_flow(
+    stream: &mut ServerTlsStream<TcpStream>,
+) -> Result<(u64, Target), TestError> {
+    let open = read_frame(stream, FrameLimits::default()).await?;
+    assert_eq!(open.header.frame_type, FrameType::UdpOpen);
+    let flow_id = open.header.id;
+    let mut payload = open.payload;
+    let target = UdpOpen::decode(&mut payload)?.target;
+    let ack = Frame::new(FrameType::UdpData, 0, flow_id, Bytes::new())?;
+    write_frame(stream, &ack).await?;
+    Ok((flow_id, target))
+}
+
+async fn read_fake_udp_data(
+    stream: &mut ServerTlsStream<TcpStream>,
+    flow_id: u64,
+) -> Result<Bytes, TestError> {
+    loop {
+        let frame = read_frame(stream, FrameLimits::default()).await?;
+        match frame.header.frame_type {
+            FrameType::UdpData if frame.header.id == flow_id => return Ok(frame.payload),
+            FrameType::Ping => {
+                let pong = Frame::new(FrameType::Pong, 0, 0, frame.payload)?;
+                write_frame(stream, &pong).await?;
+            }
+            other => {
+                return Err(
+                    format!("unexpected frame while waiting for UDP data: {other:?}").into(),
+                );
+            }
+        }
     }
 }
 
