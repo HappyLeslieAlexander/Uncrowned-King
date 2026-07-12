@@ -44,3 +44,8 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 zeroize = "1"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"

@@ -37,3 +37,7 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Release build
+        if: matrix.toolchain == 'stable'
+        run: cargo build --workspace --release --locked

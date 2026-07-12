@@ -197,4 +197,9 @@ cargo fmt --all --check
 cargo check --workspace --locked
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo build --workspace --release --locked
 ```
+
+GitHub Actions runs the same checks on Rust 1.85 and stable, builds release
+binaries on stable, and audits `Cargo.lock` against RustSec advisories on
+dependency changes and a daily schedule.
