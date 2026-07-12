@@ -73,6 +73,7 @@ handshake_timeout_seconds = 10
 target_connect_timeout_seconds = 10
 tcp_half_close_timeout_seconds = 30
 udp_flow_idle_timeout_seconds = 120
+shutdown_timeout_seconds = 30
 replay_cache_window_seconds = 300
 replay_cache_max_entries = 65536
 ```
@@ -82,6 +83,8 @@ Set `handshake_timeout_seconds = 0` to disable the TLS/auth handshake timeout.
 Set `target_connect_timeout_seconds = 0` to disable the server target dial timeout.
 Set `tcp_half_close_timeout_seconds = 0` to disable the TCP half-close drain timeout.
 Set `udp_flow_idle_timeout_seconds = 0` to disable server-side UDP flow idle cleanup.
+Set `shutdown_timeout_seconds = 0` to wait indefinitely for listener tasks to
+finish after shutdown; otherwise remaining tasks are aborted after the timeout.
 Set `max_udp_flows = 0` to disable UDP relay.
 `auth_skew_seconds` defaults to 30 and bounds accepted client and server
 authentication timestamps.
@@ -107,6 +110,9 @@ activity is bidirectional: downstream target replies also refresh the idle
 timer. SOCKS5 UDP ASSOCIATE honors the client-declared UDP source endpoint:
 declared non-zero addresses or ports must match incoming UDP datagrams, while
 an all-zero endpoint learns the first accepted peer.
+`shutdown_timeout_seconds = 30` bounds how long the local SOCKS listener waits
+for active connection tasks after Ctrl+C/SIGTERM before aborting the stragglers;
+set it to `0` to wait indefinitely.
 `max_pending_open_bytes = 65536` bounds local bytes buffered before that open
 response arrives.
 `max_socks_connections = 1024` bounds concurrent local SOCKS connections before

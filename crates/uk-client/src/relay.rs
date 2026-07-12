@@ -373,6 +373,7 @@ where
     crate::check_config(&config)?;
     let listen = listener.local_addr()?;
     let socks_handshake_timeout = timeout(config.socks_handshake_timeout_seconds());
+    let shutdown_timeout = timeout(config.shutdown_timeout_seconds());
     let max_socks_connections = usize_limit(config.max_socks_connections())?;
     let sessions = Arc::new(ClientSessionManager::new(config));
     let connection_slots = Arc::new(Semaphore::new(max_socks_connections));
@@ -433,12 +434,35 @@ where
         }
     }
 
-    while let Some(joined) = connections.join_next().await {
-        log_socks_task_result(Some(joined));
-    }
+    drain_socks_tasks(&mut connections, shutdown_timeout).await;
     sessions.shutdown().await;
 
     Ok(())
+}
+
+async fn drain_socks_tasks(connections: &mut JoinSet<()>, shutdown_timeout: Option<Duration>) {
+    if let Some(timeout) = shutdown_timeout {
+        if time::timeout(timeout, join_socks_tasks(connections))
+            .await
+            .is_err()
+        {
+            warn!(
+                event = "socks5.shutdown.timeout",
+                remaining_connections = connections.len(),
+                timeout_seconds = timeout.as_secs()
+            );
+            connections.abort_all();
+            join_socks_tasks(connections).await;
+        }
+    } else {
+        join_socks_tasks(connections).await;
+    }
+}
+
+async fn join_socks_tasks(connections: &mut JoinSet<()>) {
+    while let Some(joined) = connections.join_next().await {
+        log_socks_task_result(Some(joined));
+    }
 }
 
 fn log_socks_task_result(result: Option<Result<(), tokio::task::JoinError>>) {
@@ -2445,6 +2469,7 @@ mod tests {
             socks_handshake_timeout_seconds: None,
             tcp_open_timeout_seconds: None,
             udp_flow_idle_timeout_seconds: None,
+            shutdown_timeout_seconds: None,
             max_pending_open_bytes: None,
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
@@ -3333,6 +3358,31 @@ mod tests {
             .unwrap_err();
         let io_error = err.downcast_ref::<io::Error>().unwrap();
         assert_eq!(io_error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn socks_shutdown_timeout_aborts_pending_connection_tasks() {
+        let mut connections = JoinSet::new();
+        connections.spawn(std::future::pending::<()>());
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_socks_tasks(&mut connections, Some(Duration::from_millis(10))),
+        )
+        .await
+        .unwrap();
+
+        assert!(connections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn socks_shutdown_drain_waits_for_completed_connection_tasks() {
+        let mut connections = JoinSet::new();
+        connections.spawn(async {});
+
+        drain_socks_tasks(&mut connections, Some(Duration::from_secs(1))).await;
+
+        assert!(connections.is_empty());
     }
 
     #[tokio::test]

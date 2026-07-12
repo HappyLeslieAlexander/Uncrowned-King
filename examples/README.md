@@ -41,6 +41,8 @@ server endpoint gets its own `handshake_timeout_seconds` budget.
 The example limits enable UDP relay with `max_udp_flows = 64` and close
 per-target UDP flows after `udp_flow_idle_timeout_seconds = 120` seconds with no
 datagrams relayed in either direction.
+Both listener examples wait up to `shutdown_timeout_seconds = 30` seconds for
+active connection tasks to finish after Ctrl+C/SIGTERM before aborting them.
 
 The example policy denies private resolved addresses before allowing
 `example.com` traffic. Keep deny rules before broad allow rules when adapting it.

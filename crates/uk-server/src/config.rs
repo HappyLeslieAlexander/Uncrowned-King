@@ -263,6 +263,14 @@ impl ServerConfig {
             .unwrap_or(120)
     }
 
+    /// Graceful listener shutdown timeout in seconds. Zero disables it.
+    pub fn shutdown_timeout_seconds(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.shutdown_timeout_seconds)
+            .unwrap_or(30)
+    }
+
     /// Replay cache retention window in seconds.
     pub fn replay_cache_window_seconds(&self) -> u64 {
         self.limits
@@ -365,6 +373,8 @@ pub struct LimitConfig {
     pub tcp_half_close_timeout_seconds: Option<u64>,
     /// UDP flow idle timeout in seconds.
     pub udp_flow_idle_timeout_seconds: Option<u64>,
+    /// Graceful listener shutdown timeout in seconds.
+    pub shutdown_timeout_seconds: Option<u64>,
     /// Replay cache retention window in seconds.
     pub replay_cache_window_seconds: Option<u64>,
     /// Maximum accepted nonce pairs retained by the replay cache.
@@ -1016,6 +1026,11 @@ target_connect_timeout_seconds = 7
     }
 
     #[test]
+    fn defaults_shutdown_timeout() {
+        assert_eq!(minimal_config().shutdown_timeout_seconds(), 30);
+    }
+
+    #[test]
     fn parses_tcp_half_close_timeout() {
         let config: ServerConfig = toml::from_str(
             r#"
@@ -1052,6 +1067,24 @@ udp_flow_idle_timeout_seconds = 17
     }
 
     #[test]
+    fn parses_shutdown_timeout() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+shutdown_timeout_seconds = 9
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.shutdown_timeout_seconds(), 9);
+    }
+
+    #[test]
     fn accepts_zero_timeout_limits() {
         let config: ServerConfig = toml::from_str(
             r#"
@@ -1066,6 +1099,7 @@ handshake_timeout_seconds = 0
 target_connect_timeout_seconds = 0
 tcp_half_close_timeout_seconds = 0
 udp_flow_idle_timeout_seconds = 0
+shutdown_timeout_seconds = 0
 "#,
         )
         .unwrap();
@@ -1075,6 +1109,7 @@ udp_flow_idle_timeout_seconds = 0
         assert_eq!(config.target_connect_timeout_seconds(), 0);
         assert_eq!(config.tcp_half_close_timeout_seconds(), 0);
         assert_eq!(config.udp_flow_idle_timeout_seconds(), 0);
+        assert_eq!(config.shutdown_timeout_seconds(), 0);
         assert!(config.validate_limits().is_ok());
     }
 

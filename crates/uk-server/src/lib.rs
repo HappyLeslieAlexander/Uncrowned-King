@@ -89,6 +89,7 @@ where
     } = runtime;
     let listen = listener.local_addr()?;
     let session_permits = Arc::new(Semaphore::new(max_sessions));
+    let shutdown_timeout = listener_shutdown_timeout(config.shutdown_timeout_seconds());
 
     info!(event = "server.listen", listen = %listen);
 
@@ -151,9 +152,7 @@ where
         }
     }
 
-    while let Some(joined) = connections.join_next().await {
-        log_connection_task_result(Some(joined));
-    }
+    drain_connection_tasks(&mut connections, shutdown_timeout).await;
 
     Ok(())
 }
@@ -188,6 +187,31 @@ fn prepare_server_runtime(config: ServerConfig) -> Result<ServerRuntime, AnyErro
 fn log_connection_task_result(result: Option<Result<(), tokio::task::JoinError>>) {
     if let Some(Err(err)) = result {
         warn!(event = "server.connection.task_error", error = %err);
+    }
+}
+
+async fn drain_connection_tasks(connections: &mut JoinSet<()>, shutdown_timeout: Option<Duration>) {
+    if let Some(timeout) = shutdown_timeout {
+        if time::timeout(timeout, join_connection_tasks(connections))
+            .await
+            .is_err()
+        {
+            warn!(
+                event = "server.shutdown.timeout",
+                remaining_connections = connections.len(),
+                timeout_seconds = timeout.as_secs()
+            );
+            connections.abort_all();
+            join_connection_tasks(connections).await;
+        }
+    } else {
+        join_connection_tasks(connections).await;
+    }
+}
+
+async fn join_connection_tasks(connections: &mut JoinSet<()>) {
+    while let Some(joined) = connections.join_next().await {
+        log_connection_task_result(Some(joined));
     }
 }
 
@@ -417,6 +441,10 @@ fn udp_flow_idle_timeout(seconds: u64) -> Option<Duration> {
     (seconds != 0).then(|| Duration::from_secs(seconds))
 }
 
+fn listener_shutdown_timeout(seconds: u64) -> Option<Duration> {
+    (seconds != 0).then(|| Duration::from_secs(seconds))
+}
+
 fn is_clean_tls_handshake_disconnect(error: &AnyError) -> bool {
     error
         .as_ref()
@@ -551,5 +579,30 @@ mod tests {
         assert!(is_clean_tls_handshake_disconnect(&not_connected));
         assert!(is_clean_tls_handshake_disconnect(&rustls_eof));
         assert!(!is_clean_tls_handshake_disconnect(&protocol_error));
+    }
+
+    #[tokio::test]
+    async fn server_shutdown_timeout_aborts_pending_connection_tasks() {
+        let mut connections = JoinSet::new();
+        connections.spawn(std::future::pending::<()>());
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_connection_tasks(&mut connections, Some(Duration::from_millis(10))),
+        )
+        .await
+        .unwrap();
+
+        assert!(connections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn server_shutdown_drain_waits_for_completed_connection_tasks() {
+        let mut connections = JoinSet::new();
+        connections.spawn(async {});
+
+        drain_connection_tasks(&mut connections, Some(Duration::from_secs(1))).await;
+
+        assert!(connections.is_empty());
     }
 }
