@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use tokio::net::TcpListener;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
@@ -19,9 +19,18 @@ struct Args {
     /// Path to client TOML config.
     #[arg(long, global = true)]
     config: Option<String>,
+    /// Log output format.
+    #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
     /// Client subcommand.
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
 }
 
 /// Client mode.
@@ -44,8 +53,8 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<(), AnyError> {
-    init_tracing();
     let args = Args::parse();
+    init_tracing(args.log_format);
     let config = ClientConfig::load(config_path(&args)?)?;
     match args.command {
         Command::ConfigCheck => {
@@ -94,9 +103,15 @@ fn config_path(args: &Args) -> Result<&str, AnyError> {
         .ok_or_else(|| "--config is required".into())
 }
 
-fn init_tracing() {
+fn init_tracing(log_format: LogFormat) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    match log_format {
+        LogFormat::Text => tracing_subscriber::fmt().with_env_filter(filter).init(),
+        LogFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .init(),
+    }
 }
 
 async fn shutdown_signal() {
@@ -153,6 +168,21 @@ mod tests {
 
         assert_eq!(args.config.as_deref(), Some("client.toml"));
         assert!(matches!(args.command, Command::ConfigCheck));
+    }
+
+    #[test]
+    fn parses_json_log_format_after_subcommand() {
+        let args = Args::try_parse_from([
+            "uk-client",
+            "config-check",
+            "--config",
+            "client.toml",
+            "--log-format",
+            "json",
+        ])
+        .unwrap();
+
+        assert_eq!(args.log_format, LogFormat::Json);
     }
 
     #[test]

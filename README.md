@@ -162,6 +162,14 @@ or network access controls.
 
 Both long-running listeners stop gracefully on Ctrl+C or SIGTERM.
 
+Both binaries accept global `--log-format text|json` output selection and use
+`RUST_LOG` for filtering. JSON mode preserves structured event fields for log
+collection systems:
+
+```sh
+RUST_LOG=info uk-server --config examples/server.toml --log-format json serve
+```
+
 Configured endpoints use `host:port` syntax. IPv6 literals must be bracketed,
 for example `[::1]:9443`; port `0` is rejected by config validation.
 

@@ -1,6 +1,6 @@
 //! Uncrowned King server binary.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 use uk_server::{AnyError, check_config, config::ServerConfig, run_until_shutdown};
@@ -12,9 +12,18 @@ struct Args {
     /// Path to server TOML config.
     #[arg(long, global = true)]
     config: Option<String>,
+    /// Log output format.
+    #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
     /// Server subcommand.
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
 }
 
 /// Server mode.
@@ -28,8 +37,8 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<(), AnyError> {
-    init_tracing();
     let args = Args::parse();
+    init_tracing(args.log_format);
     let config = ServerConfig::load(config_path(&args)?)?;
     match args.command.unwrap_or(Command::Serve) {
         Command::Serve => run_until_shutdown(config, shutdown_signal()).await?,
@@ -47,9 +56,15 @@ fn config_path(args: &Args) -> Result<&str, AnyError> {
         .ok_or_else(|| "--config is required".into())
 }
 
-fn init_tracing() {
+fn init_tracing(log_format: LogFormat) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    match log_format {
+        LogFormat::Text => tracing_subscriber::fmt().with_env_filter(filter).init(),
+        LogFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .init(),
+    }
 }
 
 async fn shutdown_signal() {
@@ -106,6 +121,21 @@ mod tests {
 
         assert_eq!(args.config.as_deref(), Some("server.toml"));
         assert!(matches!(args.command, Some(Command::ConfigCheck)));
+    }
+
+    #[test]
+    fn parses_json_log_format_after_subcommand() {
+        let args = Args::try_parse_from([
+            "uk-server",
+            "config-check",
+            "--config",
+            "server.toml",
+            "--log-format",
+            "json",
+        ])
+        .unwrap();
+
+        assert_eq!(args.log_format, LogFormat::Json);
     }
 
     #[test]

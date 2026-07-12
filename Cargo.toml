@@ -42,5 +42,5 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-threa
 tokio-rustls = "0.26"
 toml = "0.8"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 zeroize = "1"
