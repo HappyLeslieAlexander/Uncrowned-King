@@ -35,6 +35,9 @@ Both long-running commands stop gracefully on Ctrl+C or SIGTERM.
 Replace the example shared secret before using these configs anywhere outside a
 local throwaway environment.
 
+Client `server_addrs` entries are tried after `server_addr`; each configured
+server endpoint gets its own `handshake_timeout_seconds` budget.
+
 The example limits enable UDP relay with `max_udp_flows = 64` and close
 per-target UDP flows after `udp_flow_idle_timeout_seconds = 120` seconds with no
 datagrams relayed in either direction.

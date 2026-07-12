@@ -92,11 +92,12 @@ least 75 bytes so a minimum `AUTH_RESPONSE` can fit. `max_pre_auth_bytes`,
 At least one credential is required. Credential `key_id` values must be unique.
 When set, `policy_group` must be non-empty printable text.
 
-Client configs may also set `handshake_timeout_seconds = 10` to bound the
-server connection, TLS handshake, authentication exchange, and SETTINGS read.
-Set `server_addrs = ["backup.example.com:443"]` to try fallback server
-endpoints after `server_addr` within that same timeout. Fallback endpoints must
-not duplicate `server_addr` or each other.
+Client configs may also set `handshake_timeout_seconds = 10` to bound each
+server endpoint attempt, including TCP connect, TLS handshake, authentication
+exchange, and SETTINGS read. Set `server_addrs = ["backup.example.com:443"]`
+to try fallback server endpoints after `server_addr`; each endpoint receives
+its own handshake timeout budget. Fallback endpoints must not duplicate
+`server_addr` or each other.
 When running the SOCKS5 listener, `socks_handshake_timeout_seconds = 10` bounds
 the local SOCKS greeting and CONNECT request. `tcp_open_timeout_seconds = 10`
 bounds waiting for a UK TCP open response from the server.
