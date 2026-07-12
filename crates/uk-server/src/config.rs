@@ -522,14 +522,18 @@ mod tests {
     }
 
     #[cfg(unix)]
+    static NEXT_TEMP_PATH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    #[cfg(unix)]
     fn temp_path(label: &str, extension: &str) -> std::path::PathBuf {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let path_id = NEXT_TEMP_PATH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "uk-server-{label}-test-{}-{now}.{extension}",
-            std::process::id()
+            "uk-server-{label}-test-{}-{now}-{path_id}.{extension}",
+            std::process::id(),
         ))
     }
 
