@@ -636,6 +636,15 @@ async fn closes_session_when_keepalive_pong_payload_is_invalid() -> Result<(), T
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closes_session_when_keepalive_pong_nonce_does_not_match() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_wrong_nonce_pong_keepalive_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closes_target_when_socks_client_disconnects() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_client_disconnect_e2e()).await?
 }
@@ -1433,6 +1442,30 @@ async fn run_invalid_pong_keepalive_e2e() -> Result<(), TestError> {
     init_tracing();
 
     let mut harness = MissingPongServerHarness::start_with_empty_pong().await?;
+    let mut socks = TcpStream::connect(harness.socks_addr).await?;
+    let request = socks_connect_request(SocketAddr::from((Ipv4Addr::LOCALHOST, 80)));
+    socks.write_all(&request).await?;
+
+    let mut method_response = [0_u8; 2];
+    socks.read_exact(&mut method_response).await?;
+    assert_eq!(method_response, [0x05, 0x00]);
+    let mut connect_reply = [0_u8; 10];
+    socks.read_exact(&mut connect_reply).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    harness.observed_client_close_after_ping().await?;
+    let mut byte = [0_u8; 1];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), socks.read(&mut byte)).await??,
+        0
+    );
+    Ok(())
+}
+
+async fn run_wrong_nonce_pong_keepalive_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let mut harness = MissingPongServerHarness::start_with_wrong_nonce_pong().await?;
     let mut socks = TcpStream::connect(harness.socks_addr).await?;
     let request = socks_connect_request(SocketAddr::from((Ipv4Addr::LOCALHOST, 80)));
     socks.write_all(&request).await?;
@@ -3702,6 +3735,7 @@ struct MissingPongServerHarness {
 enum PongBehavior {
     Missing,
     Empty,
+    WrongNonce,
 }
 
 impl MissingPongServerHarness {
@@ -3711,6 +3745,10 @@ impl MissingPongServerHarness {
 
     async fn start_with_empty_pong() -> Result<Self, TestError> {
         Self::start_with_behavior(PongBehavior::Empty).await
+    }
+
+    async fn start_with_wrong_nonce_pong() -> Result<Self, TestError> {
+        Self::start_with_behavior(PongBehavior::WrongNonce).await
     }
 
     async fn start_with_behavior(pong_behavior: PongBehavior) -> Result<Self, TestError> {
@@ -4048,9 +4086,25 @@ async fn run_missing_pong_server(
     .await??;
     validate_connection_frame(&ping, FrameType::Ping)?;
 
-    if matches!(pong_behavior, PongBehavior::Empty) {
-        let empty_pong_frame = Frame::new(FrameType::Pong, 0, 0, Bytes::new())?;
-        write_frame(&mut stream, &empty_pong_frame).await?;
+    match pong_behavior {
+        PongBehavior::Missing => {}
+        PongBehavior::Empty => {
+            let empty_pong_frame = Frame::new(FrameType::Pong, 0, 0, Bytes::new())?;
+            write_frame(&mut stream, &empty_pong_frame).await?;
+        }
+        PongBehavior::WrongNonce => {
+            let ping_nonce = u64::from_be_bytes(ping.payload.as_ref().try_into()?);
+            let wrong_nonce = ping_nonce
+                .checked_add(1)
+                .ok_or("test ping nonce overflow")?;
+            let wrong_pong = Frame::new(
+                FrameType::Pong,
+                0,
+                0,
+                Bytes::copy_from_slice(&wrong_nonce.to_be_bytes()),
+            )?;
+            write_frame(&mut stream, &wrong_pong).await?;
+        }
     }
 
     match tokio::time::timeout(

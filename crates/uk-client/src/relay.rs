@@ -56,6 +56,13 @@ enum ClientConnectionState {
     Closed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeepalivePong {
+    Matched(u64),
+    InvalidPayload,
+    Unexpected { nonce: u64, expected_nonce: u64 },
+}
+
 struct ClientSession {
     writer: CarrierWriter,
     flows: FlowTable,
@@ -74,6 +81,7 @@ struct ClientSession {
     shutdown: ClientSessionShutdown,
     next_flow_id: AtomicU64,
     next_ping_nonce: AtomicU64,
+    outstanding_ping_nonce: AtomicU64,
     last_pong_nonce: AtomicU64,
     pong_notify: Notify,
 }
@@ -855,6 +863,7 @@ impl ClientSession {
             shutdown: ClientSessionShutdown::default(),
             next_flow_id: AtomicU64::new(FIRST_CLIENT_FLOW_ID),
             next_ping_nonce: AtomicU64::new(0),
+            outstanding_ping_nonce: AtomicU64::new(0),
             last_pong_nonce: AtomicU64::new(0),
             pong_notify: Notify::new(),
         });
@@ -1265,8 +1274,12 @@ impl ClientSession {
     async fn write_ping(&self) -> Result<u64, AnyError> {
         let nonce =
             next_keepalive_nonce(&self.next_ping_nonce).ok_or("keepalive nonce space exhausted")?;
+        self.outstanding_ping_nonce.store(nonce, Ordering::SeqCst);
         let frame = Frame::new(FrameType::Ping, 0, 0, keepalive_nonce_payload(nonce))?;
-        self.write_frame(&frame).await?;
+        if let Err(err) = self.write_frame(&frame).await {
+            self.clear_outstanding_ping(nonce);
+            return Err(err);
+        }
         Ok(nonce)
     }
 
@@ -1275,15 +1288,33 @@ impl ClientSession {
     }
 
     fn record_pong(&self, payload: &Bytes) {
-        let Some(nonce) = decode_keepalive_nonce(payload) else {
-            debug!(
-                event = "client.session.keepalive.pong_ignored",
-                payload_len = payload.len()
-            );
-            return;
-        };
-        self.last_pong_nonce.store(nonce, Ordering::SeqCst);
-        self.pong_notify.notify_waiters();
+        match record_matching_pong(&self.outstanding_ping_nonce, &self.last_pong_nonce, payload) {
+            KeepalivePong::Matched(_) => self.pong_notify.notify_waiters(),
+            KeepalivePong::InvalidPayload => {
+                debug!(
+                    event = "client.session.keepalive.pong_ignored",
+                    payload_len = payload.len()
+                );
+            }
+            KeepalivePong::Unexpected {
+                nonce,
+                expected_nonce,
+            } => {
+                debug!(
+                    event = "client.session.keepalive.pong_ignored",
+                    nonce, expected_nonce
+                );
+            }
+        }
+    }
+
+    fn clear_outstanding_ping(&self, nonce: u64) {
+        let _ = self.outstanding_ping_nonce.compare_exchange(
+            nonce,
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 
     async fn wait_for_pong(&self, nonce: u64) -> bool {
@@ -1440,6 +1471,25 @@ fn decode_keepalive_nonce(payload: &Bytes) -> Option<u64> {
     Some(u64::from_be_bytes(bytes))
 }
 
+fn record_matching_pong(
+    outstanding_ping_nonce: &AtomicU64,
+    last_pong_nonce: &AtomicU64,
+    payload: &Bytes,
+) -> KeepalivePong {
+    let Some(nonce) = decode_keepalive_nonce(payload) else {
+        return KeepalivePong::InvalidPayload;
+    };
+    let expected_nonce = outstanding_ping_nonce.load(Ordering::SeqCst);
+    if expected_nonce == 0 || nonce != expected_nonce {
+        return KeepalivePong::Unexpected {
+            nonce,
+            expected_nonce,
+        };
+    }
+    last_pong_nonce.store(nonce, Ordering::SeqCst);
+    KeepalivePong::Matched(nonce)
+}
+
 async fn spawn_carrier_reader(
     mut carrier_reader: ReadHalf<TlsStream<TcpStream>>,
     session: Arc<ClientSession>,
@@ -1499,7 +1549,9 @@ async fn spawn_keepalive(session: Arc<ClientSession>, interval: Duration) {
                         return;
                     }
                 };
-                match time::timeout(interval, task_session.wait_for_pong(nonce)).await {
+                let pong_result = time::timeout(interval, task_session.wait_for_pong(nonce)).await;
+                task_session.clear_outstanding_ping(nonce);
+                match pong_result {
                     Ok(true) => {}
                     Ok(false) => return,
                     Err(_) => {
@@ -3695,6 +3747,48 @@ mod tests {
             decode_keepalive_nonce(&Bytes::from_static(b"too long!")),
             None
         );
+    }
+
+    #[test]
+    fn records_only_the_outstanding_keepalive_pong() {
+        let outstanding = AtomicU64::new(42);
+        let last_pong = AtomicU64::new(0);
+
+        assert_eq!(
+            record_matching_pong(&outstanding, &last_pong, &keepalive_nonce_payload(42)),
+            KeepalivePong::Matched(42)
+        );
+        assert_eq!(last_pong.load(Ordering::SeqCst), 42);
+    }
+
+    #[test]
+    fn stale_keepalive_pong_cannot_overwrite_a_match() {
+        let outstanding = AtomicU64::new(42);
+        let last_pong = AtomicU64::new(42);
+
+        assert_eq!(
+            record_matching_pong(&outstanding, &last_pong, &keepalive_nonce_payload(41)),
+            KeepalivePong::Unexpected {
+                nonce: 41,
+                expected_nonce: 42
+            }
+        );
+        assert_eq!(last_pong.load(Ordering::SeqCst), 42);
+    }
+
+    #[test]
+    fn unsolicited_keepalive_pong_is_ignored() {
+        let outstanding = AtomicU64::new(0);
+        let last_pong = AtomicU64::new(0);
+
+        assert_eq!(
+            record_matching_pong(&outstanding, &last_pong, &keepalive_nonce_payload(1)),
+            KeepalivePong::Unexpected {
+                nonce: 1,
+                expected_nonce: 0
+            }
+        );
+        assert_eq!(last_pong.load(Ordering::SeqCst), 0);
     }
 
     #[test]
