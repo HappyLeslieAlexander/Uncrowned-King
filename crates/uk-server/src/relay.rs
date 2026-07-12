@@ -1370,48 +1370,81 @@ fn udp_flow_count(target_writers: &FlowTable) -> usize {
 
 fn spawn_target_open(task: TargetOpenTask) {
     tokio::spawn(async move {
-        tokio::select! {
-            result = connect_allowed_target(
+        let result = wait_for_open_task(
+            connect_allowed_target(
                 &task.target,
                 &task.credential,
                 &task.policy_set,
                 &task.open_dial_limiter,
                 task.target_connect_timeout,
-            ) => {
-                if !task.shutdown.is_closed() && !task.cancel.is_cancelled() {
-                    send_flow_event_or_shutdown(&task.event_tx, FlowEvent::OpenCompleted {
-                        flow_id: task.flow_id,
-                        target: task.target,
-                        result,
-                    }, &task.shutdown).await;
-                }
+            ),
+            &task.shutdown,
+            &task.cancel,
+        )
+        .await;
+        if let Some(result) = result {
+            if task.cancel.is_cancelled() {
+                return;
             }
-            () = task.cancel.cancelled() => {}
+            send_flow_event_or_shutdown(
+                &task.event_tx,
+                FlowEvent::OpenCompleted {
+                    flow_id: task.flow_id,
+                    target: task.target,
+                    result,
+                },
+                &task.shutdown,
+            )
+            .await;
         }
     });
 }
 
 fn spawn_udp_open(task: UdpOpenTask) {
     tokio::spawn(async move {
-        tokio::select! {
-            result = connect_allowed_udp_target(
+        let result = wait_for_open_task(
+            connect_allowed_udp_target(
                 &task.target,
                 &task.credential,
                 &task.policy_set,
                 &task.open_dial_limiter,
                 task.target_connect_timeout,
-            ) => {
-                if !task.shutdown.is_closed() && !task.cancel.is_cancelled() {
-                    send_flow_event_or_shutdown(&task.event_tx, FlowEvent::UdpOpenCompleted {
-                        flow_id: task.flow_id,
-                        target: task.target,
-                        result,
-                    }, &task.shutdown).await;
-                }
+            ),
+            &task.shutdown,
+            &task.cancel,
+        )
+        .await;
+        if let Some(result) = result {
+            if task.cancel.is_cancelled() {
+                return;
             }
-            () = task.cancel.cancelled() => {}
+            send_flow_event_or_shutdown(
+                &task.event_tx,
+                FlowEvent::UdpOpenCompleted {
+                    flow_id: task.flow_id,
+                    target: task.target,
+                    result,
+                },
+                &task.shutdown,
+            )
+            .await;
         }
     });
+}
+
+async fn wait_for_open_task<F, T>(
+    future: F,
+    shutdown: &SessionShutdown,
+    cancel: &OpenFlowCancel,
+) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::select! {
+        result = future => Some(result),
+        () = shutdown.closed() => None,
+        () = cancel.cancelled() => None,
+    }
 }
 
 async fn handle_tcp_open_completed(
@@ -3054,6 +3087,52 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_task_wait_returns_completed_result() {
+        let shutdown = SessionShutdown::default();
+        let cancel = OpenFlowCancel::default();
+
+        let result = wait_for_open_task(async { 7_u8 }, &shutdown, &cancel).await;
+
+        assert_eq!(result, Some(7));
+    }
+
+    #[tokio::test]
+    async fn open_task_wait_exits_on_session_shutdown() {
+        let shutdown = SessionShutdown::default();
+        let shutdown_handle = shutdown.clone();
+        let cancel = OpenFlowCancel::default();
+        let task = tokio::spawn(async move {
+            wait_for_open_task(std::future::pending::<u8>(), &shutdown, &cancel).await
+        });
+
+        shutdown_handle.close();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("open task wait should finish")
+            .expect("open task wait should not panic");
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn open_task_wait_exits_on_pending_open_cancel() {
+        let shutdown = SessionShutdown::default();
+        let cancel = OpenFlowCancel::default();
+        let cancel_handle = cancel.clone();
+        let task = tokio::spawn(async move {
+            wait_for_open_task(std::future::pending::<u8>(), &shutdown, &cancel).await
+        });
+
+        cancel_handle.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("open task wait should finish")
+            .expect("open task wait should not panic");
+        assert_eq!(result, None);
     }
 
     #[tokio::test]
