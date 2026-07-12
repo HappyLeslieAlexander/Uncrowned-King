@@ -239,6 +239,16 @@ async fn falls_back_to_secondary_server_addr_during_handshake() -> Result<(), Te
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn falls_back_to_secondary_server_addr_after_primary_handshake_timeout()
+-> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_handshake_timeout_fallback_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rejects_expired_auth_challenge_during_handshake() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_expired_auth_challenge_e2e()).await?
 }
@@ -1750,6 +1760,28 @@ async fn run_handshake_fallback_e2e() -> Result<(), TestError> {
     config.server_addrs = Some(vec![harness.server_addr.to_string()]);
 
     run_handshake(config).await?;
+    Ok(())
+}
+
+async fn run_handshake_timeout_fallback_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let primary_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let primary_addr = primary_listener.local_addr()?;
+    let silent_primary = tokio::spawn(async move {
+        let (_stream, _) = primary_listener.accept().await?;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        Ok::<(), TestError>(())
+    });
+
+    let harness = ServerHarness::start(test_limits()).await?;
+    let mut config = harness.client_config(SECRET);
+    config.server_addr = primary_addr.to_string();
+    config.server_addrs = Some(vec![harness.server_addr.to_string()]);
+    config.handshake_timeout_seconds = Some(1);
+
+    run_handshake(config).await?;
+    silent_primary.abort();
     Ok(())
 }
 

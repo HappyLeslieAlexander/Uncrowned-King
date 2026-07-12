@@ -24,26 +24,30 @@ pub async fn connect_authenticated(
 ) -> Result<(TlsStream<TcpStream>, Settings), AnyError> {
     config.validate_network_endpoints()?;
     config.validate_auth_material()?;
-    if let Some(timeout) = handshake_timeout(config.handshake_timeout_seconds()) {
-        match time::timeout(timeout, connect_authenticated_inner(config)).await {
-            Ok(result) => result,
-            Err(_) => Err("client handshake timeout".into()),
-        }
-    } else {
-        connect_authenticated_inner(config).await
-    }
+    connect_authenticated_inner(
+        config,
+        handshake_timeout(config.handshake_timeout_seconds()),
+    )
+    .await
 }
 
 async fn connect_authenticated_inner(
     config: &ClientConfig,
+    endpoint_timeout: Option<Duration>,
 ) -> Result<(TlsStream<TcpStream>, Settings), AnyError> {
     let connector = tls::connector(&config.ca_cert_path)?;
     let server_name = tls::server_name(config.server_name.clone())?;
     let mut last_error = None;
 
     for endpoint in config.server_endpoints() {
-        match connect_authenticated_endpoint(config, &connector, server_name.clone(), endpoint)
-            .await
+        match connect_authenticated_endpoint_with_timeout(
+            config,
+            &connector,
+            server_name.clone(),
+            endpoint,
+            endpoint_timeout,
+        )
+        .await
         {
             Ok(session) => return Ok(session),
             Err(err) => {
@@ -58,6 +62,28 @@ async fn connect_authenticated_inner(
     }
 
     Err(last_error.unwrap_or_else(|| "no server endpoints configured".into()))
+}
+
+async fn connect_authenticated_endpoint_with_timeout(
+    config: &ClientConfig,
+    connector: &TlsConnector,
+    server_name: ServerName<'static>,
+    endpoint: &str,
+    endpoint_timeout: Option<Duration>,
+) -> Result<(TlsStream<TcpStream>, Settings), AnyError> {
+    if let Some(timeout) = endpoint_timeout {
+        match time::timeout(
+            timeout,
+            connect_authenticated_endpoint(config, connector, server_name, endpoint),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(format!("client handshake timeout for {endpoint}").into()),
+        }
+    } else {
+        connect_authenticated_endpoint(config, connector, server_name, endpoint).await
+    }
 }
 
 async fn connect_authenticated_endpoint(
