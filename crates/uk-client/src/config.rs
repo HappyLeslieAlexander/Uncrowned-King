@@ -234,11 +234,15 @@ fn validate_sensitive_file_permissions(
     let metadata = fs::metadata(path)
         .map_err(|err| format!("failed to read {label} metadata {}: {err}", path.display()))?;
     if !metadata.is_file() {
-        return Err(format!("{label} must be a regular file").into());
+        return Err(format!("{label} {} must be a regular file", path.display()).into());
     }
     let mode = metadata.permissions().mode();
     if mode & 0o077 != 0 {
-        return Err(format!("{label} must not be accessible by group or other users").into());
+        return Err(format!(
+            "{label} {} must not be accessible by group or other users",
+            path.display()
+        )
+        .into());
     }
     Ok(())
 }
@@ -380,11 +384,13 @@ secret = "0123456789abcdef0123456789abcdef"
     #[test]
     fn load_rejects_group_readable_config_file() {
         let path = write_temp_client_config(0o644);
+        let path_text = path.to_string_lossy().into_owned();
 
         let error = ClientConfig::load(&path).unwrap_err().to_string();
         let _ = fs::remove_file(&path);
 
         assert!(error.contains("client config"));
+        assert!(error.contains(&path_text));
         assert!(error.contains("group or other"));
     }
 
