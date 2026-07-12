@@ -25,11 +25,11 @@ use tokio::{
 use tokio_rustls::client::TlsStream;
 use tracing::{debug, info, warn};
 use uk_proto::{
-    DEFAULT_MAX_STREAMS, ErrorCode, ErrorPayload, FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, Frame,
-    FrameIoError, FrameLimits, FrameType, SettingKey, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL,
-    TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose,
-    UdpOpen, frame::DEFAULT_MAX_FRAME_SIZE, is_client_initiated_flow_id, read_frame,
-    validate_connection_frame, varint::MAX_VARINT, write_frame,
+    ErrorCode, ErrorPayload, FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, Frame, FrameIoError, FrameLimits,
+    FrameType, NegotiatedSettings, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target,
+    TcpClose, TcpOpen, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose, UdpOpen,
+    is_client_initiated_flow_id, read_frame, validate_connection_frame, varint::MAX_VARINT,
+    write_frame,
 };
 
 use crate::{
@@ -721,7 +721,8 @@ impl ClientSessionManager {
 impl ClientSession {
     async fn connect(config: &ClientConfig) -> Result<Arc<Self>, AnyError> {
         let (carrier, settings) = session::connect_authenticated(config).await?;
-        let limits = frame_limits(&settings);
+        let negotiated = settings.negotiated_v0_1()?;
+        let limits = negotiated.frame_limits();
         let (carrier_reader, carrier_writer) = tokio::io::split(carrier);
         let session_buffer = ClientSessionBufferControl::default();
         let session = Arc::new(Self {
@@ -729,9 +730,9 @@ impl ClientSession {
             flows: Arc::new(Mutex::new(HashMap::new())),
             limits,
             data_frame_size: tcp_data_frame_size(limits),
-            max_streams: max_streams(&settings),
-            max_udp_flows: max_udp_flows(&settings),
-            supports_udp_stream_fallback: supports_udp_stream_fallback(&settings),
+            max_streams: negotiated.max_streams,
+            max_udp_flows: negotiated.max_udp_flows,
+            supports_udp_stream_fallback: negotiated.udp_stream_fallback_enabled(),
             max_pending_open_bytes: usize_limit(config.max_pending_open_bytes())?,
             max_buffered_bytes_per_session: usize_limit(config.max_buffered_bytes_per_session())?,
             max_buffered_bytes_per_flow: usize_limit(config.max_buffered_bytes_per_flow())?,
@@ -744,7 +745,7 @@ impl ClientSession {
             pong_notify: Notify::new(),
         });
         spawn_carrier_reader(carrier_reader, Arc::clone(&session));
-        if let Some(interval) = keepalive_interval(&settings) {
+        if let Some(interval) = keepalive_interval(negotiated) {
             spawn_keepalive(Arc::clone(&session), interval);
         }
         Ok(session)
@@ -2424,36 +2425,8 @@ fn session_shutdown_error() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "session shutdown")
 }
 
-fn frame_limits(settings: &uk_proto::Settings) -> FrameLimits {
-    FrameLimits {
-        max_frame_size: settings
-            .get(SettingKey::MaxFrameSize)
-            .unwrap_or(DEFAULT_MAX_FRAME_SIZE),
-    }
-}
-
-fn max_streams(settings: &uk_proto::Settings) -> u64 {
-    settings
-        .get(SettingKey::MaxStreams)
-        .unwrap_or(DEFAULT_MAX_STREAMS)
-}
-
-fn max_udp_flows(settings: &uk_proto::Settings) -> u64 {
-    settings
-        .get(SettingKey::MaxUdpFlows)
-        .unwrap_or_else(|| max_streams(settings))
-}
-
-fn supports_udp_stream_fallback(settings: &uk_proto::Settings) -> bool {
-    settings
-        .get(SettingKey::SupportsUdpStreamFallback)
-        .unwrap_or(1)
-        != 0
-        && max_udp_flows(settings) != 0
-}
-
-fn keepalive_interval(settings: &uk_proto::Settings) -> Option<Duration> {
-    let idle_timeout_seconds = settings.get(SettingKey::IdleTimeoutSeconds)?;
+fn keepalive_interval(settings: NegotiatedSettings) -> Option<Duration> {
+    let idle_timeout_seconds = settings.idle_timeout_seconds;
     if idle_timeout_seconds == 0 {
         return None;
     }
@@ -2552,6 +2525,17 @@ mod tests {
     use super::*;
 
     const FLOW_ID: u64 = 1;
+
+    fn negotiated_settings_with_idle_timeout(idle_timeout_seconds: u64) -> NegotiatedSettings {
+        NegotiatedSettings {
+            max_frame_size: FrameLimits::default().max_frame_size,
+            max_streams: 64,
+            max_udp_flows: 64,
+            supports_udp_datagram: false,
+            supports_udp_stream_fallback: true,
+            idle_timeout_seconds,
+        }
+    }
 
     fn minimal_config() -> ClientConfig {
         ClientConfig {
@@ -3633,78 +3617,26 @@ mod tests {
 
     #[test]
     fn derives_keepalive_interval_from_idle_timeout() {
-        let mut settings = uk_proto::Settings::default();
-        settings.set(SettingKey::IdleTimeoutSeconds, 30);
+        let settings = negotiated_settings_with_idle_timeout(30);
 
-        assert_eq!(keepalive_interval(&settings), Some(Duration::from_secs(15)));
+        assert_eq!(keepalive_interval(settings), Some(Duration::from_secs(15)));
     }
 
     #[test]
     fn keeps_one_second_idle_timeout_before_deadline() {
-        let mut settings = uk_proto::Settings::default();
-        settings.set(SettingKey::IdleTimeoutSeconds, 1);
+        let settings = negotiated_settings_with_idle_timeout(1);
 
         assert_eq!(
-            keepalive_interval(&settings),
+            keepalive_interval(settings),
             Some(Duration::from_millis(500))
         );
     }
 
     #[test]
-    fn disables_keepalive_without_idle_timeout() {
-        let settings = uk_proto::Settings::default();
-
-        assert_eq!(keepalive_interval(&settings), None);
-    }
-
-    #[test]
     fn disables_keepalive_for_zero_idle_timeout() {
-        let mut settings = uk_proto::Settings::default();
-        settings.set(SettingKey::IdleTimeoutSeconds, 0);
+        let settings = negotiated_settings_with_idle_timeout(0);
 
-        assert_eq!(keepalive_interval(&settings), None);
-    }
-
-    #[test]
-    fn max_udp_flows_defaults_to_max_streams_setting() {
-        let mut settings = uk_proto::Settings::default();
-        settings.set(SettingKey::MaxStreams, 9);
-
-        assert_eq!(max_udp_flows(&settings), 9);
-    }
-
-    #[test]
-    fn max_udp_flows_accepts_zero_to_disable_udp() {
-        let mut settings = uk_proto::Settings::default();
-        settings.set(SettingKey::MaxStreams, 9);
-        settings.set(SettingKey::MaxUdpFlows, 0);
-
-        assert_eq!(max_udp_flows(&settings), 0);
-    }
-
-    #[test]
-    fn udp_stream_fallback_defaults_to_supported_for_legacy_settings() {
-        let settings = uk_proto::Settings::default();
-
-        assert!(supports_udp_stream_fallback(&settings));
-    }
-
-    #[test]
-    fn udp_stream_fallback_can_be_disabled_by_settings() {
-        let mut settings = uk_proto::Settings::default();
-        settings.set(SettingKey::SupportsUdpStreamFallback, 0);
-
-        assert!(!supports_udp_stream_fallback(&settings));
-    }
-
-    #[test]
-    fn udp_stream_fallback_is_disabled_without_udp_flow_capacity() {
-        let mut settings = uk_proto::Settings::default();
-        settings.set(SettingKey::MaxStreams, 9);
-        settings.set(SettingKey::MaxUdpFlows, 0);
-        settings.set(SettingKey::SupportsUdpStreamFallback, 1);
-
-        assert!(!supports_udp_stream_fallback(&settings));
+        assert_eq!(keepalive_interval(settings), None);
     }
 
     #[test]

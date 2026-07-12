@@ -9,8 +9,7 @@ use tokio_rustls::{TlsConnector, client::TlsStream};
 use tracing::{info, warn};
 use uk_auth::{AuthChallenge, AuthResponse, unix_now};
 use uk_proto::{
-    DEFAULT_MAX_STREAMS, ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType,
-    MAX_FRAME_PAYLOAD_SIZE, MIN_TCP_RELAY_FRAME_SIZE, SettingKey, Settings, read_frame,
+    ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, Settings, read_frame,
     validate_connection_frame, write_frame,
 };
 
@@ -205,9 +204,10 @@ async fn connect_authenticated_endpoint(
         .map_err(|err| phase_error("read server settings", err))?;
     let settings = decode_server_settings_frame(settings_frame)
         .map_err(|err| phase_error("decode server settings", err))?;
+    let negotiated = settings.negotiated_v0_1()?;
     info!(
         event = "auth.success",
-        max_frame_size = ?settings.get(SettingKey::MaxFrameSize)
+        max_frame_size = negotiated.max_frame_size
     );
     Ok((stream, settings))
 }
@@ -218,7 +218,7 @@ fn decode_server_settings_frame(frame: Frame) -> Result<Settings, AnyError> {
             validate_connection_frame(&frame, FrameType::Settings)?;
             let mut settings_payload = frame.payload;
             let settings = Settings::decode(&mut settings_payload)?;
-            validate_server_settings(&settings)?;
+            settings.negotiated_v0_1()?;
             Ok(settings)
         }
         FrameType::Error => {
@@ -234,103 +234,6 @@ fn decode_server_settings_frame(frame: Frame) -> Result<Settings, AnyError> {
             validate_connection_frame(&frame, FrameType::Settings)?;
             Err("unexpected connection frame type".into())
         }
-    }
-}
-
-fn validate_server_settings(settings: &Settings) -> Result<(), AnyError> {
-    let Some(revision) = settings.get(SettingKey::ProtocolRevision) else {
-        return Err("missing protocol revision".into());
-    };
-    if revision != 1 {
-        return Err(format!("unsupported protocol revision {revision}").into());
-    }
-    reject_zero_setting(settings, SettingKey::MaxFrameSize, "max_frame_size")?;
-    reject_zero_setting(settings, SettingKey::MaxStreams, "max_streams")?;
-    reject_boolean_setting(
-        settings,
-        SettingKey::SupportsUdpDatagram,
-        "supports_udp_datagram",
-    )?;
-    reject_boolean_setting(
-        settings,
-        SettingKey::SupportsUdpStreamFallback,
-        "supports_udp_stream_fallback",
-    )?;
-    reject_udp_flow_limit(settings)?;
-    reject_small_setting(
-        settings,
-        SettingKey::MaxFrameSize,
-        "max_frame_size",
-        MIN_TCP_RELAY_FRAME_SIZE,
-    )?;
-    reject_large_setting(
-        settings,
-        SettingKey::MaxFrameSize,
-        "max_frame_size",
-        MAX_FRAME_PAYLOAD_SIZE,
-    )?;
-    Ok(())
-}
-
-fn reject_zero_setting(
-    settings: &Settings,
-    key: SettingKey,
-    name: &'static str,
-) -> Result<(), AnyError> {
-    if settings.get(key) == Some(0) {
-        Err(format!("{name} must be greater than zero").into())
-    } else {
-        Ok(())
-    }
-}
-
-fn reject_boolean_setting(
-    settings: &Settings,
-    key: SettingKey,
-    name: &'static str,
-) -> Result<(), AnyError> {
-    if settings.get(key).is_some_and(|value| value > 1) {
-        Err(format!("{name} must be 0 or 1").into())
-    } else {
-        Ok(())
-    }
-}
-
-fn reject_udp_flow_limit(settings: &Settings) -> Result<(), AnyError> {
-    let max_streams = settings
-        .get(SettingKey::MaxStreams)
-        .unwrap_or(DEFAULT_MAX_STREAMS);
-    let max_udp_flows = settings.get(SettingKey::MaxUdpFlows).unwrap_or(max_streams);
-    if max_udp_flows > max_streams {
-        Err("max_udp_flows must not exceed max_streams".into())
-    } else {
-        Ok(())
-    }
-}
-
-fn reject_small_setting(
-    settings: &Settings,
-    key: SettingKey,
-    name: &'static str,
-    minimum: u64,
-) -> Result<(), AnyError> {
-    if settings.get(key).is_some_and(|value| value < minimum) {
-        Err(format!("{name} must be at least {minimum}").into())
-    } else {
-        Ok(())
-    }
-}
-
-fn reject_large_setting(
-    settings: &Settings,
-    key: SettingKey,
-    name: &'static str,
-    maximum: u64,
-) -> Result<(), AnyError> {
-    if settings.get(key).is_some_and(|value| value > maximum) {
-        Err(format!("{name} must be at most {maximum}").into())
-    } else {
-        Ok(())
     }
 }
 
@@ -351,6 +254,7 @@ fn handshake_timeout(seconds: u64) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uk_proto::{MAX_FRAME_PAYLOAD_SIZE, MIN_TCP_RELAY_FRAME_SIZE, SettingKey};
 
     fn settings_frame(settings: &Settings) -> Frame {
         let mut payload = BytesMut::new();
@@ -377,7 +281,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.set(SettingKey::ProtocolRevision, 1);
 
-        assert!(validate_server_settings(&settings).is_ok());
+        assert!(settings.negotiated_v0_1().is_ok());
     }
 
     #[test]
@@ -450,7 +354,7 @@ mod tests {
     fn rejects_missing_protocol_revision() {
         let settings = Settings::default();
 
-        assert!(validate_server_settings(&settings).is_err());
+        assert!(settings.negotiated_v0_1().is_err());
     }
 
     #[test]
@@ -458,7 +362,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.set(SettingKey::ProtocolRevision, 2);
 
-        assert!(validate_server_settings(&settings).is_err());
+        assert!(settings.negotiated_v0_1().is_err());
     }
 
     #[test]
@@ -467,7 +371,7 @@ mod tests {
         settings.set(SettingKey::ProtocolRevision, 1);
         settings.set(SettingKey::MaxFrameSize, 0);
 
-        assert!(validate_server_settings(&settings).is_err());
+        assert!(settings.negotiated_v0_1().is_err());
     }
 
     #[test]
@@ -476,7 +380,7 @@ mod tests {
         settings.set(SettingKey::ProtocolRevision, 1);
         settings.set(SettingKey::MaxFrameSize, MIN_TCP_RELAY_FRAME_SIZE - 1);
 
-        assert!(validate_server_settings(&settings).is_err());
+        assert!(settings.negotiated_v0_1().is_err());
     }
 
     #[test]
@@ -485,7 +389,7 @@ mod tests {
         settings.set(SettingKey::ProtocolRevision, 1);
         settings.set(SettingKey::MaxFrameSize, MAX_FRAME_PAYLOAD_SIZE + 1);
 
-        assert!(validate_server_settings(&settings).is_err());
+        assert!(settings.negotiated_v0_1().is_err());
     }
 
     #[test]
@@ -494,7 +398,7 @@ mod tests {
         settings.set(SettingKey::ProtocolRevision, 1);
         settings.set(SettingKey::MaxStreams, 0);
 
-        assert!(validate_server_settings(&settings).is_err());
+        assert!(settings.negotiated_v0_1().is_err());
     }
 
     #[test]
@@ -504,7 +408,7 @@ mod tests {
         settings.set(SettingKey::MaxStreams, 8);
         settings.set(SettingKey::MaxUdpFlows, 9);
 
-        let error = validate_server_settings(&settings).unwrap_err();
+        let error = settings.negotiated_v0_1().unwrap_err();
         assert!(error.to_string().contains("max_udp_flows"));
     }
 
@@ -512,9 +416,9 @@ mod tests {
     fn rejects_udp_flow_limit_above_default_stream_limit() {
         let mut settings = Settings::default();
         settings.set(SettingKey::ProtocolRevision, 1);
-        settings.set(SettingKey::MaxUdpFlows, DEFAULT_MAX_STREAMS + 1);
+        settings.set(SettingKey::MaxUdpFlows, uk_proto::DEFAULT_MAX_STREAMS + 1);
 
-        let error = validate_server_settings(&settings).unwrap_err();
+        let error = settings.negotiated_v0_1().unwrap_err();
         assert!(error.to_string().contains("max_udp_flows"));
     }
 
@@ -525,7 +429,7 @@ mod tests {
         settings.set(SettingKey::SupportsUdpDatagram, 0);
         settings.set(SettingKey::SupportsUdpStreamFallback, 1);
 
-        assert!(validate_server_settings(&settings).is_ok());
+        assert!(settings.negotiated_v0_1().is_ok());
     }
 
     #[test]
@@ -534,6 +438,6 @@ mod tests {
         settings.set(SettingKey::ProtocolRevision, 1);
         settings.set(SettingKey::SupportsUdpStreamFallback, 2);
 
-        assert!(validate_server_settings(&settings).is_err());
+        assert!(settings.negotiated_v0_1().is_err());
     }
 }
