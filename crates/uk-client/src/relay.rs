@@ -43,10 +43,33 @@ const UDP_ASSOCIATION_EVENT_QUEUE_CAPACITY: usize = 128;
 const UDP_SEND_ATTEMPTS: usize = 2;
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const UDP_ASSOCIATION_BUFFER_SIZE: usize = 65_536;
+const ACCEPT_RETRY_BASE_MILLIS: u64 = 10;
+const ACCEPT_RETRY_MAX_MILLIS: u64 = 1_000;
 
 type AnyError = Box<dyn Error + Send + Sync>;
 type CarrierWriter = Arc<Mutex<WriteHalf<TlsStream<TcpStream>>>>;
 type FlowTable = Arc<Mutex<HashMap<u64, ClientFlowRoute>>>;
+
+#[derive(Default)]
+struct ListenerAcceptBackoff {
+    consecutive_failures: u32,
+}
+
+impl ListenerAcceptBackoff {
+    fn next_delay(&mut self) -> Duration {
+        let shift = self.consecutive_failures.min(7);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        Duration::from_millis(
+            ACCEPT_RETRY_BASE_MILLIS
+                .saturating_mul(1_u64 << shift)
+                .min(ACCEPT_RETRY_MAX_MILLIS),
+        )
+    }
+
+    fn reset(&mut self) {
+        self.consecutive_failures = 0;
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClientConnectionState {
@@ -485,6 +508,7 @@ where
 
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
     let mut connections = JoinSet::new();
+    let mut accept_backoff = ListenerAcceptBackoff::default();
     tokio::pin!(shutdown);
 
     loop {
@@ -495,7 +519,22 @@ where
                 break;
             }
             accepted = listener.accept() => {
-                let (mut local, peer) = accepted?;
+                let (mut local, peer) = match accepted {
+                    Ok(connection) => {
+                        accept_backoff.reset();
+                        connection
+                    }
+                    Err(err) => {
+                        let retry_delay = accept_backoff.next_delay();
+                        warn!(
+                            event = "socks5.accept.error",
+                            error = %err,
+                            retry_delay_ms = retry_delay.as_millis()
+                        );
+                        time::sleep(retry_delay).await;
+                        continue;
+                    }
+                };
                 let Ok(permit) = Arc::clone(&connection_slots).try_acquire_owned() else {
                     warn!(
                         event = "socks5.connection.limit",
@@ -3893,6 +3932,23 @@ mod tests {
     #[test]
     fn unrepresentable_retry_delay_expiry_is_treated_as_non_expiring() {
         assert_eq!(retry_delay_expires_at(Duration::MAX), None);
+    }
+
+    #[test]
+    fn listener_accept_backoff_grows_caps_and_resets() {
+        let mut backoff = ListenerAcceptBackoff::default();
+
+        assert_eq!(backoff.next_delay(), Duration::from_millis(10));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(20));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(40));
+        for _ in 0..16 {
+            let delay = backoff.next_delay();
+            assert!(delay <= Duration::from_secs(1));
+        }
+        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), Duration::from_millis(10));
     }
 
     #[test]

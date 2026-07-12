@@ -34,6 +34,30 @@ use crate::config::ServerConfig;
 /// Server error type.
 pub type AnyError = Box<dyn Error + Send + Sync>;
 
+const ACCEPT_RETRY_BASE_MILLIS: u64 = 10;
+const ACCEPT_RETRY_MAX_MILLIS: u64 = 1_000;
+
+#[derive(Default)]
+struct ListenerAcceptBackoff {
+    consecutive_failures: u32,
+}
+
+impl ListenerAcceptBackoff {
+    fn next_delay(&mut self) -> Duration {
+        let shift = self.consecutive_failures.min(7);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        Duration::from_millis(
+            ACCEPT_RETRY_BASE_MILLIS
+                .saturating_mul(1_u64 << shift)
+                .min(ACCEPT_RETRY_MAX_MILLIS),
+        )
+    }
+
+    fn reset(&mut self) {
+        self.consecutive_failures = 0;
+    }
+}
+
 #[derive(Debug)]
 struct HandshakePhaseError {
     phase: &'static str,
@@ -133,6 +157,7 @@ where
 
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
     let mut connections = JoinSet::new();
+    let mut accept_backoff = ListenerAcceptBackoff::default();
     tokio::pin!(shutdown);
 
     loop {
@@ -143,7 +168,22 @@ where
                 break;
             }
             accepted = listener.accept() => {
-                let (mut tcp, peer) = accepted?;
+                let (mut tcp, peer) = match accepted {
+                    Ok(connection) => {
+                        accept_backoff.reset();
+                        connection
+                    }
+                    Err(err) => {
+                        let retry_delay = accept_backoff.next_delay();
+                        warn!(
+                            event = "server.accept.error",
+                            error = %err,
+                            retry_delay_ms = retry_delay.as_millis()
+                        );
+                        time::sleep(retry_delay).await;
+                        continue;
+                    }
+                };
                 let Ok(handshake_permit) = Arc::clone(&handshake_permits).try_acquire_owned() else {
                     warn!(event = "server.handshake.limit", peer = %peer, max_handshakes);
                     if let Err(err) = tcp.shutdown().await {
@@ -682,6 +722,23 @@ mod tests {
     fn hex_encode_keeps_opaque_key_ids_log_safe() {
         assert_eq!(hex_encode(b"client"), "636c69656e74");
         assert_eq!(hex_encode(&[0x00, 0x1f, 0x7f, 0x80, 0xff]), "001f7f80ff");
+    }
+
+    #[test]
+    fn listener_accept_backoff_grows_caps_and_resets() {
+        let mut backoff = ListenerAcceptBackoff::default();
+
+        assert_eq!(backoff.next_delay(), Duration::from_millis(10));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(20));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(40));
+        for _ in 0..16 {
+            let delay = backoff.next_delay();
+            assert!(delay <= Duration::from_secs(1));
+        }
+        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), Duration::from_millis(10));
     }
 
     #[test]

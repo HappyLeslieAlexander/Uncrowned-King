@@ -18,6 +18,7 @@ The repository currently focuses on the first runnable v0.1 TLS/TCP carrier:
 - multiplexed TCP relay and UDP relay over the TLS/TCP carrier
 - bounded UDP flow recovery after a carrier disconnect without closing the SOCKS association
 - graceful Ctrl+C/SIGTERM shutdown for long-running client and server listeners
+- capped exponential retry for transient client and server listener accept errors
 - nonce-matched PING/PONG keepalive for active relay flows
 - negotiated UDP flow limits and idle UDP flow cleanup on both client and server
 - SETTINGS-advertised UDP stream fallback capability for the TLS/TCP carrier
