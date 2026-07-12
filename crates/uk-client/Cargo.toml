@@ -26,6 +26,7 @@ tracing-subscriber.workspace = true
 uk-auth = { path = "../uk-auth" }
 uk-policy = { path = "../uk-policy" }
 uk-proto = { path = "../uk-proto" }
+zeroize.workspace = true
 
 [dev-dependencies]
 socket2 = "0.6"

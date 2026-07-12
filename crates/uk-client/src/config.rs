@@ -9,6 +9,7 @@ use serde::Deserialize;
 use tokio::sync::Semaphore;
 use uk_auth::{AuthError, validate_key_id, validate_shared_secret};
 use uk_proto::{MAX_FRAME_PAYLOAD_SIZE, validate_host_port_endpoint};
+use zeroize::Zeroize;
 
 /// Client TOML configuration.
 #[derive(Clone, Deserialize)]
@@ -46,6 +47,16 @@ pub struct ClientConfig {
     pub max_buffered_bytes_per_session: Option<u64>,
     /// Optional maximum queued server-to-local bytes per TCP flow.
     pub max_buffered_bytes_per_flow: Option<u64>,
+}
+
+impl Drop for ClientConfig {
+    fn drop(&mut self) {
+        zeroize_client_secret(&mut self.secret);
+    }
+}
+
+fn zeroize_client_secret(secret: &mut String) {
+    secret.zeroize();
 }
 
 impl fmt::Debug for ClientConfig {
@@ -430,6 +441,15 @@ secret = "0123456789abcdef0123456789abcdef"
 
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("0123456789abcdef"));
+    }
+
+    #[test]
+    fn client_secret_supports_explicit_zeroization() {
+        let mut secret = "0123456789abcdef0123456789abcdef".to_owned();
+
+        zeroize_client_secret(&mut secret);
+
+        assert!(secret.is_empty());
     }
 
     #[test]

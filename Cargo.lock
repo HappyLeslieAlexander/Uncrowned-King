@@ -852,6 +852,7 @@ dependencies = [
  "uk-policy",
  "uk-proto",
  "uk-server",
+ "zeroize",
 ]
 
 [[package]]
