@@ -330,6 +330,9 @@ async fn handle_connection(
             target_connect_timeout: target_connect_timeout(config.target_connect_timeout_seconds()),
             tcp_half_close_timeout: tcp_half_close_timeout(config.tcp_half_close_timeout_seconds()),
             udp_flow_idle_timeout: udp_flow_idle_timeout(config.udp_flow_idle_timeout_seconds()),
+            session_task_shutdown_timeout: listener_shutdown_timeout(
+                config.shutdown_timeout_seconds(),
+            ),
         }),
         idle_timeout(config.idle_timeout_seconds()),
         shutdown_rx,

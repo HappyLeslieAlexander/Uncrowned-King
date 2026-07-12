@@ -85,8 +85,9 @@ Set `handshake_timeout_seconds = 0` to disable the TLS/auth handshake timeout.
 Set `target_connect_timeout_seconds = 0` to disable the server target dial timeout.
 Set `tcp_half_close_timeout_seconds = 0` to disable the TCP half-close drain timeout.
 Set `udp_flow_idle_timeout_seconds = 0` to disable server-side UDP flow idle cleanup.
-Set `shutdown_timeout_seconds = 0` to wait indefinitely for listener tasks to
-finish after shutdown; otherwise remaining tasks are aborted after the timeout.
+Set `shutdown_timeout_seconds = 0` to wait indefinitely for listener and relay
+session tasks to finish after shutdown; otherwise remaining tasks are aborted
+after the timeout.
 Set `max_udp_flows = 0` to disable UDP relay.
 `auth_skew_seconds` defaults to 30 and bounds accepted client and server
 authentication timestamps.

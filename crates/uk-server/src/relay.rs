@@ -23,7 +23,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
-    task::{Id, JoinSet},
+    task::{Id, JoinError, JoinSet},
     time,
 };
 use tokio_rustls::server::TlsStream;
@@ -59,6 +59,11 @@ struct ConnectTasks<T> {
     permits: HashMap<Id, OpenDialPermit>,
 }
 
+struct SessionTasks {
+    tasks: JoinSet<SessionTaskKind>,
+    kinds: HashMap<Id, SessionTaskKind>,
+}
+
 #[derive(Clone)]
 struct CarrierWriter {
     inner: Arc<Mutex<WriteHalf<TlsStream<TcpStream>>>>,
@@ -74,6 +79,62 @@ impl CarrierWriter {
     }
 }
 
+impl Default for SessionTasks {
+    fn default() -> Self {
+        Self {
+            tasks: JoinSet::new(),
+            kinds: HashMap::new(),
+        }
+    }
+}
+
+impl SessionTasks {
+    fn spawn<F>(&mut self, kind: SessionTaskKind, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let handle = self.tasks.spawn(async move {
+            task.await;
+            kind
+        });
+        self.kinds.insert(handle.id(), kind);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    async fn join_next(&mut self) {
+        let Some(result) = self.tasks.join_next_with_id().await else {
+            return;
+        };
+        match result {
+            Ok((id, kind)) => {
+                self.kinds.remove(&id);
+                debug!(event = "server.session.task.done", kind = ?kind);
+            }
+            Err(err) => {
+                let kind = self.kinds.remove(&err.id());
+                log_session_task_error(kind, &err);
+            }
+        }
+    }
+
+    async fn join_all(&mut self) {
+        while !self.is_empty() {
+            self.join_next().await;
+        }
+    }
+
+    fn abort_all(&mut self) {
+        self.tasks.abort_all();
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RelayLimits {
     frame: FrameLimits,
@@ -86,6 +147,7 @@ pub(crate) struct RelayLimits {
     target_connect_timeout: Option<Duration>,
     tcp_half_close_timeout: Option<Duration>,
     udp_flow_idle_timeout: Option<Duration>,
+    session_task_shutdown_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -99,6 +161,7 @@ pub(crate) struct RelayLimitConfig {
     pub(crate) target_connect_timeout: Option<Duration>,
     pub(crate) tcp_half_close_timeout: Option<Duration>,
     pub(crate) udp_flow_idle_timeout: Option<Duration>,
+    pub(crate) session_task_shutdown_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,10 +239,21 @@ enum SessionEvent {
     Flow(Option<FlowEvent>),
     Frame(Frame),
     FrameReadError(FrameIoError),
+    SessionTaskCompleted,
     IdleTimeout,
     UdpIdleMaintenance,
     PeerClosed,
     Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionTaskKind {
+    TcpOpen,
+    UdpOpen,
+    TargetReader,
+    UdpReader,
+    TargetWriter,
+    HalfCloseTimer,
 }
 
 #[derive(Debug)]
@@ -328,6 +402,36 @@ struct UdpOpenTask {
     cancel: OpenFlowCancel,
 }
 
+struct TargetReaderTask {
+    identity: TargetFlowIdentity,
+    target_reader: OwnedReadHalf,
+    flow_control: TargetFlowControl,
+    carrier_writer: CarrierWriter,
+    event_tx: FlowEventSender,
+    shutdown: SessionShutdown,
+    data_frame_size: usize,
+}
+
+struct UdpReaderTask {
+    flow_id: u64,
+    target_socket: Arc<UdpSocket>,
+    flow_control: TargetFlowControl,
+    carrier_writer: CarrierWriter,
+    event_tx: FlowEventSender,
+    shutdown: SessionShutdown,
+    data_frame_size: usize,
+}
+
+struct TargetWriterTask {
+    identity: TargetFlowIdentity,
+    target_writer: OwnedWriteHalf,
+    commands: mpsc::Receiver<TargetCommand>,
+    flow_control: TargetFlowControl,
+    carrier_writer: CarrierWriter,
+    event_tx: FlowEventSender,
+    shutdown: SessionShutdown,
+}
+
 pub(crate) async fn relay_session(
     carrier: TlsStream<TcpStream>,
     credential: Credential,
@@ -342,6 +446,7 @@ pub(crate) async fn relay_session(
     let (mut carrier_reader, carrier_writer) = tokio::io::split(carrier);
     let (event_tx, mut event_rx) = mpsc::channel(session_event_queue_capacity(limits));
     let mut target_writers = FlowTable::new();
+    let mut session_tasks = SessionTasks::default();
     let shutdown = SessionShutdown::default();
     let session_buffer = SessionBufferControl::default();
     let open_dial_limiter = OpenDialLimiter::new(limits.max_outbound_dials_per_session);
@@ -365,6 +470,7 @@ pub(crate) async fn relay_session(
         let event = match next_session_event(
             &mut carrier_reader,
             &mut event_rx,
+            &mut session_tasks,
             limits.frame,
             idle_deadline,
             &mut udp_idle_interval,
@@ -379,15 +485,19 @@ pub(crate) async fn relay_session(
             SessionEvent::Flow(event) => {
                 let counts_as_activity =
                     flow_event_counts_as_session_activity(event.as_ref(), &target_writers);
-                handle_flow_event(event, &context, &mut target_writers).await?;
+                handle_flow_event(event, &context, &mut target_writers, &mut session_tasks).await?;
                 counts_as_activity
             }
             SessionEvent::Frame(frame) => {
-                if let Err(err) = handle_session_frame(frame, &context, &mut target_writers).await {
+                if let Err(err) =
+                    handle_session_frame(frame, &context, &mut target_writers, &mut session_tasks)
+                        .await
+                {
                     break Err(err);
                 }
                 session_has_activity_flows(&target_writers)
             }
+            SessionEvent::SessionTaskCompleted => false,
             SessionEvent::UdpIdleMaintenance => {
                 if let Err(err) = close_idle_udp_flows(&context, &mut target_writers).await {
                     break Err(err);
@@ -420,6 +530,7 @@ pub(crate) async fn relay_session(
     transition(&mut state, ServerSessionState::Closing);
     shutdown.close();
     close_target_flows(&mut target_writers);
+    drain_session_tasks(&mut session_tasks, limits.session_task_shutdown_timeout).await;
     shutdown_carrier_writer(&carrier_writer).await;
     transition(&mut state, ServerSessionState::Closed);
     result
@@ -429,18 +540,39 @@ async fn handle_flow_event(
     event: Option<FlowEvent>,
     context: &RelaySessionContext<'_>,
     target_writers: &mut FlowTable,
+    session_tasks: &mut SessionTasks,
 ) -> Result<(), AnyError> {
     match event {
         Some(FlowEvent::OpenCompleted {
             flow_id,
             target,
             result,
-        }) => handle_tcp_open_completed(flow_id, target, result, context, target_writers).await?,
+        }) => {
+            handle_tcp_open_completed(
+                flow_id,
+                target,
+                result,
+                context,
+                target_writers,
+                session_tasks,
+            )
+            .await?;
+        }
         Some(FlowEvent::UdpOpenCompleted {
             flow_id,
             target,
             result,
-        }) => handle_udp_open_completed(flow_id, target, result, context, target_writers).await?,
+        }) => {
+            handle_udp_open_completed(
+                flow_id,
+                target,
+                result,
+                context,
+                target_writers,
+                session_tasks,
+            )
+            .await?;
+        }
         Some(FlowEvent::ReadClosed { flow_id, token }) => {
             handle_target_read_closed(
                 flow_id,
@@ -449,6 +581,7 @@ async fn handle_flow_event(
                 context.event_tx,
                 &context.shutdown,
                 target_writers,
+                session_tasks,
             );
         }
         Some(FlowEvent::UdpReadClosed(flow_id)) => {
@@ -485,6 +618,7 @@ fn handle_target_read_closed(
     event_tx: &FlowEventSender,
     shutdown: &SessionShutdown,
     target_writers: &mut FlowTable,
+    session_tasks: &mut SessionTasks,
 ) {
     if let Some(target) = open_target_flow_mut(target_writers, flow_id) {
         if target.token != token {
@@ -495,6 +629,7 @@ fn handle_target_read_closed(
         if target.client_to_target_open {
             if let Some(timeout) = tcp_half_close_timeout {
                 spawn_half_close_timer(
+                    session_tasks,
                     flow_id,
                     token,
                     HalfCloseSide::TargetToClient,
@@ -590,6 +725,7 @@ fn handle_target_write_closed(flow_id: u64, token: FlowToken, target_writers: &m
 async fn next_session_event(
     carrier_reader: &mut tokio::io::ReadHalf<TlsStream<TcpStream>>,
     event_rx: &mut FlowEventReceiver,
+    session_tasks: &mut SessionTasks,
     limits: FrameLimits,
     idle_deadline: Option<time::Instant>,
     udp_idle_interval: &mut Option<time::Interval>,
@@ -603,6 +739,9 @@ async fn next_session_event(
         tokio::select! {
             event = event_rx.recv() => Ok(SessionEvent::Flow(event)),
             frame = read_frame(carrier_reader, limits) => Ok(map_frame_event(frame)),
+            () = session_tasks.join_next(), if !session_tasks.is_empty() => {
+                Ok(SessionEvent::SessionTaskCompleted)
+            }
             changed = shutdown_rx.changed() => {
                 let _ = changed;
                 Ok(SessionEvent::Shutdown)
@@ -616,6 +755,9 @@ async fn next_session_event(
         tokio::select! {
             event = event_rx.recv() => Ok(SessionEvent::Flow(event)),
             frame = read_frame(carrier_reader, limits) => Ok(map_frame_event(frame)),
+            () = session_tasks.join_next(), if !session_tasks.is_empty() => {
+                Ok(SessionEvent::SessionTaskCompleted)
+            }
             changed = shutdown_rx.changed() => {
                 let _ = changed;
                 Ok(SessionEvent::Shutdown)
@@ -634,6 +776,30 @@ fn session_event_queue_capacity(limits: RelayLimits) -> usize {
     SESSION_EVENT_QUEUE_BASE_CAPACITY
         .saturating_add(stream_capacity)
         .min(SESSION_EVENT_QUEUE_MAX_CAPACITY)
+}
+
+async fn drain_session_tasks(tasks: &mut SessionTasks, shutdown_timeout: Option<Duration>) {
+    if let Some(timeout) = shutdown_timeout {
+        if time::timeout(timeout, tasks.join_all()).await.is_err() {
+            warn!(
+                event = "server.session.task_shutdown.timeout",
+                remaining_tasks = tasks.len(),
+                timeout_seconds = timeout.as_secs()
+            );
+            tasks.abort_all();
+            tasks.join_all().await;
+        }
+    } else {
+        tasks.join_all().await;
+    }
+}
+
+fn log_session_task_error(kind: Option<SessionTaskKind>, err: &JoinError) {
+    if err.is_cancelled() {
+        debug!(event = "server.session.task.cancelled", kind = ?kind, error = %err);
+    } else {
+        warn!(event = "server.session.task.error", kind = ?kind, error = %err);
+    }
 }
 
 async fn send_flow_event_or_shutdown(
@@ -710,12 +876,19 @@ async fn handle_session_frame(
     frame: Frame,
     context: &RelaySessionContext<'_>,
     target_writers: &mut FlowTable,
+    session_tasks: &mut SessionTasks,
 ) -> Result<(), AnyError> {
     match frame.header.frame_type {
-        FrameType::TcpOpen => handle_tcp_open_frame(context, frame, target_writers).await,
+        FrameType::TcpOpen => {
+            handle_tcp_open_frame(context, frame, target_writers, session_tasks).await
+        }
         FrameType::TcpData => handle_tcp_data_frame(frame, context, target_writers).await,
-        FrameType::TcpClose => handle_tcp_close_frame(frame, context, target_writers).await,
-        FrameType::UdpOpen => handle_udp_open_frame(context, frame, target_writers).await,
+        FrameType::TcpClose => {
+            handle_tcp_close_frame(frame, context, target_writers, session_tasks).await
+        }
+        FrameType::UdpOpen => {
+            handle_udp_open_frame(context, frame, target_writers, session_tasks).await
+        }
         FrameType::UdpData => handle_udp_data_frame(frame, context, target_writers).await,
         FrameType::UdpClose => handle_udp_close_frame(frame, context, target_writers).await,
         FrameType::Error | FrameType::PolicyDenied | FrameType::ResourceLimit => {
@@ -844,6 +1017,7 @@ async fn handle_tcp_close_frame(
     frame: Frame,
     context: &RelaySessionContext<'_>,
     target_writers: &mut FlowTable,
+    session_tasks: &mut SessionTasks,
 ) -> Result<(), AnyError> {
     let flow_id = frame.header.id;
     if let Err(rejection) = validate_client_relay_flow_id(flow_id) {
@@ -875,6 +1049,7 @@ async fn handle_tcp_close_frame(
                 if should_start_drain_timer {
                     if let Some(timeout) = context.limits.tcp_half_close_timeout {
                         spawn_half_close_timer(
+                            session_tasks,
                             flow_id,
                             token,
                             HalfCloseSide::ClientToTarget,
@@ -1049,6 +1224,7 @@ async fn handle_tcp_open_frame(
     context: &RelaySessionContext<'_>,
     frame: Frame,
     target_writers: &mut FlowTable,
+    session_tasks: &mut SessionTasks,
 ) -> Result<(), AnyError> {
     match check_open_slot(frame.header.id, target_writers, context.limits.max_streams) {
         Ok(()) => {}
@@ -1068,17 +1244,20 @@ async fn handle_tcp_open_frame(
     if let Some((flow_id, target)) = validate_tcp_open_request(context, frame).await? {
         let cancel = OpenFlowCancel::default();
         target_writers.insert(flow_id, FlowSlot::OpeningTcp(cancel.clone()));
-        spawn_target_open(TargetOpenTask {
-            flow_id,
-            target,
-            credential: context.credential.clone(),
-            policy_set: Arc::clone(&context.policy_set),
-            open_dial_limiter: context.open_dial_limiter.clone(),
-            target_connect_timeout: context.limits.target_connect_timeout,
-            event_tx: context.event_tx.clone(),
-            shutdown: context.shutdown.clone(),
-            cancel,
-        });
+        spawn_target_open(
+            session_tasks,
+            TargetOpenTask {
+                flow_id,
+                target,
+                credential: context.credential.clone(),
+                policy_set: Arc::clone(&context.policy_set),
+                open_dial_limiter: context.open_dial_limiter.clone(),
+                target_connect_timeout: context.limits.target_connect_timeout,
+                event_tx: context.event_tx.clone(),
+                shutdown: context.shutdown.clone(),
+                cancel,
+            },
+        );
     }
     Ok(())
 }
@@ -1127,6 +1306,7 @@ async fn handle_udp_open_frame(
     context: &RelaySessionContext<'_>,
     frame: Frame,
     target_writers: &mut FlowTable,
+    session_tasks: &mut SessionTasks,
 ) -> Result<(), AnyError> {
     match check_udp_open_slot(
         frame.header.id,
@@ -1151,17 +1331,20 @@ async fn handle_udp_open_frame(
     if let Some((flow_id, target)) = validate_udp_open_request(context, frame).await? {
         let cancel = OpenFlowCancel::default();
         target_writers.insert(flow_id, FlowSlot::OpeningUdp(cancel.clone()));
-        spawn_udp_open(UdpOpenTask {
-            flow_id,
-            target,
-            credential: context.credential.clone(),
-            policy_set: Arc::clone(&context.policy_set),
-            open_dial_limiter: context.open_dial_limiter.clone(),
-            target_connect_timeout: context.limits.target_connect_timeout,
-            event_tx: context.event_tx.clone(),
-            shutdown: context.shutdown.clone(),
-            cancel,
-        });
+        spawn_udp_open(
+            session_tasks,
+            UdpOpenTask {
+                flow_id,
+                target,
+                credential: context.credential.clone(),
+                policy_set: Arc::clone(&context.policy_set),
+                open_dial_limiter: context.open_dial_limiter.clone(),
+                target_connect_timeout: context.limits.target_connect_timeout,
+                event_tx: context.event_tx.clone(),
+                shutdown: context.shutdown.clone(),
+                cancel,
+            },
+        );
     }
     Ok(())
 }
@@ -1369,8 +1552,8 @@ fn udp_flow_count(target_writers: &FlowTable) -> usize {
         .count()
 }
 
-fn spawn_target_open(task: TargetOpenTask) {
-    tokio::spawn(async move {
+fn spawn_target_open(session_tasks: &mut SessionTasks, task: TargetOpenTask) {
+    session_tasks.spawn(SessionTaskKind::TcpOpen, async move {
         let result = wait_for_open_task(
             connect_allowed_target(
                 &task.target,
@@ -1401,8 +1584,8 @@ fn spawn_target_open(task: TargetOpenTask) {
     });
 }
 
-fn spawn_udp_open(task: UdpOpenTask) {
-    tokio::spawn(async move {
+fn spawn_udp_open(session_tasks: &mut SessionTasks, task: UdpOpenTask) {
+    session_tasks.spawn(SessionTaskKind::UdpOpen, async move {
         let result = wait_for_open_task(
             connect_allowed_udp_target(
                 &task.target,
@@ -1454,6 +1637,7 @@ async fn handle_tcp_open_completed(
     result: Result<TcpStream, OpenFailure>,
     context: &RelaySessionContext<'_>,
     target_writers: &mut FlowTable,
+    session_tasks: &mut SessionTasks,
 ) -> Result<(), AnyError> {
     if !matches!(target_writers.get(&flow_id), Some(FlowSlot::OpeningTcp(_))) {
         return Ok(());
@@ -1461,7 +1645,8 @@ async fn handle_tcp_open_completed(
 
     match result {
         Ok(target_stream) => {
-            let target_flow = accept_open_target(flow_id, target, target_stream, context).await?;
+            let target_flow =
+                accept_open_target(flow_id, target, target_stream, context, session_tasks).await?;
             target_writers.insert(flow_id, FlowSlot::Tcp(target_flow));
         }
         Err(err) => {
@@ -1478,6 +1663,7 @@ async fn handle_udp_open_completed(
     result: Result<UdpSocket, OpenFailure>,
     context: &RelaySessionContext<'_>,
     target_writers: &mut FlowTable,
+    session_tasks: &mut SessionTasks,
 ) -> Result<(), AnyError> {
     if !matches!(target_writers.get(&flow_id), Some(FlowSlot::OpeningUdp(_))) {
         return Ok(());
@@ -1486,7 +1672,8 @@ async fn handle_udp_open_completed(
     match result {
         Ok(target_socket) => {
             let target_flow =
-                accept_open_udp_target(flow_id, target, target_socket, context).await?;
+                accept_open_udp_target(flow_id, target, target_socket, context, session_tasks)
+                    .await?;
             target_writers.insert(flow_id, FlowSlot::Udp(target_flow));
         }
         Err(err) => {
@@ -1502,6 +1689,7 @@ async fn accept_open_target(
     target: Target,
     target_stream: TcpStream,
     context: &RelaySessionContext<'_>,
+    session_tasks: &mut SessionTasks,
 ) -> Result<TargetFlow, AnyError> {
     let (target_reader, target_writer) = target_stream.into_split();
     let (target_writer_tx, target_writer_rx) = mpsc::channel(TARGET_WRITE_QUEUE_CAPACITY);
@@ -1511,22 +1699,28 @@ async fn accept_open_target(
     let target_flow = TargetFlow::new(token, target_writer_tx, flow_control.clone());
     send_tcp_data(context.carrier_writer, flow_id, Bytes::new()).await?;
     spawn_target_reader(
-        identity,
-        target_reader,
-        flow_control.clone(),
-        context.carrier_writer.clone(),
-        context.event_tx.clone(),
-        context.shutdown.clone(),
-        context.limits.data_frame_size,
+        session_tasks,
+        TargetReaderTask {
+            identity,
+            target_reader,
+            flow_control: flow_control.clone(),
+            carrier_writer: context.carrier_writer.clone(),
+            event_tx: context.event_tx.clone(),
+            shutdown: context.shutdown.clone(),
+            data_frame_size: context.limits.data_frame_size,
+        },
     );
     spawn_target_writer(
-        identity,
-        target_writer,
-        target_writer_rx,
-        flow_control,
-        context.carrier_writer.clone(),
-        context.event_tx.clone(),
-        context.shutdown.clone(),
+        session_tasks,
+        TargetWriterTask {
+            identity,
+            target_writer,
+            commands: target_writer_rx,
+            flow_control,
+            carrier_writer: context.carrier_writer.clone(),
+            event_tx: context.event_tx.clone(),
+            shutdown: context.shutdown.clone(),
+        },
     );
     info!(event = "tcp.open", flow_id, target = %target.log_safe());
     Ok(target_flow)
@@ -1537,19 +1731,23 @@ async fn accept_open_udp_target(
     target: Target,
     target_socket: UdpSocket,
     context: &RelaySessionContext<'_>,
+    session_tasks: &mut SessionTasks,
 ) -> Result<UdpTargetFlow, AnyError> {
     let target_socket = Arc::new(target_socket);
     let flow_control = TargetFlowControl::new(context.session_buffer.clone());
     let target_flow = UdpTargetFlow::new(Arc::clone(&target_socket), flow_control.clone());
     send_udp_data(context.carrier_writer, flow_id, Bytes::new()).await?;
     spawn_udp_reader(
-        flow_id,
-        target_socket,
-        flow_control,
-        context.carrier_writer.clone(),
-        context.event_tx.clone(),
-        context.shutdown.clone(),
-        context.limits.data_frame_size,
+        session_tasks,
+        UdpReaderTask {
+            flow_id,
+            target_socket,
+            flow_control,
+            carrier_writer: context.carrier_writer.clone(),
+            event_tx: context.event_tx.clone(),
+            shutdown: context.shutdown.clone(),
+            data_frame_size: context.limits.data_frame_size,
+        },
     );
     info!(event = "udp.open", flow_id, target = %target.log_safe());
     Ok(target_flow)
@@ -1637,113 +1835,105 @@ async fn reject_udp_open_failure(
     Ok(())
 }
 
-fn spawn_target_reader(
-    identity: TargetFlowIdentity,
-    target_reader: OwnedReadHalf,
-    flow_control: TargetFlowControl,
-    carrier_writer: CarrierWriter,
-    event_tx: FlowEventSender,
-    shutdown: SessionShutdown,
-    data_frame_size: usize,
-) {
-    tokio::spawn(async move {
-        let flow_id = identity.flow_id;
+fn spawn_target_reader(session_tasks: &mut SessionTasks, task: TargetReaderTask) {
+    session_tasks.spawn(SessionTaskKind::TargetReader, async move {
+        let flow_id = task.identity.flow_id;
         match relay_target_to_client(
             flow_id,
-            target_reader,
-            flow_control,
-            &carrier_writer,
-            &event_tx,
-            &shutdown,
-            data_frame_size,
+            task.target_reader,
+            task.flow_control,
+            &task.carrier_writer,
+            &task.event_tx,
+            &task.shutdown,
+            task.data_frame_size,
         )
         .await
         {
-            Err(err) if !shutdown.is_closed() => {
+            Err(err) if !task.shutdown.is_closed() => {
                 warn!(event = "tcp.target.read.error", flow_id, error = %err);
-                let _ = send_error(&carrier_writer, flow_id, ErrorCode::TargetUnavailable).await;
-                let _ = send_tcp_close(&carrier_writer, flow_id, TCP_CLOSE_ERROR).await;
+                let _ =
+                    send_error(&task.carrier_writer, flow_id, ErrorCode::TargetUnavailable).await;
+                let _ = send_tcp_close(&task.carrier_writer, flow_id, TCP_CLOSE_ERROR).await;
             }
             _ => {}
         }
         send_flow_event_or_shutdown(
-            &event_tx,
+            &task.event_tx,
             FlowEvent::ReadClosed {
                 flow_id,
-                token: identity.token,
+                token: task.identity.token,
             },
-            &shutdown,
+            &task.shutdown,
         )
         .await;
     });
 }
 
-fn spawn_udp_reader(
-    flow_id: u64,
-    target_socket: Arc<UdpSocket>,
-    flow_control: TargetFlowControl,
-    carrier_writer: CarrierWriter,
-    event_tx: FlowEventSender,
-    shutdown: SessionShutdown,
-    data_frame_size: usize,
-) {
-    tokio::spawn(async move {
+fn spawn_udp_reader(session_tasks: &mut SessionTasks, task: UdpReaderTask) {
+    session_tasks.spawn(SessionTaskKind::UdpReader, async move {
         match relay_udp_target_to_client(
-            flow_id,
-            target_socket,
-            flow_control,
-            &carrier_writer,
-            &event_tx,
-            &shutdown,
-            data_frame_size,
+            task.flow_id,
+            task.target_socket,
+            task.flow_control,
+            &task.carrier_writer,
+            &task.event_tx,
+            &task.shutdown,
+            task.data_frame_size,
         )
         .await
         {
-            Err(err) if !shutdown.is_closed() => {
+            Err(err) if !task.shutdown.is_closed() => {
+                let flow_id = task.flow_id;
                 warn!(event = "udp.target.read.error", flow_id, error = %err);
-                let _ = send_error(&carrier_writer, flow_id, ErrorCode::TargetUnavailable).await;
-                let _ = send_udp_close(&carrier_writer, flow_id, UDP_CLOSE_ERROR).await;
-            }
-            _ => {}
-        }
-        send_flow_event_or_shutdown(&event_tx, FlowEvent::UdpReadClosed(flow_id), &shutdown).await;
-    });
-}
-
-fn spawn_target_writer(
-    identity: TargetFlowIdentity,
-    target_writer: OwnedWriteHalf,
-    commands: mpsc::Receiver<TargetCommand>,
-    flow_control: TargetFlowControl,
-    carrier_writer: CarrierWriter,
-    event_tx: FlowEventSender,
-    shutdown: SessionShutdown,
-) {
-    tokio::spawn(async move {
-        let flow_id = identity.flow_id;
-        match relay_client_to_target(target_writer, commands, flow_control, &event_tx, &shutdown)
-            .await
-        {
-            Err(err) if !shutdown.is_closed() => {
-                warn!(event = "tcp.target.write.error", flow_id, error = %err);
-                let _ = send_error(&carrier_writer, flow_id, ErrorCode::TargetUnavailable).await;
-                let _ = send_tcp_close(&carrier_writer, flow_id, TCP_CLOSE_ERROR).await;
+                let _ =
+                    send_error(&task.carrier_writer, flow_id, ErrorCode::TargetUnavailable).await;
+                let _ = send_udp_close(&task.carrier_writer, flow_id, UDP_CLOSE_ERROR).await;
             }
             _ => {}
         }
         send_flow_event_or_shutdown(
-            &event_tx,
+            &task.event_tx,
+            FlowEvent::UdpReadClosed(task.flow_id),
+            &task.shutdown,
+        )
+        .await;
+    });
+}
+
+fn spawn_target_writer(session_tasks: &mut SessionTasks, task: TargetWriterTask) {
+    session_tasks.spawn(SessionTaskKind::TargetWriter, async move {
+        let flow_id = task.identity.flow_id;
+        match relay_client_to_target(
+            task.target_writer,
+            task.commands,
+            task.flow_control,
+            &task.event_tx,
+            &task.shutdown,
+        )
+        .await
+        {
+            Err(err) if !task.shutdown.is_closed() => {
+                warn!(event = "tcp.target.write.error", flow_id, error = %err);
+                let _ =
+                    send_error(&task.carrier_writer, flow_id, ErrorCode::TargetUnavailable).await;
+                let _ = send_tcp_close(&task.carrier_writer, flow_id, TCP_CLOSE_ERROR).await;
+            }
+            _ => {}
+        }
+        send_flow_event_or_shutdown(
+            &task.event_tx,
             FlowEvent::WriteClosed {
                 flow_id,
-                token: identity.token,
+                token: task.identity.token,
             },
-            &shutdown,
+            &task.shutdown,
         )
         .await;
     });
 }
 
 fn spawn_half_close_timer(
+    session_tasks: &mut SessionTasks,
     flow_id: u64,
     token: FlowToken,
     closed_side: HalfCloseSide,
@@ -1751,7 +1941,7 @@ fn spawn_half_close_timer(
     event_tx: FlowEventSender,
     shutdown: SessionShutdown,
 ) {
-    tokio::spawn(async move {
+    session_tasks.spawn(SessionTaskKind::HalfCloseTimer, async move {
         tokio::select! {
             () = tokio::time::sleep(timeout) => {
                 send_flow_event_or_shutdown(
@@ -1826,6 +2016,7 @@ impl RelayLimits {
             target_connect_timeout: config.target_connect_timeout,
             tcp_half_close_timeout: config.tcp_half_close_timeout,
             udp_flow_idle_timeout: config.udp_flow_idle_timeout,
+            session_task_shutdown_timeout: config.session_task_shutdown_timeout,
         }
     }
 }
@@ -2881,6 +3072,7 @@ mod tests {
             target_connect_timeout: None,
             tcp_half_close_timeout: None,
             udp_flow_idle_timeout: None,
+            session_task_shutdown_timeout: None,
         }
     }
 
@@ -2990,6 +3182,7 @@ mod tests {
         );
         let (event_tx, _event_rx) = mpsc::channel(1);
         let shutdown = SessionShutdown::default();
+        let mut session_tasks = SessionTasks::default();
 
         handle_target_read_closed(
             1,
@@ -2998,6 +3191,7 @@ mod tests {
             &event_tx,
             &shutdown,
             &mut target_writers,
+            &mut session_tasks,
         );
 
         let target = open_target_flow_mut(&mut target_writers, 1).expect("flow should remain open");
@@ -3014,6 +3208,7 @@ mod tests {
         );
         let (event_tx, _event_rx) = mpsc::channel(1);
         let shutdown = SessionShutdown::default();
+        let mut session_tasks = SessionTasks::default();
 
         handle_target_read_closed(
             1,
@@ -3022,6 +3217,7 @@ mod tests {
             &event_tx,
             &shutdown,
             &mut target_writers,
+            &mut session_tasks,
         );
 
         let target = open_target_flow_mut(&mut target_writers, 1).expect("flow should remain open");
@@ -3620,6 +3816,32 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_tasks_reap_completed_tasks() {
+        let mut tasks = SessionTasks::default();
+
+        tasks.spawn(SessionTaskKind::HalfCloseTimer, async {});
+        tokio::time::timeout(Duration::from_secs(1), tasks.join_next())
+            .await
+            .expect("completed session task should be reaped");
+
+        assert!(tasks.is_empty());
+        assert!(tasks.kinds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_task_drain_aborts_pending_tasks_after_timeout() {
+        let mut tasks = SessionTasks::default();
+
+        tasks.spawn(SessionTaskKind::TargetReader, async {
+            std::future::pending::<()>().await;
+        });
+        drain_session_tasks(&mut tasks, Some(Duration::from_millis(10))).await;
+
+        assert!(tasks.is_empty());
+        assert!(tasks.kinds.is_empty());
     }
 
     #[test]
