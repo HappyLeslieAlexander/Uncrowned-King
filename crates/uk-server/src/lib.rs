@@ -27,6 +27,7 @@ use uk_proto::{
     ErrorCode, ErrorPayload, Frame, FrameIoError, FrameLimits, FrameType, SettingKey, Settings,
     read_frame, validate_connection_frame, write_frame,
 };
+use zeroize::Zeroize;
 
 use crate::config::ServerConfig;
 
@@ -189,11 +190,11 @@ where
     Ok(())
 }
 
-fn prepare_server_runtime(config: ServerConfig) -> Result<ServerRuntime, AnyError> {
+fn prepare_server_runtime(mut config: ServerConfig) -> Result<ServerRuntime, AnyError> {
     config.validate_network_endpoints()?;
     config.validate_limits()?;
     config.validate_sensitive_paths()?;
-    let credentials = Arc::new(config.credentials()?);
+    let credentials = Arc::new(take_runtime_credentials(&mut config)?);
     let policy_set = Arc::new(config.policy_set()?);
     let replay_cache = Arc::new(Mutex::new(ReplayCache::with_max_entries(
         Duration::from_secs(config.replay_cache_window_seconds()),
@@ -216,6 +217,17 @@ fn prepare_server_runtime(config: ServerConfig) -> Result<ServerRuntime, AnyErro
         max_sessions,
         max_handshakes,
     })
+}
+
+fn take_runtime_credentials(
+    config: &mut ServerConfig,
+) -> Result<Vec<uk_auth::Credential>, uk_auth::AuthError> {
+    let credentials = config.credentials();
+    for credential in &mut config.credentials {
+        credential.secret.zeroize();
+    }
+    config.credentials.clear();
+    credentials
 }
 
 fn log_connection_task_result(result: Option<Result<(), tokio::task::JoinError>>) {
@@ -614,6 +626,29 @@ mod tests {
         assert_eq!(settings.get(SettingKey::SupportsUdpDatagram), Some(0));
         assert_eq!(settings.get(SettingKey::SupportsUdpStreamFallback), Some(1));
         assert_eq!(settings.get(SettingKey::IdleTimeoutSeconds), Some(42));
+    }
+
+    #[test]
+    fn runtime_credentials_remove_secrets_from_server_config() {
+        let mut config = minimal_config();
+
+        let credentials = take_runtime_credentials(&mut config).unwrap();
+
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(credentials[0].key_id, b"client");
+        assert!(config.credentials.is_empty());
+    }
+
+    #[test]
+    fn invalid_runtime_credentials_still_clear_server_config_secrets() {
+        let mut config = minimal_config();
+        config.credentials[0].secret = "too-short".to_owned();
+
+        assert_eq!(
+            take_runtime_credentials(&mut config),
+            Err(uk_auth::AuthError::SecretTooShort)
+        );
+        assert!(config.credentials.is_empty());
     }
 
     #[test]

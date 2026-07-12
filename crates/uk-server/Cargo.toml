@@ -26,6 +26,7 @@ tracing-subscriber.workspace = true
 uk-auth = { path = "../uk-auth" }
 uk-policy = { path = "../uk-policy" }
 uk-proto = { path = "../uk-proto" }
+zeroize.workspace = true
 
 [lints]
 workspace = true

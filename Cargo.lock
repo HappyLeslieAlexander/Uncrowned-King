@@ -830,6 +830,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "uk-proto",
+ "zeroize",
 ]
 
 [[package]]
@@ -890,6 +891,7 @@ dependencies = [
  "uk-auth",
  "uk-policy",
  "uk-proto",
+ "zeroize",
 ]
 
 [[package]]

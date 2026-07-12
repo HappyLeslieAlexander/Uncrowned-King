@@ -12,6 +12,7 @@ use rand::RngCore;
 use sha2::Sha256;
 use thiserror::Error;
 use uk_proto::{ProtocolError, varint};
+use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -97,7 +98,7 @@ pub struct Credential {
     /// Opaque key id sent by the client.
     pub key_id: Vec<u8>,
     /// Shared secret, at least 32 bytes.
-    pub secret: Vec<u8>,
+    pub secret: Zeroizing<Vec<u8>>,
     /// Lifecycle status.
     pub status: CredentialStatus,
     /// Optional unix timestamp when the key becomes valid.
@@ -145,7 +146,7 @@ impl Credential {
     pub fn active(key_id: impl Into<Vec<u8>>, secret: impl Into<Vec<u8>>) -> AuthResult<Self> {
         let credential = Self {
             key_id: key_id.into(),
-            secret: secret.into(),
+            secret: Zeroizing::new(secret.into()),
             status: CredentialStatus::Active,
             not_before: None,
             not_after: None,
@@ -640,6 +641,7 @@ pub fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroize::Zeroize;
 
     fn fixture() -> (Credential, [u8; 32], AuthChallenge, AuthResponse) {
         let credential = Credential::active(
@@ -713,6 +715,19 @@ mod tests {
 
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("0123456789abcdef"));
+    }
+
+    #[test]
+    fn credential_secret_supports_explicit_zeroization() {
+        let mut credential = Credential::active(
+            b"client-a".to_vec(),
+            b"0123456789abcdef0123456789abcdef".to_vec(),
+        )
+        .unwrap();
+
+        credential.secret.zeroize();
+
+        assert!(credential.secret.is_empty());
     }
 
     #[test]

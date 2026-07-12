@@ -15,6 +15,7 @@ rand.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 uk-proto = { path = "../uk-proto" }
+zeroize.workspace = true
 
 [lints]
 workspace = true
