@@ -249,6 +249,15 @@ async fn falls_back_to_secondary_server_addr_after_primary_handshake_timeout()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reports_every_failed_server_addr_during_handshake() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_all_handshake_endpoints_failed_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rejects_expired_auth_challenge_during_handshake() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_expired_auth_challenge_e2e()).await?
 }
@@ -1801,6 +1810,37 @@ async fn run_handshake_timeout_fallback_e2e() -> Result<(), TestError> {
 
     run_handshake(config).await?;
     silent_primary.abort();
+    Ok(())
+}
+
+async fn run_all_handshake_endpoints_failed_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let harness = ServerHarness::start(test_limits()).await?;
+    let primary = unused_loopback_addr().await?;
+    let fallback = unused_loopback_addr().await?;
+    let mut config = harness.client_config(SECRET);
+    config.server_addr = primary.to_string();
+    config.server_addrs = Some(vec![fallback.to_string()]);
+    config.handshake_timeout_seconds = Some(1);
+
+    let error = run_handshake(config)
+        .await
+        .expect_err("all unavailable handshake endpoints must fail");
+    let text = error.to_string();
+
+    assert!(
+        text.contains("2 endpoint attempt"),
+        "error did not report both endpoint attempts: {text}"
+    );
+    assert!(
+        text.contains(&format!("[0] {primary}: tcp connect failed")),
+        "error did not include primary endpoint failure: {text}"
+    );
+    assert!(
+        text.contains(&format!("[1] {fallback}: tcp connect failed")),
+        "error did not include fallback endpoint failure: {text}"
+    );
     Ok(())
 }
 
