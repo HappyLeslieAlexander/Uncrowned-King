@@ -30,6 +30,11 @@ uk-server --config examples/server.toml serve
 uk-client --config examples/client.toml socks5 --listen 127.0.0.1:1080
 ```
 
+The example server exposes local-only operational endpoints at
+`http://127.0.0.1:9090/healthz`, `/readyz`, and `/metrics`. These endpoints are
+unauthenticated; keep the listener on loopback or a protected management
+network when adapting the example.
+
 The client rejects non-loopback SOCKS5 listen addresses unless
 `--allow-non-loopback` is set. Because the local SOCKS5 endpoint has no user
 authentication, use that override only with separate firewall or network

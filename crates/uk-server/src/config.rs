@@ -23,6 +23,8 @@ pub const DEFAULT_AUTH_SKEW_SECONDS: u64 = 30;
 pub struct ServerConfig {
     /// TCP listen address.
     pub listen: String,
+    /// Optional unauthenticated HTTP health and metrics listen address.
+    pub observability_listen: Option<String>,
     /// Certificate chain PEM path.
     pub cert_path: String,
     /// Private key PEM path.
@@ -146,6 +148,9 @@ impl ServerConfig {
     /// Validates configured network endpoints without resolving DNS.
     pub fn validate_network_endpoints(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         validate_host_port_endpoint("listen", &self.listen)?;
+        if let Some(listen) = &self.observability_listen {
+            validate_host_port_endpoint("observability_listen", listen)?;
+        }
         Ok(())
     }
 
@@ -512,6 +517,7 @@ mod tests {
     fn minimal_config() -> ServerConfig {
         ServerConfig {
             listen: "127.0.0.1:0".to_owned(),
+            observability_listen: None,
             cert_path: "cert.pem".to_owned(),
             key_path: "key.pem".to_owned(),
             auth_skew_seconds: None,
@@ -703,6 +709,37 @@ credentials = []
         .unwrap();
 
         assert_eq!(config.auth_skew_seconds(), 45);
+    }
+
+    #[test]
+    fn parses_observability_listener() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:9443"
+observability_listen = "127.0.0.1:9090"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.observability_listen.as_deref(),
+            Some("127.0.0.1:9090")
+        );
+        assert!(config.validate_network_endpoints().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_observability_listener() {
+        let mut config = minimal_config();
+        config.listen = "127.0.0.1:9443".to_owned();
+        config.observability_listen = Some("127.0.0.1".to_owned());
+
+        let error = config.validate_network_endpoints().unwrap_err().to_string();
+
+        assert!(error.contains("observability_listen"));
     }
 
     #[test]

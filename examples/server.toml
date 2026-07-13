@@ -1,6 +1,7 @@
 # Example UK server configuration.
 
 listen = "127.0.0.1:9443"
+observability_listen = "127.0.0.1:9090"
 cert_path = "server-cert.pem"
 key_path = "server-key.pem"
 policy_path = "policy.toml"

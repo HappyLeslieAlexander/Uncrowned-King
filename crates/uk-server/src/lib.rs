@@ -2,6 +2,7 @@
 
 pub mod config;
 
+mod observability;
 mod relay;
 mod tls;
 
@@ -39,6 +40,7 @@ use uk_proto::{
 use zeroize::Zeroize;
 
 use crate::config::ServerConfig;
+use crate::observability::ServerMetrics;
 
 /// Server error type.
 pub type AnyError = Box<dyn Error + Send + Sync>;
@@ -105,6 +107,7 @@ struct ConnectionRuntime {
     session_permits: Arc<Semaphore>,
     config: Arc<ServerConfig>,
     max_sessions: usize,
+    metrics: Arc<ServerMetrics>,
 }
 
 /// Runs the UK server listener until the task is cancelled or the listener fails.
@@ -162,10 +165,15 @@ where
     let session_permits = Arc::new(Semaphore::new(max_sessions));
     let handshake_permits = Arc::new(Semaphore::new(max_handshakes));
     let shutdown_timeout = listener_shutdown_timeout(config.shutdown_timeout_seconds());
+    let metrics = Arc::new(ServerMetrics::default());
 
     info!(event = "server.listen", listen = %listen);
 
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+    let (observability_shutdown_tx, observability_shutdown_rx) = watch::channel(false);
+    let observability_task =
+        start_observability(&config, Arc::clone(&metrics), observability_shutdown_rx).await?;
+    metrics.set_ready(true);
     let mut connections = JoinSet::new();
     let mut accept_backoff = ListenerAcceptBackoff::default();
     tokio::pin!(shutdown);
@@ -174,13 +182,14 @@ where
         tokio::select! {
             () = &mut shutdown => {
                 info!(event = "server.shutdown");
-                let _ = shutdown_tx.send(true);
+                begin_server_shutdown(&metrics, &shutdown_tx);
                 break;
             }
             accepted = listener.accept() => {
                 let (mut tcp, peer) = match accepted {
                     Ok(connection) => {
                         accept_backoff.reset();
+                        metrics.record_accepted_connection();
                         connection
                     }
                     Err(err) => {
@@ -195,6 +204,7 @@ where
                     }
                 };
                 let Ok(handshake_permit) = Arc::clone(&handshake_permits).try_acquire_owned() else {
+                    metrics.record_rejected_handshake();
                     warn!(event = "server.handshake.limit", peer = %peer, max_handshakes);
                     if let Err(err) = tcp.shutdown().await {
                         debug!(
@@ -213,10 +223,10 @@ where
                     session_permits: Arc::clone(&session_permits),
                     config: Arc::clone(&config),
                     max_sessions,
+                    metrics: Arc::clone(&metrics),
                 };
                 let shutdown_rx = shutdown_tx.subscribe();
-                let connection_id =
-                    NEXT_CONNECTION_CORRELATION_ID.fetch_add(1, Ordering::Relaxed);
+                let connection_id = next_connection_correlation_id();
 
                 let connection = async move {
                     if let Err(err) =
@@ -243,8 +253,46 @@ where
     }
 
     drain_connection_tasks(&mut connections, shutdown_timeout).await;
+    stop_observability(observability_shutdown_tx, observability_task).await;
 
     Ok(())
+}
+
+fn begin_server_shutdown(metrics: &ServerMetrics, shutdown_tx: &watch::Sender<bool>) {
+    metrics.set_ready(false);
+    let _ = shutdown_tx.send(true);
+}
+
+fn next_connection_correlation_id() -> u64 {
+    NEXT_CONNECTION_CORRELATION_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+async fn start_observability(
+    config: &ServerConfig,
+    metrics: Arc<ServerMetrics>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<Option<tokio::task::JoinHandle<()>>, AnyError> {
+    let Some(listen) = &config.observability_listen else {
+        return Ok(None);
+    };
+    let listener = TcpListener::bind(listen).await?;
+    Ok(Some(tokio::spawn(observability::serve(
+        listener,
+        metrics,
+        shutdown_rx,
+    ))))
+}
+
+async fn stop_observability(
+    shutdown_tx: watch::Sender<bool>,
+    task: Option<tokio::task::JoinHandle<()>>,
+) {
+    let _ = shutdown_tx.send(true);
+    if let Some(task) = task
+        && let Err(err) = task.await
+    {
+        warn!(event = "server.observability.task_error", error = %err);
+    }
 }
 
 fn prepare_server_runtime(mut config: ServerConfig) -> Result<ServerRuntime, AnyError> {
@@ -333,6 +381,7 @@ async fn handle_connection(
         session_permits,
         config,
         max_sessions,
+        metrics,
     } = runtime;
     tcp.set_nodelay(true)?;
     if *shutdown_rx.borrow() {
@@ -355,25 +404,39 @@ async fn handle_connection(
         }
     };
 
-    let (mut stream, identity) = tokio::select! {
-        result = handshake => result?,
+    let handshake_guard = metrics.begin_handshake();
+    let handshake_result = tokio::select! {
+        result = handshake => Some(result),
         changed = shutdown_rx.changed() => {
             let _ = changed;
-            return Ok(());
+            None
         }
     };
+    let Some(handshake_result) = handshake_result else {
+        return Ok(());
+    };
+    let (mut stream, identity) = match handshake_result {
+        Ok(handshake) => handshake,
+        Err(err) => {
+            metrics.record_failed_handshake();
+            return Err(err);
+        }
+    };
+    drop(handshake_guard);
     drop(handshake_permit);
     if *shutdown_rx.borrow() {
         return Ok(());
     }
 
     let Ok(session_permit) = session_permits.try_acquire_owned() else {
+        metrics.record_rejected_session();
         warn!(event = "server.session.limit", peer = %peer, max_sessions);
         let _ = write_connection_error(&mut stream, ErrorCode::ResourceLimit).await;
         let _ = stream.shutdown().await;
         return Err("authenticated session limit exceeded".into());
     };
     let _session_permit = session_permit;
+    let _active_session = metrics.begin_session();
 
     write_server_settings(&mut stream, &config).await?;
 
@@ -647,6 +710,7 @@ mod tests {
     fn minimal_config() -> ServerConfig {
         ServerConfig {
             listen: "127.0.0.1:1".to_owned(),
+            observability_listen: None,
             cert_path: "cert.pem".to_owned(),
             key_path: "key.pem".to_owned(),
             auth_skew_seconds: None,

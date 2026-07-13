@@ -19,6 +19,7 @@ The repository currently focuses on the first runnable v0.1 TLS/TCP carrier:
 - bounded UDP flow recovery after a carrier disconnect without closing the SOCKS association
 - graceful Ctrl+C/SIGTERM shutdown for long-running client and server listeners
 - capped exponential retry for transient client and server listener accept errors
+- bounded server health, readiness, and Prometheus metrics endpoint
 - nonce-matched PING/PONG keepalive for active relay flows
 - negotiated UDP flow limits and idle UDP flow cleanup on both client and server
 - SETTINGS-advertised UDP stream fallback capability for the TLS/TCP carrier
@@ -99,6 +100,15 @@ least 75 bytes so a minimum `AUTH_RESPONSE` can fit. `max_pre_auth_bytes`,
 `max_buffered_bytes_per_flow` must be at most 16777216 bytes.
 At least one credential is required. Credential `key_id` values must be unique.
 When set, `policy_group` must be non-empty printable text.
+
+Set `observability_listen = "127.0.0.1:9090"` at the top level of the server
+config to enable the operational HTTP listener. It is disabled when omitted and
+serves only `GET /healthz`, `GET /readyz`, and `GET /metrics`. Readiness drops
+before relay shutdown begins, and metrics expose accepted connections, active
+and failed handshakes, authenticated and rejected sessions, and active sessions
+in Prometheus text format. The endpoint has no authentication; bind it to
+loopback or a firewall-protected management network. Requests are limited to an
+8 KiB header, a five-second read timeout, and 32 concurrent connections.
 
 Client configs may also set `handshake_timeout_seconds = 10` to bound each
 server endpoint attempt, including TCP connect, TLS handshake, authentication

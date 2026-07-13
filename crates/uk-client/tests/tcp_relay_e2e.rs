@@ -468,6 +468,11 @@ async fn server_listener_stops_on_shutdown_signal() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_exposes_health_readiness_and_metrics() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_server_observability_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_shutdown_closes_authenticated_session() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -2747,6 +2752,74 @@ async fn run_server_listener_shutdown_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+async fn run_server_observability_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    fs::write(&cert_path, CERT_PEM)?;
+    write_private_key(&key_path)?;
+    let observability_addr = unused_loopback_addr().await?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut config = test_server_config(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        &cert_path,
+        &key_path,
+        test_limits(),
+        None,
+        30,
+    );
+    config.observability_listen = Some(observability_addr.to_string());
+    let (server_addr, mut server_task) = start_uk_server_until_shutdown(config, async {
+        let _ = shutdown_rx.await;
+    })
+    .await?;
+    wait_for_listener(
+        "uk-server observability",
+        observability_addr,
+        &mut server_task,
+    )
+    .await?;
+
+    let health = http_get(observability_addr, "/healthz").await?;
+    let ready = http_get(observability_addr, "/readyz").await?;
+    assert!(health.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(ready.starts_with("HTTP/1.1 200 OK\r\n"));
+
+    let (carrier, _settings) = connect_authenticated_carrier(ClientConfig {
+        server_addr: server_addr.to_string(),
+        server_addrs: None,
+        server_name: "localhost".to_owned(),
+        ca_cert_path: path_string(&cert_path),
+        key_id: KEY_ID.to_owned(),
+        secret: SECRET.to_owned(),
+        handshake_timeout_seconds: Some(3),
+        server_connect_retry_delay_millis: None,
+        socks_handshake_timeout_seconds: Some(3),
+        tcp_open_timeout_seconds: Some(3),
+        udp_flow_idle_timeout_seconds: None,
+        shutdown_timeout_seconds: Some(3),
+        max_pending_open_bytes: None,
+        max_socks_connections: None,
+        max_buffered_bytes_per_session: None,
+        max_buffered_bytes_per_flow: None,
+    })
+    .await?;
+    let metrics = http_get(observability_addr, "/metrics").await?;
+    assert!(metrics.contains("uncrowned_king_server_ready 1\n"));
+    assert!(metrics.contains("uncrowned_king_server_authenticated_sessions_total 1\n"));
+    assert!(metrics.contains("uncrowned_king_server_active_sessions 1\n"));
+
+    shutdown_tx
+        .send(())
+        .map_err(|()| "server shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(3), server_task).await???;
+    drop(carrier);
+    assert!(TcpStream::connect(observability_addr).await.is_err());
+    Ok(())
+}
+
 async fn run_server_active_session_shutdown_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -4809,6 +4882,16 @@ async fn wait_for_listener(
     Err(format!("listener did not start at {addr}").into())
 }
 
+async fn http_get(addr: SocketAddr, path: &str) -> Result<String, TestError> {
+    let mut stream = TcpStream::connect(addr).await?;
+    stream
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .await?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await?;
+    Ok(response)
+}
+
 fn test_server_config(
     listen: SocketAddr,
     cert_path: &Path,
@@ -4819,6 +4902,7 @@ fn test_server_config(
 ) -> ServerConfig {
     ServerConfig {
         listen: listen.to_string(),
+        observability_listen: None,
         cert_path: path_string(cert_path),
         key_path: path_string(key_path),
         auth_skew_seconds: Some(auth_skew_seconds),
