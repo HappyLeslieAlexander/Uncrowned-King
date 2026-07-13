@@ -13,6 +13,7 @@ use uk_auth::{
 };
 use uk_policy::PolicySet;
 use uk_proto::{MAX_FRAME_PAYLOAD_SIZE, MIN_TCP_RELAY_FRAME_SIZE, validate_host_port_endpoint};
+use zeroize::Zeroize;
 
 /// Default accepted authentication timestamp skew in seconds.
 pub const DEFAULT_AUTH_SKEW_SECONDS: u64 = 30;
@@ -431,6 +432,10 @@ impl fmt::Debug for CredentialConfig {
 }
 
 impl CredentialConfig {
+    pub(crate) fn zeroize_secret(&mut self) {
+        self.secret.zeroize();
+    }
+
     fn to_credential(&self) -> Result<Credential, AuthError> {
         let status_text = self.status.as_deref().unwrap_or("active");
         let status = match status_text {
@@ -459,6 +464,12 @@ impl CredentialConfig {
         credential.not_after = self.not_after;
         credential.policy_group.clone_from(&self.policy_group);
         Ok(credential)
+    }
+}
+
+impl Drop for CredentialConfig {
+    fn drop(&mut self) {
+        self.zeroize_secret();
     }
 }
 
@@ -1664,6 +1675,22 @@ secret = "0123456789abcdef0123456789abcdef"
 
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("0123456789abcdef"));
+    }
+
+    #[test]
+    fn credential_config_supports_explicit_secret_zeroization() {
+        let mut credential = CredentialConfig {
+            key_id: "client".to_owned(),
+            secret: "0123456789abcdef0123456789abcdef".to_owned(),
+            status: Some("active".to_owned()),
+            not_before: None,
+            not_after: None,
+            policy_group: Some("default".to_owned()),
+        };
+
+        credential.zeroize_secret();
+
+        assert!(credential.secret.is_empty());
     }
 
     #[test]

@@ -37,7 +37,6 @@ use uk_proto::{
     ErrorCode, ErrorPayload, Frame, FrameIoError, FrameLimits, FrameType, SettingKey, Settings,
     read_frame, validate_connection_frame, write_frame,
 };
-use zeroize::Zeroize;
 
 use crate::config::ServerConfig;
 use crate::observability::ServerMetrics;
@@ -329,7 +328,7 @@ fn take_runtime_credentials(
 ) -> Result<Vec<uk_auth::Credential>, uk_auth::AuthError> {
     let credentials = config.credentials();
     for credential in &mut config.credentials {
-        credential.secret.zeroize();
+        credential.zeroize_secret();
     }
     config.credentials.clear();
     credentials
