@@ -47,8 +47,9 @@ require a restart.
 
 The client also accepts `SIGHUP`. Its server endpoints, CA, key id, secret, and
 new-session limits reload atomically without terminating existing SOCKS flows.
-SOCKS handshake timeout, shutdown timeout, and maximum SOCKS connection changes
-require a client restart.
+New flows switch immediately to the new carrier generation; old carriers close
+after their final flow drains. SOCKS handshake timeout, shutdown timeout, and
+maximum SOCKS connection changes require a client restart.
 
 Replace the example shared secret before using these configs anywhere outside a
 local throwaway environment.

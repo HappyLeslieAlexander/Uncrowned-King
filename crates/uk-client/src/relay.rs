@@ -93,6 +93,7 @@ enum KeepalivePong {
 
 struct ClientSession {
     correlation_id: u64,
+    config_generation: u64,
     writer: CarrierWriter,
     flows: FlowTable,
     limits: FrameLimits,
@@ -108,6 +109,7 @@ struct ClientSession {
     task_shutdown_timeout: Option<Duration>,
     tasks: Mutex<ClientSessionTasks>,
     shutdown: ClientSessionShutdown,
+    draining: AtomicBool,
     next_flow_id: AtomicU64,
     next_ping_nonce: AtomicU64,
     outstanding_ping_nonce: AtomicU64,
@@ -136,6 +138,9 @@ struct CachedConnectFailureError {
     message: Arc<str>,
 }
 
+#[derive(Debug)]
+struct SessionDrainingError;
+
 struct ClientSessionTasks {
     tasks: JoinSet<ClientSessionTaskKind>,
     kinds: HashMap<Id, ClientSessionTaskKind>,
@@ -152,6 +157,14 @@ impl fmt::Display for CachedConnectFailureError {
 }
 
 impl Error for CachedConnectFailureError {}
+
+impl fmt::Display for SessionDrainingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("uk session is draining")
+    }
+}
+
+impl Error for SessionDrainingError {}
 
 impl Default for ClientSessionTasks {
     fn default() -> Self {
@@ -755,6 +768,10 @@ impl ClientSessionManager {
         ensure_reload_compatible(&current.config, &candidate)?;
         let generation = self.config.replace(candidate);
         self.clear_connect_failure().await;
+        let previous = self.current.lock().await.take();
+        if let Some(previous) = previous {
+            previous.begin_drain().await;
+        }
         Ok(generation)
     }
 
@@ -788,7 +805,9 @@ impl ClientSessionManager {
                         attempt,
                         error = %err
                     );
-                    self.invalidate(&session).await;
+                    if !is_session_draining_error(&err) {
+                        self.invalidate(&session).await;
+                    }
                     last_error = Some(err);
                 }
             }
@@ -827,7 +846,9 @@ impl ClientSessionManager {
                         attempt,
                         error = %err
                     );
-                    self.invalidate(&session).await;
+                    if !is_session_draining_error(&err) {
+                        self.invalidate(&session).await;
+                    }
                     last_error = Some(err);
                 }
             }
@@ -864,7 +885,7 @@ impl ClientSessionManager {
                 event = "client.session.connect",
                 config_generation = snapshot.generation
             );
-            let session = match ClientSession::connect(&snapshot.config).await {
+            let session = match ClientSession::connect(&snapshot).await {
                 Ok(session) => session,
                 Err(err) => {
                     if self.remember_connect_failure(&snapshot, &err).await {
@@ -1025,7 +1046,8 @@ fn ensure_reload_compatible(
 }
 
 impl ClientSession {
-    async fn connect(config: &ClientConfig) -> Result<Arc<Self>, AnyError> {
+    async fn connect(snapshot: &ClientConfigSnapshot) -> Result<Arc<Self>, AnyError> {
+        let config = snapshot.config.as_ref();
         let (carrier, settings) = session::connect_authenticated(config).await?;
         let negotiated = settings.negotiated_v0_1()?;
         let limits = negotiated.frame_limits();
@@ -1034,6 +1056,7 @@ impl ClientSession {
         let correlation_id = NEXT_CLIENT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let session = Arc::new(Self {
             correlation_id,
+            config_generation: snapshot.generation,
             writer: Arc::new(Mutex::new(carrier_writer)),
             flows: Arc::new(Mutex::new(HashMap::new())),
             limits,
@@ -1049,13 +1072,18 @@ impl ClientSession {
             task_shutdown_timeout: timeout(config.shutdown_timeout_seconds()),
             tasks: Mutex::new(ClientSessionTasks::default()),
             shutdown: ClientSessionShutdown::default(),
+            draining: AtomicBool::new(false),
             next_flow_id: AtomicU64::new(FIRST_CLIENT_FLOW_ID),
             next_ping_nonce: AtomicU64::new(0),
             outstanding_ping_nonce: AtomicU64::new(0),
             last_pong_nonce: AtomicU64::new(0),
             pong_notify: Notify::new(),
         });
-        info!(event = "client.session.established", correlation_id);
+        info!(
+            event = "client.session.established",
+            correlation_id,
+            config_generation = snapshot.generation
+        );
         spawn_carrier_reader(carrier_reader, Arc::clone(&session)).await;
         if let Some(interval) = keepalive_interval(negotiated) {
             spawn_keepalive(Arc::clone(&session), interval).await;
@@ -1065,6 +1093,49 @@ impl ClientSession {
 
     fn is_closed(&self) -> bool {
         self.shutdown.is_closed()
+    }
+
+    fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+    }
+
+    async fn begin_drain(&self) {
+        if self.draining.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        info!(
+            event = "client.session.draining",
+            correlation_id = self.correlation_id,
+            config_generation = self.config_generation
+        );
+        self.close_if_drained().await;
+    }
+
+    async fn remove_flow(&self, flow_id: u64) {
+        let should_close = {
+            let mut flows = self.flows.lock().await;
+            let removed = flows.remove(&flow_id).is_some();
+            removed && self.is_draining() && flows.is_empty()
+        };
+        if should_close {
+            info!(
+                event = "client.session.drain_complete",
+                correlation_id = self.correlation_id,
+                config_generation = self.config_generation
+            );
+            self.close().await;
+        }
+    }
+
+    async fn close_if_drained(&self) {
+        if self.is_draining() && self.flows.lock().await.is_empty() {
+            info!(
+                event = "client.session.drain_complete",
+                correlation_id = self.correlation_id,
+                config_generation = self.config_generation
+            );
+            self.close().await;
+        }
     }
 
     async fn has_open_flows(&self) -> bool {
@@ -1095,6 +1166,9 @@ impl ClientSession {
         pending_local_data: &mut PendingOpenLocalData,
         shutdown_rx: &mut watch::Receiver<bool>,
     ) -> Result<OpenOutcome, AnyError> {
+        if self.is_draining() {
+            return Err(Box::new(SessionDrainingError));
+        }
         if self.is_closed() {
             return Err("uk session is closed".into());
         }
@@ -1102,13 +1176,13 @@ impl ClientSession {
             return Ok(OpenOutcome::Rejected(socks5::Reply::GeneralFailure));
         };
         if self.is_closed() {
-            self.flows.lock().await.remove(&flow_id);
+            self.remove_flow(flow_id).await;
             return Err("uk session is closed".into());
         }
 
         let send_result = self.send_tcp_open(flow_id, target).await;
         if let Err(err) = send_result {
-            self.flows.lock().await.remove(&flow_id);
+            self.remove_flow(flow_id).await;
             return Err(err);
         }
 
@@ -1140,11 +1214,11 @@ impl ClientSession {
                 Ok(OpenOutcome::Open(flow))
             }
             Ok(OpenResponse::Rejected(reply)) => {
-                self.flows.lock().await.remove(&flow_id);
+                self.remove_flow(flow_id).await;
                 Ok(OpenOutcome::Rejected(reply))
             }
             Err(err) => {
-                self.flows.lock().await.remove(&flow_id);
+                self.remove_flow(flow_id).await;
                 report_protocol_error(self).await;
                 Err(err)
             }
@@ -1158,6 +1232,9 @@ impl ClientSession {
         tcp_buf: &mut [u8; 1],
         shutdown_rx: &mut watch::Receiver<bool>,
     ) -> Result<OpenOutcome, AnyError> {
+        if self.is_draining() {
+            return Err(Box::new(SessionDrainingError));
+        }
         if self.is_closed() {
             return Err("uk session is closed".into());
         }
@@ -1168,12 +1245,12 @@ impl ClientSession {
             return Ok(OpenOutcome::Rejected(socks5::Reply::GeneralFailure));
         };
         if self.is_closed() {
-            self.flows.lock().await.remove(&flow_id);
+            self.remove_flow(flow_id).await;
             return Err("uk session is closed".into());
         }
 
         if let Err(err) = self.send_udp_open(flow_id, target).await {
-            self.flows.lock().await.remove(&flow_id);
+            self.remove_flow(flow_id).await;
             return Err(err);
         }
 
@@ -1196,11 +1273,11 @@ impl ClientSession {
         match decode_udp_open_response(frame) {
             Ok(OpenResponse::Accepted) => Ok(OpenOutcome::Open(flow)),
             Ok(OpenResponse::Rejected(reply)) => {
-                self.flows.lock().await.remove(&flow_id);
+                self.remove_flow(flow_id).await;
                 Ok(OpenOutcome::Rejected(reply))
             }
             Err(err) => {
-                self.flows.lock().await.remove(&flow_id);
+                self.remove_flow(flow_id).await;
                 report_protocol_error(self).await;
                 Err(err)
             }
@@ -1362,13 +1439,13 @@ impl ClientSession {
     }
 
     async fn cancel_pending_open(&self, flow_id: u64) {
-        self.flows.lock().await.remove(&flow_id);
         let _ = self.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await;
+        self.remove_flow(flow_id).await;
     }
 
     async fn cancel_pending_udp_open(&self, flow_id: u64) {
-        self.flows.lock().await.remove(&flow_id);
         let _ = self.send_udp_close(flow_id, UDP_CLOSE_ERROR).await;
+        self.remove_flow(flow_id).await;
     }
 
     async fn reserve_flow(
@@ -1377,6 +1454,9 @@ impl ClientSession {
     ) -> Result<Option<(u64, mpsc::Receiver<BufferedFlowFrame>)>, AnyError> {
         let (sender, frames) = mpsc::channel(FLOW_FRAME_QUEUE_CAPACITY);
         let mut flows = self.flows.lock().await;
+        if self.is_draining() {
+            return Err(Box::new(SessionDrainingError));
+        }
         let Some(flow_id) = reserve_flow_slot(
             &mut flows,
             self.max_streams,
@@ -1788,6 +1868,13 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
                     session.max_buffered_bytes_per_session,
                 )
             };
+            let removed_flow = matches!(
+                route,
+                FlowFrameRoute::ProtocolMismatch
+                    | FlowFrameRoute::FlowQueueFull
+                    | FlowFrameRoute::SessionQueueFull
+                    | FlowFrameRoute::FlowClosed
+            );
             match route {
                 FlowFrameRoute::InvalidFlowId => {
                     report_protocol_error(session).await;
@@ -1818,6 +1905,9 @@ async fn handle_carrier_frame(session: &ClientSession, frame: Frame) -> Result<(
                 FlowFrameRoute::UnknownFlow
                 | FlowFrameRoute::Enqueued
                 | FlowFrameRoute::FlowClosed => {}
+            }
+            if removed_flow {
+                session.close_if_drained().await;
             }
             Ok(())
         }
@@ -2038,7 +2128,7 @@ async fn handle_socks_connection(
     if let Err(err) = socks5::send_reply(&mut local, socks5::Reply::Succeeded).await {
         transition(&mut state, ClientConnectionState::Closing);
         let _ = flow_session.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await;
-        flow_session.flows.lock().await.remove(&flow_id);
+        flow_session.remove_flow(flow_id).await;
         transition(&mut state, ClientConnectionState::Closed);
         return Err(err.into());
     }
@@ -2049,7 +2139,7 @@ async fn handle_socks_connection(
         transition(&mut state, ClientConnectionState::Closing);
         let _ = flow_session.send_tcp_close(flow_id, TCP_CLOSE_ERROR).await;
     }
-    flow_session.flows.lock().await.remove(&flow_id);
+    flow_session.remove_flow(flow_id).await;
     transition(&mut state, ClientConnectionState::Closed);
     relay_result
 }
@@ -2236,7 +2326,7 @@ impl UdpAssociation {
                         error = %err
                     );
                     self.remove_flow_if_matches(&datagram.target, flow.id);
-                    flow.session.flows.lock().await.remove(&flow.id);
+                    flow.session.remove_flow(flow.id).await;
                     last_error = Some(err);
                 }
             }
@@ -2324,7 +2414,7 @@ impl UdpAssociation {
             let session = Arc::clone(&flow.session);
             let outcome = async {
                 session.send_udp_close(flow_id, UDP_CLOSE_ERROR).await?;
-                session.flows.lock().await.remove(&flow_id);
+                session.remove_flow(flow_id).await;
                 Ok(())
             }
             .await;
@@ -2386,7 +2476,7 @@ impl UdpAssociation {
     async fn close(&mut self) {
         for flow in self.flows_by_target.values().cloned().collect::<Vec<_>>() {
             let _ = flow.session.send_udp_close(flow.id, UDP_CLOSE_NORMAL).await;
-            flow.session.flows.lock().await.remove(&flow.id);
+            flow.session.remove_flow(flow.id).await;
         }
         self.flows_by_target.clear();
         self.flow_tasks.abort_all();
@@ -2413,7 +2503,7 @@ impl UdpAssociation {
                     target = %target.log_safe()
                 );
                 let _ = flow.session.send_udp_close(flow.id, UDP_CLOSE_NORMAL).await;
-                flow.session.flows.lock().await.remove(&flow.id);
+                flow.session.remove_flow(flow.id).await;
             }
         }
     }
@@ -2508,7 +2598,7 @@ async fn relay_udp_flow_to_client(
         flow_event_tx,
     )
     .await;
-    session.flows.lock().await.remove(&flow_id);
+    session.remove_flow(flow_id).await;
     UdpFlowTaskResult {
         flow_id,
         target,
@@ -2901,6 +2991,13 @@ fn cached_connect_failure_error(failure: CachedConnectFailure) -> AnyError {
     Box::new(CachedConnectFailureError {
         message: failure.message,
     })
+}
+
+fn is_session_draining_error(error: &AnyError) -> bool {
+    error
+        .as_ref()
+        .downcast_ref::<SessionDrainingError>()
+        .is_some()
 }
 
 fn transition(state: &mut ClientConnectionState, next: ClientConnectionState) {

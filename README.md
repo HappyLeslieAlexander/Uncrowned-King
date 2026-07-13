@@ -190,10 +190,11 @@ On Unix, `uk-client` also reloads its server endpoints, TLS server name and CA,
 key id and shared secret, handshake and retry timing, TCP open and UDP flow idle
 timeouts, and per-session/per-flow buffer limits on `SIGHUP`. Candidate CA and
 authentication material are validated before the new client config generation
-is published. Existing carrier sessions and SOCKS flows continue; future carrier
-connections use the new generation. If a reload races an in-flight handshake,
-that handshake cannot publish a stale session or cache a stale connection
-failure after the reload. `socks_handshake_timeout_seconds`,
+is published. Existing SOCKS flows continue on their old carrier, while new TCP
+and UDP flows immediately use a carrier from the new generation. A draining old
+carrier closes automatically after its final flow ends. If a reload races an
+in-flight handshake, that handshake cannot publish a stale session or cache a
+stale connection failure after the reload. `socks_handshake_timeout_seconds`,
 `shutdown_timeout_seconds`, and `max_socks_connections` still require a client
 restart because the listener owns those resources.
 

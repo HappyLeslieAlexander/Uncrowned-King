@@ -3149,7 +3149,8 @@ async fn run_client_connection_config_reload_e2e() -> Result<(), TestError> {
 
     let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let server_addr = server_listener.local_addr()?;
-    let initial_server_config = test_server_config(
+    let observability_addr = unused_loopback_addr().await?;
+    let mut initial_server_config = test_server_config(
         server_addr,
         &server_cert_path,
         &server_key_path,
@@ -3157,12 +3158,20 @@ async fn run_client_connection_config_reload_e2e() -> Result<(), TestError> {
         Some(&policy_path),
         30,
     );
-    let (initial_server_shutdown_tx, initial_server_shutdown_rx) = oneshot::channel();
-    let initial_server_task =
-        start_uk_server_on_listener_until_shutdown(initial_server_config, server_listener, async {
-            let _ = initial_server_shutdown_rx.await;
-        })
-        .await?;
+    initial_server_config.observability_listen = Some(observability_addr.to_string());
+    let mut rotated_server_config = initial_server_config.clone();
+    WRONG_SECRET.clone_into(&mut rotated_server_config.credentials[0].secret);
+    let (server_reload_handle, server_reload_rx) = server_reload_channel();
+    let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
+    let mut server_task = tokio::spawn(run_on_listener_until_shutdown_with_reload(
+        initial_server_config,
+        server_listener,
+        server_reload_rx,
+        async {
+            let _ = server_shutdown_rx.await;
+        },
+    ));
+    wait_for_listener("uk-server", server_addr, &mut server_task).await?;
 
     let initial_client_config = test_client_config(server_addr, &initial_ca_path, SECRET);
     let mut rotated_client_config = initial_client_config.clone();
@@ -3178,6 +3187,7 @@ async fn run_client_connection_config_reload_e2e() -> Result<(), TestError> {
     let (old_target_addr, old_target_task) = spawn_echo_target().await?;
     let (mut old_socks, connect_reply) = open_socks_connect(socks_addr, old_target_addr).await?;
     assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+    let mut udp_probe = UdpReloadProbe::start(socks_addr).await?;
 
     assert_client_reload_rejections(
         &reload_handle,
@@ -3186,7 +3196,21 @@ async fn run_client_connection_config_reload_e2e() -> Result<(), TestError> {
         &temp_dir,
     )
     .await?;
+    fs::write(&server_cert_path, ROTATED_CERT_PEM)?;
+    write_private_key_contents(&server_key_path, ROTATED_KEY_PEM)?;
+    assert_eq!(server_reload_handle.reload(rotated_server_config).await?, 2);
     assert_eq!(reload_handle.reload(rotated_client_config).await?, 2);
+
+    let (rotated_target_addr, rotated_target_task) = spawn_echo_target().await?;
+    assert_echo_roundtrip(
+        socks_addr,
+        rotated_target_addr,
+        b"new flow immediately uses reloaded client carrier",
+    )
+    .await?;
+    rotated_target_task.await??;
+    udp_probe.verify_after_reload().await?;
+    wait_for_active_server_sessions(observability_addr, 2).await?;
 
     let payload = b"existing SOCKS flow survives client config reload";
     old_socks.write_all(payload).await?;
@@ -3195,50 +3219,17 @@ async fn run_client_connection_config_reload_e2e() -> Result<(), TestError> {
     assert_eq!(echoed, payload);
     old_target_task.await??;
     drop(old_socks);
+    wait_for_active_server_sessions(observability_addr, 2).await?;
+    drop(udp_probe);
+    wait_for_active_server_sessions(observability_addr, 1).await?;
 
-    initial_server_shutdown_tx
+    server_shutdown_tx
         .send(())
-        .map_err(|()| "initial server shutdown receiver dropped")?;
-    tokio::time::timeout(Duration::from_secs(3), initial_server_task).await???;
-
-    fs::write(&server_cert_path, ROTATED_CERT_PEM)?;
-    write_private_key_contents(&server_key_path, ROTATED_KEY_PEM)?;
-    let mut rotated_server_config = test_server_config(
-        server_addr,
-        &server_cert_path,
-        &server_key_path,
-        test_limits(),
-        Some(&policy_path),
-        30,
-    );
-    WRONG_SECRET.clone_into(&mut rotated_server_config.credentials[0].secret);
-    let rotated_server_listener = TcpListener::bind(server_addr).await?;
-    let (rotated_server_shutdown_tx, rotated_server_shutdown_rx) = oneshot::channel();
-    let rotated_server_task = start_uk_server_on_listener_until_shutdown(
-        rotated_server_config,
-        rotated_server_listener,
-        async {
-            let _ = rotated_server_shutdown_rx.await;
-        },
-    )
-    .await?;
-
-    let (rotated_target_addr, rotated_target_task) = spawn_echo_target().await?;
-    assert_echo_roundtrip(
-        socks_addr,
-        rotated_target_addr,
-        b"new carrier uses reloaded CA and credential",
-    )
-    .await?;
-    rotated_target_task.await??;
-
-    rotated_server_shutdown_tx
-        .send(())
-        .map_err(|()| "rotated server shutdown receiver dropped")?;
+        .map_err(|()| "server shutdown receiver dropped")?;
     client_shutdown_tx
         .send(())
         .map_err(|()| "client shutdown receiver dropped")?;
-    tokio::time::timeout(Duration::from_secs(3), rotated_server_task).await???;
+    tokio::time::timeout(Duration::from_secs(3), server_task).await???;
     tokio::time::timeout(Duration::from_secs(3), client_task).await???;
     let _ = fs::remove_dir_all(temp_dir);
     Ok(())
@@ -5077,6 +5068,60 @@ struct ReloadableSocksListener {
     task: JoinHandle<Result<(), TestError>>,
 }
 
+struct UdpReloadProbe {
+    _control: TcpStream,
+    client: UdpSocket,
+    relay_addr: SocketAddr,
+    old_target_addr: SocketAddr,
+    old_target_task: Option<JoinHandle<Result<(), TestError>>>,
+}
+
+impl UdpReloadProbe {
+    async fn start(socks_addr: SocketAddr) -> Result<Self, TestError> {
+        let (old_target_addr, old_target_task) = spawn_udp_echo_target_roundtrips(2).await?;
+        let (control, relay_addr) = open_socks_udp_associate(socks_addr).await?;
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        assert_socks_udp_roundtrip(
+            &client,
+            relay_addr,
+            old_target_addr,
+            b"old UDP flow before client reload",
+        )
+        .await?;
+        Ok(Self {
+            _control: control,
+            client,
+            relay_addr,
+            old_target_addr,
+            old_target_task: Some(old_target_task),
+        })
+    }
+
+    async fn verify_after_reload(&mut self) -> Result<(), TestError> {
+        let (new_target_addr, new_target_task) = spawn_udp_echo_target().await?;
+        assert_socks_udp_roundtrip(
+            &self.client,
+            self.relay_addr,
+            new_target_addr,
+            b"new UDP flow after client reload",
+        )
+        .await?;
+        assert_socks_udp_roundtrip(
+            &self.client,
+            self.relay_addr,
+            self.old_target_addr,
+            b"old UDP flow survives client reload",
+        )
+        .await?;
+        new_target_task.await??;
+        self.old_target_task
+            .take()
+            .ok_or("missing old UDP target task")?
+            .await??;
+        Ok(())
+    }
+}
+
 impl RelayHarness {
     async fn start(policy_toml: Option<String>) -> Result<Self, TestError> {
         Self::start_with_limits(policy_toml, test_limits()).await
@@ -5216,12 +5261,20 @@ async fn spawn_echo_target()
 
 async fn spawn_udp_echo_target()
 -> Result<(SocketAddr, tokio::task::JoinHandle<Result<(), TestError>>), TestError> {
+    spawn_udp_echo_target_roundtrips(1).await
+}
+
+async fn spawn_udp_echo_target_roundtrips(
+    roundtrips: usize,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<Result<(), TestError>>), TestError> {
     let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let addr = socket.local_addr()?;
     let task = tokio::spawn(async move {
         let mut buf = [0_u8; 1024];
-        let (read, peer) = socket.recv_from(&mut buf).await?;
-        socket.send_to(&buf[..read], peer).await?;
+        for _ in 0..roundtrips {
+            let (read, peer) = socket.recv_from(&mut buf).await?;
+            socket.send_to(&buf[..read], peer).await?;
+        }
         Ok(())
     });
     Ok((addr, task))
@@ -5466,6 +5519,30 @@ async fn http_get(addr: SocketAddr, path: &str) -> Result<String, TestError> {
     let mut response = String::new();
     stream.read_to_string(&mut response).await?;
     Ok(response)
+}
+
+async fn wait_for_server_metric(addr: SocketAddr, expected: &str) -> Result<(), TestError> {
+    for _ in 0..100 {
+        if http_get(addr, "/metrics")
+            .await
+            .is_ok_and(|metrics| metrics.contains(expected))
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err(format!("server metric did not reach `{}`", expected.trim()).into())
+}
+
+async fn wait_for_active_server_sessions(
+    addr: SocketAddr,
+    expected: usize,
+) -> Result<(), TestError> {
+    wait_for_server_metric(
+        addr,
+        &format!("uncrowned_king_server_active_sessions {expected}\n"),
+    )
+    .await
 }
 
 fn test_server_config(
@@ -6022,6 +6099,21 @@ async fn recv_socks_udp_datagram(
         tokio::time::timeout(Duration::from_secs(3), udp_client.recv_from(&mut buf)).await??;
     assert_eq!(peer, udp_relay_addr);
     parse_socks_udp_datagram(&buf[..read])
+}
+
+async fn assert_socks_udp_roundtrip(
+    client: &UdpSocket,
+    relay_addr: SocketAddr,
+    target_addr: SocketAddr,
+    payload: &[u8],
+) -> Result<(), TestError> {
+    client
+        .send_to(&socks_udp_datagram(target_addr, payload), relay_addr)
+        .await?;
+    let (reply_target, reply_payload) = recv_socks_udp_datagram(client, relay_addr).await?;
+    assert_eq!(reply_target, target_addr);
+    assert_eq!(reply_payload, payload);
+    Ok(())
 }
 
 async fn assert_no_socks_udp_datagram(udp_client: &UdpSocket) -> Result<(), TestError> {
