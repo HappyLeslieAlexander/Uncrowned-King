@@ -107,8 +107,8 @@ serves only `GET /healthz`, `GET /readyz`, and `GET /metrics`. Readiness drops
 before relay shutdown begins. Metrics expose accepted connections, active and
 failed handshakes, authenticated and rejected sessions, TCP/UDP open requests
 and bounded failure reasons, active flows, and successfully relayed payload
-bytes by protocol and direction in Prometheus text format. Access-control
-generation and config reload attempt, success, and failure counters make reload
+bytes by protocol and direction in Prometheus text format. Security config
+generation and reload attempt, success, and failure counters make reload
 outcomes observable. The endpoint has no authentication; bind it to loopback or
 a firewall-protected management network. Requests are limited to an 8 KiB
 header, a five-second read timeout, and 32 concurrent connections.
@@ -174,15 +174,16 @@ acknowledge that exposure with `--allow-non-loopback` and provide host firewall
 or network access controls.
 
 Both long-running listeners stop gracefully on Ctrl+C or SIGTERM. On Unix,
-`uk-server` reloads credentials, credential status and validity windows, policy,
-and `auth_skew_seconds` from its original config path on `SIGHUP`. A reload is
-published atomically only after the new credentials and policy validate. Existing
-TCP and UDP flows continue; new flow opens on existing sessions use the new
-policy and require the authenticated key to remain active in the same policy
-group, while new handshakes use the new credentials. Removing, disabling,
-expiring, or reassigning a key therefore blocks new flows on its existing
-sessions without terminating flows that are already open. Listener addresses,
-TLS paths, resource limits, and timeout settings still require a process restart.
+`uk-server` reloads its TLS certificate and private key, credentials, credential
+status and validity windows, policy, and `auth_skew_seconds` from its original
+config path on `SIGHUP`. A reload is published atomically only after the new TLS
+identity, credentials, and policy validate. Existing TCP and UDP flows continue;
+new handshakes use the new TLS identity and credentials, while new flow opens on
+existing sessions use the new policy and require the authenticated key to remain
+active in the same policy group. Removing, disabling, expiring, or reassigning a
+key therefore blocks new flows on its existing sessions without terminating
+flows that are already open. Listener addresses, resource limits, and timeout
+settings still require a process restart.
 
 Both binaries accept global `--log-format text|json` output selection and use
 `RUST_LOG` for filtering. JSON mode preserves structured event fields for log

@@ -158,7 +158,7 @@ async fn queue_config_reload(config_path: &str, reload_handle: &ServerReloadHand
         Ok(generation) => {
             info!(
                 event = "server.config.reload_applied",
-                access_control_generation = generation
+                security_generation = generation
             );
             true
         }

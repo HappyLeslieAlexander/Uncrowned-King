@@ -37,10 +37,10 @@ use uk_proto::{
     validate_connection_frame, write_frame,
 };
 
-use crate::access_control::AccessControl;
 use crate::observability::{
     ActiveFlowGuard, FlowOpenFailure, RelayDirection, RelayProtocol, ServerMetrics,
 };
+use crate::security::SecurityState;
 
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const TARGET_CONNECT_PARALLELISM: usize = 4;
@@ -385,7 +385,7 @@ struct SessionShutdown {
 
 struct RelaySessionContext<'a> {
     identity: AuthenticatedIdentity,
-    access_control: AccessControl,
+    security: SecurityState,
     carrier_writer: &'a CarrierWriter,
     event_tx: &'a FlowEventSender,
     limits: RelayLimits,
@@ -453,7 +453,7 @@ struct TargetWriterTask {
 pub(crate) async fn relay_session(
     carrier: TlsStream<TcpStream>,
     identity: AuthenticatedIdentity,
-    access_control: AccessControl,
+    security: SecurityState,
     limits: RelayLimits,
     idle_timeout: Option<Duration>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -473,7 +473,7 @@ pub(crate) async fn relay_session(
     let carrier_writer = CarrierWriter::new(carrier_writer, shutdown.clone(), Arc::clone(&metrics));
     let context = RelaySessionContext {
         identity,
-        access_control,
+        security,
         carrier_writer: &carrier_writer,
         event_tx: &event_tx,
         limits,
@@ -1270,7 +1270,7 @@ async fn handle_tcp_open_frame(
 
     if let Some((flow_id, target)) = validate_tcp_open_request(context, frame).await? {
         let Some(policy) = context
-            .access_control
+            .security
             .policy_snapshot(&context.identity, unix_now())
         else {
             reject_open_failure(flow_id, &target, OpenFailure::PolicyDenied, context).await?;
@@ -1279,7 +1279,7 @@ async fn handle_tcp_open_frame(
         debug!(
             event = "tcp.open.policy_snapshot",
             flow_id,
-            access_control_generation = policy.generation
+            security_generation = policy.generation
         );
         let cancel = OpenFlowCancel::default();
         target_writers.insert(flow_id, FlowSlot::OpeningTcp(cancel.clone()));
@@ -1388,7 +1388,7 @@ async fn handle_udp_open_frame(
 
     if let Some((flow_id, target)) = validate_udp_open_request(context, frame).await? {
         let Some(policy) = context
-            .access_control
+            .security
             .policy_snapshot(&context.identity, unix_now())
         else {
             reject_udp_open_failure(flow_id, &target, OpenFailure::PolicyDenied, context).await?;
@@ -1397,7 +1397,7 @@ async fn handle_udp_open_frame(
         debug!(
             event = "udp.open.policy_snapshot",
             flow_id,
-            access_control_generation = policy.generation
+            security_generation = policy.generation
         );
         let cancel = OpenFlowCancel::default();
         target_writers.insert(flow_id, FlowSlot::OpeningUdp(cancel.clone()));

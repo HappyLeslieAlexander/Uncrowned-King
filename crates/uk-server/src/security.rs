@@ -7,19 +7,21 @@ use std::{
 };
 
 use tokio::sync::watch;
+use tokio_rustls::TlsAcceptor;
 use uk_auth::{AuthenticatedIdentity, Credential};
 use uk_policy::PolicySet;
 
 const INITIAL_GENERATION: u64 = 1;
 
 #[derive(Clone)]
-pub(crate) struct AccessControl {
-    current: watch::Sender<Arc<AccessControlState>>,
+pub(crate) struct SecurityState {
+    current: watch::Sender<Arc<SecurityGeneration>>,
     next_generation: Arc<AtomicU64>,
 }
 
-struct AccessControlState {
+struct SecurityGeneration {
     generation: u64,
+    tls_acceptor: TlsAcceptor,
     credentials: Arc<Vec<Credential>>,
     policy_set: Arc<PolicySet>,
     auth_skew: Duration,
@@ -27,6 +29,7 @@ struct AccessControlState {
 
 pub(crate) struct AuthenticationSnapshot {
     pub(crate) generation: u64,
+    pub(crate) tls_acceptor: TlsAcceptor,
     pub(crate) credentials: Arc<Vec<Credential>>,
     pub(crate) auth_skew: Duration,
 }
@@ -36,14 +39,16 @@ pub(crate) struct PolicySnapshot {
     pub(crate) policy_set: Arc<PolicySet>,
 }
 
-impl AccessControl {
+impl SecurityState {
     pub(crate) fn new(
+        tls_acceptor: TlsAcceptor,
         credentials: Vec<Credential>,
         policy_set: PolicySet,
         auth_skew: Duration,
     ) -> Self {
-        let state = Arc::new(AccessControlState {
+        let state = Arc::new(SecurityGeneration {
             generation: INITIAL_GENERATION,
+            tls_acceptor,
             credentials: Arc::new(credentials),
             policy_set: Arc::new(policy_set),
             auth_skew,
@@ -63,6 +68,7 @@ impl AccessControl {
         let state = self.current.borrow();
         AuthenticationSnapshot {
             generation: state.generation,
+            tls_acceptor: state.tls_acceptor.clone(),
             credentials: Arc::clone(&state.credentials),
             auth_skew: state.auth_skew,
         }
@@ -87,19 +93,33 @@ impl AccessControl {
 
     pub(crate) fn replace(
         &self,
+        tls_acceptor: TlsAcceptor,
         credentials: Vec<Credential>,
         policy_set: PolicySet,
         auth_skew: Duration,
     ) -> u64 {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        self.current.send_replace(Arc::new(AccessControlState {
+        self.current.send_replace(Arc::new(SecurityGeneration {
             generation,
+            tls_acceptor,
             credentials: Arc::new(credentials),
             policy_set: Arc::new(policy_set),
             auth_skew,
         }));
         generation
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_tls_acceptor() -> TlsAcceptor {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
+    config.alpn_protocols = vec![uk_proto::ALPN_PROTOCOL.to_vec()];
+    TlsAcceptor::from(Arc::new(config))
 }
 
 #[cfg(test)]
@@ -112,26 +132,28 @@ mod tests {
 
     #[test]
     fn replacement_is_visible_only_to_new_snapshots() {
-        let access_control = AccessControl::new(
+        let security = SecurityState::new(
+            test_tls_acceptor(),
             vec![credential(b"old", b"0123456789abcdef0123456789abcdef")],
             PolicySet::default(),
             Duration::from_secs(30),
         );
-        let old_authentication = access_control.authentication_snapshot();
+        let old_authentication = security.authentication_snapshot();
         let old_identity = AuthenticatedIdentity::from(&old_authentication.credentials[0]);
-        let old_policy = access_control.policy_snapshot(&old_identity, 1).unwrap();
+        let old_policy = security.policy_snapshot(&old_identity, 1).unwrap();
 
-        let generation = access_control.replace(
+        let generation = security.replace(
+            test_tls_acceptor(),
             vec![credential(b"new", b"fedcba9876543210fedcba9876543210")],
             PolicySet::default(),
             Duration::from_secs(60),
         );
-        let new_authentication = access_control.authentication_snapshot();
+        let new_authentication = security.authentication_snapshot();
         let new_identity = AuthenticatedIdentity::from(&new_authentication.credentials[0]);
-        let new_policy = access_control.policy_snapshot(&new_identity, 1).unwrap();
+        let new_policy = security.policy_snapshot(&new_identity, 1).unwrap();
 
         assert_eq!(generation, 2);
-        assert_eq!(access_control.generation(), 2);
+        assert_eq!(security.generation(), 2);
         assert_eq!(old_authentication.generation, 1);
         assert_eq!(old_authentication.credentials[0].key_id, b"old");
         assert_eq!(old_authentication.auth_skew, Duration::from_secs(30));
@@ -141,7 +163,7 @@ mod tests {
         assert_eq!(new_authentication.auth_skew, Duration::from_secs(60));
         assert_eq!(new_policy.generation, 2);
         assert!(!Arc::ptr_eq(&old_policy.policy_set, &new_policy.policy_set));
-        assert!(access_control.policy_snapshot(&old_identity, 1).is_none());
+        assert!(security.policy_snapshot(&old_identity, 1).is_none());
     }
 
     #[test]
@@ -149,27 +171,33 @@ mod tests {
         let mut active = credential(b"client", b"0123456789abcdef0123456789abcdef");
         active.policy_group = Some("default".to_owned());
         let identity = AuthenticatedIdentity::from(&active);
-        let access_control =
-            AccessControl::new(vec![active], PolicySet::default(), Duration::from_secs(30));
-        assert!(access_control.policy_snapshot(&identity, 1).is_some());
+        let security = SecurityState::new(
+            test_tls_acceptor(),
+            vec![active],
+            PolicySet::default(),
+            Duration::from_secs(30),
+        );
+        assert!(security.policy_snapshot(&identity, 1).is_some());
 
         let mut disabled = credential(b"client", b"fedcba9876543210fedcba9876543210");
         disabled.status = uk_auth::CredentialStatus::Disabled;
         disabled.policy_group = Some("default".to_owned());
-        access_control.replace(
+        security.replace(
+            test_tls_acceptor(),
             vec![disabled],
             PolicySet::default(),
             Duration::from_secs(30),
         );
-        assert!(access_control.policy_snapshot(&identity, 1).is_none());
+        assert!(security.policy_snapshot(&identity, 1).is_none());
 
         let mut reassigned = credential(b"client", b"abcdef0123456789abcdef0123456789");
         reassigned.policy_group = Some("admins".to_owned());
-        access_control.replace(
+        security.replace(
+            test_tls_acceptor(),
             vec![reassigned],
             PolicySet::default(),
             Duration::from_secs(30),
         );
-        assert!(access_control.policy_snapshot(&identity, 1).is_none());
+        assert!(security.policy_snapshot(&identity, 1).is_none());
     }
 }

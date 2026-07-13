@@ -2,9 +2,9 @@
 
 pub mod config;
 
-mod access_control;
 mod observability;
 mod relay;
+mod security;
 mod tls;
 
 use std::{
@@ -39,9 +39,9 @@ use uk_proto::{
     read_frame, validate_connection_frame, write_frame,
 };
 
-use crate::access_control::{AccessControl, AuthenticationSnapshot};
 use crate::config::ServerConfig;
 use crate::observability::ServerMetrics;
+use crate::security::{AuthenticationSnapshot, SecurityState};
 
 /// Server error type.
 pub type AnyError = Box<dyn Error + Send + Sync>;
@@ -51,13 +51,13 @@ const ACCEPT_RETRY_MAX_MILLIS: u64 = 1_000;
 const RELOAD_CHANNEL_CAPACITY: usize = 1;
 static NEXT_CONNECTION_CORRELATION_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Sends validated access-control reloads to a running server.
+/// Sends validated security config reloads to a running server.
 #[derive(Clone, Debug)]
 pub struct ServerReloadHandle {
     tx: mpsc::Sender<ServerReloadRequest>,
 }
 
-/// Receives access-control reloads inside the server listener loop.
+/// Receives security config reloads inside the server listener loop.
 #[derive(Debug)]
 pub struct ServerReloadReceiver {
     rx: mpsc::Receiver<ServerReloadRequest>,
@@ -151,17 +151,15 @@ impl Error for HandshakePhaseError {
 
 struct ServerRuntime {
     config: Arc<ServerConfig>,
-    access_control: AccessControl,
+    security: SecurityState,
     replay_cache: Arc<Mutex<ReplayCache>>,
-    acceptor: TlsAcceptor,
     max_sessions: usize,
     max_handshakes: usize,
 }
 
 #[derive(Clone)]
 struct ConnectionRuntime {
-    acceptor: TlsAcceptor,
-    access_control: AccessControl,
+    security: SecurityState,
     replay_cache: Arc<Mutex<ReplayCache>>,
     session_permits: Arc<Semaphore>,
     config: Arc<ServerConfig>,
@@ -232,7 +230,7 @@ where
     run_on_listener_inner(runtime, listener, None, shutdown).await
 }
 
-/// Runs the UK server until shutdown and applies validated access-control reloads.
+/// Runs the UK server until shutdown and applies validated security config reloads.
 pub async fn run_until_shutdown_with_reload<F>(
     config: ServerConfig,
     reload_rx: ServerReloadReceiver,
@@ -265,7 +263,7 @@ where
     run_on_listener_inner(runtime, listener, None, shutdown).await
 }
 
-/// Runs an already-bound server until shutdown and applies validated access-control reloads.
+/// Runs an already-bound server until shutdown and applies validated security config reloads.
 pub async fn run_on_listener_until_shutdown_with_reload<F>(
     mut config: ServerConfig,
     listener: TcpListener,
@@ -291,9 +289,8 @@ where
 {
     let ServerRuntime {
         config,
-        access_control,
+        security,
         replay_cache,
-        acceptor,
         max_sessions,
         max_handshakes,
     } = runtime;
@@ -302,10 +299,9 @@ where
     let handshake_permits = Arc::new(Semaphore::new(max_handshakes));
     let shutdown_timeout = listener_shutdown_timeout(config.shutdown_timeout_seconds());
     let metrics = Arc::new(ServerMetrics::default());
-    metrics.set_access_control_generation(access_control.generation());
+    metrics.set_security_generation(security.generation());
     let connection_runtime = ConnectionRuntime {
-        acceptor: acceptor.clone(),
-        access_control: access_control.clone(),
+        security: security.clone(),
         replay_cache: Arc::clone(&replay_cache),
         session_permits: Arc::clone(&session_permits),
         config: Arc::clone(&config),
@@ -335,7 +331,7 @@ where
             }
             reload = receive_reload(&mut reload_rx) => {
                 if let Some(request) = reload {
-                    handle_reload_request(&config, &access_control, &metrics, request);
+                    handle_reload_request(&config, &security, &metrics, request);
                 } else {
                     reload_rx = None;
                     debug!(event = "server.config.reload_channel_closed");
@@ -376,16 +372,16 @@ where
 
 fn handle_reload_request(
     config: &ServerConfig,
-    access_control: &AccessControl,
+    security: &SecurityState,
     metrics: &ServerMetrics,
     request: ServerReloadRequest,
 ) {
-    match apply_access_control_reload(config, access_control, request.config) {
+    match apply_security_reload(config, security, request.config) {
         Ok(generation) => {
             metrics.record_config_reload_success(generation);
             info!(
                 event = "server.config.reload_success",
-                access_control_generation = generation
+                security_generation = generation
             );
             let _ = request.response.send(Ok(generation));
         }
@@ -447,9 +443,12 @@ fn prepare_server_runtime(mut config: ServerConfig) -> Result<ServerRuntime, Any
     config.validate_network_endpoints()?;
     config.validate_limits()?;
     config.validate_sensitive_paths()?;
+    let tls_config = tls::server_config(&config.cert_path, &config.key_path)?;
+    let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
     let credentials = take_runtime_credentials(&mut config)?;
     let policy_set = config.policy_set()?;
-    let access_control = AccessControl::new(
+    let security = SecurityState::new(
+        tls_acceptor,
         credentials,
         policy_set,
         Duration::from_secs(config.auth_skew_seconds()),
@@ -461,16 +460,13 @@ fn prepare_server_runtime(mut config: ServerConfig) -> Result<ServerRuntime, Any
             config.replay_cache_max_entries(),
         )?,
     )));
-    let tls_config = tls::server_config(&config.cert_path, &config.key_path)?;
-    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
     let max_sessions = usize_limit("max_sessions", config.max_sessions())?;
     let max_handshakes = usize_limit("max_handshakes", config.max_handshakes())?;
 
     Ok(ServerRuntime {
         config: Arc::new(config),
-        access_control,
+        security,
         replay_cache,
-        acceptor,
         max_sessions,
         max_handshakes,
     })
@@ -487,15 +483,19 @@ fn take_runtime_credentials(
     credentials
 }
 
-fn apply_access_control_reload(
+fn apply_security_reload(
     current: &ServerConfig,
-    access_control: &AccessControl,
+    security: &SecurityState,
     mut candidate: ServerConfig,
 ) -> Result<u64, AnyError> {
     ensure_reload_compatible(current, &candidate)?;
+    candidate.validate_sensitive_paths()?;
+    let tls_config = tls::server_config(&candidate.cert_path, &candidate.key_path)?;
+    let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
     let credentials = take_runtime_credentials(&mut candidate)?;
     let policy_set = candidate.policy_set()?;
-    Ok(access_control.replace(
+    Ok(security.replace(
+        tls_acceptor,
         credentials,
         policy_set,
         Duration::from_secs(candidate.auth_skew_seconds()),
@@ -528,10 +528,6 @@ fn changed_static_config_field(
         Some("listen")
     } else if current.observability_listen != candidate.observability_listen {
         Some("observability_listen")
-    } else if current.cert_path != candidate.cert_path {
-        Some("cert_path")
-    } else if current.key_path != candidate.key_path {
-        Some("key_path")
     } else {
         None
     }
@@ -632,8 +628,7 @@ async fn handle_connection(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AnyError> {
     let ConnectionRuntime {
-        acceptor,
-        access_control,
+        security,
         replay_cache,
         session_permits,
         config,
@@ -646,12 +641,12 @@ async fn handle_connection(
         return Ok(());
     }
 
-    let authentication = access_control.authentication_snapshot();
+    let authentication = security.authentication_snapshot();
     let handshake = async {
         if let Some(timeout) = handshake_timeout(config.handshake_timeout_seconds()) {
             match time::timeout(
                 timeout,
-                complete_handshake(acceptor, tcp, authentication, replay_cache, &config),
+                complete_handshake(tcp, authentication, replay_cache, &config),
             )
             .await
             {
@@ -659,7 +654,7 @@ async fn handle_connection(
                 Err(_) => Err("handshake timeout".into()),
             }
         } else {
-            complete_handshake(acceptor, tcp, authentication, replay_cache, &config).await
+            complete_handshake(tcp, authentication, replay_cache, &config).await
         }
     };
 
@@ -702,7 +697,7 @@ async fn handle_connection(
     relay::relay_session(
         stream,
         identity,
-        access_control,
+        security,
         relay::RelayLimits::new(relay::RelayLimitConfig {
             frame: FrameLimits {
                 max_frame_size: config.max_frame_size(),
@@ -747,13 +742,13 @@ pub fn check_config(config: &ServerConfig) -> Result<(), AnyError> {
 }
 
 async fn complete_handshake(
-    acceptor: TlsAcceptor,
     tcp: tokio::net::TcpStream,
     authentication: AuthenticationSnapshot,
     replay_cache: Arc<Mutex<ReplayCache>>,
     config: &ServerConfig,
 ) -> Result<(TlsStream<tokio::net::TcpStream>, AuthenticatedIdentity), AnyError> {
-    let mut stream = acceptor
+    let mut stream = authentication
+        .tls_acceptor
         .accept(tcp)
         .await
         .map_err(|err| phase_error("tls accept", err))?;
@@ -823,7 +818,7 @@ async fn complete_handshake(
     info!(
         event = "auth.success",
         key_id_hex = %hex_encode(&identity.key_id),
-        access_control_generation = authentication.generation
+        security_generation = authentication.generation
     );
 
     Ok((stream, identity))
@@ -967,6 +962,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::config::{CredentialConfig, LimitConfig};
+    use crate::security::test_tls_acceptor;
 
     fn minimal_config() -> ServerConfig {
         ServerConfig {
@@ -1034,31 +1030,10 @@ mod tests {
     }
 
     #[test]
-    fn access_control_reload_atomically_replaces_reloadable_fields() {
+    fn security_reload_rejects_static_runtime_changes() {
         let current = minimal_config();
-        let access_control = AccessControl::new(
-            current.credentials().unwrap(),
-            current.policy_set().unwrap(),
-            Duration::from_secs(current.auth_skew_seconds()),
-        );
-        let mut candidate = current.clone();
-        candidate.auth_skew_seconds = Some(60);
-        candidate.credentials[0].key_id = "rotated-client".to_owned();
-        candidate.credentials[0].secret = "fedcba9876543210fedcba9876543210".to_owned();
-
-        let generation = apply_access_control_reload(&current, &access_control, candidate).unwrap();
-        let authentication = access_control.authentication_snapshot();
-
-        assert_eq!(generation, 2);
-        assert_eq!(authentication.generation, 2);
-        assert_eq!(authentication.credentials[0].key_id, b"rotated-client");
-        assert_eq!(authentication.auth_skew, Duration::from_secs(60));
-    }
-
-    #[test]
-    fn access_control_reload_rejects_static_runtime_changes() {
-        let current = minimal_config();
-        let access_control = AccessControl::new(
+        let security = SecurityState::new(
+            test_tls_acceptor(),
             current.credentials().unwrap(),
             current.policy_set().unwrap(),
             Duration::from_secs(current.auth_skew_seconds()),
@@ -1066,19 +1041,20 @@ mod tests {
         let mut candidate = current.clone();
         candidate.listen = "127.0.0.1:2".to_owned();
 
-        let error = apply_access_control_reload(&current, &access_control, candidate)
+        let error = apply_security_reload(&current, &security, candidate)
             .unwrap_err()
             .to_string();
 
         assert!(error.contains("listen"));
         assert!(error.contains("requires a restart"));
-        assert_eq!(access_control.generation(), 1);
+        assert_eq!(security.generation(), 1);
     }
 
     #[test]
-    fn access_control_reload_failure_preserves_current_generation() {
+    fn security_reload_failure_preserves_current_generation() {
         let current = minimal_config();
-        let access_control = AccessControl::new(
+        let security = SecurityState::new(
+            test_tls_acceptor(),
             current.credentials().unwrap(),
             current.policy_set().unwrap(),
             Duration::from_secs(current.auth_skew_seconds()),
@@ -1086,16 +1062,16 @@ mod tests {
         let mut candidate = current.clone();
         candidate.credentials[0].secret = "too-short".to_owned();
 
-        assert!(apply_access_control_reload(&current, &access_control, candidate).is_err());
-        assert_eq!(access_control.generation(), 1);
+        assert!(apply_security_reload(&current, &security, candidate).is_err());
+        assert_eq!(security.generation(), 1);
         assert_eq!(
-            access_control.authentication_snapshot().credentials[0].key_id,
+            security.authentication_snapshot().credentials[0].key_id,
             b"client"
         );
     }
 
     #[test]
-    fn access_control_reload_accepts_equivalent_effective_limits() {
+    fn security_reload_accepts_equivalent_effective_limits() {
         let current = minimal_config();
         let mut candidate = current.clone();
         candidate.limits = Some(LimitConfig {

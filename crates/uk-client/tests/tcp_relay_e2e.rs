@@ -104,6 +104,58 @@ VODOlcdwgEkE3j5MxS0brpI9
 -----END PRIVATE KEY-----
 ";
 
+const ROTATED_CERT_PEM: &str = r"-----BEGIN CERTIFICATE-----
+MIIDSTCCAjGgAwIBAgIUbKiGvhPFpGKNHR7j/6IXUhFdHiswDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcxMzA5MTEzMloXDTM2MDcx
+MDA5MTEzMlowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEAkFhamPCkNJ11kWw3cFy+/8mokhXfr21B6uD5uCXYru+2
+RxnV0ALFBzfA42ZcRuesSmlwauQKBnwYD6VfYNJWL0n+UibPI57cNW5yDQg04PY9
+hMoexD9Ls9e2DSpP7Xa2ROx5kbI+1epR1Couu7vFcIVHahz7y8O/QH97xqrMBzmP
+4EEEQKYi61YvUbHRYdFLOJZA2qe2T9CMJVQkwGI2vGHlUpNdP7BYFqj787Y/d+DI
+2nnS/UFm7Hr1S3oBdwkcoqdPC4wqSq4akyYppKuWS9/fpyC+Oo2XCAFQ47YsPguV
+2UjmoBG4hIycdi9ffAKUH9O3lzp7FYT5uIhwG4PwywIDAQABo4GSMIGPMB0GA1Ud
+DgQWBBQgGGr6Btii4e151B3kGUK0enNy9DAfBgNVHSMEGDAWgBQgGGr6Btii4e15
+1B3kGUK0enNy9DAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwDAYDVR0TAQH/
+BAIwADAOBgNVHQ8BAf8EBAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDQYJKoZI
+hvcNAQELBQADggEBABhyQN2prI40OBsUAMkNtwIGP1ApVuTMKHd7KyA/NB+WIW1Q
+W5tBG2g375X5BX8H9+FlVV57Y5lLf0ypUI7Dp6Kwx3Opd77r1IUGT4/SltUxAa04
+0epEQiIKXl/m7dV+XqKMzftn/q92ZXib3/Cy+3SdYoUoD/p4sXcvJ27Dt6pZFHru
+Eyk0ziHhZXvMWYm8k5HUx4/KJrJ14v50Y3ySU7B9FnqwMztL4voIQpA7GeSfsQZY
+a2QH+2MZeMVBaZQ8jAjq24WcpAM1Hx26UOmIy85/NvPFZBbT8ggH2r8CKYjiDqcL
+C2n4SLoR1xpiEaImSSin581IyIJ4vFLJYsUfPJ8=
+-----END CERTIFICATE-----
+";
+
+const ROTATED_KEY_PEM: &str = r"-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCQWFqY8KQ0nXWR
+bDdwXL7/yaiSFd+vbUHq4Pm4Jdiu77ZHGdXQAsUHN8DjZlxG56xKaXBq5AoGfBgP
+pV9g0lYvSf5SJs8jntw1bnINCDTg9j2Eyh7EP0uz17YNKk/tdrZE7HmRsj7V6lHU
+Ki67u8VwhUdqHPvLw79Af3vGqswHOY/gQQRApiLrVi9RsdFh0Us4lkDap7ZP0Iwl
+VCTAYja8YeVSk10/sFgWqPvztj934MjaedL9QWbsevVLegF3CRyip08LjCpKrhqT
+Jimkq5ZL39+nIL46jZcIAVDjtiw+C5XZSOagEbiEjJx2L198ApQf07eXOnsVhPm4
+iHAbg/DLAgMBAAECggEARtPz8KP0DxVMgUUWlv4LgrvTCYvOLOhxte0a2+9GOeDK
+Em1s6xrQz0/eSDcMBIbdlc3TKcAn4zK1I8hD2uCbBa1LK8h7T8E90MIXGKn0OIbb
+fPMo0ac1YFPystcWTTE5EuzuYj2Sc6j86hygveHPaf0cI8eBDmVIzT9A3yUj5E7v
+zKesn/CDhLvbaWwbGAEAX20MLJmZ4LYzIDsBj/hTFBGYPgH56Ri3MnQjFHod4Wel
+8H0+W8OkVwhFe8NS65W4reWCCFF+yyEWk1x5C7gXCAwlGr/3+r2cEXkDo9AAS1CC
+MDBkU3aQcG1XR9+l/jFhhIGkeViqB/cuq5qk7ozbYQKBgQDC/18ZShjY5r+hnfrf
+WU/NayJFY0ZjNE2uFMKztgVu/d4QRPOBqJSIHDIGLr7Si8Lkmz6pKHvqlluRhfds
+I2zD7HLGsyDLQvrVMedOb3DOoMtgZ2PtQJNIEH3Ln9ePm+trK2TvOV3fIu8V76Jy
+McKFtQscTw2e1vEmvNa2LWhCaQKBgQC9gGtC7ozhJlSbISVrew84ejh8vCFpke8S
+C2yqMMQFqMr3bj/mdL7MHbhOHL9dCV48MhYnxO39Jqf1lE57q4YFy9MwloxmNKW1
+VeKe1R57TubbcU7nuPVFV3qw9nZv9p0zirtAVpU/v3lCRt+blS5m3IA4Wr8WWj05
+AE0NE/iLEwKBgQCmGQDYedVQbL0u3XKkbV8civVWRYnfVt4UOnreuV1Hfdd55EHH
+X+GlTt8NhSPmFEaek958GI/08r5s5sAqzMII4Y+i0VJN0W/3ydpNZX+hgjW6mFb1
+8NuDtwhwOmdTXGzbjMsdOrBLMWaWONkWjGw1mFEue+gONOiVJqV96I+2gQKBgG7Y
+smVJYrDEmhLP9bKEHigcHfSgmy7EhUJZ2mtG8TKaRHctT0V/nqeI7ukKGcnTFANE
+DP+gStGcjfyxjqL6dv/m9RbjySZzv0ZuAYyE/zqDsbhE9DHJV/cCr6rZz/e4GsYu
+bU+6Fb1fRA/Hoz6/qY/ThVDxi/sIN+2ixm9S8jxvAoGAEJsnJ2UltVmxABZ7SI5l
+1DAVywgdd2a0KD2tAJ/2xtWwLUDSXcEdjV6OmVFP+a1NmdJy8c8464LhVi1zuklQ
+ynyYvuWbr7hzVILrpTzcxdlFzLwlD9SUIu7xUP9k3Xg8CjTZfakgwNWRUo5L/BcT
+w/AVoMNYXILLNFPO133rNMo=
+-----END PRIVATE KEY-----
+";
+
 const KEY_ID: &str = "e2e-client";
 const SECRET: &str = "0123456789abcdef0123456789abcdef";
 const WRONG_SECRET: &str = "fedcba9876543210fedcba9876543210";
@@ -481,6 +533,15 @@ async fn server_atomically_reloads_access_control() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(10),
         run_server_access_control_reload_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_atomically_rotates_tls_identity() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_server_tls_identity_reload_e2e(),
     )
     .await?
 }
@@ -2965,9 +3026,98 @@ async fn run_server_access_control_reload_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+async fn run_server_tls_identity_reload_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let server_cert_path = temp_dir.join("server-cert.pem");
+    let server_key_path = temp_dir.join("server-key.pem");
+    let initial_ca_path = temp_dir.join("initial-ca.pem");
+    let rotated_ca_path = temp_dir.join("rotated-ca.pem");
+    let policy_path = temp_dir.join("policy.toml");
+    fs::write(&server_cert_path, CERT_PEM)?;
+    write_private_key(&server_key_path)?;
+    fs::write(&initial_ca_path, CERT_PEM)?;
+    fs::write(&rotated_ca_path, ROTATED_CERT_PEM)?;
+    fs::write(&policy_path, allow_loopback_any_port_policy())?;
+
+    let (target_addr, target_task) = spawn_echo_target().await?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let server_addr = listener.local_addr()?;
+    let config = test_server_config(
+        server_addr,
+        &server_cert_path,
+        &server_key_path,
+        test_limits(),
+        Some(&policy_path),
+        30,
+    );
+    let reload_config = config.clone();
+    let (reload_handle, reload_rx) = server_reload_channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut server_task = tokio::spawn(run_on_listener_until_shutdown_with_reload(
+        config,
+        listener,
+        reload_rx,
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+    wait_for_listener("uk-server", server_addr, &mut server_task).await?;
+
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(test_client_config(server_addr, &initial_ca_path, SECRET))
+            .await?;
+    write_frame(&mut carrier, &tcp_open_frame(1, target_addr)?).await?;
+    read_open_ack(&mut carrier, 1).await?;
+
+    fs::write(&server_cert_path, ROTATED_CERT_PEM)?;
+    let rejection = reload_handle
+        .reload(reload_config.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(rejection, ServerReloadError::Rejected(reason) if !reason.is_empty()));
+
+    let (rollback_carrier, _settings) =
+        connect_authenticated_carrier(test_client_config(server_addr, &initial_ca_path, SECRET))
+            .await?;
+    drop(rollback_carrier);
+
+    write_private_key_contents(&server_key_path, ROTATED_KEY_PEM)?;
+    assert_eq!(reload_handle.reload(reload_config).await?, 2);
+
+    let payload = Bytes::from_static(b"existing flow survives TLS identity rotation");
+    write_frame(
+        &mut carrier,
+        &Frame::new(FrameType::TcpData, 0, 1, payload.clone())?,
+    )
+    .await?;
+    let echoed = read_relay_frame(&mut carrier, FrameType::TcpData, 1).await?;
+    assert_eq!(echoed.payload, payload);
+    target_task.await??;
+
+    assert!(
+        connect_authenticated_carrier(test_client_config(server_addr, &initial_ca_path, SECRET,))
+            .await
+            .is_err()
+    );
+    let (rotated_carrier, _settings) =
+        connect_authenticated_carrier(test_client_config(server_addr, &rotated_ca_path, SECRET))
+            .await?;
+
+    drop(carrier);
+    drop(rotated_carrier);
+    shutdown_tx
+        .send(())
+        .map_err(|()| "server shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(3), server_task).await???;
+    let _ = fs::remove_dir_all(temp_dir);
+    Ok(())
+}
+
 fn assert_observability_relay_metrics(metrics: &str, tcp_bytes: usize, udp_bytes: usize) {
     assert!(metrics.contains("uncrowned_king_server_ready 1\n"));
-    assert!(metrics.contains("uncrowned_king_server_access_control_generation 1\n"));
+    assert!(metrics.contains("uncrowned_king_server_security_generation 1\n"));
     assert!(metrics.contains("uncrowned_king_server_authenticated_sessions_total 1\n"));
     assert!(metrics.contains("uncrowned_king_server_active_sessions 1\n"));
     assert!(
@@ -5778,7 +5928,11 @@ fn create_temp_dir() -> Result<PathBuf, TestError> {
 }
 
 fn write_private_key(path: &Path) -> io::Result<()> {
-    fs::write(path, KEY_PEM)?;
+    write_private_key_contents(path, KEY_PEM)
+}
+
+fn write_private_key_contents(path: &Path, contents: &str) -> io::Result<()> {
+    fs::write(path, contents)?;
     restrict_private_key_permissions(path)
 }
 

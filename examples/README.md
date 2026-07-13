@@ -41,9 +41,9 @@ authentication, use that override only with separate firewall or network
 access controls.
 
 Both long-running commands stop gracefully on Ctrl+C or SIGTERM. On Unix, edit
-the server credentials, policy, or `auth_skew_seconds`, then send `SIGHUP` to
-reload them atomically. Listener, TLS, limit, and timeout changes require a
-restart.
+the server TLS paths or files, credentials, policy, or `auth_skew_seconds`, then
+send `SIGHUP` to reload them atomically. Listener, limit, and timeout changes
+require a restart.
 
 Replace the example shared secret before using these configs anywhere outside a
 local throwaway environment.
