@@ -2,6 +2,7 @@
 
 pub mod config;
 
+mod access_control;
 mod observability;
 mod relay;
 mod tls;
@@ -22,8 +23,8 @@ use std::{
 use bytes::BytesMut;
 use tokio::{
     io::AsyncWriteExt,
-    net::TcpListener,
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch},
+    net::{TcpListener, TcpStream},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     task::JoinSet,
     time,
 };
@@ -38,6 +39,7 @@ use uk_proto::{
     read_frame, validate_connection_frame, write_frame,
 };
 
+use crate::access_control::{AccessControl, AuthenticationSnapshot};
 use crate::config::ServerConfig;
 use crate::observability::ServerMetrics;
 
@@ -46,7 +48,67 @@ pub type AnyError = Box<dyn Error + Send + Sync>;
 
 const ACCEPT_RETRY_BASE_MILLIS: u64 = 10;
 const ACCEPT_RETRY_MAX_MILLIS: u64 = 1_000;
+const RELOAD_CHANNEL_CAPACITY: usize = 1;
 static NEXT_CONNECTION_CORRELATION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Sends validated access-control reloads to a running server.
+#[derive(Clone, Debug)]
+pub struct ServerReloadHandle {
+    tx: mpsc::Sender<ServerReloadRequest>,
+}
+
+/// Receives access-control reloads inside the server listener loop.
+#[derive(Debug)]
+pub struct ServerReloadReceiver {
+    rx: mpsc::Receiver<ServerReloadRequest>,
+}
+
+#[derive(Debug)]
+struct ServerReloadRequest {
+    config: ServerConfig,
+    response: oneshot::Sender<Result<u64, String>>,
+}
+
+/// Error returned when a server config reload cannot be applied.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ServerReloadError {
+    /// The server stopped before it could apply the reload.
+    ServerStopped,
+    /// The candidate config was incompatible or invalid.
+    Rejected(String),
+}
+
+impl fmt::Display for ServerReloadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ServerStopped => formatter.write_str("server stopped before config reload"),
+            Self::Rejected(reason) => write!(formatter, "server rejected config reload: {reason}"),
+        }
+    }
+}
+
+impl Error for ServerReloadError {}
+
+impl ServerReloadHandle {
+    /// Waits until the server atomically applies or rejects the candidate config.
+    pub async fn reload(&self, config: ServerConfig) -> Result<u64, ServerReloadError> {
+        let (response, result) = oneshot::channel();
+        self.tx
+            .send(ServerReloadRequest { config, response })
+            .await
+            .map_err(|_| ServerReloadError::ServerStopped)?;
+        result
+            .await
+            .map_err(|_| ServerReloadError::ServerStopped)?
+            .map_err(ServerReloadError::Rejected)
+    }
+}
+
+/// Creates a bounded server config reload channel.
+pub fn server_reload_channel() -> (ServerReloadHandle, ServerReloadReceiver) {
+    let (tx, rx) = mpsc::channel(RELOAD_CHANNEL_CAPACITY);
+    (ServerReloadHandle { tx }, ServerReloadReceiver { rx })
+}
 
 #[derive(Default)]
 struct ListenerAcceptBackoff {
@@ -89,8 +151,7 @@ impl Error for HandshakePhaseError {
 
 struct ServerRuntime {
     config: Arc<ServerConfig>,
-    credentials: Arc<Vec<uk_auth::Credential>>,
-    policy_set: Arc<uk_policy::PolicySet>,
+    access_control: AccessControl,
     replay_cache: Arc<Mutex<ReplayCache>>,
     acceptor: TlsAcceptor,
     max_sessions: usize,
@@ -100,13 +161,60 @@ struct ServerRuntime {
 #[derive(Clone)]
 struct ConnectionRuntime {
     acceptor: TlsAcceptor,
-    credentials: Arc<Vec<uk_auth::Credential>>,
-    policy_set: Arc<uk_policy::PolicySet>,
+    access_control: AccessControl,
     replay_cache: Arc<Mutex<ReplayCache>>,
     session_permits: Arc<Semaphore>,
     config: Arc<ServerConfig>,
+    handshake_permits: Arc<Semaphore>,
     max_sessions: usize,
+    max_handshakes: usize,
     metrics: Arc<ServerMetrics>,
+}
+
+impl ConnectionRuntime {
+    async fn spawn_accepted(
+        &self,
+        connections: &mut JoinSet<()>,
+        mut tcp: TcpStream,
+        peer: SocketAddr,
+        shutdown_rx: watch::Receiver<bool>,
+    ) {
+        self.metrics.record_accepted_connection();
+        let Ok(handshake_permit) = Arc::clone(&self.handshake_permits).try_acquire_owned() else {
+            self.metrics.record_rejected_handshake();
+            warn!(
+                event = "server.handshake.limit",
+                peer = %peer,
+                max_handshakes = self.max_handshakes
+            );
+            if let Err(err) = tcp.shutdown().await {
+                debug!(
+                    event = "server.handshake.limit_shutdown_error",
+                    peer = %peer,
+                    error = %err
+                );
+            }
+            return;
+        };
+        let runtime = self.clone();
+        let connection_id = next_connection_correlation_id();
+        let connection = async move {
+            if let Err(err) =
+                handle_connection(runtime, tcp, handshake_permit, peer, shutdown_rx).await
+            {
+                if is_clean_tls_handshake_disconnect(&err) {
+                    debug!(event = "tls.handshake.closed", peer = %peer);
+                } else {
+                    warn!(event = "protocol.error", peer = %peer, error = %err);
+                }
+            }
+        };
+        connections.spawn(connection.instrument(info_span!(
+            "server.connection",
+            connection_id,
+            peer = %peer
+        )));
+    }
 }
 
 /// Runs the UK server listener until the task is cancelled or the listener fails.
@@ -121,7 +229,21 @@ where
 {
     let runtime = prepare_server_runtime(config)?;
     let listener = TcpListener::bind(&runtime.config.listen).await?;
-    run_on_listener_inner(runtime, listener, shutdown).await
+    run_on_listener_inner(runtime, listener, None, shutdown).await
+}
+
+/// Runs the UK server until shutdown and applies validated access-control reloads.
+pub async fn run_until_shutdown_with_reload<F>(
+    config: ServerConfig,
+    reload_rx: ServerReloadReceiver,
+    shutdown: F,
+) -> Result<(), AnyError>
+where
+    F: Future<Output = ()> + Send,
+{
+    let runtime = prepare_server_runtime(config)?;
+    let listener = TcpListener::bind(&runtime.config.listen).await?;
+    run_on_listener_inner(runtime, listener, Some(reload_rx), shutdown).await
 }
 
 /// Runs the UK server on an already-bound listener until the task is cancelled or the listener fails.
@@ -140,12 +262,28 @@ where
 {
     config.listen = listener.local_addr()?.to_string();
     let runtime = prepare_server_runtime(config)?;
-    run_on_listener_inner(runtime, listener, shutdown).await
+    run_on_listener_inner(runtime, listener, None, shutdown).await
+}
+
+/// Runs an already-bound server until shutdown and applies validated access-control reloads.
+pub async fn run_on_listener_until_shutdown_with_reload<F>(
+    mut config: ServerConfig,
+    listener: TcpListener,
+    reload_rx: ServerReloadReceiver,
+    shutdown: F,
+) -> Result<(), AnyError>
+where
+    F: Future<Output = ()> + Send,
+{
+    config.listen = listener.local_addr()?.to_string();
+    let runtime = prepare_server_runtime(config)?;
+    run_on_listener_inner(runtime, listener, Some(reload_rx), shutdown).await
 }
 
 async fn run_on_listener_inner<F>(
     runtime: ServerRuntime,
     listener: TcpListener,
+    mut reload_rx: Option<ServerReloadReceiver>,
     shutdown: F,
 ) -> Result<(), AnyError>
 where
@@ -153,8 +291,7 @@ where
 {
     let ServerRuntime {
         config,
-        credentials,
-        policy_set,
+        access_control,
         replay_cache,
         acceptor,
         max_sessions,
@@ -165,6 +302,18 @@ where
     let handshake_permits = Arc::new(Semaphore::new(max_handshakes));
     let shutdown_timeout = listener_shutdown_timeout(config.shutdown_timeout_seconds());
     let metrics = Arc::new(ServerMetrics::default());
+    metrics.set_access_control_generation(access_control.generation());
+    let connection_runtime = ConnectionRuntime {
+        acceptor: acceptor.clone(),
+        access_control: access_control.clone(),
+        replay_cache: Arc::clone(&replay_cache),
+        session_permits: Arc::clone(&session_permits),
+        config: Arc::clone(&config),
+        handshake_permits,
+        max_sessions,
+        max_handshakes,
+        metrics: Arc::clone(&metrics),
+    };
 
     info!(event = "server.listen", listen = %listen);
 
@@ -184,11 +333,18 @@ where
                 begin_server_shutdown(&metrics, &shutdown_tx);
                 break;
             }
+            reload = receive_reload(&mut reload_rx) => {
+                if let Some(request) = reload {
+                    handle_reload_request(&config, &access_control, &metrics, request);
+                } else {
+                    reload_rx = None;
+                    debug!(event = "server.config.reload_channel_closed");
+                }
+            }
             accepted = listener.accept() => {
-                let (mut tcp, peer) = match accepted {
+                let (tcp, peer) = match accepted {
                     Ok(connection) => {
                         accept_backoff.reset();
-                        metrics.record_accepted_connection();
                         connection
                     }
                     Err(err) => {
@@ -202,48 +358,9 @@ where
                         continue;
                     }
                 };
-                let Ok(handshake_permit) = Arc::clone(&handshake_permits).try_acquire_owned() else {
-                    metrics.record_rejected_handshake();
-                    warn!(event = "server.handshake.limit", peer = %peer, max_handshakes);
-                    if let Err(err) = tcp.shutdown().await {
-                        debug!(
-                            event = "server.handshake.limit_shutdown_error",
-                            peer = %peer,
-                            error = %err
-                        );
-                    }
-                    continue;
-                };
-                let connection_runtime = ConnectionRuntime {
-                    acceptor: acceptor.clone(),
-                    credentials: Arc::clone(&credentials),
-                    policy_set: Arc::clone(&policy_set),
-                    replay_cache: Arc::clone(&replay_cache),
-                    session_permits: Arc::clone(&session_permits),
-                    config: Arc::clone(&config),
-                    max_sessions,
-                    metrics: Arc::clone(&metrics),
-                };
-                let shutdown_rx = shutdown_tx.subscribe();
-                let connection_id = next_connection_correlation_id();
-
-                let connection = async move {
-                    if let Err(err) =
-                        handle_connection(connection_runtime, tcp, handshake_permit, peer, shutdown_rx)
-                            .await
-                    {
-                        if is_clean_tls_handshake_disconnect(&err) {
-                            debug!(event = "tls.handshake.closed", peer = %peer);
-                        } else {
-                            warn!(event = "protocol.error", peer = %peer, error = %err);
-                        }
-                    }
-                };
-                connections.spawn(connection.instrument(info_span!(
-                    "server.connection",
-                    connection_id,
-                    peer = %peer
-                )));
+                connection_runtime
+                    .spawn_accepted(&mut connections, tcp, peer, shutdown_tx.subscribe())
+                    .await;
             }
             joined = connections.join_next(), if !connections.is_empty() => {
                 log_connection_task_result(joined);
@@ -255,6 +372,38 @@ where
     stop_observability(observability_shutdown_tx, observability_task).await;
 
     Ok(())
+}
+
+fn handle_reload_request(
+    config: &ServerConfig,
+    access_control: &AccessControl,
+    metrics: &ServerMetrics,
+    request: ServerReloadRequest,
+) {
+    match apply_access_control_reload(config, access_control, request.config) {
+        Ok(generation) => {
+            metrics.record_config_reload_success(generation);
+            info!(
+                event = "server.config.reload_success",
+                access_control_generation = generation
+            );
+            let _ = request.response.send(Ok(generation));
+        }
+        Err(err) => {
+            metrics.record_config_reload_failure();
+            warn!(event = "server.config.reload_failure", error = %err);
+            let _ = request.response.send(Err(err.to_string()));
+        }
+    }
+}
+
+async fn receive_reload(
+    reload_rx: &mut Option<ServerReloadReceiver>,
+) -> Option<ServerReloadRequest> {
+    match reload_rx {
+        Some(reload_rx) => reload_rx.rx.recv().await,
+        None => future::pending().await,
+    }
 }
 
 fn begin_server_shutdown(metrics: &ServerMetrics, shutdown_tx: &watch::Sender<bool>) {
@@ -298,8 +447,13 @@ fn prepare_server_runtime(mut config: ServerConfig) -> Result<ServerRuntime, Any
     config.validate_network_endpoints()?;
     config.validate_limits()?;
     config.validate_sensitive_paths()?;
-    let credentials = Arc::new(take_runtime_credentials(&mut config)?);
-    let policy_set = Arc::new(config.policy_set()?);
+    let credentials = take_runtime_credentials(&mut config)?;
+    let policy_set = config.policy_set()?;
+    let access_control = AccessControl::new(
+        credentials,
+        policy_set,
+        Duration::from_secs(config.auth_skew_seconds()),
+    );
     let replay_cache = Arc::new(Mutex::new(ReplayCache::with_max_entries(
         Duration::from_secs(config.replay_cache_window_seconds()),
         usize_limit(
@@ -314,8 +468,7 @@ fn prepare_server_runtime(mut config: ServerConfig) -> Result<ServerRuntime, Any
 
     Ok(ServerRuntime {
         config: Arc::new(config),
-        credentials,
-        policy_set,
+        access_control,
         replay_cache,
         acceptor,
         max_sessions,
@@ -332,6 +485,112 @@ fn take_runtime_credentials(
     }
     config.credentials.clear();
     credentials
+}
+
+fn apply_access_control_reload(
+    current: &ServerConfig,
+    access_control: &AccessControl,
+    mut candidate: ServerConfig,
+) -> Result<u64, AnyError> {
+    ensure_reload_compatible(current, &candidate)?;
+    let credentials = take_runtime_credentials(&mut candidate)?;
+    let policy_set = candidate.policy_set()?;
+    Ok(access_control.replace(
+        credentials,
+        policy_set,
+        Duration::from_secs(candidate.auth_skew_seconds()),
+    ))
+}
+
+fn ensure_reload_compatible(
+    current: &ServerConfig,
+    candidate: &ServerConfig,
+) -> Result<(), AnyError> {
+    if let Some(field) = changed_static_config_field(current, candidate) {
+        return Err(reload_requires_restart(field));
+    }
+    for ((name, current), (_, candidate)) in reload_static_limits(current)
+        .into_iter()
+        .zip(reload_static_limits(candidate))
+    {
+        if current != candidate {
+            return Err(reload_requires_restart(name));
+        }
+    }
+    Ok(())
+}
+
+fn changed_static_config_field(
+    current: &ServerConfig,
+    candidate: &ServerConfig,
+) -> Option<&'static str> {
+    if current.listen != candidate.listen {
+        Some("listen")
+    } else if current.observability_listen != candidate.observability_listen {
+        Some("observability_listen")
+    } else if current.cert_path != candidate.cert_path {
+        Some("cert_path")
+    } else if current.key_path != candidate.key_path {
+        Some("key_path")
+    } else {
+        None
+    }
+}
+
+fn reload_static_limits(config: &ServerConfig) -> [(&'static str, u64); 17] {
+    [
+        ("max_pre_auth_bytes", config.max_pre_auth_bytes()),
+        ("max_frame_size", config.max_frame_size()),
+        ("max_sessions", config.max_sessions()),
+        ("max_handshakes", config.max_handshakes()),
+        ("max_streams", config.max_streams()),
+        ("max_udp_flows", config.max_udp_flows()),
+        (
+            "max_outbound_dials_per_session",
+            config.max_outbound_dials_per_session(),
+        ),
+        (
+            "max_buffered_bytes_per_session",
+            config.max_buffered_bytes_per_session(),
+        ),
+        ("idle_timeout_seconds", config.idle_timeout_seconds()),
+        (
+            "max_buffered_bytes_per_flow",
+            config.max_buffered_bytes_per_flow(),
+        ),
+        (
+            "handshake_timeout_seconds",
+            config.handshake_timeout_seconds(),
+        ),
+        (
+            "target_connect_timeout_seconds",
+            config.target_connect_timeout_seconds(),
+        ),
+        (
+            "tcp_half_close_timeout_seconds",
+            config.tcp_half_close_timeout_seconds(),
+        ),
+        (
+            "udp_flow_idle_timeout_seconds",
+            config.udp_flow_idle_timeout_seconds(),
+        ),
+        (
+            "shutdown_timeout_seconds",
+            config.shutdown_timeout_seconds(),
+        ),
+        (
+            "replay_cache_window_seconds",
+            config.replay_cache_window_seconds(),
+        ),
+        (
+            "replay_cache_max_entries",
+            config.replay_cache_max_entries(),
+        ),
+    ]
+}
+
+fn reload_requires_restart(field: &str) -> AnyError {
+    format!("server config field {field} changed and requires a restart").into()
 }
 
 fn log_connection_task_result(result: Option<Result<(), tokio::task::JoinError>>) {
@@ -374,24 +633,25 @@ async fn handle_connection(
 ) -> Result<(), AnyError> {
     let ConnectionRuntime {
         acceptor,
-        credentials,
-        policy_set,
+        access_control,
         replay_cache,
         session_permits,
         config,
         max_sessions,
         metrics,
+        ..
     } = runtime;
     tcp.set_nodelay(true)?;
     if *shutdown_rx.borrow() {
         return Ok(());
     }
 
+    let authentication = access_control.authentication_snapshot();
     let handshake = async {
         if let Some(timeout) = handshake_timeout(config.handshake_timeout_seconds()) {
             match time::timeout(
                 timeout,
-                complete_handshake(acceptor, tcp, credentials, replay_cache, &config),
+                complete_handshake(acceptor, tcp, authentication, replay_cache, &config),
             )
             .await
             {
@@ -399,7 +659,7 @@ async fn handle_connection(
                 Err(_) => Err("handshake timeout".into()),
             }
         } else {
-            complete_handshake(acceptor, tcp, credentials, replay_cache, &config).await
+            complete_handshake(acceptor, tcp, authentication, replay_cache, &config).await
         }
     };
 
@@ -442,7 +702,7 @@ async fn handle_connection(
     relay::relay_session(
         stream,
         identity,
-        policy_set,
+        access_control,
         relay::RelayLimits::new(relay::RelayLimitConfig {
             frame: FrameLimits {
                 max_frame_size: config.max_frame_size(),
@@ -489,7 +749,7 @@ pub fn check_config(config: &ServerConfig) -> Result<(), AnyError> {
 async fn complete_handshake(
     acceptor: TlsAcceptor,
     tcp: tokio::net::TcpStream,
-    credentials: Arc<Vec<uk_auth::Credential>>,
+    authentication: AuthenticationSnapshot,
     replay_cache: Arc<Mutex<ReplayCache>>,
     config: &ServerConfig,
 ) -> Result<(TlsStream<tokio::net::TcpStream>, AuthenticatedIdentity), AnyError> {
@@ -543,12 +803,12 @@ async fn complete_handshake(
     let verification = {
         let mut replay_cache = replay_cache.lock().await;
         verify_auth_response_identity(
-            &credentials,
+            &authentication.credentials,
             &exporter,
             &challenge,
             &response,
             now,
-            Duration::from_secs(config.auth_skew_seconds()),
+            authentication.auth_skew,
             &mut replay_cache,
         )
     };
@@ -562,7 +822,8 @@ async fn complete_handshake(
 
     info!(
         event = "auth.success",
-        key_id_hex = %hex_encode(&identity.key_id)
+        key_id_hex = %hex_encode(&identity.key_id),
+        access_control_generation = authentication.generation
     );
 
     Ok((stream, identity))
@@ -770,6 +1031,79 @@ mod tests {
             Err(uk_auth::AuthError::SecretTooShort)
         );
         assert!(config.credentials.is_empty());
+    }
+
+    #[test]
+    fn access_control_reload_atomically_replaces_reloadable_fields() {
+        let current = minimal_config();
+        let access_control = AccessControl::new(
+            current.credentials().unwrap(),
+            current.policy_set().unwrap(),
+            Duration::from_secs(current.auth_skew_seconds()),
+        );
+        let mut candidate = current.clone();
+        candidate.auth_skew_seconds = Some(60);
+        candidate.credentials[0].key_id = "rotated-client".to_owned();
+        candidate.credentials[0].secret = "fedcba9876543210fedcba9876543210".to_owned();
+
+        let generation = apply_access_control_reload(&current, &access_control, candidate).unwrap();
+        let authentication = access_control.authentication_snapshot();
+
+        assert_eq!(generation, 2);
+        assert_eq!(authentication.generation, 2);
+        assert_eq!(authentication.credentials[0].key_id, b"rotated-client");
+        assert_eq!(authentication.auth_skew, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn access_control_reload_rejects_static_runtime_changes() {
+        let current = minimal_config();
+        let access_control = AccessControl::new(
+            current.credentials().unwrap(),
+            current.policy_set().unwrap(),
+            Duration::from_secs(current.auth_skew_seconds()),
+        );
+        let mut candidate = current.clone();
+        candidate.listen = "127.0.0.1:2".to_owned();
+
+        let error = apply_access_control_reload(&current, &access_control, candidate)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("listen"));
+        assert!(error.contains("requires a restart"));
+        assert_eq!(access_control.generation(), 1);
+    }
+
+    #[test]
+    fn access_control_reload_failure_preserves_current_generation() {
+        let current = minimal_config();
+        let access_control = AccessControl::new(
+            current.credentials().unwrap(),
+            current.policy_set().unwrap(),
+            Duration::from_secs(current.auth_skew_seconds()),
+        );
+        let mut candidate = current.clone();
+        candidate.credentials[0].secret = "too-short".to_owned();
+
+        assert!(apply_access_control_reload(&current, &access_control, candidate).is_err());
+        assert_eq!(access_control.generation(), 1);
+        assert_eq!(
+            access_control.authentication_snapshot().credentials[0].key_id,
+            b"client"
+        );
+    }
+
+    #[test]
+    fn access_control_reload_accepts_equivalent_effective_limits() {
+        let current = minimal_config();
+        let mut candidate = current.clone();
+        candidate.limits = Some(LimitConfig {
+            max_sessions: Some(current.max_sessions()),
+            ..LimitConfig::default()
+        });
+
+        assert!(ensure_reload_compatible(&current, &candidate).is_ok());
     }
 
     #[test]

@@ -46,7 +46,11 @@ use uk_proto::{
     Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose, UdpOpen, read_frame,
     validate_connection_frame, write_frame,
 };
-use uk_server::config::{CredentialConfig, LimitConfig, ServerConfig};
+use uk_server::{
+    ServerReloadError,
+    config::{CredentialConfig, LimitConfig, ServerConfig},
+    run_on_listener_until_shutdown_with_reload, server_reload_channel,
+};
 
 const CERT_PEM: &str = r"-----BEGIN CERTIFICATE-----
 MIIDSTCCAjGgAwIBAgIUEX51v2igsFngMQTuqhBx+gKL2MswDQYJKoZIhvcNAQEL
@@ -470,6 +474,15 @@ async fn server_listener_stops_on_shutdown_signal() -> Result<(), TestError> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_exposes_health_readiness_and_metrics() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_server_observability_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_atomically_reloads_access_control() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_server_access_control_reload_e2e(),
+    )
+    .await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2847,8 +2860,114 @@ async fn run_server_observability_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+async fn run_server_access_control_reload_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    let policy_path = temp_dir.join("policy.toml");
+    fs::write(&cert_path, CERT_PEM)?;
+    write_private_key(&key_path)?;
+    fs::write(&policy_path, allow_loopback_any_port_policy())?;
+    let (target_addr, target_task) = spawn_echo_target().await?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let server_addr = listener.local_addr()?;
+    let config = test_server_config(
+        server_addr,
+        &cert_path,
+        &key_path,
+        test_limits(),
+        Some(&policy_path),
+        30,
+    );
+    let mut candidate = config.clone();
+    candidate.policy_path = None;
+    WRONG_SECRET.clone_into(&mut candidate.credentials[0].secret);
+    let mut incompatible_candidate = candidate.clone();
+    "127.0.0.1:1".clone_into(&mut incompatible_candidate.listen);
+    let mut disabled_candidate = candidate.clone();
+    disabled_candidate.policy_path = Some(path_string(&policy_path));
+    disabled_candidate.credentials[0].status = Some("disabled".to_owned());
+    let (reload_handle, reload_rx) = server_reload_channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut server_task = tokio::spawn(run_on_listener_until_shutdown_with_reload(
+        config,
+        listener,
+        reload_rx,
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+    wait_for_listener("uk-server", server_addr, &mut server_task).await?;
+
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(test_client_config(server_addr, &cert_path, SECRET)).await?;
+    write_frame(&mut carrier, &tcp_open_frame(1, target_addr)?).await?;
+    read_open_ack(&mut carrier, 1).await?;
+
+    let rejection = reload_handle
+        .reload(incompatible_candidate)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        rejection,
+        ServerReloadError::Rejected(reason)
+            if reason.contains("listen") && reason.contains("requires a restart")
+    ));
+    assert_eq!(reload_handle.reload(candidate).await?, 2);
+
+    let payload = Bytes::from_static(b"existing flow survives access-control reload");
+    write_frame(
+        &mut carrier,
+        &Frame::new(FrameType::TcpData, 0, 1, payload.clone())?,
+    )
+    .await?;
+    let echoed = read_relay_frame(&mut carrier, FrameType::TcpData, 1).await?;
+    assert_eq!(echoed.payload, payload);
+    target_task.await??;
+
+    write_frame(&mut carrier, &tcp_open_frame(3, target_addr)?).await?;
+    let denied = read_relay_frame(&mut carrier, FrameType::PolicyDenied, 3).await?;
+    let mut denied_payload = denied.payload;
+    assert_eq!(
+        ErrorPayload::decode(&mut denied_payload)?.code,
+        ErrorCode::PolicyDenied
+    );
+    assert_tcp_close(&mut carrier, 3, TCP_CLOSE_NORMAL).await?;
+
+    assert!(
+        connect_authenticated_carrier(test_client_config(server_addr, &cert_path, SECRET))
+            .await
+            .is_err()
+    );
+    let (rotated_carrier, _settings) =
+        connect_authenticated_carrier(test_client_config(server_addr, &cert_path, WRONG_SECRET))
+            .await?;
+
+    assert_eq!(reload_handle.reload(disabled_candidate).await?, 3);
+    write_frame(&mut carrier, &tcp_open_frame(5, target_addr)?).await?;
+    let revoked = read_relay_frame(&mut carrier, FrameType::PolicyDenied, 5).await?;
+    let mut revoked_payload = revoked.payload;
+    assert_eq!(
+        ErrorPayload::decode(&mut revoked_payload)?.code,
+        ErrorCode::PolicyDenied
+    );
+    assert_tcp_close(&mut carrier, 5, TCP_CLOSE_NORMAL).await?;
+
+    drop(carrier);
+    drop(rotated_carrier);
+    shutdown_tx
+        .send(())
+        .map_err(|()| "server shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(3), server_task).await???;
+    let _ = fs::remove_dir_all(temp_dir);
+    Ok(())
+}
+
 fn assert_observability_relay_metrics(metrics: &str, tcp_bytes: usize, udp_bytes: usize) {
     assert!(metrics.contains("uncrowned_king_server_ready 1\n"));
+    assert!(metrics.contains("uncrowned_king_server_access_control_generation 1\n"));
     assert!(metrics.contains("uncrowned_king_server_authenticated_sessions_total 1\n"));
     assert!(metrics.contains("uncrowned_king_server_active_sessions 1\n"));
     assert!(
@@ -4977,6 +5096,27 @@ fn test_server_config(
             not_after: None,
             policy_group: Some("default".to_owned()),
         }],
+    }
+}
+
+fn test_client_config(server_addr: SocketAddr, cert_path: &Path, secret: &str) -> ClientConfig {
+    ClientConfig {
+        server_addr: server_addr.to_string(),
+        server_addrs: None,
+        server_name: "localhost".to_owned(),
+        ca_cert_path: path_string(cert_path),
+        key_id: KEY_ID.to_owned(),
+        secret: secret.to_owned(),
+        handshake_timeout_seconds: Some(3),
+        server_connect_retry_delay_millis: None,
+        socks_handshake_timeout_seconds: Some(3),
+        tcp_open_timeout_seconds: Some(3),
+        udp_flow_idle_timeout_seconds: None,
+        shutdown_timeout_seconds: Some(3),
+        max_pending_open_bytes: None,
+        max_socks_connections: None,
+        max_buffered_bytes_per_session: None,
+        max_buffered_bytes_per_flow: None,
     }
 }
 

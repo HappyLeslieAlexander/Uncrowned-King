@@ -116,6 +116,10 @@ impl RelayDirection {
 #[derive(Debug, Default)]
 pub(super) struct ServerMetrics {
     ready: AtomicBool,
+    access_control_generation: AtomicU64,
+    config_reload_attempts_total: AtomicU64,
+    config_reload_successes_total: AtomicU64,
+    config_reload_failures_total: AtomicU64,
     accepted_connections_total: AtomicU64,
     rejected_handshakes_total: AtomicU64,
     failed_handshakes_total: AtomicU64,
@@ -137,6 +141,26 @@ impl ServerMetrics {
 
     fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
+    }
+
+    pub(super) fn set_access_control_generation(&self, generation: u64) {
+        self.access_control_generation
+            .store(generation, Ordering::Release);
+    }
+
+    pub(super) fn record_config_reload_success(&self, generation: u64) {
+        self.config_reload_attempts_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.config_reload_successes_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.set_access_control_generation(generation);
+    }
+
+    pub(super) fn record_config_reload_failure(&self) {
+        self.config_reload_attempts_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.config_reload_failures_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn record_accepted_connection(&self) {
@@ -209,6 +233,18 @@ impl ServerMetrics {
                 "# HELP uncrowned_king_server_ready Whether the relay listener is ready to accept connections.\n",
                 "# TYPE uncrowned_king_server_ready gauge\n",
                 "uncrowned_king_server_ready {ready}\n",
+                "# HELP uncrowned_king_server_access_control_generation Active credential and policy generation.\n",
+                "# TYPE uncrowned_king_server_access_control_generation gauge\n",
+                "uncrowned_king_server_access_control_generation {access_control_generation}\n",
+                "# HELP uncrowned_king_server_config_reload_attempts_total Access-control config reloads attempted.\n",
+                "# TYPE uncrowned_king_server_config_reload_attempts_total counter\n",
+                "uncrowned_king_server_config_reload_attempts_total {config_reload_attempts_total}\n",
+                "# HELP uncrowned_king_server_config_reload_successes_total Access-control config reloads applied atomically.\n",
+                "# TYPE uncrowned_king_server_config_reload_successes_total counter\n",
+                "uncrowned_king_server_config_reload_successes_total {config_reload_successes_total}\n",
+                "# HELP uncrowned_king_server_config_reload_failures_total Access-control config reloads rejected.\n",
+                "# TYPE uncrowned_king_server_config_reload_failures_total counter\n",
+                "uncrowned_king_server_config_reload_failures_total {config_reload_failures_total}\n",
                 "# HELP uncrowned_king_server_accepted_connections_total Accepted TCP carrier connections.\n",
                 "# TYPE uncrowned_king_server_accepted_connections_total counter\n",
                 "uncrowned_king_server_accepted_connections_total {accepted_connections_total}\n",
@@ -232,6 +268,13 @@ impl ServerMetrics {
                 "uncrowned_king_server_active_sessions {active_sessions}\n",
             ),
             ready = ready,
+            access_control_generation = self.access_control_generation.load(Ordering::Acquire),
+            config_reload_attempts_total =
+                self.config_reload_attempts_total.load(Ordering::Relaxed),
+            config_reload_successes_total =
+                self.config_reload_successes_total.load(Ordering::Relaxed),
+            config_reload_failures_total =
+                self.config_reload_failures_total.load(Ordering::Relaxed),
             accepted_connections_total = self.accepted_connections_total.load(Ordering::Relaxed),
             rejected_handshakes_total = self.rejected_handshakes_total.load(Ordering::Relaxed),
             failed_handshakes_total = self.failed_handshakes_total.load(Ordering::Relaxed),
@@ -241,6 +284,11 @@ impl ServerMetrics {
             rejected_sessions_total = self.rejected_sessions_total.load(Ordering::Relaxed),
             active_sessions = self.active_sessions.load(Ordering::Relaxed),
         );
+        self.render_flow_metrics(&mut output);
+        output
+    }
+
+    fn render_flow_metrics(&self, output: &mut String) {
         output.push_str(
             "# HELP uncrowned_king_server_flow_open_requests_total UK flow open requests received.\n\
 # TYPE uncrowned_king_server_flow_open_requests_total counter\n\
@@ -299,7 +347,6 @@ impl ServerMetrics {
                 .expect("writing metrics to a String cannot fail");
             }
         }
-        output
     }
 }
 
@@ -568,6 +615,9 @@ mod tests {
     async fn serves_prometheus_metrics() {
         let metrics = Arc::new(ServerMetrics::default());
         metrics.set_ready(true);
+        metrics.set_access_control_generation(1);
+        metrics.record_config_reload_success(2);
+        metrics.record_config_reload_failure();
         metrics.record_accepted_connection();
         metrics.record_rejected_handshake();
         metrics.record_failed_handshake();
@@ -587,6 +637,10 @@ mod tests {
         .await;
 
         assert!(response.contains("uncrowned_king_server_ready 1\n"));
+        assert!(response.contains("uncrowned_king_server_access_control_generation 2\n"));
+        assert!(response.contains("uncrowned_king_server_config_reload_attempts_total 2\n"));
+        assert!(response.contains("uncrowned_king_server_config_reload_successes_total 1\n"));
+        assert!(response.contains("uncrowned_king_server_config_reload_failures_total 1\n"));
         assert!(response.contains("uncrowned_king_server_accepted_connections_total 1\n"));
         assert!(response.contains("uncrowned_king_server_active_handshakes 1\n"));
         assert!(response.contains("uncrowned_king_server_active_sessions 1\n"));

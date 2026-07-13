@@ -161,7 +161,8 @@ impl Credential {
         validate_shared_secret(&self.secret)
     }
 
-    fn is_active_at(&self, now: u64) -> bool {
+    /// Returns whether the credential may authenticate at the supplied Unix time.
+    pub fn is_active_at(&self, now: u64) -> bool {
         if self.status != CredentialStatus::Active {
             return false;
         }

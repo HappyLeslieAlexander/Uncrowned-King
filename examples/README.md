@@ -40,7 +40,10 @@ The client rejects non-loopback SOCKS5 listen addresses unless
 authentication, use that override only with separate firewall or network
 access controls.
 
-Both long-running commands stop gracefully on Ctrl+C or SIGTERM.
+Both long-running commands stop gracefully on Ctrl+C or SIGTERM. On Unix, edit
+the server credentials, policy, or `auth_skew_seconds`, then send `SIGHUP` to
+reload them atomically. Listener, TLS, limit, and timeout changes require a
+restart.
 
 Replace the example shared secret before using these configs anywhere outside a
 local throwaway environment.

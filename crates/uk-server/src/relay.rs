@@ -28,7 +28,7 @@ use tokio::{
 };
 use tokio_rustls::server::TlsStream;
 use tracing::{Instrument, Span, debug, info, warn};
-use uk_auth::AuthenticatedIdentity;
+use uk_auth::{AuthenticatedIdentity, unix_now};
 use uk_policy::{PolicyContext, PolicyDecision, PolicySet};
 use uk_proto::{
     ErrorCode, ErrorPayload, Frame, FrameIoError, FrameLimits, FrameType, TCP_CLOSE_ERROR,
@@ -37,6 +37,7 @@ use uk_proto::{
     validate_connection_frame, write_frame,
 };
 
+use crate::access_control::AccessControl;
 use crate::observability::{
     ActiveFlowGuard, FlowOpenFailure, RelayDirection, RelayProtocol, ServerMetrics,
 };
@@ -384,7 +385,7 @@ struct SessionShutdown {
 
 struct RelaySessionContext<'a> {
     identity: AuthenticatedIdentity,
-    policy_set: Arc<PolicySet>,
+    access_control: AccessControl,
     carrier_writer: &'a CarrierWriter,
     event_tx: &'a FlowEventSender,
     limits: RelayLimits,
@@ -452,7 +453,7 @@ struct TargetWriterTask {
 pub(crate) async fn relay_session(
     carrier: TlsStream<TcpStream>,
     identity: AuthenticatedIdentity,
-    policy_set: Arc<PolicySet>,
+    access_control: AccessControl,
     limits: RelayLimits,
     idle_timeout: Option<Duration>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -472,7 +473,7 @@ pub(crate) async fn relay_session(
     let carrier_writer = CarrierWriter::new(carrier_writer, shutdown.clone(), Arc::clone(&metrics));
     let context = RelaySessionContext {
         identity,
-        policy_set,
+        access_control,
         carrier_writer: &carrier_writer,
         event_tx: &event_tx,
         limits,
@@ -1268,6 +1269,18 @@ async fn handle_tcp_open_frame(
     }
 
     if let Some((flow_id, target)) = validate_tcp_open_request(context, frame).await? {
+        let Some(policy) = context
+            .access_control
+            .policy_snapshot(&context.identity, unix_now())
+        else {
+            reject_open_failure(flow_id, &target, OpenFailure::PolicyDenied, context).await?;
+            return Ok(());
+        };
+        debug!(
+            event = "tcp.open.policy_snapshot",
+            flow_id,
+            access_control_generation = policy.generation
+        );
         let cancel = OpenFlowCancel::default();
         target_writers.insert(flow_id, FlowSlot::OpeningTcp(cancel.clone()));
         spawn_target_open(
@@ -1276,7 +1289,7 @@ async fn handle_tcp_open_frame(
                 flow_id,
                 target,
                 identity: context.identity.clone(),
-                policy_set: Arc::clone(&context.policy_set),
+                policy_set: policy.policy_set,
                 open_dial_limiter: context.open_dial_limiter.clone(),
                 target_connect_timeout: context.limits.target_connect_timeout,
                 event_tx: context.event_tx.clone(),
@@ -1374,6 +1387,18 @@ async fn handle_udp_open_frame(
     }
 
     if let Some((flow_id, target)) = validate_udp_open_request(context, frame).await? {
+        let Some(policy) = context
+            .access_control
+            .policy_snapshot(&context.identity, unix_now())
+        else {
+            reject_udp_open_failure(flow_id, &target, OpenFailure::PolicyDenied, context).await?;
+            return Ok(());
+        };
+        debug!(
+            event = "udp.open.policy_snapshot",
+            flow_id,
+            access_control_generation = policy.generation
+        );
         let cancel = OpenFlowCancel::default();
         target_writers.insert(flow_id, FlowSlot::OpeningUdp(cancel.clone()));
         spawn_udp_open(
@@ -1382,7 +1407,7 @@ async fn handle_udp_open_frame(
                 flow_id,
                 target,
                 identity: context.identity.clone(),
-                policy_set: Arc::clone(&context.policy_set),
+                policy_set: policy.policy_set,
                 open_dial_limiter: context.open_dial_limiter.clone(),
                 target_connect_timeout: context.limits.target_connect_timeout,
                 event_tx: context.event_tx.clone(),
