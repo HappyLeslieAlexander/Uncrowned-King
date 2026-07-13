@@ -37,8 +37,9 @@ use uk_auth::{
     verify_auth_response,
 };
 use uk_client::{
-    config::ClientConfig, connect_authenticated_carrier, run_handshake,
-    run_socks5_listener_on_until_shutdown,
+    ClientReloadError, ClientReloadHandle, client_reload_channel, config::ClientConfig,
+    connect_authenticated_carrier, run_handshake, run_socks5_listener_on_until_shutdown,
+    run_socks5_listener_on_until_shutdown_with_reload,
 };
 use uk_proto::{
     ALPN_PROTOCOL, ErrorCode, ErrorPayload, Frame, FrameHeader, FrameIoError, FrameLimits,
@@ -542,6 +543,24 @@ async fn server_atomically_rotates_tls_identity() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(10),
         run_server_tls_identity_reload_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_atomically_reloads_connection_config() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        run_client_connection_config_reload_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_reload_supersedes_in_flight_handshake() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_client_reload_during_handshake_e2e(),
     )
     .await?
 }
@@ -3115,6 +3134,226 @@ async fn run_server_tls_identity_reload_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+async fn run_client_connection_config_reload_e2e() -> Result<(), TestError> {
+    let temp_dir = create_temp_dir()?;
+    let server_cert_path = temp_dir.join("server-cert.pem");
+    let server_key_path = temp_dir.join("server-key.pem");
+    let initial_ca_path = temp_dir.join("initial-ca.pem");
+    let rotated_ca_path = temp_dir.join("rotated-ca.pem");
+    let policy_path = temp_dir.join("policy.toml");
+    fs::write(&server_cert_path, CERT_PEM)?;
+    write_private_key(&server_key_path)?;
+    fs::write(&initial_ca_path, CERT_PEM)?;
+    fs::write(&rotated_ca_path, ROTATED_CERT_PEM)?;
+    fs::write(&policy_path, allow_loopback_any_port_policy())?;
+
+    let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let server_addr = server_listener.local_addr()?;
+    let initial_server_config = test_server_config(
+        server_addr,
+        &server_cert_path,
+        &server_key_path,
+        test_limits(),
+        Some(&policy_path),
+        30,
+    );
+    let (initial_server_shutdown_tx, initial_server_shutdown_rx) = oneshot::channel();
+    let initial_server_task =
+        start_uk_server_on_listener_until_shutdown(initial_server_config, server_listener, async {
+            let _ = initial_server_shutdown_rx.await;
+        })
+        .await?;
+
+    let initial_client_config = test_client_config(server_addr, &initial_ca_path, SECRET);
+    let mut rotated_client_config = initial_client_config.clone();
+    rotated_client_config.ca_cert_path = path_string(&rotated_ca_path);
+    WRONG_SECRET.clone_into(&mut rotated_client_config.secret);
+    let ReloadableSocksListener {
+        socks_addr,
+        reload_handle,
+        shutdown_tx: client_shutdown_tx,
+        task: client_task,
+    } = start_reloadable_socks5_listener(initial_client_config.clone()).await?;
+
+    let (old_target_addr, old_target_task) = spawn_echo_target().await?;
+    let (mut old_socks, connect_reply) = open_socks_connect(socks_addr, old_target_addr).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    assert_client_reload_rejections(
+        &reload_handle,
+        &initial_client_config,
+        &rotated_client_config,
+        &temp_dir,
+    )
+    .await?;
+    assert_eq!(reload_handle.reload(rotated_client_config).await?, 2);
+
+    let payload = b"existing SOCKS flow survives client config reload";
+    old_socks.write_all(payload).await?;
+    let mut echoed = vec![0_u8; payload.len()];
+    old_socks.read_exact(&mut echoed).await?;
+    assert_eq!(echoed, payload);
+    old_target_task.await??;
+    drop(old_socks);
+
+    initial_server_shutdown_tx
+        .send(())
+        .map_err(|()| "initial server shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(3), initial_server_task).await???;
+
+    fs::write(&server_cert_path, ROTATED_CERT_PEM)?;
+    write_private_key_contents(&server_key_path, ROTATED_KEY_PEM)?;
+    let mut rotated_server_config = test_server_config(
+        server_addr,
+        &server_cert_path,
+        &server_key_path,
+        test_limits(),
+        Some(&policy_path),
+        30,
+    );
+    WRONG_SECRET.clone_into(&mut rotated_server_config.credentials[0].secret);
+    let rotated_server_listener = TcpListener::bind(server_addr).await?;
+    let (rotated_server_shutdown_tx, rotated_server_shutdown_rx) = oneshot::channel();
+    let rotated_server_task = start_uk_server_on_listener_until_shutdown(
+        rotated_server_config,
+        rotated_server_listener,
+        async {
+            let _ = rotated_server_shutdown_rx.await;
+        },
+    )
+    .await?;
+
+    let (rotated_target_addr, rotated_target_task) = spawn_echo_target().await?;
+    assert_echo_roundtrip(
+        socks_addr,
+        rotated_target_addr,
+        b"new carrier uses reloaded CA and credential",
+    )
+    .await?;
+    rotated_target_task.await??;
+
+    rotated_server_shutdown_tx
+        .send(())
+        .map_err(|()| "rotated server shutdown receiver dropped")?;
+    client_shutdown_tx
+        .send(())
+        .map_err(|()| "client shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(3), rotated_server_task).await???;
+    tokio::time::timeout(Duration::from_secs(3), client_task).await???;
+    let _ = fs::remove_dir_all(temp_dir);
+    Ok(())
+}
+
+async fn assert_client_reload_rejections(
+    reload_handle: &ClientReloadHandle,
+    initial: &ClientConfig,
+    rotated: &ClientConfig,
+    temp_dir: &Path,
+) -> Result<(), TestError> {
+    let mut incompatible = initial.clone();
+    incompatible.max_socks_connections = Some(initial.max_socks_connections() + 1);
+    let rejection = reload_handle.reload(incompatible).await.unwrap_err();
+    assert!(matches!(
+        rejection,
+        ClientReloadError::Rejected(reason)
+            if reason.contains("max_socks_connections")
+                && reason.contains("requires a restart")
+    ));
+
+    let mut invalid_ca = rotated.clone();
+    invalid_ca.ca_cert_path = path_string(&temp_dir.join("missing-ca.pem"));
+    assert!(matches!(
+        reload_handle.reload(invalid_ca).await.unwrap_err(),
+        ClientReloadError::Rejected(reason) if reason.contains("missing-ca.pem")
+    ));
+    Ok(())
+}
+
+async fn run_client_reload_during_handshake_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    let policy_path = temp_dir.join("policy.toml");
+    fs::write(&cert_path, CERT_PEM)?;
+    write_private_key(&key_path)?;
+    fs::write(&policy_path, allow_loopback_any_port_policy())?;
+
+    let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let server_addr = server_listener.local_addr()?;
+    let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
+    let mut server_task = tokio::spawn(uk_server::run_on_listener_until_shutdown(
+        test_server_config(
+            server_addr,
+            &cert_path,
+            &key_path,
+            test_limits(),
+            Some(&policy_path),
+            30,
+        ),
+        server_listener,
+        async {
+            let _ = server_shutdown_rx.await;
+        },
+    ));
+    wait_for_listener("uk-server", server_addr, &mut server_task).await?;
+
+    let stalled_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let stalled_addr = stalled_listener.local_addr()?;
+    let (stalled_accepted_tx, stalled_accepted_rx) = oneshot::channel();
+    let (release_stalled_tx, release_stalled_rx) = oneshot::channel();
+    let stalled_task = tokio::spawn(async move {
+        let (stream, _) = stalled_listener.accept().await?;
+        stalled_accepted_tx
+            .send(())
+            .map_err(|()| "stalled handshake observer dropped")?;
+        let _ = release_stalled_rx.await;
+        drop(stream);
+        Ok::<(), TestError>(())
+    });
+
+    let mut initial_config = test_client_config(stalled_addr, &cert_path, SECRET);
+    initial_config.handshake_timeout_seconds = Some(30);
+    let mut reloaded_config = initial_config.clone();
+    reloaded_config.server_addr = server_addr.to_string();
+    let ReloadableSocksListener {
+        socks_addr,
+        reload_handle,
+        shutdown_tx: client_shutdown_tx,
+        task: client_task,
+    } = start_reloadable_socks5_listener(initial_config).await?;
+
+    let (target_addr, target_task) = spawn_echo_target().await?;
+    let socks_task = tokio::spawn(open_socks_connect(socks_addr, target_addr));
+    stalled_accepted_rx.await?;
+    assert_eq!(reload_handle.reload(reloaded_config).await?, 2);
+    release_stalled_tx
+        .send(())
+        .map_err(|()| "stalled handshake release receiver dropped")?;
+
+    let (mut socks, connect_reply) = socks_task.await??;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+    let payload = b"in-flight handshake switches to reloaded client config";
+    socks.write_all(payload).await?;
+    let mut echoed = vec![0_u8; payload.len()];
+    socks.read_exact(&mut echoed).await?;
+    assert_eq!(echoed, payload);
+    target_task.await??;
+    stalled_task.await??;
+
+    server_shutdown_tx
+        .send(())
+        .map_err(|()| "server shutdown receiver dropped")?;
+    client_shutdown_tx
+        .send(())
+        .map_err(|()| "client shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(3), server_task).await???;
+    tokio::time::timeout(Duration::from_secs(3), client_task).await???;
+    let _ = fs::remove_dir_all(temp_dir);
+    Ok(())
+}
+
 fn assert_observability_relay_metrics(metrics: &str, tcp_bytes: usize, udp_bytes: usize) {
     assert!(metrics.contains("uncrowned_king_server_ready 1\n"));
     assert!(metrics.contains("uncrowned_king_server_security_generation 1\n"));
@@ -4831,6 +5070,13 @@ struct RelayHarness {
     client_task: JoinHandle<Result<(), TestError>>,
 }
 
+struct ReloadableSocksListener {
+    socks_addr: SocketAddr,
+    reload_handle: ClientReloadHandle,
+    shutdown_tx: oneshot::Sender<()>,
+    task: JoinHandle<Result<(), TestError>>,
+}
+
 impl RelayHarness {
     async fn start(policy_toml: Option<String>) -> Result<Self, TestError> {
         Self::start_with_limits(policy_toml, test_limits()).await
@@ -5285,11 +5531,25 @@ where
 {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let server_addr = listener.local_addr()?;
+    let server_task =
+        start_uk_server_on_listener_until_shutdown(config, listener, shutdown).await?;
+    Ok((server_addr, server_task))
+}
+
+async fn start_uk_server_on_listener_until_shutdown<F>(
+    config: ServerConfig,
+    listener: TcpListener,
+    shutdown: F,
+) -> Result<JoinHandle<Result<(), TestError>>, TestError>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let server_addr = listener.local_addr()?;
     let mut server_task = tokio::spawn(uk_server::run_on_listener_until_shutdown(
         config, listener, shutdown,
     ));
     wait_for_listener("uk-server", server_addr, &mut server_task).await?;
-    Ok((server_addr, server_task))
+    Ok(server_task)
 }
 
 async fn start_socks5_listener(
@@ -5313,6 +5573,31 @@ where
     ));
     wait_for_listener("uk-client", socks_addr, &mut client_task).await?;
     Ok((socks_addr, client_task))
+}
+
+async fn start_reloadable_socks5_listener(
+    config: ClientConfig,
+) -> Result<ReloadableSocksListener, TestError> {
+    uk_client::check_config(&config)?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let socks_addr = listener.local_addr()?;
+    let (reload_handle, reload_rx) = client_reload_channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut task = tokio::spawn(run_socks5_listener_on_until_shutdown_with_reload(
+        config,
+        listener,
+        reload_rx,
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+    wait_for_listener("uk-client", socks_addr, &mut task).await?;
+    Ok(ReloadableSocksListener {
+        socks_addr,
+        reload_handle,
+        shutdown_tx,
+        task,
+    })
 }
 
 async fn open_socks_connect(

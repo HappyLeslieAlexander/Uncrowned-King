@@ -33,7 +33,9 @@ use uk_proto::{
 };
 
 use crate::{
+    ClientReloadReceiver, ClientReloadRequest,
     config::{ClientConfig, validate_endpoint},
+    config_state::{ClientConfigSnapshot, ClientConfigState},
     session, socks5,
 };
 
@@ -114,16 +116,17 @@ struct ClientSession {
 }
 
 struct ClientSessionManager {
-    config: ClientConfig,
+    config: ClientConfigState,
     current: Mutex<Option<Arc<ClientSession>>>,
     connect_lock: Mutex<()>,
+    config_publish_lock: Mutex<()>,
     recent_connect_failure: Mutex<Option<CachedConnectFailure>>,
-    connect_retry_delay: Option<Duration>,
     closed: AtomicBool,
 }
 
 #[derive(Clone, Debug)]
 struct CachedConnectFailure {
+    generation: u64,
     message: Arc<str>,
     expires_at: Option<time::Instant>,
 }
@@ -489,12 +492,51 @@ where
     crate::check_config(&config)?;
     validate_endpoint("socks listen", &listen)?;
     let listener = TcpListener::bind(&listen).await?;
-    run_socks5_listener_on_until_shutdown(config, listener, shutdown).await
+    run_socks5_listener_on_until_shutdown_inner(config, listener, None, shutdown).await
+}
+
+pub(crate) async fn run_socks5_listener_until_shutdown_with_reload<F>(
+    config: ClientConfig,
+    listen: String,
+    reload_rx: ClientReloadReceiver,
+    shutdown: F,
+) -> Result<(), AnyError>
+where
+    F: Future<Output = ()> + Send,
+{
+    crate::check_config(&config)?;
+    validate_endpoint("socks listen", &listen)?;
+    let listener = TcpListener::bind(&listen).await?;
+    run_socks5_listener_on_until_shutdown_inner(config, listener, Some(reload_rx), shutdown).await
 }
 
 pub(crate) async fn run_socks5_listener_on_until_shutdown<F>(
     config: ClientConfig,
     listener: TcpListener,
+    shutdown: F,
+) -> Result<(), AnyError>
+where
+    F: Future<Output = ()> + Send,
+{
+    run_socks5_listener_on_until_shutdown_inner(config, listener, None, shutdown).await
+}
+
+pub(crate) async fn run_socks5_listener_on_until_shutdown_with_reload<F>(
+    config: ClientConfig,
+    listener: TcpListener,
+    reload_rx: ClientReloadReceiver,
+    shutdown: F,
+) -> Result<(), AnyError>
+where
+    F: Future<Output = ()> + Send,
+{
+    run_socks5_listener_on_until_shutdown_inner(config, listener, Some(reload_rx), shutdown).await
+}
+
+async fn run_socks5_listener_on_until_shutdown_inner<F>(
+    config: ClientConfig,
+    listener: TcpListener,
+    mut reload_rx: Option<ClientReloadReceiver>,
     shutdown: F,
 ) -> Result<(), AnyError>
 where
@@ -583,6 +625,14 @@ where
             joined = connections.join_next(), if !connections.is_empty() => {
                 log_socks_task_result(joined);
             }
+            reload = receive_reload(&mut reload_rx) => {
+                if let Some(request) = reload {
+                    handle_reload_request(&sessions, request).await;
+                } else {
+                    reload_rx = None;
+                    debug!(event = "client.config.reload_channel_closed");
+                }
+            }
         }
     }
 
@@ -590,6 +640,27 @@ where
     sessions.shutdown().await;
 
     Ok(())
+}
+
+async fn receive_reload(
+    reload_rx: &mut Option<ClientReloadReceiver>,
+) -> Option<ClientReloadRequest> {
+    match reload_rx {
+        Some(reload_rx) => reload_rx.rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn handle_reload_request(sessions: &ClientSessionManager, request: ClientReloadRequest) {
+    let result = sessions.reload(request.config).await;
+    match &result {
+        Ok(generation) => info!(
+            event = "client.config.reload_success",
+            config_generation = generation
+        ),
+        Err(err) => warn!(event = "client.config.reload_failure", error = %err),
+    }
+    let _ = request.response.send(result.map_err(|err| err.to_string()));
 }
 
 async fn drain_socks_tasks(connections: &mut JoinSet<()>, shutdown_timeout: Option<Duration>) {
@@ -667,15 +738,24 @@ fn is_clean_socks_disconnect(error: &AnyError) -> bool {
 
 impl ClientSessionManager {
     fn new(config: ClientConfig) -> Self {
-        let connect_retry_delay = retry_delay(config.server_connect_retry_delay_millis());
         Self {
-            config,
+            config: ClientConfigState::new(config),
             current: Mutex::new(None),
             connect_lock: Mutex::new(()),
+            config_publish_lock: Mutex::new(()),
             recent_connect_failure: Mutex::new(None),
-            connect_retry_delay,
             closed: AtomicBool::new(false),
         }
+    }
+
+    async fn reload(&self, candidate: ClientConfig) -> Result<u64, AnyError> {
+        crate::check_config(&candidate)?;
+        let _publish_guard = self.config_publish_lock.lock().await;
+        let current = self.config.snapshot();
+        ensure_reload_compatible(&current.config, &candidate)?;
+        let generation = self.config.replace(candidate);
+        self.clear_connect_failure().await;
+        Ok(generation)
     }
 
     async fn open_flow(
@@ -757,48 +837,65 @@ impl ClientSessionManager {
     }
 
     async fn current_session(&self) -> Result<Arc<ClientSession>, AnyError> {
-        if self.is_closed() {
-            return Err("client session manager is shutting down".into());
-        }
-        if let Some(session) = self.current_session_if_live().await {
-            return Ok(session);
-        }
-        if let Some(failure) = self.recent_connect_failure_if_active().await {
-            return Err(cached_connect_failure_error(failure));
-        }
-
-        let _connect_guard = self.connect_lock.lock().await;
-        if self.is_closed() {
-            return Err("client session manager is shutting down".into());
-        }
-        if let Some(session) = self.current_session_if_live().await {
-            return Ok(session);
-        }
-        if let Some(failure) = self.recent_connect_failure_if_active().await {
-            return Err(cached_connect_failure_error(failure));
-        }
-
-        info!(event = "client.session.connect");
-        let session = match ClientSession::connect(&self.config).await {
-            Ok(session) => session,
-            Err(err) => {
-                self.remember_connect_failure(&err).await;
-                return Err(err);
+        loop {
+            if self.is_closed() {
+                return Err("client session manager is shutting down".into());
             }
-        };
-        self.clear_connect_failure().await;
-        if self.is_closed() {
-            session.close_and_wait().await;
-            return Err("client session manager is shutting down".into());
+            if let Some(session) = self.current_session_if_live().await {
+                return Ok(session);
+            }
+            if let Some(failure) = self.recent_connect_failure_if_active().await {
+                return Err(cached_connect_failure_error(failure));
+            }
+
+            let _connect_guard = self.connect_lock.lock().await;
+            if self.is_closed() {
+                return Err("client session manager is shutting down".into());
+            }
+            if let Some(session) = self.current_session_if_live().await {
+                return Ok(session);
+            }
+            if let Some(failure) = self.recent_connect_failure_if_active().await {
+                return Err(cached_connect_failure_error(failure));
+            }
+
+            let snapshot = self.config.snapshot();
+            info!(
+                event = "client.session.connect",
+                config_generation = snapshot.generation
+            );
+            let session = match ClientSession::connect(&snapshot.config).await {
+                Ok(session) => session,
+                Err(err) => {
+                    if self.remember_connect_failure(&snapshot, &err).await {
+                        return Err(err);
+                    }
+                    continue;
+                }
+            };
+
+            let publish_guard = self.config_publish_lock.lock().await;
+            if self.config.generation() != snapshot.generation {
+                drop(publish_guard);
+                session.close_and_wait().await;
+                continue;
+            }
+            self.clear_connect_failure().await;
+            if self.is_closed() {
+                drop(publish_guard);
+                session.close_and_wait().await;
+                return Err("client session manager is shutting down".into());
+            }
+            let mut current = self.current.lock().await;
+            if self.is_closed() {
+                drop(current);
+                drop(publish_guard);
+                session.close_and_wait().await;
+                return Err("client session manager is shutting down".into());
+            }
+            *current = Some(Arc::clone(&session));
+            return Ok(session);
         }
-        let mut current = self.current.lock().await;
-        if self.is_closed() {
-            drop(current);
-            session.close_and_wait().await;
-            return Err("client session manager is shutting down".into());
-        }
-        *current = Some(Arc::clone(&session));
-        Ok(session)
     }
 
     async fn current_session_if_live(&self) -> Option<Arc<ClientSession>> {
@@ -821,6 +918,10 @@ impl ClientSessionManager {
     async fn recent_connect_failure_if_active(&self) -> Option<CachedConnectFailure> {
         let mut recent = self.recent_connect_failure.lock().await;
         let failure = recent.as_ref()?;
+        if failure.generation != self.config.generation() {
+            *recent = None;
+            return None;
+        }
         if let Some(expires_at) = failure.expires_at {
             if time::Instant::now() >= expires_at {
                 *recent = None;
@@ -831,15 +932,25 @@ impl ClientSessionManager {
         Some(failure.clone())
     }
 
-    async fn remember_connect_failure(&self, error: &AnyError) {
-        let Some(delay) = self.connect_retry_delay else {
-            return;
+    async fn remember_connect_failure(
+        &self,
+        snapshot: &ClientConfigSnapshot,
+        error: &AnyError,
+    ) -> bool {
+        let _publish_guard = self.config_publish_lock.lock().await;
+        if self.config.generation() != snapshot.generation {
+            return false;
+        }
+        let Some(delay) = retry_delay(snapshot.config.server_connect_retry_delay_millis()) else {
+            return true;
         };
         let mut recent = self.recent_connect_failure.lock().await;
         *recent = Some(CachedConnectFailure {
+            generation: snapshot.generation,
             message: Arc::from(error.to_string()),
             expires_at: retry_delay_expires_at(delay),
         });
+        true
     }
 
     async fn clear_connect_failure(&self) {
@@ -883,7 +994,33 @@ impl ClientSessionManager {
     }
 
     fn udp_flow_idle_timeout(&self) -> Option<Duration> {
-        timeout(self.config.udp_flow_idle_timeout_seconds())
+        timeout(
+            self.config
+                .snapshot()
+                .config
+                .udp_flow_idle_timeout_seconds(),
+        )
+    }
+}
+
+fn ensure_reload_compatible(
+    current: &ClientConfig,
+    candidate: &ClientConfig,
+) -> Result<(), AnyError> {
+    let changed = if current.socks_handshake_timeout_seconds()
+        != candidate.socks_handshake_timeout_seconds()
+    {
+        Some("socks_handshake_timeout_seconds")
+    } else if current.shutdown_timeout_seconds() != candidate.shutdown_timeout_seconds() {
+        Some("shutdown_timeout_seconds")
+    } else if current.max_socks_connections() != candidate.max_socks_connections() {
+        Some("max_socks_connections")
+    } else {
+        None
+    };
+    match changed {
+        Some(field) => Err(format!("client config field `{field}` requires a restart").into()),
+        None => Ok(()),
     }
 }
 
@@ -3935,12 +4072,52 @@ mod tests {
     async fn expired_session_connect_failure_cache_is_cleared() {
         let manager = ClientSessionManager::new(minimal_config());
         *manager.recent_connect_failure.lock().await = Some(CachedConnectFailure {
+            generation: 1,
             message: Arc::from("old failure"),
             expires_at: Some(time::Instant::now() - Duration::from_millis(1)),
         });
 
         assert!(manager.recent_connect_failure_if_active().await.is_none());
         assert!(manager.recent_connect_failure.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn previous_generation_connect_failure_cache_is_cleared() {
+        let manager = ClientSessionManager::new(minimal_config());
+        *manager.recent_connect_failure.lock().await = Some(CachedConnectFailure {
+            generation: 1,
+            message: Arc::from("old failure"),
+            expires_at: None,
+        });
+        manager.config.replace(minimal_config());
+
+        assert!(manager.recent_connect_failure_if_active().await.is_none());
+        assert!(manager.recent_connect_failure.lock().await.is_none());
+    }
+
+    #[test]
+    fn client_reload_rejects_static_listener_changes() {
+        let current = minimal_config();
+        let mut candidate = current.clone();
+        candidate.max_socks_connections = Some(current.max_socks_connections() + 1);
+
+        let error = ensure_reload_compatible(&current, &candidate)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("max_socks_connections"));
+        assert!(error.contains("requires a restart"));
+    }
+
+    #[test]
+    fn client_reload_accepts_equivalent_effective_listener_settings() {
+        let current = minimal_config();
+        let mut candidate = current.clone();
+        candidate.socks_handshake_timeout_seconds = Some(current.socks_handshake_timeout_seconds());
+        candidate.shutdown_timeout_seconds = Some(current.shutdown_timeout_seconds());
+        candidate.max_socks_connections = Some(current.max_socks_connections());
+
+        assert!(ensure_reload_compatible(&current, &candidate).is_ok());
     }
 
     #[test]

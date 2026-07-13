@@ -45,6 +45,11 @@ the server TLS paths or files, credentials, policy, or `auth_skew_seconds`, then
 send `SIGHUP` to reload them atomically. Listener, limit, and timeout changes
 require a restart.
 
+The client also accepts `SIGHUP`. Its server endpoints, CA, key id, secret, and
+new-session limits reload atomically without terminating existing SOCKS flows.
+SOCKS handshake timeout, shutdown timeout, and maximum SOCKS connection changes
+require a client restart.
+
 Replace the example shared secret before using these configs anywhere outside a
 local throwaway environment.
 

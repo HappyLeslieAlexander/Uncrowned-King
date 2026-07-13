@@ -4,11 +4,11 @@ use std::net::SocketAddr;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use tokio::net::TcpListener;
-use tracing::warn;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use uk_client::{
-    AnyError, check_config, config::ClientConfig, run_handshake,
-    run_socks5_listener_on_until_shutdown,
+    AnyError, ClientReloadError, ClientReloadHandle, check_config, client_reload_channel,
+    config::ClientConfig, run_handshake, run_socks5_listener_on_until_shutdown_with_reload,
 };
 use uk_proto::validate_host_port_endpoint;
 
@@ -55,7 +55,8 @@ enum Command {
 async fn main() -> Result<(), AnyError> {
     let args = Args::parse();
     init_tracing(args.log_format);
-    let config = ClientConfig::load(config_path(&args)?)?;
+    let config_path = config_path(&args)?.to_owned();
+    let config = ClientConfig::load(&config_path)?;
     match args.command {
         Command::ConfigCheck => {
             check_config(&config)?;
@@ -77,7 +78,14 @@ async fn main() -> Result<(), AnyError> {
             if allow_non_loopback && !listen.ip().is_loopback() {
                 warn!(event = "socks5.non_loopback_allowed", listen = %listen);
             }
-            run_socks5_listener_on_until_shutdown(config, listener, shutdown_signal()).await?;
+            let (reload_handle, reload_rx) = client_reload_channel();
+            run_socks5_listener_on_until_shutdown_with_reload(
+                config,
+                listener,
+                reload_rx,
+                shutdown_signal(config_path, reload_handle),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -114,25 +122,95 @@ fn init_tracing(log_format: LogFormat) {
     }
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(config_path: String, reload_handle: ClientReloadHandle) {
     #[cfg(unix)]
     {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut terminate) => {
-                tokio::select! {
-                    () = wait_for_ctrl_c() => {}
-                    _ = terminate.recv() => {}
+        let mut terminate =
+            install_unix_signal("SIGTERM", tokio::signal::unix::SignalKind::terminate());
+        let mut hangup = install_unix_signal("SIGHUP", tokio::signal::unix::SignalKind::hangup());
+        let ctrl_c = wait_for_ctrl_c();
+        tokio::pin!(ctrl_c);
+
+        loop {
+            tokio::select! {
+                () = &mut ctrl_c => break,
+                received = receive_optional_unix_signal(&mut terminate) => {
+                    if received {
+                        break;
+                    }
+                    terminate = None;
                 }
-            }
-            Err(err) => {
-                warn!(event = "client.signal.install_error", error = %err);
-                wait_for_ctrl_c().await;
+                received = receive_optional_unix_signal(&mut hangup) => {
+                    if !received {
+                        hangup = None;
+                        continue;
+                    }
+                    if !queue_config_reload(&config_path, &reload_handle).await {
+                        break;
+                    }
+                }
             }
         }
     }
 
     #[cfg(not(unix))]
-    wait_for_ctrl_c().await;
+    {
+        let _ = (config_path, reload_handle);
+        wait_for_ctrl_c().await;
+    }
+}
+
+#[cfg(unix)]
+fn install_unix_signal(
+    name: &'static str,
+    kind: tokio::signal::unix::SignalKind,
+) -> Option<tokio::signal::unix::Signal> {
+    match tokio::signal::unix::signal(kind) {
+        Ok(signal) => Some(signal),
+        Err(err) => {
+            warn!(event = "client.signal.install_error", signal = name, error = %err);
+            None
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn receive_optional_unix_signal(signal: &mut Option<tokio::signal::unix::Signal>) -> bool {
+    match signal {
+        Some(signal) => signal.recv().await.is_some(),
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(unix)]
+async fn queue_config_reload(config_path: &str, reload_handle: &ClientReloadHandle) -> bool {
+    let load_path = config_path.to_owned();
+    let loaded = tokio::task::spawn_blocking(move || ClientConfig::load(load_path)).await;
+    let config = match loaded {
+        Ok(Ok(config)) => config,
+        Ok(Err(err)) => {
+            warn!(event = "client.config.reload_load_failure", error = %err);
+            return true;
+        }
+        Err(err) => {
+            warn!(event = "client.config.reload_task_failure", error = %err);
+            return true;
+        }
+    };
+    match reload_handle.reload(config).await {
+        Ok(generation) => {
+            info!(
+                event = "client.config.reload_applied",
+                config_generation = generation
+            );
+            true
+        }
+        Err(ClientReloadError::Rejected(reason)) => {
+            warn!(event = "client.config.reload_rejected", error = %reason);
+            true
+        }
+        Err(ClientReloadError::ClientStopped) => false,
+    }
 }
 
 async fn wait_for_ctrl_c() {

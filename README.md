@@ -20,6 +20,7 @@ The repository currently focuses on the first runnable v0.1 TLS/TCP carrier:
 - graceful Ctrl+C/SIGTERM shutdown for long-running client and server listeners
 - capped exponential retry for transient client and server listener accept errors
 - bounded server health, readiness, and Prometheus metrics endpoint
+- atomic SIGHUP reload for server and client TLS/auth configuration
 - nonce-matched PING/PONG keepalive for active relay flows
 - negotiated UDP flow limits and idle UDP flow cleanup on both client and server
 - SETTINGS-advertised UDP stream fallback capability for the TLS/TCP carrier
@@ -184,6 +185,17 @@ active in the same policy group. Removing, disabling, expiring, or reassigning a
 key therefore blocks new flows on its existing sessions without terminating
 flows that are already open. Listener addresses, resource limits, and timeout
 settings still require a process restart.
+
+On Unix, `uk-client` also reloads its server endpoints, TLS server name and CA,
+key id and shared secret, handshake and retry timing, TCP open and UDP flow idle
+timeouts, and per-session/per-flow buffer limits on `SIGHUP`. Candidate CA and
+authentication material are validated before the new client config generation
+is published. Existing carrier sessions and SOCKS flows continue; future carrier
+connections use the new generation. If a reload races an in-flight handshake,
+that handshake cannot publish a stale session or cache a stale connection
+failure after the reload. `socks_handshake_timeout_seconds`,
+`shutdown_timeout_seconds`, and `max_socks_connections` still require a client
+restart because the listener owns those resources.
 
 Both binaries accept global `--log-format text|json` output selection and use
 `RUST_LOG` for filtering. JSON mode preserves structured event fields for log
