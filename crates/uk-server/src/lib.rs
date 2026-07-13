@@ -288,10 +288,10 @@ async fn stop_observability(
     task: Option<tokio::task::JoinHandle<()>>,
 ) {
     let _ = shutdown_tx.send(true);
-    if let Some(task) = task
-        && let Err(err) = task.await
-    {
-        warn!(event = "server.observability.task_error", error = %err);
+    if let Some(task) = task {
+        if let Err(err) = task.await {
+            warn!(event = "server.observability.task_error", error = %err);
+        }
     }
 }
 
@@ -471,6 +471,7 @@ async fn handle_connection(
         }),
         idle_timeout(config.idle_timeout_seconds()),
         shutdown_rx,
+        metrics,
     )
     .await
 }

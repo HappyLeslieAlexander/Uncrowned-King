@@ -104,11 +104,13 @@ When set, `policy_group` must be non-empty printable text.
 Set `observability_listen = "127.0.0.1:9090"` at the top level of the server
 config to enable the operational HTTP listener. It is disabled when omitted and
 serves only `GET /healthz`, `GET /readyz`, and `GET /metrics`. Readiness drops
-before relay shutdown begins, and metrics expose accepted connections, active
-and failed handshakes, authenticated and rejected sessions, and active sessions
-in Prometheus text format. The endpoint has no authentication; bind it to
-loopback or a firewall-protected management network. Requests are limited to an
-8 KiB header, a five-second read timeout, and 32 concurrent connections.
+before relay shutdown begins. Metrics expose accepted connections, active and
+failed handshakes, authenticated and rejected sessions, TCP/UDP open requests
+and bounded failure reasons, active flows, and successfully relayed payload
+bytes by protocol and direction in Prometheus text format. The endpoint has no
+authentication; bind it to loopback or a firewall-protected management network.
+Requests are limited to an 8 KiB header, a five-second read timeout, and 32
+concurrent connections.
 
 Client configs may also set `handshake_timeout_seconds = 10` to bound each
 server endpoint attempt, including TCP connect, TLS handshake, authentication

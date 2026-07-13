@@ -2758,8 +2758,12 @@ async fn run_server_observability_e2e() -> Result<(), TestError> {
     let temp_dir = create_temp_dir()?;
     let cert_path = temp_dir.join("server-cert.pem");
     let key_path = temp_dir.join("server-key.pem");
+    let policy_path = temp_dir.join("policy.toml");
     fs::write(&cert_path, CERT_PEM)?;
     write_private_key(&key_path)?;
+    fs::write(&policy_path, allow_loopback_any_port_policy())?;
+    let (tcp_target_addr, tcp_target_task) = spawn_echo_target().await?;
+    let (udp_target_addr, udp_target_task) = spawn_udp_echo_target().await?;
     let observability_addr = unused_loopback_addr().await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let mut config = test_server_config(
@@ -2767,7 +2771,7 @@ async fn run_server_observability_e2e() -> Result<(), TestError> {
         &cert_path,
         &key_path,
         test_limits(),
-        None,
+        Some(&policy_path),
         30,
     );
     config.observability_listen = Some(observability_addr.to_string());
@@ -2787,7 +2791,7 @@ async fn run_server_observability_e2e() -> Result<(), TestError> {
     assert!(health.starts_with("HTTP/1.1 200 OK\r\n"));
     assert!(ready.starts_with("HTTP/1.1 200 OK\r\n"));
 
-    let (carrier, _settings) = connect_authenticated_carrier(ClientConfig {
+    let (mut carrier, _settings) = connect_authenticated_carrier(ClientConfig {
         server_addr: server_addr.to_string(),
         server_addrs: None,
         server_name: "localhost".to_owned(),
@@ -2806,10 +2810,33 @@ async fn run_server_observability_e2e() -> Result<(), TestError> {
         max_buffered_bytes_per_flow: None,
     })
     .await?;
+
+    let tcp_payload = Bytes::from_static(b"observability tcp payload");
+    write_frame(&mut carrier, &tcp_open_frame(1, tcp_target_addr)?).await?;
+    read_open_ack(&mut carrier, 1).await?;
+    write_frame(
+        &mut carrier,
+        &Frame::new(FrameType::TcpData, 0, 1, tcp_payload.clone())?,
+    )
+    .await?;
+    let tcp_echo = read_relay_frame(&mut carrier, FrameType::TcpData, 1).await?;
+    assert_eq!(tcp_echo.payload, tcp_payload);
+    tcp_target_task.await??;
+
+    let udp_payload = Bytes::from_static(b"observability udp payload");
+    write_frame(&mut carrier, &udp_open_frame(3, udp_target_addr)?).await?;
+    read_relay_frame(&mut carrier, FrameType::UdpData, 3).await?;
+    write_frame(
+        &mut carrier,
+        &Frame::new(FrameType::UdpData, 0, 3, udp_payload.clone())?,
+    )
+    .await?;
+    let udp_echo = read_relay_frame(&mut carrier, FrameType::UdpData, 3).await?;
+    assert_eq!(udp_echo.payload, udp_payload);
+    udp_target_task.await??;
+
     let metrics = http_get(observability_addr, "/metrics").await?;
-    assert!(metrics.contains("uncrowned_king_server_ready 1\n"));
-    assert!(metrics.contains("uncrowned_king_server_authenticated_sessions_total 1\n"));
-    assert!(metrics.contains("uncrowned_king_server_active_sessions 1\n"));
+    assert_observability_relay_metrics(&metrics, tcp_payload.len(), udp_payload.len());
 
     shutdown_tx
         .send(())
@@ -2818,6 +2845,40 @@ async fn run_server_observability_e2e() -> Result<(), TestError> {
     drop(carrier);
     assert!(TcpStream::connect(observability_addr).await.is_err());
     Ok(())
+}
+
+fn assert_observability_relay_metrics(metrics: &str, tcp_bytes: usize, udp_bytes: usize) {
+    assert!(metrics.contains("uncrowned_king_server_ready 1\n"));
+    assert!(metrics.contains("uncrowned_king_server_authenticated_sessions_total 1\n"));
+    assert!(metrics.contains("uncrowned_king_server_active_sessions 1\n"));
+    assert!(
+        metrics.contains("uncrowned_king_server_flow_open_requests_total{protocol=\"tcp\"} 1\n")
+    );
+    assert!(metrics.contains("uncrowned_king_server_opened_flows_total{protocol=\"tcp\"} 1\n"));
+    assert!(metrics.contains(
+        &format!(
+            "uncrowned_king_server_relay_bytes_total{{protocol=\"tcp\",direction=\"client_to_target\"}} {tcp_bytes}\n"
+        )
+    ));
+    assert!(metrics.contains(
+        &format!(
+            "uncrowned_king_server_relay_bytes_total{{protocol=\"tcp\",direction=\"target_to_client\"}} {tcp_bytes}\n"
+        )
+    ));
+    assert!(
+        metrics.contains("uncrowned_king_server_flow_open_requests_total{protocol=\"udp\"} 1\n")
+    );
+    assert!(metrics.contains("uncrowned_king_server_opened_flows_total{protocol=\"udp\"} 1\n"));
+    assert!(metrics.contains(
+        &format!(
+            "uncrowned_king_server_relay_bytes_total{{protocol=\"udp\",direction=\"client_to_target\"}} {udp_bytes}\n"
+        )
+    ));
+    assert!(metrics.contains(
+        &format!(
+            "uncrowned_king_server_relay_bytes_total{{protocol=\"udp\",direction=\"target_to_client\"}} {udp_bytes}\n"
+        )
+    ));
 }
 
 async fn run_server_active_session_shutdown_e2e() -> Result<(), TestError> {
@@ -5210,6 +5271,24 @@ async fn read_udp_open_ack(
     assert_eq!(frame.header.id, flow_id);
     assert!(frame.payload.is_empty());
     Ok(())
+}
+
+async fn read_relay_frame(
+    carrier: &mut ClientTlsStream<TcpStream>,
+    frame_type: FrameType,
+    flow_id: u64,
+) -> Result<Frame, TestError> {
+    for _ in 0..8 {
+        let frame = tokio::time::timeout(
+            Duration::from_secs(3),
+            read_frame(carrier, FrameLimits::default()),
+        )
+        .await??;
+        if frame.header.frame_type == frame_type && frame.header.id == flow_id {
+            return Ok(frame);
+        }
+    }
+    Err(format!("did not receive {frame_type:?} for flow {flow_id}").into())
 }
 
 async fn assert_flow_error(

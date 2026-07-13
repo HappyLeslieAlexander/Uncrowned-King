@@ -37,6 +37,10 @@ use uk_proto::{
     validate_connection_frame, write_frame,
 };
 
+use crate::observability::{
+    ActiveFlowGuard, FlowOpenFailure, RelayDirection, RelayProtocol, ServerMetrics,
+};
+
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const TARGET_CONNECT_PARALLELISM: usize = 4;
 const TARGET_RESOLUTION_ADDR_LIMIT: usize = 64;
@@ -68,13 +72,19 @@ struct SessionTasks {
 struct CarrierWriter {
     inner: Arc<Mutex<WriteHalf<TlsStream<TcpStream>>>>,
     shutdown: SessionShutdown,
+    metrics: Arc<ServerMetrics>,
 }
 
 impl CarrierWriter {
-    fn new(inner: WriteHalf<TlsStream<TcpStream>>, shutdown: SessionShutdown) -> Self {
+    fn new(
+        inner: WriteHalf<TlsStream<TcpStream>>,
+        shutdown: SessionShutdown,
+        metrics: Arc<ServerMetrics>,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(inner)),
             shutdown,
+            metrics,
         }
     }
 }
@@ -355,6 +365,7 @@ struct TargetFlow {
     control: TargetFlowControl,
     target_to_client_open: bool,
     client_to_target_open: bool,
+    metrics_guard: Option<ActiveFlowGuard>,
 }
 
 #[derive(Debug)]
@@ -362,6 +373,7 @@ struct UdpTargetFlow {
     socket: Arc<UdpSocket>,
     control: TargetFlowControl,
     last_activity: time::Instant,
+    metrics_guard: Option<ActiveFlowGuard>,
 }
 
 #[derive(Debug, Clone)]
@@ -380,6 +392,7 @@ struct RelaySessionContext<'a> {
     session_buffer: SessionBufferControl,
     open_dial_limiter: OpenDialLimiter,
     flow_tokens: FlowTokenAllocator,
+    metrics: Arc<ServerMetrics>,
 }
 
 struct TargetOpenTask {
@@ -443,6 +456,7 @@ pub(crate) async fn relay_session(
     limits: RelayLimits,
     idle_timeout: Option<Duration>,
     mut shutdown_rx: watch::Receiver<bool>,
+    metrics: Arc<ServerMetrics>,
 ) -> Result<(), AnyError> {
     let mut state = ServerSessionState::Authenticated;
     transition(&mut state, ServerSessionState::Relaying);
@@ -455,7 +469,7 @@ pub(crate) async fn relay_session(
     let session_buffer = SessionBufferControl::default();
     let open_dial_limiter = OpenDialLimiter::new(limits.max_outbound_dials_per_session);
     let flow_tokens = FlowTokenAllocator::default();
-    let carrier_writer = CarrierWriter::new(carrier_writer, shutdown.clone());
+    let carrier_writer = CarrierWriter::new(carrier_writer, shutdown.clone(), Arc::clone(&metrics));
     let context = RelaySessionContext {
         identity,
         policy_set,
@@ -466,6 +480,7 @@ pub(crate) async fn relay_session(
         session_buffer,
         open_dial_limiter,
         flow_tokens,
+        metrics,
     };
     let mut idle_deadline = next_idle_deadline(idle_timeout);
     let mut udp_idle_interval = udp_idle_interval(limits.udp_flow_idle_timeout);
@@ -1230,15 +1245,22 @@ async fn handle_tcp_open_frame(
     target_writers: &mut FlowTable,
     session_tasks: &mut SessionTasks,
 ) -> Result<(), AnyError> {
+    context.metrics.record_flow_open_request(RelayProtocol::Tcp);
     match check_open_slot(frame.header.id, target_writers, context.limits.max_streams) {
         Ok(()) => {}
         Err(OpenSlotRejection::DuplicateFlowId) => {
+            context
+                .metrics
+                .record_flow_open_failure(RelayProtocol::Tcp, FlowOpenFailure::Protocol);
             send_error(context.carrier_writer, frame.header.id, ErrorCode::Protocol).await?;
             send_tcp_close(context.carrier_writer, frame.header.id, TCP_CLOSE_ERROR).await?;
             remove_flow_slot(target_writers, frame.header.id);
             return Ok(());
         }
         Err(OpenSlotRejection::ResourceLimit) => {
+            context
+                .metrics
+                .record_flow_open_failure(RelayProtocol::Tcp, FlowOpenFailure::ResourceLimit);
             send_resource_limit(context.carrier_writer, frame.header.id).await?;
             send_tcp_close(context.carrier_writer, frame.header.id, TCP_CLOSE_ERROR).await?;
             return Ok(());
@@ -1272,10 +1294,16 @@ async fn validate_tcp_open_request(
 ) -> Result<Option<(u64, Target)>, AnyError> {
     let flow_id = frame.header.id;
     if flow_id == 0 {
+        context
+            .metrics
+            .record_flow_open_failure(RelayProtocol::Tcp, FlowOpenFailure::Protocol);
         send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
         return Err("tcp flow id must be non-zero".into());
     }
     if !is_client_initiated_flow_id(flow_id) {
+        context
+            .metrics
+            .record_flow_open_failure(RelayProtocol::Tcp, FlowOpenFailure::Protocol);
         send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
         send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
         warn!(event = "tcp.open.reserved_flow_id", flow_id);
@@ -1286,6 +1314,9 @@ async fn validate_tcp_open_request(
     let open = match TcpOpen::decode(&mut payload) {
         Ok(open) => open,
         Err(err) => {
+            context
+                .metrics
+                .record_flow_open_failure(RelayProtocol::Tcp, FlowOpenFailure::Protocol);
             send_error(
                 context.carrier_writer,
                 flow_id,
@@ -1298,6 +1329,9 @@ async fn validate_tcp_open_request(
         }
     };
     if open.open_flags != TCP_OPEN_FLAGS_NONE {
+        context
+            .metrics
+            .record_flow_open_failure(RelayProtocol::Tcp, FlowOpenFailure::Protocol);
         send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
         send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
         return Ok(None);
@@ -1312,6 +1346,7 @@ async fn handle_udp_open_frame(
     target_writers: &mut FlowTable,
     session_tasks: &mut SessionTasks,
 ) -> Result<(), AnyError> {
+    context.metrics.record_flow_open_request(RelayProtocol::Udp);
     match check_udp_open_slot(
         frame.header.id,
         target_writers,
@@ -1320,12 +1355,18 @@ async fn handle_udp_open_frame(
     ) {
         Ok(()) => {}
         Err(UdpOpenSlotRejection::DuplicateFlowId) => {
+            context
+                .metrics
+                .record_flow_open_failure(RelayProtocol::Udp, FlowOpenFailure::Protocol);
             send_error(context.carrier_writer, frame.header.id, ErrorCode::Protocol).await?;
             send_udp_close(context.carrier_writer, frame.header.id, UDP_CLOSE_ERROR).await?;
             remove_flow_slot(target_writers, frame.header.id);
             return Ok(());
         }
         Err(UdpOpenSlotRejection::ResourceLimit | UdpOpenSlotRejection::UdpFlowLimit) => {
+            context
+                .metrics
+                .record_flow_open_failure(RelayProtocol::Udp, FlowOpenFailure::ResourceLimit);
             send_resource_limit(context.carrier_writer, frame.header.id).await?;
             send_udp_close(context.carrier_writer, frame.header.id, UDP_CLOSE_ERROR).await?;
             return Ok(());
@@ -1359,10 +1400,16 @@ async fn validate_udp_open_request(
 ) -> Result<Option<(u64, Target)>, AnyError> {
     let flow_id = frame.header.id;
     if flow_id == 0 {
+        context
+            .metrics
+            .record_flow_open_failure(RelayProtocol::Udp, FlowOpenFailure::Protocol);
         send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
         return Err("udp flow id must be non-zero".into());
     }
     if !is_client_initiated_flow_id(flow_id) {
+        context
+            .metrics
+            .record_flow_open_failure(RelayProtocol::Udp, FlowOpenFailure::Protocol);
         send_error(context.carrier_writer, flow_id, ErrorCode::Protocol).await?;
         send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
         warn!(event = "udp.open.reserved_flow_id", flow_id);
@@ -1373,6 +1420,9 @@ async fn validate_udp_open_request(
     let open = match UdpOpen::decode(&mut payload) {
         Ok(open) => open,
         Err(err) => {
+            context
+                .metrics
+                .record_flow_open_failure(RelayProtocol::Udp, FlowOpenFailure::Protocol);
             send_error(
                 context.carrier_writer,
                 flow_id,
@@ -1435,16 +1485,23 @@ async fn forward_udp_data_frame(
         return Ok(());
     };
     target.record_activity();
-    if let Err(err) = target.socket.send(&payload).await {
-        warn!(event = "udp.target.write.error", flow_id, error = %err);
-        send_error(
-            context.carrier_writer,
-            flow_id,
-            ErrorCode::TargetUnavailable,
-        )
-        .await?;
-        send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
-        remove_flow_slot(target_writers, flow_id);
+    match target.socket.send(&payload).await {
+        Ok(written) => context.metrics.record_relay_bytes(
+            RelayProtocol::Udp,
+            RelayDirection::ClientToTarget,
+            written,
+        ),
+        Err(err) => {
+            warn!(event = "udp.target.write.error", flow_id, error = %err);
+            send_error(
+                context.carrier_writer,
+                flow_id,
+                ErrorCode::TargetUnavailable,
+            )
+            .await?;
+            send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
+            remove_flow_slot(target_writers, flow_id);
+        }
     }
     Ok(())
 }
@@ -1700,8 +1757,9 @@ async fn accept_open_target(
     let flow_control = TargetFlowControl::new(context.session_buffer.clone());
     let token = context.flow_tokens.next();
     let identity = TargetFlowIdentity { flow_id, token };
-    let target_flow = TargetFlow::new(token, target_writer_tx, flow_control.clone());
     send_tcp_data(context.carrier_writer, flow_id, Bytes::new()).await?;
+    let target_flow = TargetFlow::new(token, target_writer_tx, flow_control.clone())
+        .track_metrics(context.metrics.begin_flow(RelayProtocol::Tcp));
     spawn_target_reader(
         session_tasks,
         TargetReaderTask {
@@ -1739,8 +1797,9 @@ async fn accept_open_udp_target(
 ) -> Result<UdpTargetFlow, AnyError> {
     let target_socket = Arc::new(target_socket);
     let flow_control = TargetFlowControl::new(context.session_buffer.clone());
-    let target_flow = UdpTargetFlow::new(Arc::clone(&target_socket), flow_control.clone());
     send_udp_data(context.carrier_writer, flow_id, Bytes::new()).await?;
+    let target_flow = UdpTargetFlow::new(Arc::clone(&target_socket), flow_control.clone())
+        .track_metrics(context.metrics.begin_flow(RelayProtocol::Udp));
     spawn_udp_reader(
         session_tasks,
         UdpReaderTask {
@@ -1765,16 +1824,25 @@ async fn reject_open_failure(
 ) -> Result<(), AnyError> {
     match failure {
         OpenFailure::PolicyDenied => {
+            context
+                .metrics
+                .record_flow_open_failure(RelayProtocol::Tcp, FlowOpenFailure::PolicyDenied);
             warn!(event = "policy.denied", flow_id, target = %target.log_safe());
             send_policy_denied(context.carrier_writer, flow_id).await?;
             send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_NORMAL).await?;
         }
         OpenFailure::ResourceLimit => {
+            context
+                .metrics
+                .record_flow_open_failure(RelayProtocol::Tcp, FlowOpenFailure::ResourceLimit);
             warn!(event = "tcp.open.dial_limit", flow_id, target = %target.log_safe());
             send_resource_limit(context.carrier_writer, flow_id).await?;
             send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
         }
         OpenFailure::TargetUnavailable(err) => {
+            context
+                .metrics
+                .record_flow_open_failure(RelayProtocol::Tcp, FlowOpenFailure::TargetUnavailable);
             warn!(
                 event = "target.unavailable",
                 flow_id,
@@ -1790,6 +1858,9 @@ async fn reject_open_failure(
             send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
         }
         OpenFailure::TargetTimeout => {
+            context
+                .metrics
+                .record_flow_open_failure(RelayProtocol::Tcp, FlowOpenFailure::TargetTimeout);
             warn!(event = "target.timeout", flow_id, target = %target.log_safe());
             send_error(context.carrier_writer, flow_id, ErrorCode::TargetTimeout).await?;
             send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
@@ -1806,16 +1877,25 @@ async fn reject_udp_open_failure(
 ) -> Result<(), AnyError> {
     match failure {
         OpenFailure::PolicyDenied => {
+            context
+                .metrics
+                .record_flow_open_failure(RelayProtocol::Udp, FlowOpenFailure::PolicyDenied);
             warn!(event = "udp.policy.denied", flow_id, target = %target.log_safe());
             send_policy_denied(context.carrier_writer, flow_id).await?;
             send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_NORMAL).await?;
         }
         OpenFailure::ResourceLimit => {
+            context
+                .metrics
+                .record_flow_open_failure(RelayProtocol::Udp, FlowOpenFailure::ResourceLimit);
             warn!(event = "udp.open.dial_limit", flow_id, target = %target.log_safe());
             send_resource_limit(context.carrier_writer, flow_id).await?;
             send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
         }
         OpenFailure::TargetUnavailable(err) => {
+            context
+                .metrics
+                .record_flow_open_failure(RelayProtocol::Udp, FlowOpenFailure::TargetUnavailable);
             warn!(
                 event = "udp.target.unavailable",
                 flow_id,
@@ -1831,6 +1911,9 @@ async fn reject_udp_open_failure(
             send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
         }
         OpenFailure::TargetTimeout => {
+            context
+                .metrics
+                .record_flow_open_failure(RelayProtocol::Udp, FlowOpenFailure::TargetTimeout);
             warn!(event = "udp.target.timeout", flow_id, target = %target.log_safe());
             send_error(context.carrier_writer, flow_id, ErrorCode::TargetTimeout).await?;
             send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
@@ -1913,6 +1996,7 @@ fn spawn_target_writer(session_tasks: &mut SessionTasks, task: TargetWriterTask)
             task.flow_control,
             &task.event_tx,
             &task.shutdown,
+            &task.carrier_writer.metrics,
         )
         .await
         {
@@ -1970,6 +2054,7 @@ async fn relay_client_to_target(
     flow_control: TargetFlowControl,
     event_tx: &FlowEventSender,
     shutdown: &SessionShutdown,
+    metrics: &ServerMetrics,
 ) -> Result<(), AnyError> {
     loop {
         let command = tokio::select! {
@@ -1986,12 +2071,18 @@ async fn relay_client_to_target(
                     return Ok(());
                 }
 
+                let payload_len = buffered_data.payload().len();
                 let write_result = tokio::select! {
                     result = target_writer.write_all(buffered_data.payload()) => result,
                     () = shutdown.closed() => return Ok(()),
                     () = flow_control.aborted() => return Ok(()),
                 };
                 write_result?;
+                metrics.record_relay_bytes(
+                    RelayProtocol::Tcp,
+                    RelayDirection::ClientToTarget,
+                    payload_len,
+                );
                 try_record_flow_activity(event_tx, FlowEvent::Activity);
             }
             TargetCommand::Close => {
@@ -2308,7 +2399,13 @@ impl TargetFlow {
             control,
             target_to_client_open: true,
             client_to_target_open: true,
+            metrics_guard: None,
         }
+    }
+
+    fn track_metrics(mut self, guard: ActiveFlowGuard) -> Self {
+        self.metrics_guard = Some(guard);
+        self
     }
 
     fn enqueue_data(
@@ -2406,7 +2503,13 @@ impl UdpTargetFlow {
             socket,
             control,
             last_activity: time::Instant::now(),
+            metrics_guard: None,
         }
+    }
+
+    fn track_metrics(mut self, guard: ActiveFlowGuard) -> Self {
+        self.metrics_guard = Some(guard);
+        self
     }
 
     fn abort(&self) {
@@ -2478,6 +2581,11 @@ async fn relay_target_to_client(
             Bytes::copy_from_slice(&target_buf[..read]),
         )
         .await?;
+        carrier_writer.metrics.record_relay_bytes(
+            RelayProtocol::Tcp,
+            RelayDirection::TargetToClient,
+            read,
+        );
         try_record_flow_activity(event_tx, FlowEvent::Activity);
     }
 }
@@ -2519,6 +2627,11 @@ async fn relay_udp_target_to_client(
             Bytes::copy_from_slice(&target_buf[..read]),
         )
         .await?;
+        carrier_writer.metrics.record_relay_bytes(
+            RelayProtocol::Udp,
+            RelayDirection::TargetToClient,
+            read,
+        );
         try_record_flow_activity(event_tx, FlowEvent::UdpActivity(flow_id));
     }
 }
@@ -3498,6 +3611,7 @@ mod tests {
         let flow_control = TargetFlowControl::default();
         let shutdown = SessionShutdown::default();
         let shutdown_handle = shutdown.clone();
+        let metrics = Arc::new(ServerMetrics::default());
 
         let writer = tokio::spawn(async move {
             relay_client_to_target(
@@ -3506,6 +3620,7 @@ mod tests {
                 flow_control,
                 &event_tx,
                 &shutdown,
+                &metrics,
             )
             .await
         });
@@ -3529,6 +3644,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(1);
         let flow_control = TargetFlowControl::default();
         let shutdown = SessionShutdown::default();
+        let metrics = ServerMetrics::default();
         let payload = Bytes::from_static(b"writer activity");
         let buffered_payload =
             BufferedTargetData::new(payload.clone(), flow_control.clone(), 1024, 1024).unwrap();
@@ -3545,6 +3661,7 @@ mod tests {
             flow_control,
             &event_tx,
             &shutdown,
+            &metrics,
         );
         let reader = async {
             let mut received = vec![0_u8; payload.len()];

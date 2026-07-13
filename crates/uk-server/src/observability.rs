@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     io,
     sync::{
         Arc,
@@ -21,7 +22,98 @@ const MAX_REQUEST_HEAD_BYTES: usize = 8 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-#[derive(Default)]
+const PROTOCOL_COUNT: usize = 2;
+const OPEN_FAILURE_COUNT: usize = 5;
+const DIRECTION_COUNT: usize = 2;
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum RelayProtocol {
+    Tcp,
+    Udp,
+}
+
+impl RelayProtocol {
+    const ALL: [Self; PROTOCOL_COUNT] = [Self::Tcp, Self::Udp];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Tcp => 0,
+            Self::Udp => 1,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum FlowOpenFailure {
+    Protocol,
+    PolicyDenied,
+    ResourceLimit,
+    TargetUnavailable,
+    TargetTimeout,
+}
+
+impl FlowOpenFailure {
+    const ALL: [Self; OPEN_FAILURE_COUNT] = [
+        Self::Protocol,
+        Self::PolicyDenied,
+        Self::ResourceLimit,
+        Self::TargetUnavailable,
+        Self::TargetTimeout,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Protocol => 0,
+            Self::PolicyDenied => 1,
+            Self::ResourceLimit => 2,
+            Self::TargetUnavailable => 3,
+            Self::TargetTimeout => 4,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Protocol => "protocol",
+            Self::PolicyDenied => "policy_denied",
+            Self::ResourceLimit => "resource_limit",
+            Self::TargetUnavailable => "target_unavailable",
+            Self::TargetTimeout => "target_timeout",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum RelayDirection {
+    ClientToTarget,
+    TargetToClient,
+}
+
+impl RelayDirection {
+    const ALL: [Self; DIRECTION_COUNT] = [Self::ClientToTarget, Self::TargetToClient];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::ClientToTarget => 0,
+            Self::TargetToClient => 1,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ClientToTarget => "client_to_target",
+            Self::TargetToClient => "target_to_client",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 pub(super) struct ServerMetrics {
     ready: AtomicBool,
     accepted_connections_total: AtomicU64,
@@ -31,6 +123,11 @@ pub(super) struct ServerMetrics {
     authenticated_sessions_total: AtomicU64,
     rejected_sessions_total: AtomicU64,
     active_sessions: AtomicU64,
+    flow_open_requests_total: [AtomicU64; PROTOCOL_COUNT],
+    flow_open_failures_total: [[AtomicU64; OPEN_FAILURE_COUNT]; PROTOCOL_COUNT],
+    opened_flows_total: [AtomicU64; PROTOCOL_COUNT],
+    active_flows: [AtomicU64; PROTOCOL_COUNT],
+    relay_bytes_total: [[AtomicU64; DIRECTION_COUNT]; PROTOCOL_COUNT],
 }
 
 impl ServerMetrics {
@@ -72,9 +169,42 @@ impl ServerMetrics {
         ActiveMetricGuard::new(Arc::clone(self), ActiveMetric::Session)
     }
 
+    pub(super) fn record_flow_open_request(&self, protocol: RelayProtocol) {
+        self.flow_open_requests_total[protocol.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_flow_open_failure(
+        &self,
+        protocol: RelayProtocol,
+        failure: FlowOpenFailure,
+    ) {
+        self.flow_open_failures_total[protocol.index()][failure.index()]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn begin_flow(self: &Arc<Self>, protocol: RelayProtocol) -> ActiveFlowGuard {
+        self.opened_flows_total[protocol.index()].fetch_add(1, Ordering::Relaxed);
+        self.active_flows[protocol.index()].fetch_add(1, Ordering::Relaxed);
+        ActiveFlowGuard {
+            metrics: Arc::clone(self),
+            protocol,
+        }
+    }
+
+    pub(super) fn record_relay_bytes(
+        &self,
+        protocol: RelayProtocol,
+        direction: RelayDirection,
+        bytes: usize,
+    ) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.relay_bytes_total[protocol.index()][direction.index()]
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
     fn render(&self) -> String {
         let ready = u8::from(self.is_ready());
-        format!(
+        let mut output = format!(
             concat!(
                 "# HELP uncrowned_king_server_ready Whether the relay listener is ready to accept connections.\n",
                 "# TYPE uncrowned_king_server_ready gauge\n",
@@ -110,7 +240,66 @@ impl ServerMetrics {
                 self.authenticated_sessions_total.load(Ordering::Relaxed),
             rejected_sessions_total = self.rejected_sessions_total.load(Ordering::Relaxed),
             active_sessions = self.active_sessions.load(Ordering::Relaxed),
-        )
+        );
+        output.push_str(
+            "# HELP uncrowned_king_server_flow_open_requests_total UK flow open requests received.\n\
+# TYPE uncrowned_king_server_flow_open_requests_total counter\n\
+# HELP uncrowned_king_server_flow_open_failures_total UK flow opens rejected or failed.\n\
+# TYPE uncrowned_king_server_flow_open_failures_total counter\n\
+# HELP uncrowned_king_server_opened_flows_total UK flows opened successfully.\n\
+# TYPE uncrowned_king_server_opened_flows_total counter\n\
+# HELP uncrowned_king_server_active_flows UK flows currently active.\n\
+# TYPE uncrowned_king_server_active_flows gauge\n\
+# HELP uncrowned_king_server_relay_bytes_total Payload bytes relayed after a successful socket or carrier write.\n\
+# TYPE uncrowned_king_server_relay_bytes_total counter\n",
+        );
+        for protocol in RelayProtocol::ALL {
+            let protocol_index = protocol.index();
+            writeln!(
+                output,
+                "uncrowned_king_server_flow_open_requests_total{{protocol=\"{}\"}} {}",
+                protocol.label(),
+                self.flow_open_requests_total[protocol_index].load(Ordering::Relaxed)
+            )
+            .expect("writing metrics to a String cannot fail");
+            for failure in FlowOpenFailure::ALL {
+                writeln!(
+                    output,
+                    "uncrowned_king_server_flow_open_failures_total{{protocol=\"{}\",reason=\"{}\"}} {}",
+                    protocol.label(),
+                    failure.label(),
+                    self.flow_open_failures_total[protocol_index][failure.index()]
+                        .load(Ordering::Relaxed)
+                )
+                .expect("writing metrics to a String cannot fail");
+            }
+            writeln!(
+                output,
+                "uncrowned_king_server_opened_flows_total{{protocol=\"{}\"}} {}",
+                protocol.label(),
+                self.opened_flows_total[protocol_index].load(Ordering::Relaxed)
+            )
+            .expect("writing metrics to a String cannot fail");
+            writeln!(
+                output,
+                "uncrowned_king_server_active_flows{{protocol=\"{}\"}} {}",
+                protocol.label(),
+                self.active_flows[protocol_index].load(Ordering::Relaxed)
+            )
+            .expect("writing metrics to a String cannot fail");
+            for direction in RelayDirection::ALL {
+                writeln!(
+                    output,
+                    "uncrowned_king_server_relay_bytes_total{{protocol=\"{}\",direction=\"{}\"}} {}",
+                    protocol.label(),
+                    direction.label(),
+                    self.relay_bytes_total[protocol_index][direction.index()]
+                        .load(Ordering::Relaxed)
+                )
+                .expect("writing metrics to a String cannot fail");
+            }
+        }
+        output
     }
 }
 
@@ -137,6 +326,18 @@ impl Drop for ActiveMetricGuard {
             ActiveMetric::Session => &self.metrics.active_sessions,
         };
         gauge.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct ActiveFlowGuard {
+    metrics: Arc<ServerMetrics>,
+    protocol: RelayProtocol,
+}
+
+impl Drop for ActiveFlowGuard {
+    fn drop(&mut self) {
+        self.metrics.active_flows[self.protocol.index()].fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -373,6 +574,11 @@ mod tests {
         let handshake = metrics.begin_handshake();
         let session = metrics.begin_session();
         metrics.record_rejected_session();
+        metrics.record_flow_open_request(RelayProtocol::Tcp);
+        metrics.record_flow_open_request(RelayProtocol::Udp);
+        metrics.record_flow_open_failure(RelayProtocol::Tcp, FlowOpenFailure::TargetUnavailable);
+        metrics.record_relay_bytes(RelayProtocol::Tcp, RelayDirection::ClientToTarget, 123);
+        let flow = metrics.begin_flow(RelayProtocol::Tcp);
 
         let response = request(
             Arc::clone(&metrics),
@@ -384,12 +590,25 @@ mod tests {
         assert!(response.contains("uncrowned_king_server_accepted_connections_total 1\n"));
         assert!(response.contains("uncrowned_king_server_active_handshakes 1\n"));
         assert!(response.contains("uncrowned_king_server_active_sessions 1\n"));
+        assert!(
+            response
+                .contains("uncrowned_king_server_flow_open_requests_total{protocol=\"tcp\"} 1\n")
+        );
+        assert!(response.contains(
+            "uncrowned_king_server_flow_open_failures_total{protocol=\"tcp\",reason=\"target_unavailable\"} 1\n"
+        ));
+        assert!(response.contains("uncrowned_king_server_active_flows{protocol=\"tcp\"} 1\n"));
+        assert!(response.contains(
+            "uncrowned_king_server_relay_bytes_total{protocol=\"tcp\",direction=\"client_to_target\"} 123\n"
+        ));
 
         drop(handshake);
         drop(session);
+        drop(flow);
         let response = request(metrics, b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
         assert!(response.contains("uncrowned_king_server_active_handshakes 0\n"));
         assert!(response.contains("uncrowned_king_server_active_sessions 0\n"));
+        assert!(response.contains("uncrowned_king_server_active_flows{protocol=\"tcp\"} 0\n"));
     }
 
     #[tokio::test]
