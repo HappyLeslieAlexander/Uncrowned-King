@@ -17,6 +17,59 @@ use crate::{config::ClientConfig, tls};
 
 type AnyError = Box<dyn Error + Send + Sync>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EndpointAttemptOutcome {
+    Succeeded,
+    Failed(EndpointFailurePhase),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EndpointFailurePhase {
+    Tcp,
+    Tls,
+    Auth,
+    Settings,
+    Timeout,
+    Protocol,
+    Other,
+}
+
+impl EndpointFailurePhase {
+    pub(crate) const ALL: [Self; 7] = [
+        Self::Tcp,
+        Self::Tls,
+        Self::Auth,
+        Self::Settings,
+        Self::Timeout,
+        Self::Protocol,
+        Self::Other,
+    ];
+
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Tcp => 0,
+            Self::Tls => 1,
+            Self::Auth => 2,
+            Self::Settings => 3,
+            Self::Timeout => 4,
+            Self::Protocol => 5,
+            Self::Other => 6,
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Tls => "tls",
+            Self::Auth => "auth",
+            Self::Settings => "settings",
+            Self::Timeout => "timeout",
+            Self::Protocol => "protocol",
+            Self::Other => "other",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct EndpointAttemptError {
     index: usize,
@@ -62,7 +115,13 @@ impl Error for ConnectAttemptsError {
 #[derive(Debug)]
 struct HandshakePhaseError {
     phase: &'static str,
+    failure_phase: EndpointFailurePhase,
     source: AnyError,
+}
+
+#[derive(Debug)]
+struct ServerHandshakeError {
+    code: ErrorCode,
 }
 
 impl fmt::Display for HandshakePhaseError {
@@ -77,23 +136,49 @@ impl Error for HandshakePhaseError {
     }
 }
 
+impl fmt::Display for ServerHandshakeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.code {
+            ErrorCode::AuthFailed => formatter.write_str("authentication failed"),
+            code => write!(formatter, "server returned handshake error: {code:?}"),
+        }
+    }
+}
+
+impl Error for ServerHandshakeError {}
+
 /// Connects to the configured server and completes UK authentication.
 pub async fn connect_authenticated(
     config: &ClientConfig,
 ) -> Result<(TlsStream<TcpStream>, Settings), AnyError> {
+    connect_authenticated_observed(config, |_| {}).await
+}
+
+pub(crate) async fn connect_authenticated_observed<F>(
+    config: &ClientConfig,
+    observe: F,
+) -> Result<(TlsStream<TcpStream>, Settings), AnyError>
+where
+    F: FnMut(EndpointAttemptOutcome),
+{
     config.validate_network_endpoints()?;
     config.validate_auth_material()?;
     connect_authenticated_inner(
         config,
         handshake_timeout(config.handshake_timeout_seconds()),
+        observe,
     )
     .await
 }
 
-async fn connect_authenticated_inner(
+async fn connect_authenticated_inner<F>(
     config: &ClientConfig,
     endpoint_timeout: Option<Duration>,
-) -> Result<(TlsStream<TcpStream>, Settings), AnyError> {
+    mut observe: F,
+) -> Result<(TlsStream<TcpStream>, Settings), AnyError>
+where
+    F: FnMut(EndpointAttemptOutcome),
+{
     let connector = tls::connector(&config.ca_cert_path)?;
     let server_name = tls::server_name(config.server_name.clone())?;
     let mut attempts = Vec::new();
@@ -108,12 +193,18 @@ async fn connect_authenticated_inner(
         )
         .await
         {
-            Ok(session) => return Ok(session),
+            Ok(session) => {
+                observe(EndpointAttemptOutcome::Succeeded);
+                return Ok(session);
+            }
             Err(err) => {
+                let failure_phase = endpoint_failure_phase(&err);
+                observe(EndpointAttemptOutcome::Failed(failure_phase));
                 warn!(
                     event = "client.session.connect_endpoint_failed",
                     attempt = index,
                     server_addr = %endpoint,
+                    failure_phase = failure_phase.label(),
                     error = %err
                 );
                 attempts.push(EndpointAttemptError {
@@ -145,6 +236,7 @@ async fn connect_authenticated_endpoint_with_timeout(
             Ok(result) => result,
             Err(_) => Err(phase_error(
                 "client handshake",
+                EndpointFailurePhase::Timeout,
                 format!("deadline exceeded for {endpoint} after {timeout:?}"),
             )),
         }
@@ -161,24 +253,31 @@ async fn connect_authenticated_endpoint(
 ) -> Result<(TlsStream<TcpStream>, Settings), AnyError> {
     let tcp = TcpStream::connect(endpoint)
         .await
-        .map_err(|err| phase_error("tcp connect", err))?;
+        .map_err(|err| phase_error("tcp connect", EndpointFailurePhase::Tcp, err))?;
     tcp.set_nodelay(true)
-        .map_err(|err| phase_error("tcp nodelay", err))?;
+        .map_err(|err| phase_error("tcp nodelay", EndpointFailurePhase::Tcp, err))?;
     let mut stream = connector
         .connect(server_name, tcp)
         .await
-        .map_err(|err| phase_error("tls connect", err))?;
-    tls::verify_alpn(&stream).map_err(|err| phase_error("tls alpn verify", err))?;
-    let exporter = tls::exporter(&stream).map_err(|err| phase_error("tls exporter", err))?;
+        .map_err(|err| phase_error("tls connect", EndpointFailurePhase::Tls, err))?;
+    tls::verify_alpn(&stream)
+        .map_err(|err| phase_error("tls alpn verify", EndpointFailurePhase::Tls, err))?;
+    let exporter = tls::exporter(&stream)
+        .map_err(|err| phase_error("tls exporter", EndpointFailurePhase::Tls, err))?;
 
     let challenge_frame = read_frame(&mut stream, FrameLimits::default())
         .await
-        .map_err(|err| phase_error("read auth challenge", err))?;
-    validate_connection_frame(&challenge_frame, FrameType::AuthChallenge)
-        .map_err(|err| phase_error("validate auth challenge", err))?;
+        .map_err(|err| phase_error("read auth challenge", EndpointFailurePhase::Auth, err))?;
+    validate_connection_frame(&challenge_frame, FrameType::AuthChallenge).map_err(|err| {
+        phase_error(
+            "validate auth challenge",
+            EndpointFailurePhase::Protocol,
+            err,
+        )
+    })?;
     let mut challenge_payload = challenge_frame.payload;
     let challenge = AuthChallenge::decode(&mut challenge_payload)
-        .map_err(|err| phase_error("decode auth challenge", err))?;
+        .map_err(|err| phase_error("decode auth challenge", EndpointFailurePhase::Protocol, err))?;
 
     let response = AuthResponse::for_challenge(
         config.key_id.as_bytes(),
@@ -188,23 +287,28 @@ async fn connect_authenticated_endpoint(
         unix_now(),
         Vec::new(),
     )
-    .map_err(|err| phase_error("build auth response", err))?;
+    .map_err(|err| phase_error("build auth response", EndpointFailurePhase::Auth, err))?;
     let mut response_payload = BytesMut::new();
     response
         .encode(&mut response_payload)
-        .map_err(|err| phase_error("encode auth response", err))?;
+        .map_err(|err| phase_error("encode auth response", EndpointFailurePhase::Auth, err))?;
     let response_frame = Frame::new(FrameType::AuthResponse, 0, 0, response_payload.freeze())
-        .map_err(|err| phase_error("build auth response frame", err))?;
+        .map_err(|err| phase_error("build auth response frame", EndpointFailurePhase::Auth, err))?;
     write_frame(&mut stream, &response_frame)
         .await
-        .map_err(|err| phase_error("write auth response", err))?;
+        .map_err(|err| phase_error("write auth response", EndpointFailurePhase::Auth, err))?;
 
     let settings_frame = read_frame(&mut stream, FrameLimits::default())
         .await
-        .map_err(|err| phase_error("read server settings", err))?;
-    let settings = decode_server_settings_frame(settings_frame)
-        .map_err(|err| phase_error("decode server settings", err))?;
-    let negotiated = settings.negotiated_v0_1()?;
+        .map_err(|err| phase_error("read server settings", EndpointFailurePhase::Auth, err))?;
+    let settings = decode_server_settings_frame(settings_frame)?;
+    let negotiated = settings.negotiated_v0_1().map_err(|err| {
+        phase_error(
+            "negotiate server settings",
+            EndpointFailurePhase::Settings,
+            err,
+        )
+    })?;
     info!(
         event = "auth.success",
         max_frame_size = negotiated.max_frame_size
@@ -215,36 +319,89 @@ async fn connect_authenticated_endpoint(
 fn decode_server_settings_frame(frame: Frame) -> Result<Settings, AnyError> {
     match frame.header.frame_type {
         FrameType::Settings => {
-            validate_connection_frame(&frame, FrameType::Settings)?;
+            validate_connection_frame(&frame, FrameType::Settings).map_err(|err| {
+                phase_error(
+                    "validate server settings",
+                    EndpointFailurePhase::Protocol,
+                    err,
+                )
+            })?;
             let mut settings_payload = frame.payload;
-            let settings = Settings::decode(&mut settings_payload)?;
-            settings.negotiated_v0_1()?;
+            let settings = Settings::decode(&mut settings_payload).map_err(|err| {
+                phase_error(
+                    "decode server settings",
+                    EndpointFailurePhase::Protocol,
+                    err,
+                )
+            })?;
+            settings.negotiated_v0_1().map_err(|err| {
+                phase_error(
+                    "negotiate server settings",
+                    EndpointFailurePhase::Settings,
+                    err,
+                )
+            })?;
             Ok(settings)
         }
         FrameType::Error => {
-            validate_connection_frame(&frame, FrameType::Error)?;
+            validate_connection_frame(&frame, FrameType::Error).map_err(|err| {
+                phase_error(
+                    "validate server handshake error",
+                    EndpointFailurePhase::Protocol,
+                    err,
+                )
+            })?;
             let mut payload = frame.payload;
-            let status = ErrorPayload::decode(&mut payload)?;
-            match status.code {
-                ErrorCode::AuthFailed => Err("authentication failed".into()),
-                code => Err(format!("server returned handshake error: {code:?}").into()),
-            }
+            let status = ErrorPayload::decode(&mut payload).map_err(|err| {
+                phase_error(
+                    "decode server handshake error",
+                    EndpointFailurePhase::Protocol,
+                    err,
+                )
+            })?;
+            Err(Box::new(ServerHandshakeError { code: status.code }))
         }
         _ => {
-            validate_connection_frame(&frame, FrameType::Settings)?;
+            validate_connection_frame(&frame, FrameType::Settings).map_err(|err| {
+                phase_error(
+                    "validate server response",
+                    EndpointFailurePhase::Protocol,
+                    err,
+                )
+            })?;
             Err("unexpected connection frame type".into())
         }
     }
 }
 
-fn phase_error<E>(phase: &'static str, source: E) -> AnyError
+fn phase_error<E>(phase: &'static str, failure_phase: EndpointFailurePhase, source: E) -> AnyError
 where
     E: Into<AnyError>,
 {
     Box::new(HandshakePhaseError {
         phase,
+        failure_phase,
         source: source.into(),
     })
+}
+
+fn endpoint_failure_phase(error: &AnyError) -> EndpointFailurePhase {
+    let mut current = Some(error.as_ref() as &(dyn Error + 'static));
+    while let Some(source) = current {
+        if source.downcast_ref::<ServerHandshakeError>().is_some() {
+            return EndpointFailurePhase::Auth;
+        }
+        current = source.source();
+    }
+
+    let mut current = Some(error.as_ref() as &(dyn Error + 'static));
+    while let Some(source) = current {
+        if let Some(error) = source.downcast_ref::<HandshakePhaseError>() {
+            return error.failure_phase;
+        }
+        current = source.source();
+    }
+    EndpointFailurePhase::Other
 }
 
 fn handshake_timeout(seconds: u64) -> Option<Duration> {
@@ -323,13 +480,39 @@ mod tests {
 
     #[test]
     fn handshake_phase_error_reports_phase_and_source() {
-        let error = phase_error("tls connect", "certificate verify failed");
+        let error = phase_error(
+            "tls connect",
+            EndpointFailurePhase::Tls,
+            "certificate verify failed",
+        );
 
         assert_eq!(
             error.to_string(),
             "tls connect failed: certificate verify failed"
         );
         assert!(error.source().is_some());
+        assert_eq!(endpoint_failure_phase(&error), EndpointFailurePhase::Tls);
+    }
+
+    #[test]
+    fn classifies_nested_server_rejection_as_auth_failure() {
+        let rejection: AnyError = Box::new(ServerHandshakeError {
+            code: ErrorCode::AuthFailed,
+        });
+        let error = phase_error(
+            "decode server settings",
+            EndpointFailurePhase::Settings,
+            rejection,
+        );
+
+        assert_eq!(endpoint_failure_phase(&error), EndpointFailurePhase::Auth);
+    }
+
+    #[test]
+    fn classifies_unstructured_endpoint_error_as_other() {
+        let error: AnyError = "unstructured failure".into();
+
+        assert_eq!(endpoint_failure_phase(&error), EndpointFailurePhase::Other);
     }
 
     #[test]
@@ -337,6 +520,7 @@ mod tests {
         let error = decode_server_settings_frame(error_frame(ErrorCode::AuthFailed)).unwrap_err();
 
         assert!(error.to_string().contains("authentication failed"));
+        assert_eq!(endpoint_failure_phase(&error), EndpointFailurePhase::Auth);
     }
 
     #[test]
@@ -355,6 +539,18 @@ mod tests {
         let settings = Settings::default();
 
         assert!(settings.negotiated_v0_1().is_err());
+    }
+
+    #[test]
+    fn classifies_invalid_negotiated_settings() {
+        let settings = Settings::default();
+
+        let error = decode_server_settings_frame(settings_frame(&settings)).unwrap_err();
+
+        assert_eq!(
+            endpoint_failure_phase(&error),
+            EndpointFailurePhase::Settings
+        );
     }
 
     #[test]

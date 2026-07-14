@@ -2975,7 +2975,10 @@ async fn run_client_observability_e2e() -> Result<(), TestError> {
     .await?;
 
     let observability_addr = unused_loopback_addr().await?;
+    let unavailable_primary = unused_loopback_addr().await?;
     let mut initial_config = test_client_config(server_addr, &cert_path, SECRET);
+    initial_config.server_addr = unavailable_primary.to_string();
+    initial_config.server_addrs = Some(vec![server_addr.to_string()]);
     initial_config.observability_listen = Some(observability_addr.to_string());
     let ReloadableSocksListener {
         socks_addr,
@@ -3497,6 +3500,13 @@ fn assert_client_observability_metrics(metrics: &str, tcp_bytes: usize, udp_byte
     assert!(metrics.contains("uncrowned_king_client_config_reload_successes_total 1\n"));
     assert!(metrics.contains("uncrowned_king_client_config_reload_failures_total 1\n"));
     assert!(metrics.contains("uncrowned_king_client_session_connect_attempts_total 2\n"));
+    assert!(
+        metrics.contains("uncrowned_king_client_endpoint_attempts_total{outcome=\"success\"} 2\n")
+    );
+    assert!(
+        metrics.contains("uncrowned_king_client_endpoint_attempts_total{outcome=\"failure\"} 2\n")
+    );
+    assert!(metrics.contains("uncrowned_king_client_endpoint_failures_total{phase=\"tcp\"} 2\n"));
     assert!(metrics.contains("uncrowned_king_client_established_sessions_total 2\n"));
     assert!(metrics.contains("uncrowned_king_client_active_sessions 2\n"));
     assert!(metrics.contains("uncrowned_king_client_draining_sessions 1\n"));

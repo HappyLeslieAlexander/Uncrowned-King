@@ -119,7 +119,10 @@ The client supports the same operational endpoints with
 active config generation and reload outcomes, accepted and rejected SOCKS5
 connections, carrier connection attempts and failures, active and draining
 sessions, TCP/UDP flow opens, and successfully relayed payload bytes in both
-directions. Client readiness drops before SOCKS shutdown and the management
+directions. Endpoint attempts use fixed `success`/`failure` outcomes, while
+failures are classified with bounded `tcp`, `tls`, `auth`, `settings`,
+`timeout`, `protocol`, and `other` phase labels without exposing endpoint
+addresses. Client readiness drops before SOCKS shutdown and the management
 listener remains available while active connections drain. This endpoint is
 also unauthenticated and should be bound only to loopback or a protected
 management network; it uses the same request size, timeout, and concurrency

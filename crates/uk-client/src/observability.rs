@@ -17,12 +17,15 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
+use crate::session::{EndpointAttemptOutcome, EndpointFailurePhase};
+
 const MAX_CONNECTIONS: usize = 32;
 const MAX_REQUEST_HEAD_BYTES: usize = 8 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 const PROTOCOL_COUNT: usize = 2;
 const DIRECTION_COUNT: usize = 2;
+const ENDPOINT_FAILURE_COUNT: usize = EndpointFailurePhase::ALL.len();
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RelayProtocol {
@@ -84,6 +87,9 @@ pub(crate) struct ClientMetrics {
     active_socks_connections: AtomicU64,
     session_connect_attempts_total: AtomicU64,
     session_connect_failures_total: AtomicU64,
+    endpoint_attempt_successes_total: AtomicU64,
+    endpoint_attempt_failures_total: AtomicU64,
+    endpoint_failures_total: [AtomicU64; ENDPOINT_FAILURE_COUNT],
     established_sessions_total: AtomicU64,
     active_sessions: AtomicU64,
     draining_sessions: AtomicU64,
@@ -147,6 +153,20 @@ impl ClientMetrics {
     pub(crate) fn record_session_connect_failure(&self) {
         self.session_connect_failures_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_endpoint_attempt(&self, outcome: EndpointAttemptOutcome) {
+        match outcome {
+            EndpointAttemptOutcome::Succeeded => {
+                self.endpoint_attempt_successes_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            EndpointAttemptOutcome::Failed(phase) => {
+                self.endpoint_attempt_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.endpoint_failures_total[phase.index()].fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     pub(crate) fn record_session_established(&self) {
@@ -251,6 +271,7 @@ impl ClientMetrics {
             active_sessions = self.active_sessions.load(Ordering::Relaxed),
             draining_sessions = self.draining_sessions.load(Ordering::Relaxed),
         );
+        self.render_endpoint_metrics(&mut output);
         output.push_str("# HELP uncrowned_king_client_flow_open_requests_total UK flow open requests.\n# TYPE uncrowned_king_client_flow_open_requests_total counter\n");
         output.push_str("# HELP uncrowned_king_client_opened_flows_total UK flows opened successfully.\n# TYPE uncrowned_king_client_opened_flows_total counter\n");
         output.push_str("# HELP uncrowned_king_client_active_flows Active UK flows.\n# TYPE uncrowned_king_client_active_flows gauge\n");
@@ -286,6 +307,37 @@ impl ClientMetrics {
             }
         }
         output
+    }
+
+    fn render_endpoint_metrics(&self, output: &mut String) {
+        output.push_str(
+            "# HELP uncrowned_king_client_endpoint_attempts_total UK server endpoint connection attempts.\n\
+# TYPE uncrowned_king_client_endpoint_attempts_total counter\n\
+# HELP uncrowned_king_client_endpoint_failures_total Failed UK server endpoint attempts by bounded phase.\n\
+# TYPE uncrowned_king_client_endpoint_failures_total counter\n",
+        );
+        writeln!(
+            output,
+            "uncrowned_king_client_endpoint_attempts_total{{outcome=\"success\"}} {}",
+            self.endpoint_attempt_successes_total
+                .load(Ordering::Relaxed)
+        )
+        .expect("writing metrics to a String cannot fail");
+        writeln!(
+            output,
+            "uncrowned_king_client_endpoint_attempts_total{{outcome=\"failure\"}} {}",
+            self.endpoint_attempt_failures_total.load(Ordering::Relaxed)
+        )
+        .expect("writing metrics to a String cannot fail");
+        for phase in EndpointFailurePhase::ALL {
+            writeln!(
+                output,
+                "uncrowned_king_client_endpoint_failures_total{{phase=\"{}\"}} {}",
+                phase.label(),
+                self.endpoint_failures_total[phase.index()].load(Ordering::Relaxed)
+            )
+            .expect("writing metrics to a String cannot fail");
+        }
     }
 }
 
@@ -506,6 +558,8 @@ mod tests {
         metrics.record_reload_success(2);
         metrics.record_session_connect_attempt();
         metrics.record_session_connect_failure();
+        metrics.record_endpoint_attempt(EndpointAttemptOutcome::Failed(EndpointFailurePhase::Tls));
+        metrics.record_endpoint_attempt(EndpointAttemptOutcome::Succeeded);
         metrics.record_session_established();
         metrics.record_session_draining();
         let _flow = metrics.begin_flow(RelayProtocol::Tcp);
@@ -516,6 +570,17 @@ mod tests {
         assert!(rendered.contains("uncrowned_king_client_config_generation 2\n"));
         assert!(rendered.contains("uncrowned_king_client_session_connect_attempts_total 1\n"));
         assert!(rendered.contains("uncrowned_king_client_session_connect_failures_total 1\n"));
+        assert!(
+            rendered
+                .contains("uncrowned_king_client_endpoint_attempts_total{outcome=\"success\"} 1\n")
+        );
+        assert!(
+            rendered
+                .contains("uncrowned_king_client_endpoint_attempts_total{outcome=\"failure\"} 1\n")
+        );
+        assert!(
+            rendered.contains("uncrowned_king_client_endpoint_failures_total{phase=\"tls\"} 1\n")
+        );
         assert!(rendered.contains("uncrowned_king_client_active_sessions 1\n"));
         assert!(rendered.contains("uncrowned_king_client_draining_sessions 1\n"));
         assert!(rendered.contains(

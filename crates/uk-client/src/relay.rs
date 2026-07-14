@@ -1169,7 +1169,10 @@ impl ClientSession {
         metrics: Arc<ClientMetrics>,
     ) -> Result<Arc<Self>, AnyError> {
         let config = snapshot.config.as_ref();
-        let (carrier, settings) = session::connect_authenticated(config).await?;
+        let (carrier, settings) = session::connect_authenticated_observed(config, |outcome| {
+            metrics.record_endpoint_attempt(outcome);
+        })
+        .await?;
         let negotiated = settings.negotiated_v0_1()?;
         let limits = negotiated.frame_limits();
         let (carrier_reader, carrier_writer) = tokio::io::split(carrier);
