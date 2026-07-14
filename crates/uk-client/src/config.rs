@@ -21,6 +21,8 @@ pub struct ClientConfig {
     pub server_addrs: Option<Vec<String>>,
     /// TLS server name.
     pub server_name: String,
+    /// Optional local health, readiness, and Prometheus listener.
+    pub observability_listen: Option<String>,
     /// CA certificate PEM path.
     pub ca_cert_path: String,
     /// Opaque key id.
@@ -66,6 +68,7 @@ impl fmt::Debug for ClientConfig {
             .field("server_addr", &self.server_addr)
             .field("server_addrs", &self.server_addrs)
             .field("server_name", &self.server_name)
+            .field("observability_listen", &self.observability_listen)
             .field("ca_cert_path", &self.ca_cert_path)
             .field("key_id", &self.key_id)
             .field("secret", &"<redacted>")
@@ -172,6 +175,10 @@ impl ClientConfig {
     pub fn validate_network_endpoints(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         validate_endpoint("server_addr", &self.server_addr)
             .map_err(|err| format!("server_addr: {err}"))?;
+        if let Some(listen) = &self.observability_listen {
+            validate_endpoint("observability_listen", listen)
+                .map_err(|err| format!("observability_listen: {err}"))?;
+        }
         let mut seen = HashSet::from([self.server_addr.as_str()]);
         for (index, endpoint) in self.server_addrs().iter().enumerate() {
             validate_endpoint("server_addrs", endpoint)
@@ -309,6 +316,7 @@ mod tests {
             server_addr: "127.0.0.1:443".to_owned(),
             server_addrs: None,
             server_name: "localhost".to_owned(),
+            observability_listen: None,
             ca_cert_path: "ca.pem".to_owned(),
             key_id: "client".to_owned(),
             secret: "0123456789abcdef0123456789abcdef".to_owned(),
@@ -837,6 +845,37 @@ secret = "secret"
             vec!["127.0.0.1:443", "uk-a.example.com:443", "[::1]:9443"]
         );
         assert!(config.validate_network_endpoints().is_ok());
+    }
+
+    #[test]
+    fn parses_observability_listener() {
+        let config: ClientConfig = toml::from_str(
+            r#"
+server_addr = "127.0.0.1:443"
+server_name = "localhost"
+observability_listen = "127.0.0.1:9091"
+ca_cert_path = "ca.pem"
+key_id = "client"
+secret = "secret"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.observability_listen.as_deref(),
+            Some("127.0.0.1:9091")
+        );
+        assert!(config.validate_network_endpoints().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_observability_listener() {
+        let mut config = minimal_config();
+        config.observability_listen = Some("127.0.0.1".to_owned());
+
+        let error = config.validate_network_endpoints().unwrap_err().to_string();
+
+        assert!(error.contains("observability_listen"));
     }
 
     #[test]

@@ -70,6 +70,7 @@ mod tests {
             server_addr: server_addr.to_owned(),
             server_addrs: None,
             server_name: "localhost".to_owned(),
+            observability_listen: None,
             ca_cert_path: "ca.pem".to_owned(),
             key_id: "client".to_owned(),
             secret: secret.to_owned(),

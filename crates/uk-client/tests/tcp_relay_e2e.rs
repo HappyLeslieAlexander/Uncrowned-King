@@ -530,6 +530,11 @@ async fn server_exposes_health_readiness_and_metrics() -> Result<(), TestError> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_exposes_health_readiness_and_relay_metrics() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(15), run_client_observability_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_atomically_reloads_access_control() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -1020,6 +1025,7 @@ async fn run_udp_associate_server_unavailable_e2e() -> Result<(), TestError> {
         server_addr: server_addr.to_string(),
         server_addrs: None,
         server_name: "localhost".to_owned(),
+        observability_listen: None,
         ca_cert_path: path_string(&cert_path),
         key_id: KEY_ID.to_owned(),
         secret: SECRET.to_owned(),
@@ -2888,6 +2894,7 @@ async fn run_server_observability_e2e() -> Result<(), TestError> {
         server_addr: server_addr.to_string(),
         server_addrs: None,
         server_name: "localhost".to_owned(),
+        observability_listen: None,
         ca_cert_path: path_string(&cert_path),
         key_id: KEY_ID.to_owned(),
         secret: SECRET.to_owned(),
@@ -2937,6 +2944,109 @@ async fn run_server_observability_e2e() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(3), server_task).await???;
     drop(carrier);
     assert!(TcpStream::connect(observability_addr).await.is_err());
+    Ok(())
+}
+
+async fn run_client_observability_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    let policy_path = temp_dir.join("policy.toml");
+    fs::write(&cert_path, CERT_PEM)?;
+    write_private_key(&key_path)?;
+    fs::write(&policy_path, allow_loopback_any_port_policy())?;
+
+    let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
+    let (server_addr, server_task) = start_uk_server_until_shutdown(
+        test_server_config(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            &cert_path,
+            &key_path,
+            test_limits(),
+            Some(&policy_path),
+            30,
+        ),
+        async {
+            let _ = server_shutdown_rx.await;
+        },
+    )
+    .await?;
+
+    let observability_addr = unused_loopback_addr().await?;
+    let mut initial_config = test_client_config(server_addr, &cert_path, SECRET);
+    initial_config.observability_listen = Some(observability_addr.to_string());
+    let ReloadableSocksListener {
+        socks_addr,
+        reload_handle,
+        shutdown_tx: client_shutdown_tx,
+        mut task,
+    } = start_reloadable_socks5_listener(initial_config.clone()).await?;
+    wait_for_listener("uk-client observability", observability_addr, &mut task).await?;
+
+    let health = http_get(observability_addr, "/healthz").await?;
+    let ready = http_get(observability_addr, "/readyz").await?;
+    assert!(health.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(ready.starts_with("HTTP/1.1 200 OK\r\n"));
+
+    let (udp_target_addr, udp_target_task) = spawn_udp_echo_target().await?;
+    let (udp_control, udp_relay_addr) = open_socks_udp_associate(socks_addr).await?;
+    let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let udp_payload = b"client observability udp payload";
+    assert_socks_udp_roundtrip(&udp_client, udp_relay_addr, udp_target_addr, udp_payload).await?;
+    udp_target_task.await??;
+
+    let mut incompatible = initial_config.clone();
+    incompatible.observability_listen = Some(unused_loopback_addr().await?.to_string());
+    assert!(matches!(
+        reload_handle.reload(incompatible).await.unwrap_err(),
+        ClientReloadError::Rejected(reason) if reason.contains("observability_listen")
+    ));
+    let mut reloaded = initial_config;
+    reloaded.tcp_open_timeout_seconds = Some(4);
+    assert_eq!(reload_handle.reload(reloaded).await?, 2);
+    wait_for_client_metric(
+        observability_addr,
+        "uncrowned_king_client_draining_sessions 1\n",
+    )
+    .await?;
+
+    let (tcp_target_addr, tcp_target_task) = spawn_echo_target().await?;
+    let tcp_payload = b"client observability tcp payload";
+    assert_echo_roundtrip(socks_addr, tcp_target_addr, tcp_payload).await?;
+    tcp_target_task.await??;
+    wait_for_client_metric(
+        observability_addr,
+        "uncrowned_king_client_active_sessions 2\n",
+    )
+    .await?;
+
+    let metrics = http_get(observability_addr, "/metrics").await?;
+    assert_client_observability_metrics(&metrics, tcp_payload.len(), udp_payload.len());
+
+    drop(udp_control);
+    wait_for_client_metric(
+        observability_addr,
+        "uncrowned_king_client_draining_sessions 0\n",
+    )
+    .await?;
+    wait_for_client_metric(
+        observability_addr,
+        "uncrowned_king_client_active_sessions 1\n",
+    )
+    .await?;
+
+    client_shutdown_tx
+        .send(())
+        .map_err(|()| "client shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(3), task).await???;
+    assert!(TcpStream::connect(observability_addr).await.is_err());
+    server_shutdown_tx
+        .send(())
+        .map_err(|()| "server shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(3), server_task).await???;
+    let _ = fs::remove_dir_all(temp_dir);
     Ok(())
 }
 
@@ -3380,6 +3490,32 @@ fn assert_observability_relay_metrics(metrics: &str, tcp_bytes: usize, udp_bytes
     ));
 }
 
+fn assert_client_observability_metrics(metrics: &str, tcp_bytes: usize, udp_bytes: usize) {
+    assert!(metrics.contains("uncrowned_king_client_ready 1\n"));
+    assert!(metrics.contains("uncrowned_king_client_config_generation 2\n"));
+    assert!(metrics.contains("uncrowned_king_client_config_reload_attempts_total 2\n"));
+    assert!(metrics.contains("uncrowned_king_client_config_reload_successes_total 1\n"));
+    assert!(metrics.contains("uncrowned_king_client_config_reload_failures_total 1\n"));
+    assert!(metrics.contains("uncrowned_king_client_session_connect_attempts_total 2\n"));
+    assert!(metrics.contains("uncrowned_king_client_established_sessions_total 2\n"));
+    assert!(metrics.contains("uncrowned_king_client_active_sessions 2\n"));
+    assert!(metrics.contains("uncrowned_king_client_draining_sessions 1\n"));
+    assert!(metrics.contains("uncrowned_king_client_opened_flows_total{protocol=\"tcp\"} 1\n"));
+    assert!(metrics.contains("uncrowned_king_client_opened_flows_total{protocol=\"udp\"} 1\n"));
+    assert!(metrics.contains(&format!(
+        "uncrowned_king_client_relay_bytes_total{{protocol=\"tcp\",direction=\"local_to_server\"}} {tcp_bytes}\n"
+    )));
+    assert!(metrics.contains(&format!(
+        "uncrowned_king_client_relay_bytes_total{{protocol=\"tcp\",direction=\"server_to_local\"}} {tcp_bytes}\n"
+    )));
+    assert!(metrics.contains(&format!(
+        "uncrowned_king_client_relay_bytes_total{{protocol=\"udp\",direction=\"local_to_server\"}} {udp_bytes}\n"
+    )));
+    assert!(metrics.contains(&format!(
+        "uncrowned_king_client_relay_bytes_total{{protocol=\"udp\",direction=\"server_to_local\"}} {udp_bytes}\n"
+    )));
+}
+
 async fn run_server_active_session_shutdown_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -3408,6 +3544,7 @@ async fn run_server_active_session_shutdown_e2e() -> Result<(), TestError> {
         server_addr: server_addr.to_string(),
         server_addrs: None,
         server_name: "localhost".to_owned(),
+        observability_listen: None,
         ca_cert_path: path_string(&cert_path),
         key_id: KEY_ID.to_owned(),
         secret: SECRET.to_owned(),
@@ -3451,6 +3588,7 @@ async fn run_socks_listener_shutdown_e2e() -> Result<(), TestError> {
             server_addr: server_addr.to_string(),
             server_addrs: None,
             server_name: "localhost".to_owned(),
+            observability_listen: None,
             ca_cert_path: path_string(&cert_path),
             key_id: KEY_ID.to_owned(),
             secret: SECRET.to_owned(),
@@ -3503,6 +3641,7 @@ async fn run_socks_listener_shutdown_cancels_pending_open_e2e() -> Result<(), Te
             server_addr: server_addr.to_string(),
             server_addrs: None,
             server_name: "localhost".to_owned(),
+            observability_listen: None,
             ca_cert_path: path_string(&cert_path),
             key_id: KEY_ID.to_owned(),
             secret: SECRET.to_owned(),
@@ -3568,6 +3707,7 @@ async fn run_socks_listener_shutdown_cancels_pending_udp_open_e2e() -> Result<()
             server_addr: server_addr.to_string(),
             server_addrs: None,
             server_name: "localhost".to_owned(),
+            observability_listen: None,
             ca_cert_path: path_string(&cert_path),
             key_id: KEY_ID.to_owned(),
             secret: SECRET.to_owned(),
@@ -3652,6 +3792,7 @@ async fn run_socks_listener_shutdown_during_connect_with_request(
             server_addr: server_addr.to_string(),
             server_addrs: None,
             server_name: "localhost".to_owned(),
+            observability_listen: None,
             ca_cert_path: path_string(&cert_path),
             key_id: KEY_ID.to_owned(),
             secret: SECRET.to_owned(),
@@ -3723,6 +3864,7 @@ async fn run_socks_udp_datagram_shutdown_during_reconnect_e2e() -> Result<(), Te
             server_addr: server_addr.to_string(),
             server_addrs: None,
             server_name: "localhost".to_owned(),
+            observability_listen: None,
             ca_cert_path: path_string(&cert_path),
             key_id: KEY_ID.to_owned(),
             secret: SECRET.to_owned(),
@@ -3787,6 +3929,7 @@ async fn run_udp_carrier_recovery_e2e() -> Result<(), TestError> {
         server_addr: server_addr.to_string(),
         server_addrs: None,
         server_name: "localhost".to_owned(),
+        observability_listen: None,
         ca_cert_path: path_string(&cert_path),
         key_id: KEY_ID.to_owned(),
         secret: SECRET.to_owned(),
@@ -3902,6 +4045,7 @@ impl ServerHarness {
             server_addr: self.server_addr.to_string(),
             server_addrs: None,
             server_name: "localhost".to_owned(),
+            observability_listen: None,
             ca_cert_path: path_string(&self.cert_path),
             key_id: KEY_ID.to_owned(),
             secret: secret.to_owned(),
@@ -4035,6 +4179,7 @@ impl MalformedFrameServerHarness {
             server_addr: server_addr.to_string(),
             server_addrs: None,
             server_name: "localhost".to_owned(),
+            observability_listen: None,
             ca_cert_path: path_string(&cert_path),
             key_id: KEY_ID.to_owned(),
             secret: SECRET.to_owned(),
@@ -4104,6 +4249,7 @@ impl ClientBufferedLimitServerHarness {
             server_addr: server_addr.to_string(),
             server_addrs: None,
             server_name: "localhost".to_owned(),
+            observability_listen: None,
             ca_cert_path: path_string(&cert_path),
             key_id: KEY_ID.to_owned(),
             secret: SECRET.to_owned(),
@@ -4188,6 +4334,7 @@ impl UdpStreamFallbackDisabledServerHarness {
             server_addr: server_addr.to_string(),
             server_addrs: None,
             server_name: "localhost".to_owned(),
+            observability_listen: None,
             ca_cert_path: path_string(&cert_path),
             key_id: KEY_ID.to_owned(),
             secret: SECRET.to_owned(),
@@ -4270,6 +4417,7 @@ impl AckGatedOpenServerHarness {
             server_addr: server_addr.to_string(),
             server_addrs: None,
             server_name: "localhost".to_owned(),
+            observability_listen: None,
             ca_cert_path: path_string(&cert_path),
             key_id: KEY_ID.to_owned(),
             secret: SECRET.to_owned(),
@@ -4357,6 +4505,7 @@ impl PendingOpenCancelServerHarness {
             server_addr: server_addr.to_string(),
             server_addrs: None,
             server_name: "localhost".to_owned(),
+            observability_listen: None,
             ca_cert_path: path_string(&cert_path),
             key_id: KEY_ID.to_owned(),
             secret: SECRET.to_owned(),
@@ -4429,6 +4578,7 @@ impl PendingUdpOpenCancelServerHarness {
             server_addr: server_addr.to_string(),
             server_addrs: None,
             server_name: "localhost".to_owned(),
+            observability_listen: None,
             ca_cert_path: path_string(&cert_path),
             key_id: KEY_ID.to_owned(),
             secret: SECRET.to_owned(),
@@ -4528,6 +4678,7 @@ impl MissingPongServerHarness {
             server_addr: server_addr.to_string(),
             server_addrs: None,
             server_name: "localhost".to_owned(),
+            observability_listen: None,
             ca_cert_path: path_string(&cert_path),
             key_id: KEY_ID.to_owned(),
             secret: SECRET.to_owned(),
@@ -5212,6 +5363,7 @@ impl RelayHarness {
             server_addr: server_addr.to_string(),
             server_addrs: None,
             server_name: "localhost".to_owned(),
+            observability_listen: None,
             ca_cert_path: path_string(&cert_path),
             key_id: KEY_ID.to_owned(),
             secret: SECRET.to_owned(),
@@ -5534,6 +5686,10 @@ async fn wait_for_server_metric(addr: SocketAddr, expected: &str) -> Result<(), 
     Err(format!("server metric did not reach `{}`", expected.trim()).into())
 }
 
+async fn wait_for_client_metric(addr: SocketAddr, expected: &str) -> Result<(), TestError> {
+    wait_for_server_metric(addr, expected).await
+}
+
 async fn wait_for_active_server_sessions(
     addr: SocketAddr,
     expected: usize,
@@ -5577,6 +5733,7 @@ fn test_client_config(server_addr: SocketAddr, cert_path: &Path, secret: &str) -
         server_addr: server_addr.to_string(),
         server_addrs: None,
         server_name: "localhost".to_owned(),
+        observability_listen: None,
         ca_cert_path: path_string(cert_path),
         key_id: KEY_ID.to_owned(),
         secret: secret.to_owned(),

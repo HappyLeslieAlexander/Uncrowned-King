@@ -19,7 +19,7 @@ The repository currently focuses on the first runnable v0.1 TLS/TCP carrier:
 - bounded UDP flow recovery after a carrier disconnect without closing the SOCKS association
 - graceful Ctrl+C/SIGTERM shutdown for long-running client and server listeners
 - capped exponential retry for transient client and server listener accept errors
-- bounded server health, readiness, and Prometheus metrics endpoint
+- bounded client and server health, readiness, and Prometheus metrics endpoints
 - atomic SIGHUP reload for server and client TLS/auth configuration
 - nonce-matched PING/PONG keepalive for active relay flows
 - negotiated UDP flow limits and idle UDP flow cleanup on both client and server
@@ -114,6 +114,17 @@ outcomes observable. The endpoint has no authentication; bind it to loopback or
 a firewall-protected management network. Requests are limited to an 8 KiB
 header, a five-second read timeout, and 32 concurrent connections.
 
+The client supports the same operational endpoints with
+`observability_listen = "127.0.0.1:9091"`. Its Prometheus metrics report the
+active config generation and reload outcomes, accepted and rejected SOCKS5
+connections, carrier connection attempts and failures, active and draining
+sessions, TCP/UDP flow opens, and successfully relayed payload bytes in both
+directions. Client readiness drops before SOCKS shutdown and the management
+listener remains available while active connections drain. This endpoint is
+also unauthenticated and should be bound only to loopback or a protected
+management network; it uses the same request size, timeout, and concurrency
+limits as the server endpoint.
+
 Client configs may also set `handshake_timeout_seconds = 10` to bound each
 server endpoint attempt, including TCP connect, TLS handshake, authentication
 exchange, and SETTINGS read. Set `server_addrs = ["backup.example.com:443"]`
@@ -195,8 +206,9 @@ and UDP flows immediately use a carrier from the new generation. A draining old
 carrier closes automatically after its final flow ends. If a reload races an
 in-flight handshake, that handshake cannot publish a stale session or cache a
 stale connection failure after the reload. `socks_handshake_timeout_seconds`,
-`shutdown_timeout_seconds`, and `max_socks_connections` still require a client
-restart because the listener owns those resources.
+`shutdown_timeout_seconds`, `max_socks_connections`, and
+`observability_listen` still require a client restart because the listeners own
+those resources.
 
 Both binaries accept global `--log-format text|json` output selection and use
 `RUST_LOG` for filtering. JSON mode preserves structured event fields for log

@@ -8,7 +8,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -36,6 +36,7 @@ use crate::{
     ClientReloadReceiver, ClientReloadRequest,
     config::{ClientConfig, validate_endpoint},
     config_state::{ClientConfigSnapshot, ClientConfigState},
+    observability::{ActiveFlowGuard, ClientMetrics, RelayDirection, RelayProtocol},
     session, socks5,
 };
 
@@ -110,6 +111,8 @@ struct ClientSession {
     tasks: Mutex<ClientSessionTasks>,
     shutdown: ClientSessionShutdown,
     draining: AtomicBool,
+    metrics: Arc<ClientMetrics>,
+    metric_state: StdMutex<ClientSessionMetricState>,
     next_flow_id: AtomicU64,
     next_ping_nonce: AtomicU64,
     outstanding_ping_nonce: AtomicU64,
@@ -119,11 +122,21 @@ struct ClientSession {
 
 struct ClientSessionManager {
     config: ClientConfigState,
+    metrics: Arc<ClientMetrics>,
     current: Mutex<Option<Arc<ClientSession>>>,
     connect_lock: Mutex<()>,
     config_publish_lock: Mutex<()>,
     recent_connect_failure: Mutex<Option<CachedConnectFailure>>,
     closed: AtomicBool,
+}
+
+#[derive(Clone)]
+struct SocksConnectionRuntime {
+    sessions: Arc<ClientSessionManager>,
+    metrics: Arc<ClientMetrics>,
+    connection_slots: Arc<Semaphore>,
+    handshake_timeout: Option<Duration>,
+    max_connections: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -227,6 +240,13 @@ struct ClientFlow {
     frames: mpsc::Receiver<BufferedFlowFrame>,
     session: Arc<ClientSession>,
     pending_local_data: Vec<Bytes>,
+    metric_guard: Option<ActiveFlowGuard>,
+}
+
+impl Drop for ClientFlow {
+    fn drop(&mut self) {
+        let _ = self.metric_guard.take();
+    }
 }
 
 struct UdpAssociation {
@@ -313,6 +333,22 @@ enum FlowFrameRoute {
 enum FlowProtocol {
     Tcp,
     Udp,
+}
+
+impl FlowProtocol {
+    const fn metric_protocol(self) -> RelayProtocol {
+        match self {
+            Self::Tcp => RelayProtocol::Tcp,
+            Self::Udp => RelayProtocol::Udp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientSessionMetricState {
+    Active,
+    Draining,
+    Closed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -560,11 +596,28 @@ where
     let socks_handshake_timeout = timeout(config.socks_handshake_timeout_seconds());
     let shutdown_timeout = timeout(config.shutdown_timeout_seconds());
     let max_socks_connections = usize_limit(config.max_socks_connections())?;
-    let sessions = Arc::new(ClientSessionManager::new(config));
-    let connection_slots = Arc::new(Semaphore::new(max_socks_connections));
+    let metrics = Arc::new(ClientMetrics::default());
+    let sessions = Arc::new(ClientSessionManager::new(config, Arc::clone(&metrics)));
+    let (observability_shutdown_tx, observability_shutdown_rx) = watch::channel(false);
+    let initial_config = sessions.config.snapshot();
+    let observability_task = start_observability(
+        &initial_config.config,
+        Arc::clone(&metrics),
+        observability_shutdown_rx,
+    )
+    .await?;
+    drop(initial_config);
+    let connection_runtime = SocksConnectionRuntime {
+        sessions: Arc::clone(&sessions),
+        metrics: Arc::clone(&metrics),
+        connection_slots: Arc::new(Semaphore::new(max_socks_connections)),
+        handshake_timeout: socks_handshake_timeout,
+        max_connections: max_socks_connections,
+    };
     info!(event = "socks5.listen", listen = %listen);
 
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+    metrics.set_ready(true);
     let mut connections = JoinSet::new();
     let mut accept_backoff = ListenerAcceptBackoff::default();
     tokio::pin!(shutdown);
@@ -573,11 +626,12 @@ where
         tokio::select! {
             () = &mut shutdown => {
                 info!(event = "socks5.shutdown");
+                metrics.set_ready(false);
                 let _ = shutdown_tx.send(true);
                 break;
             }
             accepted = listener.accept() => {
-                let (mut local, peer) = match accepted {
+                let (local, peer) = match accepted {
                     Ok(connection) => {
                         accept_backoff.reset();
                         connection
@@ -593,47 +647,14 @@ where
                         continue;
                     }
                 };
-                let Ok(permit) = Arc::clone(&connection_slots).try_acquire_owned() else {
-                    warn!(
-                        event = "socks5.connection.limit",
-                        peer = %peer,
-                        max_connections = max_socks_connections
-                    );
-                    if let Err(err) = local.shutdown().await {
-                        debug!(
-                            event = "socks5.connection.limit_shutdown_error",
-                            peer = %peer,
-                            error = %err
-                        );
-                    }
-                    continue;
-                };
-                let sessions = Arc::clone(&sessions);
-                let shutdown_rx = shutdown_tx.subscribe();
-                let connection_id = NEXT_SOCKS_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-                let connection = async move {
-                    let _permit = permit;
-                    if let Err(err) =
-                        handle_socks_connection(
-                            local,
-                            sessions,
-                            socks_handshake_timeout,
-                            shutdown_rx,
-                        )
-                        .await
-                    {
-                        if is_clean_socks_disconnect(&err) {
-                            debug!(event = "socks5.connection.closed", peer = %peer);
-                        } else {
-                            warn!(event = "socks5.connection.error", peer = %peer, error = %err);
-                        }
-                    }
-                };
-                connections.spawn(connection.instrument(info_span!(
-                    "socks5.connection",
-                    connection_id,
-                    peer = %peer
-                )));
+                connection_runtime
+                    .spawn_accepted(
+                        &mut connections,
+                        local,
+                        peer,
+                        shutdown_tx.subscribe(),
+                    )
+                    .await;
             }
             joined = connections.join_next(), if !connections.is_empty() => {
                 log_socks_task_result(joined);
@@ -651,8 +672,37 @@ where
 
     drain_socks_tasks(&mut connections, shutdown_timeout).await;
     sessions.shutdown().await;
+    stop_observability(observability_shutdown_tx, observability_task).await;
 
     Ok(())
+}
+
+async fn start_observability(
+    config: &ClientConfig,
+    metrics: Arc<ClientMetrics>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<Option<tokio::task::JoinHandle<()>>, AnyError> {
+    let Some(listen) = &config.observability_listen else {
+        return Ok(None);
+    };
+    let listener = TcpListener::bind(listen).await?;
+    Ok(Some(tokio::spawn(crate::observability::serve(
+        listener,
+        metrics,
+        shutdown_rx,
+    ))))
+}
+
+async fn stop_observability(
+    shutdown_tx: watch::Sender<bool>,
+    task: Option<tokio::task::JoinHandle<()>>,
+) {
+    let _ = shutdown_tx.send(true);
+    if let Some(task) = task {
+        if let Err(err) = task.await {
+            warn!(event = "client.observability.task_error", error = %err);
+        }
+    }
 }
 
 async fn receive_reload(
@@ -749,10 +799,64 @@ fn is_clean_socks_disconnect(error: &AnyError) -> bool {
         })
 }
 
+impl SocksConnectionRuntime {
+    async fn spawn_accepted(
+        &self,
+        connections: &mut JoinSet<()>,
+        mut local: TcpStream,
+        peer: SocketAddr,
+        shutdown_rx: watch::Receiver<bool>,
+    ) {
+        self.metrics.record_accepted_socks_connection();
+        let Ok(permit) = Arc::clone(&self.connection_slots).try_acquire_owned() else {
+            self.metrics.record_rejected_socks_connection();
+            warn!(
+                event = "socks5.connection.limit",
+                peer = %peer,
+                max_connections = self.max_connections
+            );
+            if let Err(err) = local.shutdown().await {
+                debug!(
+                    event = "socks5.connection.limit_shutdown_error",
+                    peer = %peer,
+                    error = %err
+                );
+            }
+            return;
+        };
+
+        let sessions = Arc::clone(&self.sessions);
+        let metrics = Arc::clone(&self.metrics);
+        let handshake_timeout = self.handshake_timeout;
+        let connection_id = NEXT_SOCKS_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+        let connection = async move {
+            let _permit = permit;
+            let _active_connection = metrics.begin_socks_connection();
+            if let Err(err) =
+                handle_socks_connection(local, sessions, handshake_timeout, shutdown_rx).await
+            {
+                if is_clean_socks_disconnect(&err) {
+                    debug!(event = "socks5.connection.closed", peer = %peer);
+                } else {
+                    warn!(event = "socks5.connection.error", peer = %peer, error = %err);
+                }
+            }
+        };
+        connections.spawn(connection.instrument(info_span!(
+            "socks5.connection",
+            connection_id,
+            peer = %peer
+        )));
+    }
+}
+
 impl ClientSessionManager {
-    fn new(config: ClientConfig) -> Self {
+    fn new(config: ClientConfig, metrics: Arc<ClientMetrics>) -> Self {
+        let config = ClientConfigState::new(config);
+        metrics.set_config_generation(config.generation());
         Self {
-            config: ClientConfigState::new(config),
+            config,
+            metrics,
             current: Mutex::new(None),
             connect_lock: Mutex::new(()),
             config_publish_lock: Mutex::new(()),
@@ -762,17 +866,25 @@ impl ClientSessionManager {
     }
 
     async fn reload(&self, candidate: ClientConfig) -> Result<u64, AnyError> {
-        crate::check_config(&candidate)?;
-        let _publish_guard = self.config_publish_lock.lock().await;
-        let current = self.config.snapshot();
-        ensure_reload_compatible(&current.config, &candidate)?;
-        let generation = self.config.replace(candidate);
-        self.clear_connect_failure().await;
-        let previous = self.current.lock().await.take();
-        if let Some(previous) = previous {
-            previous.begin_drain().await;
+        let result = async {
+            crate::check_config(&candidate)?;
+            let _publish_guard = self.config_publish_lock.lock().await;
+            let current = self.config.snapshot();
+            ensure_reload_compatible(&current.config, &candidate)?;
+            let generation = self.config.replace(candidate);
+            self.clear_connect_failure().await;
+            let previous = self.current.lock().await.take();
+            if let Some(previous) = previous {
+                previous.begin_drain().await;
+            }
+            Ok(generation)
         }
-        Ok(generation)
+        .await;
+        match &result {
+            Ok(generation) => self.metrics.record_reload_success(*generation),
+            Err(_) => self.metrics.record_reload_failure(),
+        }
+        result
     }
 
     async fn open_flow(
@@ -781,6 +893,7 @@ impl ClientSessionManager {
         local: &mut TcpStream,
         shutdown_rx: &mut watch::Receiver<bool>,
     ) -> Result<OpenOutcome, AnyError> {
+        self.metrics.record_flow_open_request(RelayProtocol::Tcp);
         if *shutdown_rx.borrow() {
             return Ok(OpenOutcome::Cancelled);
         }
@@ -823,6 +936,7 @@ impl ClientSessionManager {
         tcp_buf: &mut [u8; 1],
         shutdown_rx: &mut watch::Receiver<bool>,
     ) -> Result<OpenOutcome, AnyError> {
+        self.metrics.record_flow_open_request(RelayProtocol::Udp);
         let mut last_error = None;
         for attempt in 0..2 {
             if *shutdown_rx.borrow() {
@@ -885,9 +999,11 @@ impl ClientSessionManager {
                 event = "client.session.connect",
                 config_generation = snapshot.generation
             );
-            let session = match ClientSession::connect(&snapshot).await {
+            self.metrics.record_session_connect_attempt();
+            let session = match ClientSession::connect(&snapshot, Arc::clone(&self.metrics)).await {
                 Ok(session) => session,
                 Err(err) => {
+                    self.metrics.record_session_connect_failure();
                     if self.remember_connect_failure(&snapshot, &err).await {
                         return Err(err);
                     }
@@ -1036,6 +1152,8 @@ fn ensure_reload_compatible(
         Some("shutdown_timeout_seconds")
     } else if current.max_socks_connections() != candidate.max_socks_connections() {
         Some("max_socks_connections")
+    } else if current.observability_listen != candidate.observability_listen {
+        Some("observability_listen")
     } else {
         None
     };
@@ -1046,7 +1164,10 @@ fn ensure_reload_compatible(
 }
 
 impl ClientSession {
-    async fn connect(snapshot: &ClientConfigSnapshot) -> Result<Arc<Self>, AnyError> {
+    async fn connect(
+        snapshot: &ClientConfigSnapshot,
+        metrics: Arc<ClientMetrics>,
+    ) -> Result<Arc<Self>, AnyError> {
         let config = snapshot.config.as_ref();
         let (carrier, settings) = session::connect_authenticated(config).await?;
         let negotiated = settings.negotiated_v0_1()?;
@@ -1073,12 +1194,15 @@ impl ClientSession {
             tasks: Mutex::new(ClientSessionTasks::default()),
             shutdown: ClientSessionShutdown::default(),
             draining: AtomicBool::new(false),
+            metrics: Arc::clone(&metrics),
+            metric_state: StdMutex::new(ClientSessionMetricState::Active),
             next_flow_id: AtomicU64::new(FIRST_CLIENT_FLOW_ID),
             next_ping_nonce: AtomicU64::new(0),
             outstanding_ping_nonce: AtomicU64::new(0),
             last_pong_nonce: AtomicU64::new(0),
             pong_notify: Notify::new(),
         });
+        metrics.record_session_established();
         info!(
             event = "client.session.established",
             correlation_id,
@@ -1102,6 +1226,16 @@ impl ClientSession {
     async fn begin_drain(&self) {
         if self.draining.swap(true, Ordering::AcqRel) {
             return;
+        }
+        {
+            let mut state = self
+                .metric_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *state == ClientSessionMetricState::Active {
+                *state = ClientSessionMetricState::Draining;
+                self.metrics.record_session_draining();
+            }
         }
         info!(
             event = "client.session.draining",
@@ -1144,6 +1278,16 @@ impl ClientSession {
 
     async fn close(&self) {
         if self.shutdown.close() {
+            let was_draining = {
+                let mut state = self
+                    .metric_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let was_draining = *state == ClientSessionMetricState::Draining;
+                *state = ClientSessionMetricState::Closed;
+                was_draining
+            };
+            self.metrics.record_session_closed(was_draining);
             self.pong_notify.notify_waiters();
             self.flows.lock().await.clear();
             let mut writer = self.writer.lock().await;
@@ -1191,6 +1335,7 @@ impl ClientSession {
             frames,
             session: Arc::clone(self),
             pending_local_data: Vec::new(),
+            metric_guard: None,
         };
         let frame = match self
             .wait_for_open_frame(
@@ -1211,6 +1356,8 @@ impl ClientSession {
         match decode_open_response(frame) {
             Ok(OpenResponse::Accepted) => {
                 flow.pending_local_data = pending_local_data.take_chunks();
+                flow.metric_guard =
+                    Some(self.metrics.begin_flow(FlowProtocol::Tcp.metric_protocol()));
                 Ok(OpenOutcome::Open(flow))
             }
             Ok(OpenResponse::Rejected(reply)) => {
@@ -1259,6 +1406,7 @@ impl ClientSession {
             frames,
             session: Arc::clone(self),
             pending_local_data: Vec::new(),
+            metric_guard: None,
         };
         let frame = match self
             .wait_for_udp_open_frame(flow_id, &mut flow.frames, local, tcp_buf, shutdown_rx)
@@ -1271,7 +1419,11 @@ impl ClientSession {
             }
         };
         match decode_udp_open_response(frame) {
-            Ok(OpenResponse::Accepted) => Ok(OpenOutcome::Open(flow)),
+            Ok(OpenResponse::Accepted) => {
+                flow.metric_guard =
+                    Some(self.metrics.begin_flow(FlowProtocol::Udp.metric_protocol()));
+                Ok(OpenOutcome::Open(flow))
+            }
             Ok(OpenResponse::Rejected(reply)) => {
                 self.remove_flow(flow_id).await;
                 Ok(OpenOutcome::Rejected(reply))
@@ -1489,12 +1641,26 @@ impl ClientSession {
 
     async fn send_tcp_data(&self, flow_id: u64, payload: Bytes) -> Result<(), AnyError> {
         let frame = Frame::new(FrameType::TcpData, 0, flow_id, payload)?;
-        self.write_frame(&frame).await
+        let payload_len = frame.payload.len();
+        self.write_frame(&frame).await?;
+        self.metrics.record_relay_bytes(
+            RelayProtocol::Tcp,
+            RelayDirection::LocalToServer,
+            payload_len,
+        );
+        Ok(())
     }
 
     async fn send_udp_data(&self, flow_id: u64, payload: Bytes) -> Result<(), AnyError> {
         let frame = Frame::new(FrameType::UdpData, 0, flow_id, payload)?;
-        self.write_frame(&frame).await
+        let payload_len = frame.payload.len();
+        self.write_frame(&frame).await?;
+        self.metrics.record_relay_bytes(
+            RelayProtocol::Udp,
+            RelayDirection::LocalToServer,
+            payload_len,
+        );
+        Ok(())
     }
 
     async fn send_tcp_close(&self, flow_id: u64, close_code: u16) -> Result<(), AnyError> {
@@ -2628,8 +2794,14 @@ async fn relay_udp_flow_to_client_inner(
                 let frame = frame.into_frame()?;
                 match frame.header.frame_type {
                     FrameType::UdpData => {
+                        let payload_len = frame.payload.len();
                         let packet = socks5::encode_udp_datagram(&target, &frame.payload)?;
                         socket.send_to(&packet, client_endpoint).await?;
+                        flow.session.metrics.record_relay_bytes(
+                            RelayProtocol::Udp,
+                            RelayDirection::ServerToLocal,
+                            payload_len,
+                        );
                         try_record_udp_association_activity(&flow_event_tx, flow_id, &target);
                     }
                     FrameType::UdpClose => {
@@ -2726,9 +2898,17 @@ async fn relay_tcp(
                         if !remote_to_local_open {
                             return Err("tcp data received after remote close".into());
                         }
+                        let payload_len = frame.payload.len();
                         let local_write_open = frame.payload.is_empty()
                             || write_all_or_shutdown(&mut local, &frame.payload, &mut shutdown_rx)
                                 .await?;
+                        if local_write_open {
+                            flow.session.metrics.record_relay_bytes(
+                                RelayProtocol::Tcp,
+                                RelayDirection::ServerToLocal,
+                                payload_len,
+                            );
+                        }
                         if !local_write_open {
                             local_to_remote_open = false;
                             remote_to_local_open = false;
@@ -3058,6 +3238,7 @@ mod tests {
             server_addr: "127.0.0.1:443".to_owned(),
             server_addrs: None,
             server_name: "localhost".to_owned(),
+            observability_listen: None,
             ca_cert_path: "missing-ca.pem".to_owned(),
             key_id: "client".to_owned(),
             secret: "0123456789abcdef0123456789abcdef".to_owned(),
@@ -3072,6 +3253,10 @@ mod tests {
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
         }
+    }
+
+    fn test_session_manager(config: ClientConfig) -> ClientSessionManager {
+        ClientSessionManager::new(config, Arc::new(ClientMetrics::default()))
     }
 
     fn boxed_io_error(kind: io::ErrorKind) -> AnyError {
@@ -4140,7 +4325,7 @@ mod tests {
     async fn session_manager_reuses_recent_connect_failure_during_retry_delay() {
         let mut config = minimal_config();
         config.server_connect_retry_delay_millis = Some(250);
-        let manager = ClientSessionManager::new(config);
+        let manager = test_session_manager(config);
 
         let first = expect_session_error(manager.current_session().await);
         assert!(!first.to_string().contains("retry cooldown active"));
@@ -4156,7 +4341,7 @@ mod tests {
     async fn session_manager_can_disable_connect_failure_retry_delay() {
         let mut config = minimal_config();
         config.server_connect_retry_delay_millis = Some(0);
-        let manager = ClientSessionManager::new(config);
+        let manager = test_session_manager(config);
 
         let first = expect_session_error(manager.current_session().await);
         let second = expect_session_error(manager.current_session().await);
@@ -4167,7 +4352,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_session_connect_failure_cache_is_cleared() {
-        let manager = ClientSessionManager::new(minimal_config());
+        let manager = test_session_manager(minimal_config());
         *manager.recent_connect_failure.lock().await = Some(CachedConnectFailure {
             generation: 1,
             message: Arc::from("old failure"),
@@ -4180,7 +4365,7 @@ mod tests {
 
     #[tokio::test]
     async fn previous_generation_connect_failure_cache_is_cleared() {
-        let manager = ClientSessionManager::new(minimal_config());
+        let manager = test_session_manager(minimal_config());
         *manager.recent_connect_failure.lock().await = Some(CachedConnectFailure {
             generation: 1,
             message: Arc::from("old failure"),
@@ -4203,6 +4388,20 @@ mod tests {
             .to_string();
 
         assert!(error.contains("max_socks_connections"));
+        assert!(error.contains("requires a restart"));
+    }
+
+    #[test]
+    fn client_reload_rejects_observability_listener_changes() {
+        let current = minimal_config();
+        let mut candidate = current.clone();
+        candidate.observability_listen = Some("127.0.0.1:9091".to_owned());
+
+        let error = ensure_reload_compatible(&current, &candidate)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("observability_listen"));
         assert!(error.contains("requires a restart"));
     }
 
