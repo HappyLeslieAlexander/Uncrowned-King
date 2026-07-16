@@ -1,0 +1,66 @@
+# Fuzz targets for the Uncrowned King strict parsers (whitepaper §20).
+#
+# This crate is intentionally NOT a member of the top-level workspace: it
+# requires a nightly toolchain and `cargo fuzz`, and must not affect the stable
+# CI build. Run with, e.g.:
+#
+#     cargo +nightly fuzz run frame_header
+#     cargo +nightly fuzz run target_decoder
+#     cargo +nightly fuzz run auth_payload
+#     cargo +nightly fuzz run tcp_state
+#     cargo +nightly fuzz run udp_state
+
+[package]
+name = "uk-proto-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+uk-proto = { path = ".." }
+uk-auth = { path = "../../uk-auth" }
+
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "frame_header"
+path = "fuzz_targets/frame_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "target_decoder"
+path = "fuzz_targets/target_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "auth_payload"
+path = "fuzz_targets/auth_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcp_state"
+path = "fuzz_targets/tcp_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "udp_state"
+path = "fuzz_targets/udp_state.rs"
+test = false
+doc = false
+bench = false
