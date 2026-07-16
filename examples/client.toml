@@ -1,7 +1,10 @@
 # Example UK client configuration.
 
-server_addr = "127.0.0.1:9443"
-server_addrs = []
+# Prefer the QUIC carrier, falling back to TLS/TCP on the same host:port.
+# A bare "host:port" or "tls://host:port" uses TLS/TCP; "quic://host:port"
+# uses QUIC. Endpoints are tried in order.
+server_addr = "quic://127.0.0.1:9443"
+server_addrs = ["tls://127.0.0.1:9443"]
 server_name = "localhost"
 observability_listen = "127.0.0.1:9091"
 ca_cert_path = "server-cert.pem"

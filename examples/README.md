@@ -30,6 +30,12 @@ uk-server --config examples/server.toml serve
 uk-client --config examples/client.toml socks5 --listen 127.0.0.1:1080
 ```
 
+The example server enables both carriers: the TLS/TCP `listen` and the QUIC
+`quic_listen` on the same `host:port` (TCP and UDP respectively). The example
+client prefers `quic://` and falls back to `tls://`, so it uses QUIC when the
+server offers it and TLS/TCP otherwise. Remove `quic_listen` from the server
+and the `quic://` entry from the client to run TLS/TCP only.
+
 The example server exposes local-only operational endpoints at
 `http://127.0.0.1:9090/healthz`, `/readyz`, and `/metrics`. These endpoints are
 unauthenticated; keep the listener on loopback or a protected management

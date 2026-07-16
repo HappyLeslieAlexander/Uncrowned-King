@@ -1,6 +1,9 @@
 # Example UK server configuration.
 
 listen = "127.0.0.1:9443"
+# Also accept the QUIC carrier on this UDP address (optional). Shares the
+# certificate, key, and uk/1 ALPN below. Remove to run TLS/TCP only.
+quic_listen = "127.0.0.1:9443"
 observability_listen = "127.0.0.1:9090"
 cert_path = "server-cert.pem"
 key_path = "server-key.pem"
