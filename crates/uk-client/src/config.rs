@@ -827,11 +827,49 @@ handshake_timeout_secondz = 4
         let config: ClientConfig = toml::from_str(include_str!("../../../examples/client.toml"))
             .expect("example client config should parse");
 
-        assert_eq!(config.server_addr, "127.0.0.1:9443");
-        assert_eq!(config.server_endpoints(), vec!["127.0.0.1:9443"]);
+        assert_eq!(config.server_addr, "quic://127.0.0.1:9443");
+        assert_eq!(
+            config.server_endpoints(),
+            vec!["quic://127.0.0.1:9443", "tls://127.0.0.1:9443"]
+        );
+        assert_eq!(
+            parse_endpoint(&config.server_addr).unwrap(),
+            (CarrierKind::Quic, "127.0.0.1:9443")
+        );
         assert!(config.validate_network_endpoints().is_ok());
         assert!(config.validate_resource_limits().is_ok());
         assert!(config.validate_auth_material().is_ok());
+    }
+
+    #[test]
+    fn parses_carrier_scheme_prefixes() {
+        assert_eq!(
+            parse_endpoint("127.0.0.1:9443").unwrap(),
+            (CarrierKind::Tls, "127.0.0.1:9443")
+        );
+        assert_eq!(
+            parse_endpoint("tls://127.0.0.1:9443").unwrap(),
+            (CarrierKind::Tls, "127.0.0.1:9443")
+        );
+        assert_eq!(
+            parse_endpoint("quic://uk.example.com:443").unwrap(),
+            (CarrierKind::Quic, "uk.example.com:443")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_carrier_scheme() {
+        let error = parse_endpoint("h3://127.0.0.1:9443")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("h3://"));
+    }
+
+    #[test]
+    fn validates_endpoint_with_carrier_scheme() {
+        assert!(validate_endpoint("server_addr", "quic://127.0.0.1:9443").is_ok());
+        assert!(validate_endpoint("server_addr", "quic://127.0.0.1").is_err());
     }
 
     #[test]
