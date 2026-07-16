@@ -23,7 +23,7 @@ use rustls::{
 };
 use socket2::Socket;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{Barrier, oneshot},
     task::{JoinHandle, JoinSet},
@@ -6063,8 +6063,8 @@ where
     Ok(())
 }
 
-async fn read_open_ack(
-    carrier: &mut ClientTlsStream<TcpStream>,
+async fn read_open_ack<C: AsyncRead + AsyncWrite + Unpin>(
+    carrier: &mut C,
     flow_id: u64,
 ) -> Result<(), TestError> {
     let frame = tokio::time::timeout(
@@ -6078,8 +6078,8 @@ async fn read_open_ack(
     Ok(())
 }
 
-async fn read_udp_open_ack(
-    carrier: &mut ClientTlsStream<TcpStream>,
+async fn read_udp_open_ack<C: AsyncRead + AsyncWrite + Unpin>(
+    carrier: &mut C,
     flow_id: u64,
 ) -> Result<(), TestError> {
     let frame = tokio::time::timeout(
@@ -6093,8 +6093,8 @@ async fn read_udp_open_ack(
     Ok(())
 }
 
-async fn read_relay_frame(
-    carrier: &mut ClientTlsStream<TcpStream>,
+async fn read_relay_frame<C: AsyncRead + AsyncWrite + Unpin>(
+    carrier: &mut C,
     frame_type: FrameType,
     flow_id: u64,
 ) -> Result<Frame, TestError> {
@@ -6111,8 +6111,8 @@ async fn read_relay_frame(
     Err(format!("did not receive {frame_type:?} for flow {flow_id}").into())
 }
 
-async fn assert_flow_error(
-    carrier: &mut ClientTlsStream<TcpStream>,
+async fn assert_flow_error<C: AsyncRead + AsyncWrite + Unpin>(
+    carrier: &mut C,
     flow_id: u64,
     expected: ErrorCode,
 ) -> Result<(), TestError> {
@@ -6128,8 +6128,8 @@ async fn assert_flow_error(
     Ok(())
 }
 
-async fn assert_tcp_close(
-    carrier: &mut ClientTlsStream<TcpStream>,
+async fn assert_tcp_close<C: AsyncRead + AsyncWrite + Unpin>(
+    carrier: &mut C,
     flow_id: u64,
     expected: u16,
 ) -> Result<(), TestError> {
@@ -6145,8 +6145,8 @@ async fn assert_tcp_close(
     Ok(())
 }
 
-async fn assert_udp_close(
-    carrier: &mut ClientTlsStream<TcpStream>,
+async fn assert_udp_close<C: AsyncRead + AsyncWrite + Unpin>(
+    carrier: &mut C,
     flow_id: u64,
     expected: u16,
 ) -> Result<(), TestError> {
@@ -6162,8 +6162,8 @@ async fn assert_udp_close(
     Ok(())
 }
 
-async fn write_ping_expect_pong(
-    carrier: &mut ClientTlsStream<TcpStream>,
+async fn write_ping_expect_pong<C: AsyncRead + AsyncWrite + Unpin>(
+    carrier: &mut C,
     payload: Bytes,
 ) -> Result<(), TestError> {
     let frame = Frame::new(FrameType::Ping, 0, 0, payload.clone())?;

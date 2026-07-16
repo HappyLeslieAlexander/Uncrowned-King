@@ -14,6 +14,7 @@ use std::{error::Error, fmt, future, future::Future};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::ClientConfig;
+pub use crate::session::ClientCarrier;
 
 const RELOAD_CHANNEL_CAPACITY: usize = 1;
 
@@ -98,13 +99,7 @@ pub async fn run_handshake(config: ClientConfig) -> Result<(), AnyError> {
 /// Connects to the server, authenticates, and returns the live UK carrier.
 pub async fn connect_authenticated_carrier(
     config: ClientConfig,
-) -> Result<
-    (
-        tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
-        uk_proto::Settings,
-    ),
-    AnyError,
-> {
+) -> Result<(ClientCarrier, uk_proto::Settings), AnyError> {
     session::connect_authenticated(&config).await
 }
 
