@@ -2948,7 +2948,7 @@ async fn run_server_observability_e2e() -> Result<(), TestError> {
 }
 
 #[tokio::test]
-async fn quic_carrier_round_trips_tcp_relay() -> Result<(), TestError> {
+async fn quic_carrier_round_trips_tcp_and_udp_relay() -> Result<(), TestError> {
     init_tracing();
 
     let temp_dir = create_temp_dir()?;
@@ -2959,6 +2959,7 @@ async fn quic_carrier_round_trips_tcp_relay() -> Result<(), TestError> {
     write_private_key(&key_path)?;
     fs::write(&policy_path, allow_loopback_any_port_policy())?;
     let (tcp_target_addr, tcp_target_task) = spawn_echo_target().await?;
+    let (udp_target_addr, udp_target_task) = spawn_udp_echo_target().await?;
 
     let quic_addr = unused_udp_loopback_addr().await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -3008,6 +3009,18 @@ async fn quic_carrier_round_trips_tcp_relay() -> Result<(), TestError> {
     let tcp_echo = read_relay_frame(&mut carrier, FrameType::TcpData, 1).await?;
     assert_eq!(tcp_echo.payload, tcp_payload);
     tcp_target_task.await??;
+
+    let udp_payload = Bytes::from_static(b"quic carrier udp payload");
+    write_frame(&mut carrier, &udp_open_frame(3, udp_target_addr)?).await?;
+    read_relay_frame(&mut carrier, FrameType::UdpData, 3).await?;
+    write_frame(
+        &mut carrier,
+        &Frame::new(FrameType::UdpData, 0, 3, udp_payload.clone())?,
+    )
+    .await?;
+    let udp_echo = read_relay_frame(&mut carrier, FrameType::UdpData, 3).await?;
+    assert_eq!(udp_echo.payload, udp_payload);
+    udp_target_task.await??;
 
     shutdown_tx
         .send(())
