@@ -2947,6 +2947,76 @@ async fn run_server_observability_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+#[tokio::test]
+async fn quic_carrier_round_trips_tcp_relay() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    let policy_path = temp_dir.join("policy.toml");
+    fs::write(&cert_path, CERT_PEM)?;
+    write_private_key(&key_path)?;
+    fs::write(&policy_path, allow_loopback_any_port_policy())?;
+    let (tcp_target_addr, tcp_target_task) = spawn_echo_target().await?;
+
+    let quic_addr = unused_udp_loopback_addr().await?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut config = test_server_config(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        &cert_path,
+        &key_path,
+        test_limits(),
+        Some(&policy_path),
+        30,
+    );
+    config.quic_listen = Some(quic_addr.to_string());
+    let (_server_addr, server_task) = start_uk_server_until_shutdown(config, async {
+        let _ = shutdown_rx.await;
+    })
+    .await?;
+
+    let (mut carrier, _settings) = connect_authenticated_carrier(ClientConfig {
+        server_addr: format!("quic://{quic_addr}"),
+        server_addrs: None,
+        server_name: "localhost".to_owned(),
+        observability_listen: None,
+        ca_cert_path: path_string(&cert_path),
+        key_id: KEY_ID.to_owned(),
+        secret: SECRET.to_owned(),
+        handshake_timeout_seconds: Some(5),
+        server_connect_retry_delay_millis: None,
+        socks_handshake_timeout_seconds: Some(3),
+        tcp_open_timeout_seconds: Some(3),
+        udp_flow_idle_timeout_seconds: None,
+        shutdown_timeout_seconds: Some(3),
+        max_pending_open_bytes: None,
+        max_socks_connections: None,
+        max_buffered_bytes_per_session: None,
+        max_buffered_bytes_per_flow: None,
+    })
+    .await?;
+
+    let tcp_payload = Bytes::from_static(b"quic carrier tcp payload");
+    write_frame(&mut carrier, &tcp_open_frame(1, tcp_target_addr)?).await?;
+    read_open_ack(&mut carrier, 1).await?;
+    write_frame(
+        &mut carrier,
+        &Frame::new(FrameType::TcpData, 0, 1, tcp_payload.clone())?,
+    )
+    .await?;
+    let tcp_echo = read_relay_frame(&mut carrier, FrameType::TcpData, 1).await?;
+    assert_eq!(tcp_echo.payload, tcp_payload);
+    tcp_target_task.await??;
+
+    shutdown_tx
+        .send(())
+        .map_err(|()| "server shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(5), server_task).await???;
+    drop(carrier);
+    Ok(())
+}
+
 async fn run_client_observability_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -6342,6 +6412,19 @@ async fn unused_loopback_addr() -> Result<SocketAddr, TestError> {
         }
     }
     Err("no available loopback port in test range".into())
+}
+
+async fn unused_udp_loopback_addr() -> Result<SocketAddr, TestError> {
+    for _ in 0..TEST_LOOPBACK_PORT_SPAN {
+        let sequence = NEXT_LOOPBACK_PORT_OFFSET.fetch_add(1, Ordering::Relaxed);
+        let port = test_loopback_port(sequence);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        if let Ok(socket) = UdpSocket::bind(addr).await {
+            drop(socket);
+            return Ok(addr);
+        }
+    }
+    Err("no available loopback UDP port in test range".into())
 }
 
 fn test_loopback_port(sequence: u16) -> u16 {

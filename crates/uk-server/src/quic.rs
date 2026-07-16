@@ -2,10 +2,13 @@
 //!
 //! The QUIC carrier reuses the same rustls TLS 1.3 material and ALPN (`uk/1`)
 //! as the TLS/TCP carrier. UK frames travel over a single bidirectional QUIC
-//! stream opened by the client after the handshake completes; QUIC DATAGRAMs
+//! stream that the server opens after the handshake completes. The server
+//! opens it (rather than the client) because UK sends `AUTH_CHALLENGE` first,
+//! and a QUIC stream only becomes visible to the peer once its opener writes;
+//! opening server-side keeps the server the first speaker. QUIC DATAGRAMs
 //! carry UDP relay payloads when both peers advertise support. 0-RTT
-//! application data is never accepted: the control stream is only accepted
-//! after the 1-RTT handshake finishes.
+//! application data is never accepted: the stream is only opened after the
+//! 1-RTT handshake finishes.
 
 use std::{net::SocketAddr, sync::Arc};
 
@@ -73,16 +76,18 @@ fn exporter(connection: &quinn::Connection) -> Result<[u8; 32], QuicError> {
     Ok(out)
 }
 
-/// Accepts the client's control stream on an ALPN-verified QUIC connection and
-/// returns carrier-neutral channel halves plus the auth exporter binding.
+/// Opens the control stream on an ALPN-verified QUIC connection and returns
+/// carrier-neutral channel halves plus the auth exporter binding. The caller
+/// must write to the returned writer (the server sends `AUTH_CHALLENGE` first)
+/// so the stream becomes visible to the client.
 pub async fn accept_carrier(
     connection: &quinn::Connection,
 ) -> Result<(BoxedCarrierReader, BoxedCarrierWriter, [u8; 32]), QuicError> {
     verify_alpn(connection)?;
     let exporter = exporter(connection)?;
     let (send, recv) = connection
-        .accept_bi()
+        .open_bi()
         .await
-        .map_err(|err| format!("failed to accept QUIC control stream: {err}"))?;
+        .map_err(|err| format!("failed to open QUIC control stream: {err}"))?;
     Ok((Box::new(recv), Box::new(send), exporter))
 }

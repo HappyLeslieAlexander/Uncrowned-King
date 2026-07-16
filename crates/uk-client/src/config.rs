@@ -255,11 +255,40 @@ impl ClientConfig {
 }
 
 /// Validates one `host:port` endpoint without resolving DNS.
+/// Carrier transport selected for a UK server endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CarrierKind {
+    /// TLS over TCP (the default when an endpoint carries no scheme).
+    Tls,
+    /// QUIC.
+    Quic,
+}
+
+/// Splits an optional `tls://` or `quic://` scheme from a server endpoint.
+///
+/// Endpoints without a scheme use the TLS/TCP carrier. Listing a `quic://`
+/// endpoint ahead of a `tls://` one in `server_addr`/`server_addrs` yields
+/// QUIC-preferred connection with automatic TLS fallback, reusing the existing
+/// ordered endpoint retry.
+pub fn parse_endpoint(raw: &str) -> Result<(CarrierKind, &str), Box<dyn Error + Send + Sync>> {
+    if let Some(rest) = raw.strip_prefix("quic://") {
+        Ok((CarrierKind::Quic, rest))
+    } else if let Some(rest) = raw.strip_prefix("tls://") {
+        Ok((CarrierKind::Tls, rest))
+    } else if let Some((scheme, _)) = raw.split_once("://") {
+        Err(format!("unsupported carrier scheme '{scheme}://' in endpoint {raw}").into())
+    } else {
+        Ok((CarrierKind::Tls, raw))
+    }
+}
+
+/// Validates a server endpoint, accepting an optional carrier scheme prefix.
 pub fn validate_endpoint(
     name: &'static str,
     value: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    validate_host_port_endpoint(name, value)?;
+    let (_, addr) = parse_endpoint(value)?;
+    validate_host_port_endpoint(name, addr)?;
     Ok(())
 }
 

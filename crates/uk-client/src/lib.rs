@@ -4,6 +4,7 @@ pub mod config;
 
 mod config_state;
 mod observability;
+mod quic;
 mod relay;
 mod session;
 mod socks5;

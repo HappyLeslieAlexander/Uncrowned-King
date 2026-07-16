@@ -23,7 +23,10 @@ use uk_proto::{
     Settings, read_frame, validate_connection_frame, write_frame,
 };
 
-use crate::{config::ClientConfig, tls};
+use crate::{
+    config::{CarrierKind, ClientConfig},
+    tls,
+};
 
 type AnyError = Box<dyn Error + Send + Sync>;
 
@@ -305,7 +308,21 @@ async fn connect_authenticated_endpoint(
     server_name: ServerName<'static>,
     endpoint: &str,
 ) -> Result<(ClientCarrier, Settings), AnyError> {
-    let tcp = TcpStream::connect(endpoint)
+    let (carrier, addr) = crate::config::parse_endpoint(endpoint)
+        .map_err(|err| phase_error("parse endpoint", EndpointFailurePhase::Other, err))?;
+    let (reader, writer, exporter) = match carrier {
+        CarrierKind::Tls => establish_tls_carrier(connector, server_name, addr).await?,
+        CarrierKind::Quic => establish_quic_carrier(config, addr).await?,
+    };
+    authenticate_over_carrier(config, reader, writer, exporter).await
+}
+
+async fn establish_tls_carrier(
+    connector: &TlsConnector,
+    server_name: ServerName<'static>,
+    addr: &str,
+) -> Result<(BoxedCarrierReader, BoxedCarrierWriter, [u8; 32]), AnyError> {
+    let tcp = TcpStream::connect(addr)
         .await
         .map_err(|err| phase_error("tcp connect", EndpointFailurePhase::Tcp, err))?;
     tcp.set_nodelay(true)
@@ -319,7 +336,18 @@ async fn connect_authenticated_endpoint(
     let exporter = tls::exporter(&stream)
         .map_err(|err| phase_error("tls exporter", EndpointFailurePhase::Tls, err))?;
     let (reader, writer) = tokio::io::split(stream);
-    authenticate_over_carrier(config, Box::new(reader), Box::new(writer), exporter).await
+    Ok((Box::new(reader), Box::new(writer), exporter))
+}
+
+async fn establish_quic_carrier(
+    config: &ClientConfig,
+    addr: &str,
+) -> Result<(BoxedCarrierReader, BoxedCarrierWriter, [u8; 32]), AnyError> {
+    let rustls_config = tls::client_config(&config.ca_cert_path)
+        .map_err(|err| phase_error("quic client config", EndpointFailurePhase::Tls, err))?;
+    crate::quic::connect(rustls_config, addr, &config.server_name)
+        .await
+        .map_err(|err| phase_error("quic connect", EndpointFailurePhase::Tls, err))
 }
 
 /// Runs the UK challenge-response authentication over an established,
