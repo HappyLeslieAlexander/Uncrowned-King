@@ -25,6 +25,50 @@ const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 const PROTOCOL_COUNT: usize = 2;
 const OPEN_FAILURE_COUNT: usize = 5;
 const DIRECTION_COUNT: usize = 2;
+const HANDSHAKE_FAILURE_COUNT: usize = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HandshakeFailureReason {
+    Tls,
+    Timeout,
+    Auth,
+    Protocol,
+    Io,
+    Other,
+}
+
+impl HandshakeFailureReason {
+    const ALL: [Self; HANDSHAKE_FAILURE_COUNT] = [
+        Self::Tls,
+        Self::Timeout,
+        Self::Auth,
+        Self::Protocol,
+        Self::Io,
+        Self::Other,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Tls => 0,
+            Self::Timeout => 1,
+            Self::Auth => 2,
+            Self::Protocol => 3,
+            Self::Io => 4,
+            Self::Other => 5,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Tls => "tls",
+            Self::Timeout => "timeout",
+            Self::Auth => "auth",
+            Self::Protocol => "protocol",
+            Self::Io => "io",
+            Self::Other => "other",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum RelayProtocol {
@@ -123,6 +167,7 @@ pub(super) struct ServerMetrics {
     accepted_connections_total: AtomicU64,
     rejected_handshakes_total: AtomicU64,
     failed_handshakes_total: AtomicU64,
+    handshake_failures_total: [AtomicU64; HANDSHAKE_FAILURE_COUNT],
     active_handshakes: AtomicU64,
     authenticated_sessions_total: AtomicU64,
     rejected_sessions_total: AtomicU64,
@@ -173,8 +218,9 @@ impl ServerMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(super) fn record_failed_handshake(&self) {
+    pub(super) fn record_failed_handshake(&self, reason: HandshakeFailureReason) {
         self.failed_handshakes_total.fetch_add(1, Ordering::Relaxed);
+        self.handshake_failures_total[reason.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn begin_handshake(self: &Arc<Self>) -> ActiveMetricGuard {
@@ -284,8 +330,25 @@ impl ServerMetrics {
             rejected_sessions_total = self.rejected_sessions_total.load(Ordering::Relaxed),
             active_sessions = self.active_sessions.load(Ordering::Relaxed),
         );
+        self.render_handshake_failure_metrics(&mut output);
         self.render_flow_metrics(&mut output);
         output
+    }
+
+    fn render_handshake_failure_metrics(&self, output: &mut String) {
+        output.push_str(
+            "# HELP uncrowned_king_server_handshake_failures_total Failed TLS or authentication handshakes by bounded reason.\n\
+# TYPE uncrowned_king_server_handshake_failures_total counter\n",
+        );
+        for reason in HandshakeFailureReason::ALL {
+            writeln!(
+                output,
+                "uncrowned_king_server_handshake_failures_total{{reason=\"{}\"}} {}",
+                reason.label(),
+                self.handshake_failures_total[reason.index()].load(Ordering::Relaxed)
+            )
+            .expect("writing metrics to a String cannot fail");
+        }
     }
 
     fn render_flow_metrics(&self, output: &mut String) {
@@ -620,7 +683,7 @@ mod tests {
         metrics.record_config_reload_failure();
         metrics.record_accepted_connection();
         metrics.record_rejected_handshake();
-        metrics.record_failed_handshake();
+        metrics.record_failed_handshake(HandshakeFailureReason::Auth);
         let handshake = metrics.begin_handshake();
         let session = metrics.begin_session();
         metrics.record_rejected_session();
@@ -643,6 +706,10 @@ mod tests {
         assert!(response.contains("uncrowned_king_server_config_reload_failures_total 1\n"));
         assert!(response.contains("uncrowned_king_server_accepted_connections_total 1\n"));
         assert!(response.contains("uncrowned_king_server_active_handshakes 1\n"));
+        assert!(
+            response
+                .contains("uncrowned_king_server_handshake_failures_total{reason=\"auth\"} 1\n")
+        );
         assert!(response.contains("uncrowned_king_server_active_sessions 1\n"));
         assert!(
             response

@@ -40,7 +40,7 @@ use uk_proto::{
 };
 
 use crate::config::ServerConfig;
-use crate::observability::ServerMetrics;
+use crate::observability::{HandshakeFailureReason, ServerMetrics};
 use crate::security::{AuthenticationSnapshot, SecurityState};
 
 /// Server error type.
@@ -134,6 +134,7 @@ impl ListenerAcceptBackoff {
 #[derive(Debug)]
 struct HandshakePhaseError {
     phase: &'static str,
+    failure_reason: HandshakeFailureReason,
     source: AnyError,
 }
 
@@ -651,7 +652,11 @@ async fn handle_connection(
             .await
             {
                 Ok(result) => result,
-                Err(_) => Err("handshake timeout".into()),
+                Err(_) => Err(phase_error(
+                    "handshake",
+                    HandshakeFailureReason::Timeout,
+                    "deadline exceeded",
+                )),
             }
         } else {
             complete_handshake(tcp, authentication, replay_cache, &config).await
@@ -669,10 +674,10 @@ async fn handle_connection(
     let Some(handshake_result) = handshake_result else {
         return Ok(());
     };
-    let (mut stream, identity) = match handshake_result {
+    let (stream, identity) = match handshake_result {
         Ok(handshake) => handshake,
         Err(err) => {
-            metrics.record_failed_handshake();
+            metrics.record_failed_handshake(handshake_failure_reason(&err));
             return Err(err);
         }
     };
@@ -682,6 +687,34 @@ async fn handle_connection(
         return Ok(());
     }
 
+    run_authenticated_session(
+        stream,
+        identity,
+        security,
+        &config,
+        session_permits,
+        max_sessions,
+        peer,
+        shutdown_rx,
+        metrics,
+    )
+    .await
+}
+
+/// Acquires a session slot, sends SETTINGS, and runs the relay loop for an
+/// authenticated carrier session.
+#[allow(clippy::too_many_arguments)]
+async fn run_authenticated_session(
+    mut stream: TlsStream<tokio::net::TcpStream>,
+    identity: AuthenticatedIdentity,
+    security: SecurityState,
+    config: &ServerConfig,
+    session_permits: Arc<Semaphore>,
+    max_sessions: usize,
+    peer: SocketAddr,
+    shutdown_rx: watch::Receiver<bool>,
+    metrics: Arc<ServerMetrics>,
+) -> Result<(), AnyError> {
     let Ok(session_permit) = session_permits.try_acquire_owned() else {
         metrics.record_rejected_session();
         warn!(event = "server.session.limit", peer = %peer, max_sessions);
@@ -692,7 +725,7 @@ async fn handle_connection(
     let _session_permit = session_permit;
     let _active_session = metrics.begin_session();
 
-    write_server_settings(&mut stream, &config).await?;
+    write_server_settings(&mut stream, config).await?;
 
     relay::relay_session(
         stream,
@@ -751,20 +784,31 @@ async fn complete_handshake(
         .tls_acceptor
         .accept(tcp)
         .await
-        .map_err(|err| phase_error("tls accept", err))?;
-    tls::verify_alpn(&stream).map_err(|err| phase_error("tls alpn verify", err))?;
-    let exporter = tls::exporter(&stream).map_err(|err| phase_error("tls exporter", err))?;
+        .map_err(|err| phase_error("tls accept", HandshakeFailureReason::Tls, err))?;
+    tls::verify_alpn(&stream)
+        .map_err(|err| phase_error("tls alpn verify", HandshakeFailureReason::Tls, err))?;
+    let exporter = tls::exporter(&stream)
+        .map_err(|err| phase_error("tls exporter", HandshakeFailureReason::Tls, err))?;
     let challenge = AuthChallenge::generate(unix_now());
 
     let mut payload = BytesMut::new();
     challenge
         .encode(&mut payload)
-        .map_err(|err| phase_error("encode auth challenge", err))?;
-    let challenge_frame = Frame::new(FrameType::AuthChallenge, 0, 0, payload.freeze())
-        .map_err(|err| phase_error("build auth challenge frame", err))?;
+        .map_err(|err| phase_error("encode auth challenge", HandshakeFailureReason::Auth, err))?;
+    let challenge_frame =
+        Frame::new(FrameType::AuthChallenge, 0, 0, payload.freeze()).map_err(|err| {
+            phase_error(
+                "build auth challenge frame",
+                HandshakeFailureReason::Auth,
+                err,
+            )
+        })?;
     write_frame(&mut stream, &challenge_frame)
         .await
-        .map_err(|err| phase_error("write auth challenge", err))?;
+        .map_err(|err| {
+            let reason = frame_io_failure_reason(&err);
+            phase_error("write auth challenge", reason, err)
+        })?;
 
     let response_frame = match read_frame(
         &mut stream,
@@ -777,13 +821,18 @@ async fn complete_handshake(
         Ok(frame) => frame,
         Err(err) => {
             report_handshake_frame_io_error(&mut stream, &err).await;
-            return Err(phase_error("read auth response", err));
+            let reason = frame_io_failure_reason(&err);
+            return Err(phase_error("read auth response", reason, err));
         }
     };
 
     if let Err(err) = validate_connection_frame(&response_frame, FrameType::AuthResponse) {
         let _ = write_connection_error(&mut stream, ErrorCode::Protocol).await;
-        return Err(phase_error("validate auth response", err));
+        return Err(phase_error(
+            "validate auth response",
+            HandshakeFailureReason::Protocol,
+            err,
+        ));
     }
 
     let mut response_payload = response_frame.payload;
@@ -791,7 +840,11 @@ async fn complete_handshake(
         Ok(response) => response,
         Err(err) => {
             let _ = write_connection_error(&mut stream, ErrorCode::AuthFailed).await;
-            return Err(phase_error("decode auth response", err));
+            return Err(phase_error(
+                "decode auth response",
+                HandshakeFailureReason::Auth,
+                err,
+            ));
         }
     };
     let now = unix_now();
@@ -811,7 +864,11 @@ async fn complete_handshake(
         Ok(identity) => identity,
         Err(err) => {
             let _ = write_connection_error(&mut stream, ErrorCode::AuthFailed).await;
-            return Err(phase_error("verify auth response", err));
+            return Err(phase_error(
+                "verify auth response",
+                HandshakeFailureReason::Auth,
+                err,
+            ));
         }
     };
 
@@ -832,12 +889,19 @@ async fn write_server_settings(
     let mut settings_payload = BytesMut::new();
     settings
         .encode(&mut settings_payload)
-        .map_err(|err| phase_error("encode server settings", err))?;
-    let settings_frame = Frame::new(FrameType::Settings, 0, 0, settings_payload.freeze())
-        .map_err(|err| phase_error("build server settings frame", err))?;
-    write_frame(stream, &settings_frame)
-        .await
-        .map_err(|err| phase_error("write server settings", err))?;
+        .map_err(|err| phase_error("encode server settings", HandshakeFailureReason::Other, err))?;
+    let settings_frame =
+        Frame::new(FrameType::Settings, 0, 0, settings_payload.freeze()).map_err(|err| {
+            phase_error(
+                "build server settings frame",
+                HandshakeFailureReason::Other,
+                err,
+            )
+        })?;
+    write_frame(stream, &settings_frame).await.map_err(|err| {
+        let reason = frame_io_failure_reason(&err);
+        phase_error("write server settings", reason, err)
+    })?;
     Ok(())
 }
 
@@ -907,14 +971,54 @@ fn listener_shutdown_timeout(seconds: u64) -> Option<Duration> {
     (seconds != 0).then(|| Duration::from_secs(seconds))
 }
 
-fn phase_error<E>(phase: &'static str, source: E) -> AnyError
+fn phase_error<E>(
+    phase: &'static str,
+    failure_reason: HandshakeFailureReason,
+    source: E,
+) -> AnyError
 where
     E: Into<AnyError>,
 {
     Box::new(HandshakePhaseError {
         phase,
+        failure_reason,
         source: source.into(),
     })
+}
+
+fn handshake_failure_reason(error: &AnyError) -> HandshakeFailureReason {
+    let mut current = Some(error.as_ref() as &(dyn Error + 'static));
+    while let Some(source) = current {
+        if let Some(error) = source.downcast_ref::<HandshakePhaseError>() {
+            return error.failure_reason;
+        }
+        current = source.source();
+    }
+    if let Some(error) = find_frame_io_error(error.as_ref()) {
+        return frame_io_failure_reason(error);
+    }
+    if find_io_error(error.as_ref()).is_some() {
+        return HandshakeFailureReason::Io;
+    }
+    HandshakeFailureReason::Other
+}
+
+fn frame_io_failure_reason(error: &FrameIoError) -> HandshakeFailureReason {
+    match error {
+        FrameIoError::Protocol(_) => HandshakeFailureReason::Protocol,
+        FrameIoError::Closed | FrameIoError::Io(_) => HandshakeFailureReason::Io,
+    }
+}
+
+fn find_frame_io_error<'a>(error: &'a (dyn Error + 'static)) -> Option<&'a FrameIoError> {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(error) = error.downcast_ref::<FrameIoError>() {
+            return Some(error);
+        }
+        current = error.source();
+    }
+    None
 }
 
 fn is_clean_tls_handshake_disconnect(error: &AnyError) -> bool {
@@ -1157,20 +1261,37 @@ mod tests {
 
     #[test]
     fn handshake_phase_error_reports_phase_and_source() {
-        let error = phase_error("tls accept", "client closed");
+        let error = phase_error("tls accept", HandshakeFailureReason::Tls, "client closed");
 
         assert_eq!(error.to_string(), "tls accept failed: client closed");
         assert!(error.source().is_some());
+        assert_eq!(
+            handshake_failure_reason(&error),
+            HandshakeFailureReason::Tls
+        );
     }
 
     #[test]
     fn classifies_clean_disconnects_through_handshake_phase_error() {
         let error = phase_error(
             "tls accept",
+            HandshakeFailureReason::Tls,
             io::Error::new(io::ErrorKind::UnexpectedEof, "client closed"),
         );
 
         assert!(is_clean_tls_handshake_disconnect(&error));
+    }
+
+    #[test]
+    fn classifies_unwrapped_frame_and_io_failures() {
+        let closed: AnyError = Box::new(FrameIoError::Closed);
+        let io: AnyError = io::Error::new(io::ErrorKind::ConnectionReset, "reset").into();
+
+        assert_eq!(
+            handshake_failure_reason(&closed),
+            HandshakeFailureReason::Io
+        );
+        assert_eq!(handshake_failure_reason(&io), HandshakeFailureReason::Io);
     }
 
     #[tokio::test]
