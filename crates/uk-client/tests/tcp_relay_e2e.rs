@@ -5721,6 +5721,7 @@ fn test_server_config(
 ) -> ServerConfig {
     ServerConfig {
         listen: listen.to_string(),
+        quic_listen: None,
         observability_listen: None,
         cert_path: path_string(cert_path),
         key_path: path_string(key_path),

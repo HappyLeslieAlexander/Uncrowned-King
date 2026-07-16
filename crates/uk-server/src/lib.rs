@@ -216,6 +216,42 @@ impl ConnectionRuntime {
             peer = %peer
         )));
     }
+
+    fn spawn_accepted_quic(
+        &self,
+        connections: &mut JoinSet<()>,
+        incoming: quinn::Incoming,
+        peer: SocketAddr,
+        shutdown_rx: watch::Receiver<bool>,
+    ) {
+        self.metrics.record_accepted_connection();
+        let Ok(handshake_permit) = Arc::clone(&self.handshake_permits).try_acquire_owned() else {
+            self.metrics.record_rejected_handshake();
+            warn!(
+                event = "server.handshake.limit",
+                peer = %peer,
+                carrier = "quic",
+                max_handshakes = self.max_handshakes
+            );
+            incoming.refuse();
+            return;
+        };
+        let runtime = self.clone();
+        let connection_id = next_connection_correlation_id();
+        let connection = async move {
+            if let Err(err) =
+                handle_quic_connection(runtime, incoming, handshake_permit, peer, shutdown_rx).await
+            {
+                warn!(event = "protocol.error", peer = %peer, carrier = "quic", error = %err);
+            }
+        };
+        connections.spawn(connection.instrument(info_span!(
+            "server.connection",
+            connection_id,
+            peer = %peer,
+            carrier = "quic"
+        )));
+    }
 }
 
 /// Runs the UK server listener until the task is cancelled or the listener fails.
@@ -316,6 +352,11 @@ where
 
     info!(event = "server.listen", listen = %listen);
 
+    let quic_endpoint = build_quic_endpoint(&config)?;
+    if let Some(endpoint) = &quic_endpoint {
+        info!(event = "server.listen.quic", listen = %endpoint.local_addr()?);
+    }
+
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
     let (observability_shutdown_tx, observability_shutdown_rx) = watch::channel(false);
     let observability_task =
@@ -361,16 +402,52 @@ where
                     .spawn_accepted(&mut connections, tcp, peer, shutdown_tx.subscribe())
                     .await;
             }
+            incoming = accept_quic(quic_endpoint.as_ref()) => {
+                if let Some(incoming) = incoming {
+                    let peer = incoming.remote_address();
+                    connection_runtime.spawn_accepted_quic(
+                        &mut connections,
+                        incoming,
+                        peer,
+                        shutdown_tx.subscribe(),
+                    );
+                }
+            }
             joined = connections.join_next(), if !connections.is_empty() => {
                 log_connection_task_result(joined);
             }
         }
     }
 
+    if let Some(endpoint) = &quic_endpoint {
+        endpoint.close(0_u32.into(), b"server shutdown");
+    }
     drain_connection_tasks(&mut connections, shutdown_timeout).await;
     stop_observability(observability_shutdown_tx, observability_task).await;
 
     Ok(())
+}
+
+/// Builds the QUIC server endpoint when `quic_listen` is configured.
+fn build_quic_endpoint(config: &ServerConfig) -> Result<Option<quinn::Endpoint>, AnyError> {
+    let Some(listen) = &config.quic_listen else {
+        return Ok(None);
+    };
+    let addr: SocketAddr = listen
+        .parse()
+        .map_err(|err| format!("invalid quic_listen address {listen}: {err}"))?;
+    let rustls_config = tls::server_config(&config.cert_path, &config.key_path)?;
+    let quic_config = quic::server_config(rustls_config)?;
+    let endpoint = quic::bind_endpoint(quic_config, addr)?;
+    Ok(Some(endpoint))
+}
+
+/// Accepts the next QUIC connection, or waits forever when QUIC is disabled.
+async fn accept_quic(endpoint: Option<&quinn::Endpoint>) -> Option<quinn::Incoming> {
+    match endpoint {
+        Some(endpoint) => endpoint.accept().await,
+        None => future::pending().await,
+    }
 }
 
 fn handle_reload_request(
@@ -529,6 +606,8 @@ fn changed_static_config_field(
 ) -> Option<&'static str> {
     if current.listen != candidate.listen {
         Some("listen")
+    } else if current.quic_listen != candidate.quic_listen {
+        Some("quic_listen")
     } else if current.observability_listen != candidate.observability_listen {
         Some("observability_listen")
     } else {
@@ -628,31 +707,80 @@ async fn handle_connection(
     tcp: tokio::net::TcpStream,
     handshake_permit: OwnedSemaphorePermit,
     peer: SocketAddr,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AnyError> {
-    let ConnectionRuntime {
-        security,
-        replay_cache,
-        session_permits,
-        config,
-        max_sessions,
-        metrics,
-        ..
-    } = runtime;
     tcp.set_nodelay(true)?;
     if *shutdown_rx.borrow() {
         return Ok(());
     }
+    let authentication = runtime.security.authentication_snapshot();
+    let replay_cache = Arc::clone(&runtime.replay_cache);
+    let config = Arc::clone(&runtime.config);
+    let handshake =
+        async move { complete_handshake(tcp, authentication, replay_cache, &config).await };
+    serve_authenticated_carrier(runtime, handshake_permit, peer, shutdown_rx, handshake).await
+}
 
-    let authentication = security.authentication_snapshot();
-    let handshake = async {
-        if let Some(timeout) = handshake_timeout(config.handshake_timeout_seconds()) {
-            match time::timeout(
-                timeout,
-                complete_handshake(tcp, authentication, replay_cache, &config),
-            )
+async fn handle_quic_connection(
+    runtime: ConnectionRuntime,
+    incoming: quinn::Incoming,
+    handshake_permit: OwnedSemaphorePermit,
+    peer: SocketAddr,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), AnyError> {
+    if *shutdown_rx.borrow() {
+        return Ok(());
+    }
+    let authentication = runtime.security.authentication_snapshot();
+    let replay_cache = Arc::clone(&runtime.replay_cache);
+    let config = Arc::clone(&runtime.config);
+    let handshake = async move {
+        let connection = incoming
             .await
-            {
+            .map_err(|err| phase_error("quic accept", HandshakeFailureReason::Tls, err))?;
+        let (reader, writer, exporter) = quic::accept_carrier(&connection)
+            .await
+            .map_err(|err| phase_error("quic carrier", HandshakeFailureReason::Tls, err))?;
+        authenticate_carrier(
+            reader,
+            writer,
+            exporter,
+            authentication,
+            replay_cache,
+            &config,
+        )
+        .await
+    };
+    serve_authenticated_carrier(runtime, handshake_permit, peer, shutdown_rx, handshake).await
+}
+
+/// Applies the handshake timeout, races the handshake against shutdown, and
+/// runs the authenticated relay session. Carrier-neutral: both the TLS/TCP and
+/// QUIC handlers build a handshake future that yields authenticated channel
+/// halves and hand it here.
+async fn serve_authenticated_carrier<H>(
+    runtime: ConnectionRuntime,
+    handshake_permit: OwnedSemaphorePermit,
+    peer: SocketAddr,
+    mut shutdown_rx: watch::Receiver<bool>,
+    handshake: H,
+) -> Result<(), AnyError>
+where
+    H: Future<
+        Output = Result<
+            (
+                BoxedCarrierReader,
+                BoxedCarrierWriter,
+                AuthenticatedIdentity,
+            ),
+            AnyError,
+        >,
+    >,
+{
+    let timeout = handshake_timeout(runtime.config.handshake_timeout_seconds());
+    let handshake = async move {
+        if let Some(timeout) = timeout {
+            match time::timeout(timeout, handshake).await {
                 Ok(result) => result,
                 Err(_) => Err(phase_error(
                     "handshake",
@@ -661,11 +789,11 @@ async fn handle_connection(
                 )),
             }
         } else {
-            complete_handshake(tcp, authentication, replay_cache, &config).await
+            handshake.await
         }
     };
 
-    let handshake_guard = metrics.begin_handshake();
+    let handshake_guard = runtime.metrics.begin_handshake();
     let handshake_result = tokio::select! {
         result = handshake => Some(result),
         changed = shutdown_rx.changed() => {
@@ -679,7 +807,9 @@ async fn handle_connection(
     let (carrier_reader, carrier_writer, identity) = match handshake_result {
         Ok(handshake) => handshake,
         Err(err) => {
-            metrics.record_failed_handshake(handshake_failure_reason(&err));
+            runtime
+                .metrics
+                .record_failed_handshake(handshake_failure_reason(&err));
             return Err(err);
         }
     };
@@ -693,13 +823,13 @@ async fn handle_connection(
         carrier_reader,
         carrier_writer,
         identity,
-        security,
-        &config,
-        session_permits,
-        max_sessions,
+        runtime.security,
+        &runtime.config,
+        runtime.session_permits,
+        runtime.max_sessions,
         peer,
         shutdown_rx,
-        metrics,
+        runtime.metrics,
     )
     .await
 }
@@ -1115,6 +1245,7 @@ mod tests {
     fn minimal_config() -> ServerConfig {
         ServerConfig {
             listen: "127.0.0.1:1".to_owned(),
+            quic_listen: None,
             observability_listen: None,
             cert_path: "cert.pem".to_owned(),
             key_path: "key.pem".to_owned(),
