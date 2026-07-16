@@ -28,15 +28,16 @@ use tokio::{
     task::JoinSet,
     time,
 };
-use tokio_rustls::{TlsAcceptor, server::TlsStream};
+use tokio_rustls::TlsAcceptor;
 use tracing::{Instrument, debug, info, info_span, warn};
 use uk_auth::{
     AuthChallenge, AuthResponse, AuthenticatedIdentity, ReplayCache, unix_now,
     verify_auth_response_identity,
 };
 use uk_proto::{
-    ErrorCode, ErrorPayload, Frame, FrameIoError, FrameLimits, FrameType, SettingKey, Settings,
-    read_frame, validate_connection_frame, write_frame,
+    BoxedCarrierReader, BoxedCarrierWriter, ErrorCode, ErrorPayload, Frame, FrameIoError,
+    FrameLimits, FrameType, SettingKey, Settings, read_frame, validate_connection_frame,
+    write_frame,
 };
 
 use crate::config::ServerConfig;
@@ -674,7 +675,7 @@ async fn handle_connection(
     let Some(handshake_result) = handshake_result else {
         return Ok(());
     };
-    let (stream, identity) = match handshake_result {
+    let (carrier_reader, carrier_writer, identity) = match handshake_result {
         Ok(handshake) => handshake,
         Err(err) => {
             metrics.record_failed_handshake(handshake_failure_reason(&err));
@@ -688,7 +689,8 @@ async fn handle_connection(
     }
 
     run_authenticated_session(
-        stream,
+        carrier_reader,
+        carrier_writer,
         identity,
         security,
         &config,
@@ -705,7 +707,8 @@ async fn handle_connection(
 /// authenticated carrier session.
 #[allow(clippy::too_many_arguments)]
 async fn run_authenticated_session(
-    mut stream: TlsStream<tokio::net::TcpStream>,
+    carrier_reader: BoxedCarrierReader,
+    mut carrier_writer: BoxedCarrierWriter,
     identity: AuthenticatedIdentity,
     security: SecurityState,
     config: &ServerConfig,
@@ -718,17 +721,16 @@ async fn run_authenticated_session(
     let Ok(session_permit) = session_permits.try_acquire_owned() else {
         metrics.record_rejected_session();
         warn!(event = "server.session.limit", peer = %peer, max_sessions);
-        let _ = write_connection_error(&mut stream, ErrorCode::ResourceLimit).await;
-        let _ = stream.shutdown().await;
+        let _ = write_connection_error(&mut carrier_writer, ErrorCode::ResourceLimit).await;
+        let _ = carrier_writer.shutdown().await;
         return Err("authenticated session limit exceeded".into());
     };
     let _session_permit = session_permit;
     let _active_session = metrics.begin_session();
 
-    write_server_settings(&mut stream, config).await?;
+    write_server_settings(&mut carrier_writer, config).await?;
 
-    let (carrier_reader, carrier_writer) = tokio::io::split(stream);
-    let carrier = relay::ServerCarrier::new(Box::new(carrier_reader), Box::new(carrier_writer));
+    let carrier = relay::ServerCarrier::new(carrier_reader, carrier_writer);
 
     relay::relay_session(
         carrier,
@@ -782,8 +784,15 @@ async fn complete_handshake(
     authentication: AuthenticationSnapshot,
     replay_cache: Arc<Mutex<ReplayCache>>,
     config: &ServerConfig,
-) -> Result<(TlsStream<tokio::net::TcpStream>, AuthenticatedIdentity), AnyError> {
-    let mut stream = authentication
+) -> Result<
+    (
+        BoxedCarrierReader,
+        BoxedCarrierWriter,
+        AuthenticatedIdentity,
+    ),
+    AnyError,
+> {
+    let stream = authentication
         .tls_acceptor
         .accept(tcp)
         .await
@@ -792,6 +801,37 @@ async fn complete_handshake(
         .map_err(|err| phase_error("tls alpn verify", HandshakeFailureReason::Tls, err))?;
     let exporter = tls::exporter(&stream)
         .map_err(|err| phase_error("tls exporter", HandshakeFailureReason::Tls, err))?;
+    let (reader, writer) = tokio::io::split(stream);
+    authenticate_carrier(
+        Box::new(reader),
+        Box::new(writer),
+        exporter,
+        authentication,
+        replay_cache,
+        config,
+    )
+    .await
+}
+
+/// Runs the UK challenge-response authentication over an established,
+/// ALPN-verified carrier. This is carrier-neutral: the TLS/TCP and QUIC
+/// acceptors both establish their transport, derive the exporter binding, and
+/// then delegate the identical frame exchange to this function.
+async fn authenticate_carrier(
+    mut reader: BoxedCarrierReader,
+    mut writer: BoxedCarrierWriter,
+    exporter: [u8; 32],
+    authentication: AuthenticationSnapshot,
+    replay_cache: Arc<Mutex<ReplayCache>>,
+    config: &ServerConfig,
+) -> Result<
+    (
+        BoxedCarrierReader,
+        BoxedCarrierWriter,
+        AuthenticatedIdentity,
+    ),
+    AnyError,
+> {
     let challenge = AuthChallenge::generate(unix_now());
 
     let mut payload = BytesMut::new();
@@ -806,7 +846,7 @@ async fn complete_handshake(
                 err,
             )
         })?;
-    write_frame(&mut stream, &challenge_frame)
+    write_frame(&mut writer, &challenge_frame)
         .await
         .map_err(|err| {
             let reason = frame_io_failure_reason(&err);
@@ -814,7 +854,7 @@ async fn complete_handshake(
         })?;
 
     let response_frame = match read_frame(
-        &mut stream,
+        &mut reader,
         FrameLimits {
             max_frame_size: config.max_pre_auth_bytes(),
         },
@@ -823,14 +863,14 @@ async fn complete_handshake(
     {
         Ok(frame) => frame,
         Err(err) => {
-            report_handshake_frame_io_error(&mut stream, &err).await;
+            report_handshake_frame_io_error(&mut writer, &err).await;
             let reason = frame_io_failure_reason(&err);
             return Err(phase_error("read auth response", reason, err));
         }
     };
 
     if let Err(err) = validate_connection_frame(&response_frame, FrameType::AuthResponse) {
-        let _ = write_connection_error(&mut stream, ErrorCode::Protocol).await;
+        let _ = write_connection_error(&mut writer, ErrorCode::Protocol).await;
         return Err(phase_error(
             "validate auth response",
             HandshakeFailureReason::Protocol,
@@ -842,7 +882,7 @@ async fn complete_handshake(
     let response = match AuthResponse::decode(&mut response_payload) {
         Ok(response) => response,
         Err(err) => {
-            let _ = write_connection_error(&mut stream, ErrorCode::AuthFailed).await;
+            let _ = write_connection_error(&mut writer, ErrorCode::AuthFailed).await;
             return Err(phase_error(
                 "decode auth response",
                 HandshakeFailureReason::Auth,
@@ -866,7 +906,7 @@ async fn complete_handshake(
     let identity = match verification {
         Ok(identity) => identity,
         Err(err) => {
-            let _ = write_connection_error(&mut stream, ErrorCode::AuthFailed).await;
+            let _ = write_connection_error(&mut writer, ErrorCode::AuthFailed).await;
             return Err(phase_error(
                 "verify auth response",
                 HandshakeFailureReason::Auth,
@@ -881,13 +921,13 @@ async fn complete_handshake(
         security_generation = authentication.generation
     );
 
-    Ok((stream, identity))
+    Ok((reader, writer, identity))
 }
 
-async fn write_server_settings(
-    stream: &mut TlsStream<tokio::net::TcpStream>,
-    config: &ServerConfig,
-) -> Result<(), AnyError> {
+async fn write_server_settings<W>(stream: &mut W, config: &ServerConfig) -> Result<(), AnyError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let settings = server_settings(config);
     let mut settings_payload = BytesMut::new();
     settings
@@ -908,19 +948,19 @@ async fn write_server_settings(
     Ok(())
 }
 
-async fn write_connection_error(
-    stream: &mut TlsStream<tokio::net::TcpStream>,
-    code: ErrorCode,
-) -> Result<(), AnyError> {
+async fn write_connection_error<W>(stream: &mut W, code: ErrorCode) -> Result<(), AnyError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let frame = connection_error_frame(code)?;
     write_frame(stream, &frame).await?;
     Ok(())
 }
 
-async fn report_handshake_frame_io_error(
-    stream: &mut TlsStream<tokio::net::TcpStream>,
-    error: &FrameIoError,
-) {
+async fn report_handshake_frame_io_error<W>(stream: &mut W, error: &FrameIoError)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     if let FrameIoError::Protocol(error) = error {
         let _ = write_connection_error(stream, ErrorCode::from_protocol_error(error)).await;
     }
