@@ -3,6 +3,7 @@
 pub mod config;
 
 mod observability;
+pub mod quic;
 mod relay;
 mod security;
 mod tls;
