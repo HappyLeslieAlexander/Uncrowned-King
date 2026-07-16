@@ -17,7 +17,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, WriteHalf},
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{
         TcpStream, UdpSocket, lookup_host,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -26,15 +26,14 @@ use tokio::{
     task::{Id, JoinError, JoinSet},
     time,
 };
-use tokio_rustls::server::TlsStream;
 use tracing::{Instrument, Span, debug, info, warn};
 use uk_auth::{AuthenticatedIdentity, unix_now};
 use uk_policy::{PolicyContext, PolicyDecision, PolicySet};
 use uk_proto::{
-    ErrorCode, ErrorPayload, Frame, FrameIoError, FrameLimits, FrameType, TCP_CLOSE_ERROR,
-    TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR,
-    UDP_CLOSE_NORMAL, UdpClose, UdpOpen, is_client_initiated_flow_id, read_frame,
-    validate_connection_frame, write_frame,
+    BoxedCarrierReader, BoxedCarrierWriter, ErrorCode, ErrorPayload, Frame, FrameIoError,
+    FrameLimits, FrameType, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target,
+    TcpClose, TcpOpen, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose, UdpOpen,
+    is_client_initiated_flow_id, read_frame, validate_connection_frame, write_frame,
 };
 
 use crate::observability::{
@@ -69,16 +68,34 @@ struct SessionTasks {
     kinds: HashMap<Id, SessionTaskKind>,
 }
 
+/// An established UK carrier's reliable control/frame channel, split into its
+/// owned read and write halves. Carrier construction (TLS accept, QUIC accept,
+/// ALPN verification) and the UK authentication handshake happen before this
+/// point; the relay only sees carrier-neutral boxed halves.
+pub(crate) struct ServerCarrier {
+    carrier_reader: BoxedCarrierReader,
+    carrier_writer: BoxedCarrierWriter,
+}
+
+impl ServerCarrier {
+    pub(crate) fn new(reader: BoxedCarrierReader, writer: BoxedCarrierWriter) -> Self {
+        Self {
+            carrier_reader: reader,
+            carrier_writer: writer,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct CarrierWriter {
-    inner: Arc<Mutex<WriteHalf<TlsStream<TcpStream>>>>,
+    inner: Arc<Mutex<BoxedCarrierWriter>>,
     shutdown: SessionShutdown,
     metrics: Arc<ServerMetrics>,
 }
 
 impl CarrierWriter {
     fn new(
-        inner: WriteHalf<TlsStream<TcpStream>>,
+        inner: BoxedCarrierWriter,
         shutdown: SessionShutdown,
         metrics: Arc<ServerMetrics>,
     ) -> Self {
@@ -451,7 +468,7 @@ struct TargetWriterTask {
 }
 
 pub(crate) async fn relay_session(
-    carrier: TlsStream<TcpStream>,
+    carrier: ServerCarrier,
     identity: AuthenticatedIdentity,
     security: SecurityState,
     limits: RelayLimits,
@@ -462,7 +479,10 @@ pub(crate) async fn relay_session(
     let mut state = ServerSessionState::Authenticated;
     transition(&mut state, ServerSessionState::Relaying);
 
-    let (mut carrier_reader, carrier_writer) = tokio::io::split(carrier);
+    let ServerCarrier {
+        mut carrier_reader,
+        carrier_writer,
+    } = carrier;
     let (event_tx, mut event_rx) = mpsc::channel(session_event_queue_capacity(limits));
     let mut target_writers = FlowTable::new();
     let mut session_tasks = SessionTasks::default();
@@ -743,7 +763,7 @@ fn handle_target_write_closed(flow_id: u64, token: FlowToken, target_writers: &m
 }
 
 async fn next_session_event(
-    carrier_reader: &mut tokio::io::ReadHalf<TlsStream<TcpStream>>,
+    carrier_reader: &mut BoxedCarrierReader,
     event_rx: &mut FlowEventReceiver,
     session_tasks: &mut SessionTasks,
     limits: FrameLimits,

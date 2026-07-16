@@ -727,8 +727,11 @@ async fn run_authenticated_session(
 
     write_server_settings(&mut stream, config).await?;
 
+    let (carrier_reader, carrier_writer) = tokio::io::split(stream);
+    let carrier = relay::ServerCarrier::new(Box::new(carrier_reader), Box::new(carrier_writer));
+
     relay::relay_session(
-        stream,
+        carrier,
         identity,
         security,
         relay::RelayLimits::new(relay::RelayLimitConfig {
