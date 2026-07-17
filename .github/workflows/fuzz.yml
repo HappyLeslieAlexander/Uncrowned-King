@@ -1,0 +1,52 @@
+name: Fuzz smoke
+
+# Short libFuzzer runs over the strict-parser fuzz targets (whitepaper §20).
+# Guards the invariant that parsing arbitrary bytes never panics. Runs when the
+# parsers or fuzz harness change, on a daily schedule, and on demand — not on
+# every PR, since it needs a nightly toolchain and cargo-fuzz.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/uk-proto/**'
+      - 'crates/uk-auth/**'
+      - '.github/workflows/fuzz.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'crates/uk-proto/**'
+      - 'crates/uk-auth/**'
+      - '.github/workflows/fuzz.yml'
+  schedule:
+    - cron: '41 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-smoke:
+    name: Fuzz smoke (strict parsers)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install nightly toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run fuzz targets
+        working-directory: crates/uk-proto/fuzz
+        run: |
+          set -euo pipefail
+          for target in frame_header target_decoder auth_payload tcp_state udp_state; do
+            echo "::group::fuzz $target"
+            cargo fuzz run "$target" -- -max_total_time=30 -runs=2000000
+            echo "::endgroup::"
+          done
