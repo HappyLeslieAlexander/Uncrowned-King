@@ -13,8 +13,10 @@ use uk_proto::ALPN_PROTOCOL;
 
 type TlsError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Builds a TLS 1.3-only client connector.
-pub fn connector(ca_cert_path: &str) -> Result<TlsConnector, TlsError> {
+/// Builds a TLS 1.3-only rustls client config with the UK ALPN and 0-RTT
+/// disabled, trusting only the configured CA. Shared by the TLS/TCP and QUIC
+/// client carriers.
+pub fn client_config(ca_cert_path: &str) -> Result<ClientConfig, TlsError> {
     let mut roots = RootCertStore::empty();
     for cert in load_certs(ca_cert_path)? {
         roots.add(cert)?;
@@ -24,7 +26,14 @@ pub fn connector(ca_cert_path: &str) -> Result<TlsConnector, TlsError> {
         .with_no_client_auth();
     config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
     config.enable_early_data = false;
-    Ok(TlsConnector::from(std::sync::Arc::new(config)))
+    Ok(config)
+}
+
+/// Builds a TLS 1.3-only client connector.
+pub fn connector(ca_cert_path: &str) -> Result<TlsConnector, TlsError> {
+    Ok(TlsConnector::from(std::sync::Arc::new(client_config(
+        ca_cert_path,
+    )?)))
 }
 
 /// Converts a configured server name into a rustls server name.

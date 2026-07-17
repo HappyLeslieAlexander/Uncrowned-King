@@ -3,6 +3,7 @@
 pub mod config;
 
 mod observability;
+pub mod quic;
 mod relay;
 mod security;
 mod tls;
@@ -28,19 +29,20 @@ use tokio::{
     task::JoinSet,
     time,
 };
-use tokio_rustls::{TlsAcceptor, server::TlsStream};
+use tokio_rustls::TlsAcceptor;
 use tracing::{Instrument, debug, info, info_span, warn};
 use uk_auth::{
     AuthChallenge, AuthResponse, AuthenticatedIdentity, ReplayCache, unix_now,
     verify_auth_response_identity,
 };
 use uk_proto::{
-    ErrorCode, ErrorPayload, Frame, FrameIoError, FrameLimits, FrameType, SettingKey, Settings,
-    read_frame, validate_connection_frame, write_frame,
+    BoxedCarrierReader, BoxedCarrierWriter, ErrorCode, ErrorPayload, Frame, FrameIoError,
+    FrameLimits, FrameType, SettingKey, Settings, read_frame, validate_connection_frame,
+    write_frame,
 };
 
 use crate::config::ServerConfig;
-use crate::observability::ServerMetrics;
+use crate::observability::{HandshakeFailureReason, ServerMetrics};
 use crate::security::{AuthenticationSnapshot, SecurityState};
 
 /// Server error type.
@@ -134,6 +136,7 @@ impl ListenerAcceptBackoff {
 #[derive(Debug)]
 struct HandshakePhaseError {
     phase: &'static str,
+    failure_reason: HandshakeFailureReason,
     source: AnyError,
 }
 
@@ -211,6 +214,42 @@ impl ConnectionRuntime {
             "server.connection",
             connection_id,
             peer = %peer
+        )));
+    }
+
+    fn spawn_accepted_quic(
+        &self,
+        connections: &mut JoinSet<()>,
+        incoming: quinn::Incoming,
+        peer: SocketAddr,
+        shutdown_rx: watch::Receiver<bool>,
+    ) {
+        self.metrics.record_accepted_connection();
+        let Ok(handshake_permit) = Arc::clone(&self.handshake_permits).try_acquire_owned() else {
+            self.metrics.record_rejected_handshake();
+            warn!(
+                event = "server.handshake.limit",
+                peer = %peer,
+                carrier = "quic",
+                max_handshakes = self.max_handshakes
+            );
+            incoming.refuse();
+            return;
+        };
+        let runtime = self.clone();
+        let connection_id = next_connection_correlation_id();
+        let connection = async move {
+            if let Err(err) =
+                handle_quic_connection(runtime, incoming, handshake_permit, peer, shutdown_rx).await
+            {
+                warn!(event = "protocol.error", peer = %peer, carrier = "quic", error = %err);
+            }
+        };
+        connections.spawn(connection.instrument(info_span!(
+            "server.connection",
+            connection_id,
+            peer = %peer,
+            carrier = "quic"
         )));
     }
 }
@@ -313,6 +352,11 @@ where
 
     info!(event = "server.listen", listen = %listen);
 
+    let quic_endpoint = build_quic_endpoint(&config)?;
+    if let Some(endpoint) = &quic_endpoint {
+        info!(event = "server.listen.quic", listen = %endpoint.local_addr()?);
+    }
+
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
     let (observability_shutdown_tx, observability_shutdown_rx) = watch::channel(false);
     let observability_task =
@@ -358,16 +402,52 @@ where
                     .spawn_accepted(&mut connections, tcp, peer, shutdown_tx.subscribe())
                     .await;
             }
+            incoming = accept_quic(quic_endpoint.as_ref()) => {
+                if let Some(incoming) = incoming {
+                    let peer = incoming.remote_address();
+                    connection_runtime.spawn_accepted_quic(
+                        &mut connections,
+                        incoming,
+                        peer,
+                        shutdown_tx.subscribe(),
+                    );
+                }
+            }
             joined = connections.join_next(), if !connections.is_empty() => {
                 log_connection_task_result(joined);
             }
         }
     }
 
+    if let Some(endpoint) = &quic_endpoint {
+        endpoint.close(0_u32.into(), b"server shutdown");
+    }
     drain_connection_tasks(&mut connections, shutdown_timeout).await;
     stop_observability(observability_shutdown_tx, observability_task).await;
 
     Ok(())
+}
+
+/// Builds the QUIC server endpoint when `quic_listen` is configured.
+fn build_quic_endpoint(config: &ServerConfig) -> Result<Option<quinn::Endpoint>, AnyError> {
+    let Some(listen) = &config.quic_listen else {
+        return Ok(None);
+    };
+    let addr: SocketAddr = listen
+        .parse()
+        .map_err(|err| format!("invalid quic_listen address {listen}: {err}"))?;
+    let rustls_config = tls::server_config(&config.cert_path, &config.key_path)?;
+    let quic_config = quic::server_config(rustls_config)?;
+    let endpoint = quic::bind_endpoint(quic_config, addr)?;
+    Ok(Some(endpoint))
+}
+
+/// Accepts the next QUIC connection, or waits forever when QUIC is disabled.
+async fn accept_quic(endpoint: Option<&quinn::Endpoint>) -> Option<quinn::Incoming> {
+    match endpoint {
+        Some(endpoint) => endpoint.accept().await,
+        None => future::pending().await,
+    }
 }
 
 fn handle_reload_request(
@@ -526,6 +606,8 @@ fn changed_static_config_field(
 ) -> Option<&'static str> {
     if current.listen != candidate.listen {
         Some("listen")
+    } else if current.quic_listen != candidate.quic_listen {
+        Some("quic_listen")
     } else if current.observability_listen != candidate.observability_listen {
         Some("observability_listen")
     } else {
@@ -625,40 +707,93 @@ async fn handle_connection(
     tcp: tokio::net::TcpStream,
     handshake_permit: OwnedSemaphorePermit,
     peer: SocketAddr,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AnyError> {
-    let ConnectionRuntime {
-        security,
-        replay_cache,
-        session_permits,
-        config,
-        max_sessions,
-        metrics,
-        ..
-    } = runtime;
     tcp.set_nodelay(true)?;
     if *shutdown_rx.borrow() {
         return Ok(());
     }
+    let authentication = runtime.security.authentication_snapshot();
+    let replay_cache = Arc::clone(&runtime.replay_cache);
+    let config = Arc::clone(&runtime.config);
+    let handshake =
+        async move { complete_handshake(tcp, authentication, replay_cache, &config).await };
+    serve_authenticated_carrier(runtime, handshake_permit, peer, shutdown_rx, handshake).await
+}
 
-    let authentication = security.authentication_snapshot();
-    let handshake = async {
-        if let Some(timeout) = handshake_timeout(config.handshake_timeout_seconds()) {
-            match time::timeout(
-                timeout,
-                complete_handshake(tcp, authentication, replay_cache, &config),
-            )
+async fn handle_quic_connection(
+    runtime: ConnectionRuntime,
+    incoming: quinn::Incoming,
+    handshake_permit: OwnedSemaphorePermit,
+    peer: SocketAddr,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), AnyError> {
+    if *shutdown_rx.borrow() {
+        return Ok(());
+    }
+    let authentication = runtime.security.authentication_snapshot();
+    let replay_cache = Arc::clone(&runtime.replay_cache);
+    let config = Arc::clone(&runtime.config);
+    let handshake = async move {
+        let connection = incoming
             .await
-            {
+            .map_err(|err| phase_error("quic accept", HandshakeFailureReason::Tls, err))?;
+        let (reader, writer, exporter) = quic::accept_carrier(&connection)
+            .await
+            .map_err(|err| phase_error("quic carrier", HandshakeFailureReason::Tls, err))?;
+        authenticate_carrier(
+            reader,
+            writer,
+            exporter,
+            authentication,
+            replay_cache,
+            &config,
+        )
+        .await
+    };
+    serve_authenticated_carrier(runtime, handshake_permit, peer, shutdown_rx, handshake).await
+}
+
+/// Applies the handshake timeout, races the handshake against shutdown, and
+/// runs the authenticated relay session. Carrier-neutral: both the TLS/TCP and
+/// QUIC handlers build a handshake future that yields authenticated channel
+/// halves and hand it here.
+async fn serve_authenticated_carrier<H>(
+    runtime: ConnectionRuntime,
+    handshake_permit: OwnedSemaphorePermit,
+    peer: SocketAddr,
+    mut shutdown_rx: watch::Receiver<bool>,
+    handshake: H,
+) -> Result<(), AnyError>
+where
+    H: Future<
+        Output = Result<
+            (
+                BoxedCarrierReader,
+                BoxedCarrierWriter,
+                AuthenticatedIdentity,
+            ),
+            AnyError,
+        >,
+    >,
+{
+    let timeout = handshake_timeout(runtime.config.handshake_timeout_seconds());
+    let handshake = async move {
+        if let Some(timeout) = timeout {
+            match time::timeout(timeout, handshake).await {
                 Ok(result) => result,
-                Err(_) => Err("handshake timeout".into()),
+                Err(_) => Err(phase_error(
+                    "handshake",
+                    HandshakeFailureReason::Timeout,
+                    "deadline exceeded",
+                )),
             }
         } else {
-            complete_handshake(tcp, authentication, replay_cache, &config).await
+            handshake.await
         }
     };
 
-    let handshake_guard = metrics.begin_handshake();
+    let handshake_guard = runtime.metrics.begin_handshake();
     let handshake_result = tokio::select! {
         result = handshake => Some(result),
         changed = shutdown_rx.changed() => {
@@ -669,10 +804,12 @@ async fn handle_connection(
     let Some(handshake_result) = handshake_result else {
         return Ok(());
     };
-    let (mut stream, identity) = match handshake_result {
+    let (carrier_reader, carrier_writer, identity) = match handshake_result {
         Ok(handshake) => handshake,
         Err(err) => {
-            metrics.record_failed_handshake();
+            runtime
+                .metrics
+                .record_failed_handshake(handshake_failure_reason(&err));
             return Err(err);
         }
     };
@@ -682,20 +819,52 @@ async fn handle_connection(
         return Ok(());
     }
 
+    run_authenticated_session(
+        carrier_reader,
+        carrier_writer,
+        identity,
+        runtime.security,
+        &runtime.config,
+        runtime.session_permits,
+        runtime.max_sessions,
+        peer,
+        shutdown_rx,
+        runtime.metrics,
+    )
+    .await
+}
+
+/// Acquires a session slot, sends SETTINGS, and runs the relay loop for an
+/// authenticated carrier session.
+#[allow(clippy::too_many_arguments)]
+async fn run_authenticated_session(
+    carrier_reader: BoxedCarrierReader,
+    mut carrier_writer: BoxedCarrierWriter,
+    identity: AuthenticatedIdentity,
+    security: SecurityState,
+    config: &ServerConfig,
+    session_permits: Arc<Semaphore>,
+    max_sessions: usize,
+    peer: SocketAddr,
+    shutdown_rx: watch::Receiver<bool>,
+    metrics: Arc<ServerMetrics>,
+) -> Result<(), AnyError> {
     let Ok(session_permit) = session_permits.try_acquire_owned() else {
         metrics.record_rejected_session();
         warn!(event = "server.session.limit", peer = %peer, max_sessions);
-        let _ = write_connection_error(&mut stream, ErrorCode::ResourceLimit).await;
-        let _ = stream.shutdown().await;
+        let _ = write_connection_error(&mut carrier_writer, ErrorCode::ResourceLimit).await;
+        let _ = carrier_writer.shutdown().await;
         return Err("authenticated session limit exceeded".into());
     };
     let _session_permit = session_permit;
     let _active_session = metrics.begin_session();
 
-    write_server_settings(&mut stream, &config).await?;
+    write_server_settings(&mut carrier_writer, config).await?;
+
+    let carrier = relay::ServerCarrier::new(carrier_reader, carrier_writer);
 
     relay::relay_session(
-        stream,
+        carrier,
         identity,
         security,
         relay::RelayLimits::new(relay::RelayLimitConfig {
@@ -746,28 +915,77 @@ async fn complete_handshake(
     authentication: AuthenticationSnapshot,
     replay_cache: Arc<Mutex<ReplayCache>>,
     config: &ServerConfig,
-) -> Result<(TlsStream<tokio::net::TcpStream>, AuthenticatedIdentity), AnyError> {
-    let mut stream = authentication
+) -> Result<
+    (
+        BoxedCarrierReader,
+        BoxedCarrierWriter,
+        AuthenticatedIdentity,
+    ),
+    AnyError,
+> {
+    let stream = authentication
         .tls_acceptor
         .accept(tcp)
         .await
-        .map_err(|err| phase_error("tls accept", err))?;
-    tls::verify_alpn(&stream).map_err(|err| phase_error("tls alpn verify", err))?;
-    let exporter = tls::exporter(&stream).map_err(|err| phase_error("tls exporter", err))?;
+        .map_err(|err| phase_error("tls accept", HandshakeFailureReason::Tls, err))?;
+    tls::verify_alpn(&stream)
+        .map_err(|err| phase_error("tls alpn verify", HandshakeFailureReason::Tls, err))?;
+    let exporter = tls::exporter(&stream)
+        .map_err(|err| phase_error("tls exporter", HandshakeFailureReason::Tls, err))?;
+    let (reader, writer) = tokio::io::split(stream);
+    authenticate_carrier(
+        Box::new(reader),
+        Box::new(writer),
+        exporter,
+        authentication,
+        replay_cache,
+        config,
+    )
+    .await
+}
+
+/// Runs the UK challenge-response authentication over an established,
+/// ALPN-verified carrier. This is carrier-neutral: the TLS/TCP and QUIC
+/// acceptors both establish their transport, derive the exporter binding, and
+/// then delegate the identical frame exchange to this function.
+async fn authenticate_carrier(
+    mut reader: BoxedCarrierReader,
+    mut writer: BoxedCarrierWriter,
+    exporter: [u8; 32],
+    authentication: AuthenticationSnapshot,
+    replay_cache: Arc<Mutex<ReplayCache>>,
+    config: &ServerConfig,
+) -> Result<
+    (
+        BoxedCarrierReader,
+        BoxedCarrierWriter,
+        AuthenticatedIdentity,
+    ),
+    AnyError,
+> {
     let challenge = AuthChallenge::generate(unix_now());
 
     let mut payload = BytesMut::new();
     challenge
         .encode(&mut payload)
-        .map_err(|err| phase_error("encode auth challenge", err))?;
-    let challenge_frame = Frame::new(FrameType::AuthChallenge, 0, 0, payload.freeze())
-        .map_err(|err| phase_error("build auth challenge frame", err))?;
-    write_frame(&mut stream, &challenge_frame)
+        .map_err(|err| phase_error("encode auth challenge", HandshakeFailureReason::Auth, err))?;
+    let challenge_frame =
+        Frame::new(FrameType::AuthChallenge, 0, 0, payload.freeze()).map_err(|err| {
+            phase_error(
+                "build auth challenge frame",
+                HandshakeFailureReason::Auth,
+                err,
+            )
+        })?;
+    write_frame(&mut writer, &challenge_frame)
         .await
-        .map_err(|err| phase_error("write auth challenge", err))?;
+        .map_err(|err| {
+            let reason = frame_io_failure_reason(&err);
+            phase_error("write auth challenge", reason, err)
+        })?;
 
     let response_frame = match read_frame(
-        &mut stream,
+        &mut reader,
         FrameLimits {
             max_frame_size: config.max_pre_auth_bytes(),
         },
@@ -776,22 +994,31 @@ async fn complete_handshake(
     {
         Ok(frame) => frame,
         Err(err) => {
-            report_handshake_frame_io_error(&mut stream, &err).await;
-            return Err(phase_error("read auth response", err));
+            report_handshake_frame_io_error(&mut writer, &err).await;
+            let reason = frame_io_failure_reason(&err);
+            return Err(phase_error("read auth response", reason, err));
         }
     };
 
     if let Err(err) = validate_connection_frame(&response_frame, FrameType::AuthResponse) {
-        let _ = write_connection_error(&mut stream, ErrorCode::Protocol).await;
-        return Err(phase_error("validate auth response", err));
+        let _ = write_connection_error(&mut writer, ErrorCode::Protocol).await;
+        return Err(phase_error(
+            "validate auth response",
+            HandshakeFailureReason::Protocol,
+            err,
+        ));
     }
 
     let mut response_payload = response_frame.payload;
     let response = match AuthResponse::decode(&mut response_payload) {
         Ok(response) => response,
         Err(err) => {
-            let _ = write_connection_error(&mut stream, ErrorCode::AuthFailed).await;
-            return Err(phase_error("decode auth response", err));
+            let _ = write_connection_error(&mut writer, ErrorCode::AuthFailed).await;
+            return Err(phase_error(
+                "decode auth response",
+                HandshakeFailureReason::Auth,
+                err,
+            ));
         }
     };
     let now = unix_now();
@@ -810,8 +1037,12 @@ async fn complete_handshake(
     let identity = match verification {
         Ok(identity) => identity,
         Err(err) => {
-            let _ = write_connection_error(&mut stream, ErrorCode::AuthFailed).await;
-            return Err(phase_error("verify auth response", err));
+            let _ = write_connection_error(&mut writer, ErrorCode::AuthFailed).await;
+            return Err(phase_error(
+                "verify auth response",
+                HandshakeFailureReason::Auth,
+                err,
+            ));
         }
     };
 
@@ -821,39 +1052,46 @@ async fn complete_handshake(
         security_generation = authentication.generation
     );
 
-    Ok((stream, identity))
+    Ok((reader, writer, identity))
 }
 
-async fn write_server_settings(
-    stream: &mut TlsStream<tokio::net::TcpStream>,
-    config: &ServerConfig,
-) -> Result<(), AnyError> {
+async fn write_server_settings<W>(stream: &mut W, config: &ServerConfig) -> Result<(), AnyError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let settings = server_settings(config);
     let mut settings_payload = BytesMut::new();
     settings
         .encode(&mut settings_payload)
-        .map_err(|err| phase_error("encode server settings", err))?;
-    let settings_frame = Frame::new(FrameType::Settings, 0, 0, settings_payload.freeze())
-        .map_err(|err| phase_error("build server settings frame", err))?;
-    write_frame(stream, &settings_frame)
-        .await
-        .map_err(|err| phase_error("write server settings", err))?;
+        .map_err(|err| phase_error("encode server settings", HandshakeFailureReason::Other, err))?;
+    let settings_frame =
+        Frame::new(FrameType::Settings, 0, 0, settings_payload.freeze()).map_err(|err| {
+            phase_error(
+                "build server settings frame",
+                HandshakeFailureReason::Other,
+                err,
+            )
+        })?;
+    write_frame(stream, &settings_frame).await.map_err(|err| {
+        let reason = frame_io_failure_reason(&err);
+        phase_error("write server settings", reason, err)
+    })?;
     Ok(())
 }
 
-async fn write_connection_error(
-    stream: &mut TlsStream<tokio::net::TcpStream>,
-    code: ErrorCode,
-) -> Result<(), AnyError> {
+async fn write_connection_error<W>(stream: &mut W, code: ErrorCode) -> Result<(), AnyError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let frame = connection_error_frame(code)?;
     write_frame(stream, &frame).await?;
     Ok(())
 }
 
-async fn report_handshake_frame_io_error(
-    stream: &mut TlsStream<tokio::net::TcpStream>,
-    error: &FrameIoError,
-) {
+async fn report_handshake_frame_io_error<W>(stream: &mut W, error: &FrameIoError)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     if let FrameIoError::Protocol(error) = error {
         let _ = write_connection_error(stream, ErrorCode::from_protocol_error(error)).await;
     }
@@ -907,14 +1145,54 @@ fn listener_shutdown_timeout(seconds: u64) -> Option<Duration> {
     (seconds != 0).then(|| Duration::from_secs(seconds))
 }
 
-fn phase_error<E>(phase: &'static str, source: E) -> AnyError
+fn phase_error<E>(
+    phase: &'static str,
+    failure_reason: HandshakeFailureReason,
+    source: E,
+) -> AnyError
 where
     E: Into<AnyError>,
 {
     Box::new(HandshakePhaseError {
         phase,
+        failure_reason,
         source: source.into(),
     })
+}
+
+fn handshake_failure_reason(error: &AnyError) -> HandshakeFailureReason {
+    let mut current = Some(error.as_ref() as &(dyn Error + 'static));
+    while let Some(source) = current {
+        if let Some(error) = source.downcast_ref::<HandshakePhaseError>() {
+            return error.failure_reason;
+        }
+        current = source.source();
+    }
+    if let Some(error) = find_frame_io_error(error.as_ref()) {
+        return frame_io_failure_reason(error);
+    }
+    if find_io_error(error.as_ref()).is_some() {
+        return HandshakeFailureReason::Io;
+    }
+    HandshakeFailureReason::Other
+}
+
+fn frame_io_failure_reason(error: &FrameIoError) -> HandshakeFailureReason {
+    match error {
+        FrameIoError::Protocol(_) => HandshakeFailureReason::Protocol,
+        FrameIoError::Closed | FrameIoError::Io(_) => HandshakeFailureReason::Io,
+    }
+}
+
+fn find_frame_io_error<'a>(error: &'a (dyn Error + 'static)) -> Option<&'a FrameIoError> {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(error) = error.downcast_ref::<FrameIoError>() {
+            return Some(error);
+        }
+        current = error.source();
+    }
+    None
 }
 
 fn is_clean_tls_handshake_disconnect(error: &AnyError) -> bool {
@@ -967,6 +1245,7 @@ mod tests {
     fn minimal_config() -> ServerConfig {
         ServerConfig {
             listen: "127.0.0.1:1".to_owned(),
+            quic_listen: None,
             observability_listen: None,
             cert_path: "cert.pem".to_owned(),
             key_path: "key.pem".to_owned(),
@@ -1157,20 +1436,37 @@ mod tests {
 
     #[test]
     fn handshake_phase_error_reports_phase_and_source() {
-        let error = phase_error("tls accept", "client closed");
+        let error = phase_error("tls accept", HandshakeFailureReason::Tls, "client closed");
 
         assert_eq!(error.to_string(), "tls accept failed: client closed");
         assert!(error.source().is_some());
+        assert_eq!(
+            handshake_failure_reason(&error),
+            HandshakeFailureReason::Tls
+        );
     }
 
     #[test]
     fn classifies_clean_disconnects_through_handshake_phase_error() {
         let error = phase_error(
             "tls accept",
+            HandshakeFailureReason::Tls,
             io::Error::new(io::ErrorKind::UnexpectedEof, "client closed"),
         );
 
         assert!(is_clean_tls_handshake_disconnect(&error));
+    }
+
+    #[test]
+    fn classifies_unwrapped_frame_and_io_failures() {
+        let closed: AnyError = Box::new(FrameIoError::Closed);
+        let io: AnyError = io::Error::new(io::ErrorKind::ConnectionReset, "reset").into();
+
+        assert_eq!(
+            handshake_failure_reason(&closed),
+            HandshakeFailureReason::Io
+        );
+        assert_eq!(handshake_failure_reason(&io), HandshakeFailureReason::Io);
     }
 
     #[tokio::test]

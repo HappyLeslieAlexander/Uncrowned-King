@@ -1,21 +1,78 @@
 //! Client-side UK session setup.
 
-use std::{error::Error, fmt, time::Duration};
+use std::{
+    error::Error,
+    fmt,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use bytes::BytesMut;
 use rustls::pki_types::ServerName;
-use tokio::{net::TcpStream, time};
-use tokio_rustls::{TlsConnector, client::TlsStream};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpStream,
+    time,
+};
+use tokio_rustls::TlsConnector;
 use tracing::{info, warn};
 use uk_auth::{AuthChallenge, AuthResponse, unix_now};
 use uk_proto::{
-    ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType, Settings, read_frame,
-    validate_connection_frame, write_frame,
+    BoxedCarrierReader, BoxedCarrierWriter, ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType,
+    Settings, read_frame, validate_connection_frame, write_frame,
 };
 
-use crate::{config::ClientConfig, tls};
+use crate::{
+    config::{CarrierKind, ClientConfig},
+    tls,
+};
 
 type AnyError = Box<dyn Error + Send + Sync>;
+
+/// A live, authenticated client carrier presented as a single duplex stream.
+///
+/// Wraps carrier-neutral boxed channel halves so the relay layer and tests can
+/// treat every carrier (TLS/TCP, QUIC) as one `AsyncRead + AsyncWrite` value
+/// and split it with [`tokio::io::split`].
+pub struct ClientCarrier {
+    reader: BoxedCarrierReader,
+    writer: BoxedCarrierWriter,
+}
+
+impl ClientCarrier {
+    fn new(reader: BoxedCarrierReader, writer: BoxedCarrierWriter) -> Self {
+        Self { reader, writer }
+    }
+}
+
+impl AsyncRead for ClientCarrier {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.reader).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ClientCarrier {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut *self.writer).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.writer).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.writer).poll_shutdown(cx)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EndpointAttemptOutcome {
@@ -150,14 +207,14 @@ impl Error for ServerHandshakeError {}
 /// Connects to the configured server and completes UK authentication.
 pub async fn connect_authenticated(
     config: &ClientConfig,
-) -> Result<(TlsStream<TcpStream>, Settings), AnyError> {
+) -> Result<(ClientCarrier, Settings), AnyError> {
     connect_authenticated_observed(config, |_| {}).await
 }
 
 pub(crate) async fn connect_authenticated_observed<F>(
     config: &ClientConfig,
     observe: F,
-) -> Result<(TlsStream<TcpStream>, Settings), AnyError>
+) -> Result<(ClientCarrier, Settings), AnyError>
 where
     F: FnMut(EndpointAttemptOutcome),
 {
@@ -175,7 +232,7 @@ async fn connect_authenticated_inner<F>(
     config: &ClientConfig,
     endpoint_timeout: Option<Duration>,
     mut observe: F,
-) -> Result<(TlsStream<TcpStream>, Settings), AnyError>
+) -> Result<(ClientCarrier, Settings), AnyError>
 where
     F: FnMut(EndpointAttemptOutcome),
 {
@@ -225,7 +282,7 @@ async fn connect_authenticated_endpoint_with_timeout(
     server_name: ServerName<'static>,
     endpoint: &str,
     endpoint_timeout: Option<Duration>,
-) -> Result<(TlsStream<TcpStream>, Settings), AnyError> {
+) -> Result<(ClientCarrier, Settings), AnyError> {
     if let Some(timeout) = endpoint_timeout {
         match time::timeout(
             timeout,
@@ -250,13 +307,27 @@ async fn connect_authenticated_endpoint(
     connector: &TlsConnector,
     server_name: ServerName<'static>,
     endpoint: &str,
-) -> Result<(TlsStream<TcpStream>, Settings), AnyError> {
-    let tcp = TcpStream::connect(endpoint)
+) -> Result<(ClientCarrier, Settings), AnyError> {
+    let (carrier, addr) = crate::config::parse_endpoint(endpoint)
+        .map_err(|err| phase_error("parse endpoint", EndpointFailurePhase::Other, err))?;
+    let (reader, writer, exporter) = match carrier {
+        CarrierKind::Tls => establish_tls_carrier(connector, server_name, addr).await?,
+        CarrierKind::Quic => establish_quic_carrier(config, addr).await?,
+    };
+    authenticate_over_carrier(config, reader, writer, exporter).await
+}
+
+async fn establish_tls_carrier(
+    connector: &TlsConnector,
+    server_name: ServerName<'static>,
+    addr: &str,
+) -> Result<(BoxedCarrierReader, BoxedCarrierWriter, [u8; 32]), AnyError> {
+    let tcp = TcpStream::connect(addr)
         .await
         .map_err(|err| phase_error("tcp connect", EndpointFailurePhase::Tcp, err))?;
     tcp.set_nodelay(true)
         .map_err(|err| phase_error("tcp nodelay", EndpointFailurePhase::Tcp, err))?;
-    let mut stream = connector
+    let stream = connector
         .connect(server_name, tcp)
         .await
         .map_err(|err| phase_error("tls connect", EndpointFailurePhase::Tls, err))?;
@@ -264,8 +335,31 @@ async fn connect_authenticated_endpoint(
         .map_err(|err| phase_error("tls alpn verify", EndpointFailurePhase::Tls, err))?;
     let exporter = tls::exporter(&stream)
         .map_err(|err| phase_error("tls exporter", EndpointFailurePhase::Tls, err))?;
+    let (reader, writer) = tokio::io::split(stream);
+    Ok((Box::new(reader), Box::new(writer), exporter))
+}
 
-    let challenge_frame = read_frame(&mut stream, FrameLimits::default())
+async fn establish_quic_carrier(
+    config: &ClientConfig,
+    addr: &str,
+) -> Result<(BoxedCarrierReader, BoxedCarrierWriter, [u8; 32]), AnyError> {
+    let rustls_config = tls::client_config(&config.ca_cert_path)
+        .map_err(|err| phase_error("quic client config", EndpointFailurePhase::Tls, err))?;
+    crate::quic::connect(rustls_config, addr, &config.server_name)
+        .await
+        .map_err(|err| phase_error("quic connect", EndpointFailurePhase::Tls, err))
+}
+
+/// Runs the UK challenge-response authentication over an established,
+/// ALPN-verified carrier. Carrier-neutral: the TLS/TCP and QUIC connectors both
+/// establish their transport and exporter binding, then delegate here.
+async fn authenticate_over_carrier(
+    config: &ClientConfig,
+    mut reader: BoxedCarrierReader,
+    mut writer: BoxedCarrierWriter,
+    exporter: [u8; 32],
+) -> Result<(ClientCarrier, Settings), AnyError> {
+    let challenge_frame = read_frame(&mut reader, FrameLimits::default())
         .await
         .map_err(|err| phase_error("read auth challenge", EndpointFailurePhase::Auth, err))?;
     validate_connection_frame(&challenge_frame, FrameType::AuthChallenge).map_err(|err| {
@@ -294,11 +388,11 @@ async fn connect_authenticated_endpoint(
         .map_err(|err| phase_error("encode auth response", EndpointFailurePhase::Auth, err))?;
     let response_frame = Frame::new(FrameType::AuthResponse, 0, 0, response_payload.freeze())
         .map_err(|err| phase_error("build auth response frame", EndpointFailurePhase::Auth, err))?;
-    write_frame(&mut stream, &response_frame)
+    write_frame(&mut writer, &response_frame)
         .await
         .map_err(|err| phase_error("write auth response", EndpointFailurePhase::Auth, err))?;
 
-    let settings_frame = read_frame(&mut stream, FrameLimits::default())
+    let settings_frame = read_frame(&mut reader, FrameLimits::default())
         .await
         .map_err(|err| phase_error("read server settings", EndpointFailurePhase::Auth, err))?;
     let settings = decode_server_settings_frame(settings_frame)?;
@@ -313,7 +407,7 @@ async fn connect_authenticated_endpoint(
         event = "auth.success",
         max_frame_size = negotiated.max_frame_size
     );
-    Ok((stream, settings))
+    Ok((ClientCarrier::new(reader, writer), settings))
 }
 
 fn decode_server_settings_frame(frame: Frame) -> Result<Settings, AnyError> {

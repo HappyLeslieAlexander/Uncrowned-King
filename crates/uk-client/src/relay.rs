@@ -16,20 +16,19 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{Mutex, Notify, Semaphore, mpsc, watch},
     task::{Id, JoinError, JoinSet},
     time,
 };
-use tokio_rustls::client::TlsStream;
 use tracing::{Instrument, debug, info, info_span, warn};
 use uk_proto::{
-    ErrorCode, ErrorPayload, FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, Frame, FrameIoError, FrameLimits,
-    FrameType, NegotiatedSettings, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target,
-    TcpClose, TcpOpen, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose, UdpOpen,
-    is_client_initiated_flow_id, read_frame, validate_connection_frame, varint::MAX_VARINT,
-    write_frame,
+    BoxedCarrierReader, BoxedCarrierWriter, ErrorCode, ErrorPayload, FIRST_CLIENT_FLOW_ID,
+    FLOW_ID_STEP, Frame, FrameIoError, FrameLimits, FrameType, NegotiatedSettings, TCP_CLOSE_ERROR,
+    TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR,
+    UDP_CLOSE_NORMAL, UdpClose, UdpOpen, is_client_initiated_flow_id, read_frame,
+    validate_connection_frame, varint::MAX_VARINT, write_frame,
 };
 
 use crate::{
@@ -52,7 +51,7 @@ static NEXT_SOCKS_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_CLIENT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 type AnyError = Box<dyn Error + Send + Sync>;
-type CarrierWriter = Arc<Mutex<WriteHalf<TlsStream<TcpStream>>>>;
+type CarrierWriter = Arc<Mutex<BoxedCarrierWriter>>;
 type FlowTable = Arc<Mutex<HashMap<u64, ClientFlowRoute>>>;
 
 #[derive(Default)]
@@ -1176,6 +1175,8 @@ impl ClientSession {
         let negotiated = settings.negotiated_v0_1()?;
         let limits = negotiated.frame_limits();
         let (carrier_reader, carrier_writer) = tokio::io::split(carrier);
+        let carrier_reader: BoxedCarrierReader = Box::new(carrier_reader);
+        let carrier_writer: BoxedCarrierWriter = Box::new(carrier_writer);
         let session_buffer = ClientSessionBufferControl::default();
         let correlation_id = NEXT_CLIENT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let session = Arc::new(Self {
@@ -1928,10 +1929,7 @@ fn record_matching_pong(
     KeepalivePong::Matched(nonce)
 }
 
-async fn spawn_carrier_reader(
-    mut carrier_reader: ReadHalf<TlsStream<TcpStream>>,
-    session: Arc<ClientSession>,
-) {
+async fn spawn_carrier_reader(mut carrier_reader: BoxedCarrierReader, session: Arc<ClientSession>) {
     let correlation_id = session.correlation_id;
     let task_session = Arc::clone(&session);
     let task = async move {

@@ -14,8 +14,13 @@ The repository currently focuses on the first runnable v0.1 TLS/TCP carrier:
 - challenge-response HMAC authentication in `uk-auth`
 - minimal policy decisions in `uk-policy`
 - TLS/TCP authenticated server sessions in `uk-server`
+- QUIC authenticated server sessions in `uk-server`, sharing the TLS 1.3
+  identity and `uk/1` ALPN, with the control channel on a server-opened
+  bidirectional stream
+- client QUIC carrier with per-endpoint carrier selection and automatic
+  fallback (prefer `quic://`, fall back to `tls://`)
 - SOCKS5 CONNECT and UDP ASSOCIATE entry points in `uk-client`
-- multiplexed TCP relay and UDP relay over the TLS/TCP carrier
+- multiplexed TCP relay and UDP relay over the TLS/TCP and QUIC carriers
 - bounded UDP flow recovery after a carrier disconnect without closing the SOCKS association
 - graceful Ctrl+C/SIGTERM shutdown for long-running client and server listeners
 - capped exponential retry for transient client and server listener accept errors
@@ -30,7 +35,39 @@ The first runnable proxy targets are:
 ```text
 SOCKS5 client -> UK over TLS/TCP -> UK server -> TCP target
 SOCKS5 client -> UK over TLS/TCP -> UK server -> UDP target
+SOCKS5 client -> UK over QUIC    -> UK server -> TCP target
+SOCKS5 client -> UK over QUIC    -> UK server -> UDP target
 ```
+
+## Carriers
+
+The server always listens for the TLS/TCP carrier on `listen`. Set
+`quic_listen` to a UDP `host:port` to additionally accept the QUIC carrier;
+both carriers share the configured certificate, key, and `uk/1` ALPN, and
+reject 0-RTT application data. QUIC UDP relay currently travels over the
+control stream (the SETTINGS-advertised UDP stream fallback); native UDP over
+QUIC DATAGRAM is not yet enabled, so the server advertises
+`supports_udp_datagram = 0`.
+
+```toml
+listen = "127.0.0.1:9443"
+quic_listen = "127.0.0.1:9443"
+```
+
+The client selects a carrier per server endpoint from an optional URI scheme on
+`server_addr` and each `server_addrs` entry. A bare `host:port` (or a
+`tls://host:port`) uses the TLS/TCP carrier; `quic://host:port` uses QUIC.
+Because endpoints are tried in order, listing a `quic://` endpoint ahead of a
+`tls://` one gives QUIC-preferred connection with automatic TLS fallback:
+
+```toml
+server_addr = "quic://server.example.com:9443"
+server_addrs = ["tls://server.example.com:9443"]
+```
+
+Changing `quic_listen` requires a server restart, like `listen`. QUIC uses the
+certificate loaded at startup; SIGHUP identity rotation currently applies to the
+TLS/TCP carrier only.
 
 Server policy is deny-all unless `policy_path` is set in the server config. A
 minimal public-domain policy should deny private resolved addresses before

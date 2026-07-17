@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 bytes.workspace = true
 clap.workspace = true
+quinn.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 serde.workspace = true

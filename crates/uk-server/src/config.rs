@@ -22,8 +22,11 @@ pub const DEFAULT_AUTH_SKEW_SECONDS: u64 = 30;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
-    /// TCP listen address.
+    /// TCP listen address for the TLS/TCP carrier.
     pub listen: String,
+    /// Optional UDP listen address for the QUIC carrier. When set, the server
+    /// accepts QUIC connections here in addition to the TLS/TCP listener.
+    pub quic_listen: Option<String>,
     /// Optional unauthenticated HTTP health and metrics listen address.
     pub observability_listen: Option<String>,
     /// Certificate chain PEM path.
@@ -149,6 +152,9 @@ impl ServerConfig {
     /// Validates configured network endpoints without resolving DNS.
     pub fn validate_network_endpoints(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         validate_host_port_endpoint("listen", &self.listen)?;
+        if let Some(listen) = &self.quic_listen {
+            validate_host_port_endpoint("quic_listen", listen)?;
+        }
         if let Some(listen) = &self.observability_listen {
             validate_host_port_endpoint("observability_listen", listen)?;
         }
@@ -528,6 +534,7 @@ mod tests {
     fn minimal_config() -> ServerConfig {
         ServerConfig {
             listen: "127.0.0.1:0".to_owned(),
+            quic_listen: None,
             observability_listen: None,
             cert_path: "cert.pem".to_owned(),
             key_path: "key.pem".to_owned(),
