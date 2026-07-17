@@ -21,6 +21,8 @@ The repository currently focuses on the first runnable v0.1 TLS/TCP carrier:
   fallback (prefer `quic://`, fall back to `tls://`)
 - SOCKS5 CONNECT and UDP ASSOCIATE entry points in `uk-client`
 - multiplexed TCP relay and UDP relay over the TLS/TCP and QUIC carriers
+- native UDP over QUIC DATAGRAM on QUIC sessions, with automatic fallback to
+  the reliable `UDP_DATA` frame path for oversized payloads
 - bounded UDP flow recovery after a carrier disconnect without closing the SOCKS association
 - graceful Ctrl+C/SIGTERM shutdown for long-running client and server listeners
 - capped exponential retry for transient client and server listener accept errors
@@ -44,10 +46,12 @@ SOCKS5 client -> UK over QUIC    -> UK server -> UDP target
 The server always listens for the TLS/TCP carrier on `listen`. Set
 `quic_listen` to a UDP `host:port` to additionally accept the QUIC carrier;
 both carriers share the configured certificate, key, and `uk/1` ALPN, and
-reject 0-RTT application data. QUIC UDP relay currently travels over the
-control stream (the SETTINGS-advertised UDP stream fallback); native UDP over
-QUIC DATAGRAM is not yet enabled, so the server advertises
-`supports_udp_datagram = 0`.
+reject 0-RTT application data. On QUIC sessions the UDP data plane uses native
+QUIC DATAGRAM (the server advertises `supports_udp_datagram = 1`): UDP payloads
+travel as unreliable datagrams, and any payload too large for the current
+datagram size falls back to the reliable `UDP_DATA` frame path. UDP relay
+control (`UDP_OPEN`/`UDP_CLOSE`) always uses the reliable stream. On the
+TLS/TCP carrier, UDP relay uses the stream path throughout.
 
 ```toml
 listen = "127.0.0.1:9443"

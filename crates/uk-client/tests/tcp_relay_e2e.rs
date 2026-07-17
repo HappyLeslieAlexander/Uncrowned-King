@@ -3092,6 +3092,95 @@ async fn quic_carrier_relays_udp_over_datagram() -> Result<(), TestError> {
     Ok(())
 }
 
+/// A UDP payload larger than any QUIC datagram size must fall back to the
+/// reliable `UDP_DATA` frame path in both directions and still round-trip.
+#[tokio::test]
+async fn quic_carrier_falls_back_to_udp_frame_for_large_payload() -> Result<(), TestError> {
+    init_tracing();
+
+    // Echo target with a buffer large enough for the oversized payload.
+    let target_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let target_addr = target_socket.local_addr()?;
+    let echo_task = tokio::spawn(async move {
+        let mut buf = vec![0_u8; 16_384];
+        let (read, peer) = target_socket.recv_from(&mut buf).await?;
+        target_socket.send_to(&buf[..read], peer).await?;
+        Ok::<(), TestError>(())
+    });
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    let policy_path = temp_dir.join("policy.toml");
+    fs::write(&cert_path, CERT_PEM)?;
+    write_private_key(&key_path)?;
+    fs::write(&policy_path, allow_loopback_policy(target_addr.port()))?;
+
+    let quic_addr = unused_udp_loopback_addr().await?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut config = test_server_config(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        &cert_path,
+        &key_path,
+        test_limits(),
+        Some(&policy_path),
+        30,
+    );
+    config.quic_listen = Some(quic_addr.to_string());
+    let (_server_addr, server_task) = start_uk_server_until_shutdown(config, async {
+        let _ = shutdown_rx.await;
+    })
+    .await?;
+
+    let (socks_addr, client_task) = start_socks5_listener(ClientConfig {
+        server_addr: format!("quic://{quic_addr}"),
+        server_addrs: None,
+        server_name: "localhost".to_owned(),
+        observability_listen: None,
+        ca_cert_path: path_string(&cert_path),
+        key_id: KEY_ID.to_owned(),
+        secret: SECRET.to_owned(),
+        handshake_timeout_seconds: Some(5),
+        server_connect_retry_delay_millis: None,
+        socks_handshake_timeout_seconds: Some(3),
+        tcp_open_timeout_seconds: Some(3),
+        udp_flow_idle_timeout_seconds: None,
+        shutdown_timeout_seconds: Some(3),
+        max_pending_open_bytes: None,
+        max_socks_connections: None,
+        max_buffered_bytes_per_session: None,
+        max_buffered_bytes_per_flow: None,
+    })
+    .await?;
+
+    let (_socks_control, udp_relay_addr) = open_socks_udp_associate(socks_addr).await?;
+    let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    // 8 KiB exceeds any QUIC datagram size but fits the frame limit.
+    let payload = vec![0x5a_u8; 8_000];
+
+    udp_client
+        .send_to(&socks_udp_datagram(target_addr, &payload), udp_relay_addr)
+        .await?;
+    // Receive with a buffer large enough for the oversized reply (the shared
+    // helper caps at 1 KiB).
+    let mut reply_buf = vec![0_u8; 16_384];
+    let (read, peer) =
+        tokio::time::timeout(Duration::from_secs(3), udp_client.recv_from(&mut reply_buf))
+            .await??;
+    assert_eq!(peer, udp_relay_addr);
+    let (reply_target, reply_payload) = parse_socks_udp_datagram(&reply_buf[..read])?;
+    assert_eq!(reply_target, target_addr);
+    assert_eq!(reply_payload, payload);
+
+    echo_task.await??;
+    shutdown_tx
+        .send(())
+        .map_err(|()| "server shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(5), server_task).await???;
+    client_task.abort();
+    Ok(())
+}
+
 async fn run_client_observability_e2e() -> Result<(), TestError> {
     init_tracing();
 
