@@ -1,10 +1,10 @@
 //! TLS helpers for the client carrier.
 
-use std::{fs::File, io::BufReader};
+use std::fs;
 
 use rustls::{
     ClientConfig, RootCertStore,
-    pki_types::{CertificateDer, ServerName},
+    pki_types::{CertificateDer, ServerName, pem::PemObject},
 };
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsConnector, client::TlsStream};
@@ -56,10 +56,9 @@ fn ensure_alpn(protocol: Option<&[u8]>) -> Result<(), TlsError> {
 }
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, TlsError> {
-    let mut reader = BufReader::new(
-        File::open(path).map_err(|err| format!("failed to open CA certificate {path}: {err}"))?,
-    );
-    let certs = rustls_pemfile::certs(&mut reader)
+    let pem =
+        fs::read(path).map_err(|err| format!("failed to open CA certificate {path}: {err}"))?;
+    let certs = CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| format!("invalid CA certificate {path}: {err}"))?;
     if certs.is_empty() {

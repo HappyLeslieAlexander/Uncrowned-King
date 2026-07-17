@@ -1,8 +1,7 @@
 //! End-to-end TCP and UDP relay tests.
 
 use std::{
-    fs,
-    io::{self, BufReader},
+    fs, io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process,
@@ -19,7 +18,7 @@ use std::os::unix::fs::PermissionsExt;
 use bytes::{Bytes, BytesMut};
 use rustls::{
     ClientConfig as RustlsClientConfig, RootCertStore, ServerConfig as RustlsServerConfig,
-    pki_types::{CertificateDer, PrivateKeyDer, ServerName},
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject},
 };
 use socket2::Socket;
 use tokio::{
@@ -4122,8 +4121,8 @@ fn client_exporter(stream: &ClientTlsStream<TcpStream>) -> Result<[u8; 32], Test
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TestError> {
-    let mut reader = BufReader::new(fs::File::open(path)?);
-    let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+    let pem = fs::read(path)?;
+    let certs = CertificateDer::pem_slice_iter(&pem).collect::<Result<Vec<_>, _>>()?;
     if certs.is_empty() {
         Err("missing certificate".into())
     } else {
@@ -5190,8 +5189,8 @@ fn server_tls_config(cert_path: &Path, key_path: &Path) -> Result<RustlsServerCo
 }
 
 fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TestError> {
-    let mut reader = BufReader::new(fs::File::open(path)?);
-    rustls_pemfile::private_key(&mut reader)?.ok_or_else(|| "missing private key".into())
+    let pem = fs::read(path)?;
+    Ok(PrivateKeyDer::from_pem_slice(&pem)?)
 }
 
 fn server_exporter(stream: &ServerTlsStream<TcpStream>) -> Result<[u8; 32], TestError> {
