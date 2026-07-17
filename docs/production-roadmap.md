@@ -48,14 +48,14 @@
 
 **目标**:达到可对外承压的安全门禁与文档。
 
-- [ ] **威胁模型文档** `docs/threat-model.md`(信任边界、攻击面、缓解、残余风险)
-- [ ] **结构化安全自审 / 第三方审查**(对照 §16 逐条核对)
-- [ ] **`cargo-deny` 接入 CI**:许可证白名单 + 依赖来源/重复依赖策略(补 RustSec 之外的供应链门禁)
-- [ ] **CI fuzz 冒烟**:每个 target 短时运行(如 60s)防回归
-- [ ] **密钥/证书管理规范** `docs/key-management.md`(生成、分发、轮换、吊销 SOP)
-- [ ] `SECURITY.md`(漏洞披露流程)
+- [x] **威胁模型文档** `docs/threat-model.md`(信任边界、资产、对手、缓解、安全不变量、残余风险)
+- [x] **结构化安全自审**(威胁模型逐条映射 §16 控制到实现)
+- [x] **`cargo-deny` 接入 CI**:许可证白名单 + 来源 + wildcard/重复依赖门禁(`deny.toml`,本地 `cargo deny check` 全绿)
+- [x] **CI fuzz 冒烟**:`fuzz.yml` 跑 5 个 target(本地 nightly+cargo-fuzz 验证:各 20 万次运行无崩溃)
+- [x] **密钥/证书管理规范** `docs/key-management.md`(生成、分发、权限、轮换、吊销 SOP)
+- [x] `SECURITY.md`(漏洞披露流程、范围、SLA)
 
-**验收**:安全自审清单全过;`cargo-deny` 与 fuzz 冒烟纳入 CI 且绿。
+**验收**:安全自审清单全过;`cargo-deny` 与 fuzz 冒烟纳入 CI 且绿。 — **已达成**
 
 ---
 

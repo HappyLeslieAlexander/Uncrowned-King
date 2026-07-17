@@ -295,5 +295,17 @@ cargo build --workspace --release --locked
 ```
 
 GitHub Actions runs the same checks on Rust 1.85 and stable, builds release
-binaries on stable, and audits `Cargo.lock` against RustSec advisories on
-dependency changes and a daily schedule.
+binaries on stable, audits `Cargo.lock` against RustSec advisories and runs
+`cargo-deny` (licenses, sources, bans) on dependency changes and a daily
+schedule, and fuzzes the strict parsers when they change.
+
+## Security
+
+- Threat model, security invariants, and residual risks:
+  [`docs/threat-model.md`](docs/threat-model.md)
+- Key and certificate lifecycle (generation, permissions, rotation,
+  revocation): [`docs/key-management.md`](docs/key-management.md)
+- Vulnerability disclosure policy: [`SECURITY.md`](SECURITY.md)
+
+Report vulnerabilities privately via GitHub's "Report a vulnerability" — not a
+public issue. See [`SECURITY.md`](SECURITY.md).
