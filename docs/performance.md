@@ -48,43 +48,52 @@ header and slices the payload without copying.
 
 ## End-to-end throughput
 
-Full-stack loopback download (target → `uk-server` → `uk-client` → SOCKS reader)
-measured by `measures_quic_carrier_throughput` in the e2e suite (a client that
-only reads, so the per-flow relay loop is not contended by a simultaneous
-upload). Machine-relative:
+Full-stack loopback download (target → `uk-server` → `uk-client` → SOCKS
+reader), measured by the `#[ignore]`d benchmark `measures_quic_carrier_throughput`.
+The client only reads, so the per-flow relay loop is not contended by a
+simultaneous upload. It is not a CI gate (see below); run it manually:
 
-| Carrier | Single-flow download | Notes |
-| --- | ---: | --- |
-| QUIC | ~130 MiB/s (32 MiB transfer) | Sustained; stable across runs. |
-| TLS/TCP | not sustained on a single flow | Shed — see below. |
+```sh
+cargo test -p uk-client --test tcp_relay_e2e --release -- \
+    --ignored --nocapture measures_quic_carrier_throughput
+```
 
-### Finding: single-flow shed on TLS/TCP (drives §13 pooling)
+On an unloaded Apple-silicon dev machine, a single QUIC flow sustains
+**~130 MiB/s** over a 32 MiB download (machine-relative).
 
-A single high-throughput flow over the **TLS/TCP** carrier is *shed* once the
-consumer falls behind: the per-flow inbound queue is bounded to
-`FLOW_FRAME_QUEUE_CAPACITY = 32` frames of `RELAY_BUFFER_SIZE` (16 KiB) each
-(≈ 512 KiB), and the **shared** carrier reader drops a flow whose queue
-overflows rather than head-of-line-blocking every other flow on that carrier.
-When the source outruns the consumer (easy over loopback TLS, which has no
-transport pacing back to the app), the queue overflows and the flow is closed.
+### Finding: high-throughput single-flow shed (drives §13 pooling)
 
-- **QUIC does not hit this**: QUIC stream flow control paces the source to the
-  consumer, so the per-flow queue stays bounded and the flow sustains.
-- This is the same root cause as the earlier "early eof" seen when raising
-  `RELAY_BUFFER_SIZE` to 32 KiB — larger server reads produced larger bursts
-  that overflowed the client's frame queue sooner. It is **not** a half-close
-  bug; ordering across the carrier is correct.
+A single high-throughput flow is *shed* once the consuming task falls behind:
+the per-flow inbound queue is bounded to `FLOW_FRAME_QUEUE_CAPACITY = 32`
+frames of `RELAY_BUFFER_SIZE` (16 KiB) each (≈ 512 KiB), and the **shared**
+carrier reader drops a flow whose queue overflows rather than
+head-of-line-blocking every other flow on that carrier.
+
+- **This affects both carriers under consumer starvation.** QUIC transport flow
+  control paces the *transport*, so on an unloaded machine a QUIC flow sustains;
+  but under enough CPU contention (e.g., a loaded CI runner executing the whole
+  e2e suite in parallel) the *application* consumer is starved and the queue
+  overflows on QUIC too. TLS/TCP has no app-facing pacing and sheds even more
+  readily.
+- Because completion depends on the consumer keeping pace, an
+  "received == total" assertion is **not deterministic under load**, which is
+  why the benchmark is `#[ignore]`d rather than a CI gate.
+- Same root cause as the earlier "early eof" when raising `RELAY_BUFFER_SIZE`
+  to 32 KiB (larger reads → larger bursts → overflow sooner). It is **not** a
+  half-close bug; carrier byte ordering is correct.
 
 **Mitigations (future work, in priority order):**
 
-1. **Bulk/latency separation via the client connection pool (§13)** — put a
-   bulk flow on its own carrier so shedding/backpressure never affects
-   latency-sensitive flows. This is the principled fix and the main reason the
-   pool is worthwhile.
-2. **Raise `FLOW_FRAME_QUEUE_CAPACITY`** (e.g., 32 → 256+) to lift the
-   single-flow shed threshold at modest memory cost, as an interim tuning knob.
-3. **Bounded per-flow backpressure** to the carrier reader that does not
-   head-of-line-block other flows (more invasive).
+1. **Bounded per-flow backpressure** that does not head-of-line-block other
+   flows — e.g., pause reading a flow's frames off the shared carrier while its
+   queue is full, up to the per-flow byte limit, only shedding past that. This
+   is the correctness-preserving fix so a momentarily-slow consumer is throttled
+   rather than dropped.
+2. **Bulk/latency separation via the client connection pool (§13)** — put a
+   bulk flow on its own carrier so its backpressure never affects
+   latency-sensitive flows on other carriers.
+3. **Raise `FLOW_FRAME_QUEUE_CAPACITY`** as an interim knob (bounded by the
+   per-flow byte limit to cap memory).
 
 ## §13 buffer bump revisited
 
