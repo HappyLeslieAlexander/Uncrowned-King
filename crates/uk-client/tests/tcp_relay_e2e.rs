@@ -2947,7 +2947,7 @@ async fn run_server_observability_e2e() -> Result<(), TestError> {
 }
 
 #[tokio::test]
-async fn quic_carrier_round_trips_tcp_and_udp_relay() -> Result<(), TestError> {
+async fn quic_carrier_round_trips_tcp_relay() -> Result<(), TestError> {
     init_tracing();
 
     let temp_dir = create_temp_dir()?;
@@ -2958,7 +2958,6 @@ async fn quic_carrier_round_trips_tcp_and_udp_relay() -> Result<(), TestError> {
     write_private_key(&key_path)?;
     fs::write(&policy_path, allow_loopback_any_port_policy())?;
     let (tcp_target_addr, tcp_target_task) = spawn_echo_target().await?;
-    let (udp_target_addr, udp_target_task) = spawn_udp_echo_target().await?;
 
     let quic_addr = unused_udp_loopback_addr().await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -3009,23 +3008,87 @@ async fn quic_carrier_round_trips_tcp_and_udp_relay() -> Result<(), TestError> {
     assert_eq!(tcp_echo.payload, tcp_payload);
     tcp_target_task.await??;
 
-    let udp_payload = Bytes::from_static(b"quic carrier udp payload");
-    write_frame(&mut carrier, &udp_open_frame(3, udp_target_addr)?).await?;
-    read_relay_frame(&mut carrier, FrameType::UdpData, 3).await?;
-    write_frame(
-        &mut carrier,
-        &Frame::new(FrameType::UdpData, 0, 3, udp_payload.clone())?,
-    )
-    .await?;
-    let udp_echo = read_relay_frame(&mut carrier, FrameType::UdpData, 3).await?;
-    assert_eq!(udp_echo.payload, udp_payload);
-    udp_target_task.await??;
-
     shutdown_tx
         .send(())
         .map_err(|()| "server shutdown receiver dropped")?;
     tokio::time::timeout(Duration::from_secs(5), server_task).await???;
     drop(carrier);
+    Ok(())
+}
+
+/// Drives a real SOCKS5 UDP ASSOCIATE round trip over the QUIC carrier, so the
+/// UDP data plane exercises native QUIC DATAGRAM on both the client
+/// (`send_udp_data`) and server (`relay_udp_target_to_client`) plus the client
+/// datagram receiver.
+#[tokio::test]
+async fn quic_carrier_relays_udp_over_datagram() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, echo_task) = spawn_udp_echo_target().await?;
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    let policy_path = temp_dir.join("policy.toml");
+    fs::write(&cert_path, CERT_PEM)?;
+    write_private_key(&key_path)?;
+    fs::write(&policy_path, allow_loopback_policy(target_addr.port()))?;
+
+    let quic_addr = unused_udp_loopback_addr().await?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut config = test_server_config(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        &cert_path,
+        &key_path,
+        test_limits(),
+        Some(&policy_path),
+        30,
+    );
+    config.quic_listen = Some(quic_addr.to_string());
+    let (_server_addr, server_task) = start_uk_server_until_shutdown(config, async {
+        let _ = shutdown_rx.await;
+    })
+    .await?;
+
+    let (socks_addr, client_task) = start_socks5_listener(ClientConfig {
+        server_addr: format!("quic://{quic_addr}"),
+        server_addrs: None,
+        server_name: "localhost".to_owned(),
+        observability_listen: None,
+        ca_cert_path: path_string(&cert_path),
+        key_id: KEY_ID.to_owned(),
+        secret: SECRET.to_owned(),
+        handshake_timeout_seconds: Some(5),
+        server_connect_retry_delay_millis: None,
+        socks_handshake_timeout_seconds: Some(3),
+        tcp_open_timeout_seconds: Some(3),
+        udp_flow_idle_timeout_seconds: None,
+        shutdown_timeout_seconds: Some(3),
+        max_pending_open_bytes: None,
+        max_socks_connections: None,
+        max_buffered_bytes_per_session: None,
+        max_buffered_bytes_per_flow: None,
+    })
+    .await?;
+
+    let (_socks_control, udp_relay_addr) = open_socks_udp_associate(socks_addr).await?;
+    let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let payload = b"uncrowned king udp over quic datagram";
+
+    udp_client
+        .send_to(&socks_udp_datagram(target_addr, payload), udp_relay_addr)
+        .await?;
+    let (reply_target, reply_payload) =
+        recv_socks_udp_datagram(&udp_client, udp_relay_addr).await?;
+    assert_eq!(reply_target, target_addr);
+    assert_eq!(reply_payload, payload);
+
+    echo_task.await??;
+    shutdown_tx
+        .send(())
+        .map_err(|()| "server shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(5), server_task).await???;
+    client_task.abort();
     Ok(())
 }
 

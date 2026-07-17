@@ -6,17 +6,56 @@
 //! a socket address itself (quinn dials socket addresses, not host names) while
 //! still presenting the configured server name for certificate verification.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{future::Future, io, net::SocketAddr, pin::Pin, sync::Arc};
 
+use bytes::Bytes;
 use quinn::{
     ClientConfig as QuinnClientConfig, Endpoint, crypto::rustls::QuicClientConfig, default_runtime,
 };
 use rustls::ClientConfig as RustlsClientConfig;
 use tokio::net::lookup_host;
 use uk_auth::EXPORTER_LABEL;
-use uk_proto::{ALPN_PROTOCOL, BoxedCarrierReader, BoxedCarrierWriter};
+use uk_proto::{
+    ALPN_PROTOCOL, BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, DatagramChannel,
+    DatagramSendOutcome,
+};
 
 type QuicError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A [`DatagramChannel`] backed by a QUIC connection, used for UDP relay over
+/// QUIC DATAGRAM.
+struct QuicDatagramChannel {
+    connection: quinn::Connection,
+}
+
+impl DatagramChannel for QuicDatagramChannel {
+    fn send(&self, datagram: Bytes) -> DatagramSendOutcome {
+        match self.connection.send_datagram(datagram) {
+            Ok(()) => DatagramSendOutcome::Sent,
+            Err(quinn::SendDatagramError::TooLarge) => DatagramSendOutcome::TooLarge,
+            Err(_) => DatagramSendOutcome::Unavailable,
+        }
+    }
+
+    fn recv(&self) -> Pin<Box<dyn Future<Output = io::Result<Bytes>> + Send + '_>> {
+        Box::pin(async move {
+            self.connection
+                .read_datagram()
+                .await
+                .map_err(io::Error::other)
+        })
+    }
+
+    fn max_datagram_size(&self) -> Option<usize> {
+        self.connection.max_datagram_size()
+    }
+}
+
+fn datagram_channel(connection: &quinn::Connection) -> BoxedDatagramChannel {
+    Arc::new(QuicDatagramChannel {
+        connection: connection.clone(),
+    })
+}
 
 /// Connects to `endpoint` over QUIC, verifies the UK ALPN, and returns the
 /// server-opened control stream as carrier-neutral halves plus the exporter.
@@ -24,7 +63,15 @@ pub async fn connect(
     rustls_config: RustlsClientConfig,
     endpoint: &str,
     server_name: &str,
-) -> Result<(BoxedCarrierReader, BoxedCarrierWriter, [u8; 32]), QuicError> {
+) -> Result<
+    (
+        BoxedCarrierReader,
+        BoxedCarrierWriter,
+        [u8; 32],
+        BoxedDatagramChannel,
+    ),
+    QuicError,
+> {
     let addr = resolve(endpoint).await?;
     let mut client_endpoint = Endpoint::client(unspecified_addr(addr))
         .map_err(|err| format!("failed to bind local QUIC socket: {err}"))?;
@@ -42,11 +89,12 @@ pub async fn connect(
         .accept_bi()
         .await
         .map_err(|err| format!("failed to accept QUIC control stream: {err}"))?;
+    let datagrams = datagram_channel(&connection);
     // Hold the connection open for the session lifetime by leaking it into the
     // endpoint's driver; the send/recv halves keep the connection state alive,
     // and the endpoint is kept alive by the spawned driver task.
     keep_endpoint_alive(client_endpoint);
-    Ok((Box::new(recv), Box::new(send), exporter))
+    Ok((Box::new(recv), Box::new(send), exporter, datagrams))
 }
 
 fn client_config(rustls_config: RustlsClientConfig) -> Result<QuinnClientConfig, QuicError> {

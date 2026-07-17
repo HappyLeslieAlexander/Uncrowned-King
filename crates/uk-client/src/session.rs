@@ -19,8 +19,8 @@ use tokio_rustls::TlsConnector;
 use tracing::{info, warn};
 use uk_auth::{AuthChallenge, AuthResponse, unix_now};
 use uk_proto::{
-    BoxedCarrierReader, BoxedCarrierWriter, ErrorCode, ErrorPayload, Frame, FrameLimits, FrameType,
-    Settings, read_frame, validate_connection_frame, write_frame,
+    BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, ErrorCode, ErrorPayload, Frame,
+    FrameLimits, FrameType, Settings, read_frame, validate_connection_frame, write_frame,
 };
 
 use crate::{
@@ -38,11 +38,32 @@ type AnyError = Box<dyn Error + Send + Sync>;
 pub struct ClientCarrier {
     reader: BoxedCarrierReader,
     writer: BoxedCarrierWriter,
+    datagrams: Option<BoxedDatagramChannel>,
 }
 
 impl ClientCarrier {
-    fn new(reader: BoxedCarrierReader, writer: BoxedCarrierWriter) -> Self {
-        Self { reader, writer }
+    fn new(
+        reader: BoxedCarrierReader,
+        writer: BoxedCarrierWriter,
+        datagrams: Option<BoxedDatagramChannel>,
+    ) -> Self {
+        Self {
+            reader,
+            writer,
+            datagrams,
+        }
+    }
+
+    /// Splits the carrier into its reliable channel halves and optional
+    /// datagram channel for the relay to drive.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        BoxedCarrierReader,
+        BoxedCarrierWriter,
+        Option<BoxedDatagramChannel>,
+    ) {
+        (self.reader, self.writer, self.datagrams)
     }
 }
 
@@ -310,18 +331,26 @@ async fn connect_authenticated_endpoint(
 ) -> Result<(ClientCarrier, Settings), AnyError> {
     let (carrier, addr) = crate::config::parse_endpoint(endpoint)
         .map_err(|err| phase_error("parse endpoint", EndpointFailurePhase::Other, err))?;
-    let (reader, writer, exporter) = match carrier {
+    let (reader, writer, exporter, datagrams) = match carrier {
         CarrierKind::Tls => establish_tls_carrier(connector, server_name, addr).await?,
         CarrierKind::Quic => establish_quic_carrier(config, addr).await?,
     };
-    authenticate_over_carrier(config, reader, writer, exporter).await
+    authenticate_over_carrier(config, reader, writer, exporter, datagrams).await
 }
 
 async fn establish_tls_carrier(
     connector: &TlsConnector,
     server_name: ServerName<'static>,
     addr: &str,
-) -> Result<(BoxedCarrierReader, BoxedCarrierWriter, [u8; 32]), AnyError> {
+) -> Result<
+    (
+        BoxedCarrierReader,
+        BoxedCarrierWriter,
+        [u8; 32],
+        Option<BoxedDatagramChannel>,
+    ),
+    AnyError,
+> {
     let tcp = TcpStream::connect(addr)
         .await
         .map_err(|err| phase_error("tcp connect", EndpointFailurePhase::Tcp, err))?;
@@ -336,18 +365,29 @@ async fn establish_tls_carrier(
     let exporter = tls::exporter(&stream)
         .map_err(|err| phase_error("tls exporter", EndpointFailurePhase::Tls, err))?;
     let (reader, writer) = tokio::io::split(stream);
-    Ok((Box::new(reader), Box::new(writer), exporter))
+    // The TLS/TCP carrier has no datagram channel.
+    Ok((Box::new(reader), Box::new(writer), exporter, None))
 }
 
 async fn establish_quic_carrier(
     config: &ClientConfig,
     addr: &str,
-) -> Result<(BoxedCarrierReader, BoxedCarrierWriter, [u8; 32]), AnyError> {
+) -> Result<
+    (
+        BoxedCarrierReader,
+        BoxedCarrierWriter,
+        [u8; 32],
+        Option<BoxedDatagramChannel>,
+    ),
+    AnyError,
+> {
     let rustls_config = tls::client_config(&config.ca_cert_path)
         .map_err(|err| phase_error("quic client config", EndpointFailurePhase::Tls, err))?;
-    crate::quic::connect(rustls_config, addr, &config.server_name)
-        .await
-        .map_err(|err| phase_error("quic connect", EndpointFailurePhase::Tls, err))
+    let (reader, writer, exporter, datagrams) =
+        crate::quic::connect(rustls_config, addr, &config.server_name)
+            .await
+            .map_err(|err| phase_error("quic connect", EndpointFailurePhase::Tls, err))?;
+    Ok((reader, writer, exporter, Some(datagrams)))
 }
 
 /// Runs the UK challenge-response authentication over an established,
@@ -358,6 +398,7 @@ async fn authenticate_over_carrier(
     mut reader: BoxedCarrierReader,
     mut writer: BoxedCarrierWriter,
     exporter: [u8; 32],
+    datagrams: Option<BoxedDatagramChannel>,
 ) -> Result<(ClientCarrier, Settings), AnyError> {
     let challenge_frame = read_frame(&mut reader, FrameLimits::default())
         .await
@@ -407,7 +448,7 @@ async fn authenticate_over_carrier(
         event = "auth.success",
         max_frame_size = negotiated.max_frame_size
     );
-    Ok((ClientCarrier::new(reader, writer), settings))
+    Ok((ClientCarrier::new(reader, writer, datagrams), settings))
 }
 
 fn decode_server_settings_frame(frame: Frame) -> Result<Settings, AnyError> {

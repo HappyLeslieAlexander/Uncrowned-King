@@ -24,11 +24,12 @@ use tokio::{
 };
 use tracing::{Instrument, debug, info, info_span, warn};
 use uk_proto::{
-    BoxedCarrierReader, BoxedCarrierWriter, ErrorCode, ErrorPayload, FIRST_CLIENT_FLOW_ID,
-    FLOW_ID_STEP, Frame, FrameIoError, FrameLimits, FrameType, NegotiatedSettings, TCP_CLOSE_ERROR,
-    TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR,
-    UDP_CLOSE_NORMAL, UdpClose, UdpOpen, is_client_initiated_flow_id, read_frame,
-    validate_connection_frame, varint::MAX_VARINT, write_frame,
+    BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, DatagramSendOutcome, ErrorCode,
+    ErrorPayload, FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, Frame, FrameIoError, FrameLimits, FrameType,
+    NegotiatedSettings, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose,
+    TcpOpen, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose, UdpOpen, datagram,
+    is_client_initiated_flow_id, read_frame, validate_connection_frame, varint::MAX_VARINT,
+    write_frame,
 };
 
 use crate::{
@@ -101,6 +102,8 @@ struct ClientSession {
     max_streams: u64,
     max_udp_flows: u64,
     supports_udp_stream_fallback: bool,
+    supports_udp_datagram: bool,
+    datagrams: Option<BoxedDatagramChannel>,
     max_pending_open_bytes: usize,
     max_buffered_bytes_per_session: usize,
     max_buffered_bytes_per_flow: usize,
@@ -353,6 +356,7 @@ enum ClientSessionMetricState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClientSessionTaskKind {
     CarrierReader,
+    DatagramReader,
     Keepalive,
 }
 
@@ -1174,9 +1178,13 @@ impl ClientSession {
         .await?;
         let negotiated = settings.negotiated_v0_1()?;
         let limits = negotiated.frame_limits();
-        let (carrier_reader, carrier_writer) = tokio::io::split(carrier);
-        let carrier_reader: BoxedCarrierReader = Box::new(carrier_reader);
-        let carrier_writer: BoxedCarrierWriter = Box::new(carrier_writer);
+        let (carrier_reader, carrier_writer, datagrams) = carrier.into_parts();
+        // Native UDP over QUIC DATAGRAM requires the peer to advertise it, a
+        // datagram-capable carrier (QUIC), and UDP relay capacity.
+        let datagrams = datagrams.filter(|channel| channel.max_datagram_size().is_some());
+        let supports_udp_datagram = negotiated.supports_udp_datagram
+            && datagrams.is_some()
+            && negotiated.max_udp_flows != 0;
         let session_buffer = ClientSessionBufferControl::default();
         let correlation_id = NEXT_CLIENT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let session = Arc::new(Self {
@@ -1189,6 +1197,8 @@ impl ClientSession {
             max_streams: negotiated.max_streams,
             max_udp_flows: negotiated.max_udp_flows,
             supports_udp_stream_fallback: negotiated.udp_stream_fallback_enabled(),
+            supports_udp_datagram,
+            datagrams,
             max_pending_open_bytes: usize_limit(config.max_pending_open_bytes())?,
             max_buffered_bytes_per_session: usize_limit(config.max_buffered_bytes_per_session())?,
             max_buffered_bytes_per_flow: usize_limit(config.max_buffered_bytes_per_flow())?,
@@ -1213,6 +1223,7 @@ impl ClientSession {
             config_generation = snapshot.generation
         );
         spawn_carrier_reader(carrier_reader, Arc::clone(&session)).await;
+        spawn_datagram_reader(Arc::clone(&session)).await;
         if let Some(interval) = keepalive_interval(negotiated) {
             spawn_keepalive(Arc::clone(&session), interval).await;
         }
@@ -1656,8 +1667,18 @@ impl ClientSession {
     }
 
     async fn send_udp_data(&self, flow_id: u64, payload: Bytes) -> Result<(), AnyError> {
+        let payload_len = payload.len();
+        // Prefer the QUIC DATAGRAM path; fall back to a reliable UDP_DATA frame
+        // when datagrams are unavailable or the payload is too large.
+        if self.try_send_udp_datagram(flow_id, &payload) {
+            self.metrics.record_relay_bytes(
+                RelayProtocol::Udp,
+                RelayDirection::LocalToServer,
+                payload_len,
+            );
+            return Ok(());
+        }
         let frame = Frame::new(FrameType::UdpData, 0, flow_id, payload)?;
-        let payload_len = frame.payload.len();
         self.write_frame(&frame).await?;
         self.metrics.record_relay_bytes(
             RelayProtocol::Udp,
@@ -1665,6 +1686,32 @@ impl ClientSession {
             payload_len,
         );
         Ok(())
+    }
+
+    /// Attempts to send one UDP payload over the QUIC DATAGRAM channel. Returns
+    /// `false` (fall back to the frame path) when datagrams are disabled,
+    /// unavailable, or the payload is too large for the current datagram size.
+    fn try_send_udp_datagram(&self, flow_id: u64, payload: &[u8]) -> bool {
+        if !self.supports_udp_datagram {
+            return false;
+        }
+        let Some(channel) = self.datagrams.as_ref() else {
+            return false;
+        };
+        let Some(max_datagram_size) = channel.max_datagram_size() else {
+            return false;
+        };
+        let Ok(overhead) = datagram::overhead(flow_id) else {
+            return false;
+        };
+        if overhead.saturating_add(payload.len()) > max_datagram_size {
+            return false;
+        }
+        let mut encoded = BytesMut::with_capacity(overhead + payload.len());
+        if datagram::encode(flow_id, payload, &mut encoded).is_err() {
+            return false;
+        }
+        matches!(channel.send(encoded.freeze()), DatagramSendOutcome::Sent)
     }
 
     async fn send_tcp_close(&self, flow_id: u64, close_code: u16) -> Result<(), AnyError> {
@@ -1961,6 +2008,92 @@ async fn spawn_carrier_reader(mut carrier_reader: BoxedCarrierReader, session: A
         ClientSessionTaskKind::CarrierReader,
         task.instrument(info_span!("client.session", correlation_id)),
     );
+}
+
+/// Receives inbound QUIC datagrams and delivers each to its flow, alongside
+/// `UDP_DATA` frames. Does nothing when the session has no datagram channel.
+async fn spawn_datagram_reader(session: Arc<ClientSession>) {
+    let Some(channel) = session.datagrams.clone() else {
+        return;
+    };
+    let correlation_id = session.correlation_id;
+    let task_session = Arc::clone(&session);
+    let task = async move {
+        loop {
+            let datagram = tokio::select! {
+                result = channel.recv() => match result {
+                    Ok(datagram) => datagram,
+                    Err(_) => return,
+                },
+                () = task_session.shutdown.closed() => return,
+            };
+            match datagram::decode(datagram) {
+                Ok((flow_id, payload)) => {
+                    deliver_inbound_udp_datagram(&task_session, flow_id, payload).await;
+                }
+                Err(err) => {
+                    debug!(event = "client.datagram.decode_error", error = %err);
+                }
+            }
+        }
+    };
+    session.tasks.lock().await.spawn(
+        ClientSessionTaskKind::DatagramReader,
+        task.instrument(info_span!("client.session", correlation_id)),
+    );
+}
+
+/// Delivers one inbound UDP datagram to its flow queue.
+///
+/// Datagrams are unreliable and unordered: a datagram for an unknown, closed,
+/// mismatched, or full flow is dropped silently. Unlike the reliable frame
+/// path, it never removes the flow or sends a protocol error.
+async fn deliver_inbound_udp_datagram(session: &ClientSession, flow_id: u64, payload: Bytes) {
+    let mut flows = session.flows.lock().await;
+    if !route_inbound_datagram(
+        flow_id,
+        payload,
+        &mut flows,
+        session.session_buffer.clone(),
+        session.max_buffered_bytes_per_flow,
+        session.max_buffered_bytes_per_session,
+    ) {
+        debug!(event = "client.datagram.dropped", flow_id);
+    }
+}
+
+/// Routes an inbound UDP datagram to its flow queue without ever mutating the
+/// flow table. Returns `true` when the payload was enqueued.
+fn route_inbound_datagram(
+    flow_id: u64,
+    payload: Bytes,
+    flows: &mut HashMap<u64, ClientFlowRoute>,
+    session_buffer: ClientSessionBufferControl,
+    flow_byte_limit: usize,
+    session_byte_limit: usize,
+) -> bool {
+    if !is_client_initiated_flow_id(flow_id) {
+        return false;
+    }
+    let Some(route) = flows.get(&flow_id) else {
+        return false;
+    };
+    if !matches!(route.protocol, FlowProtocol::Udp) {
+        return false;
+    }
+    let Ok(frame) = Frame::new(FrameType::UdpData, 0, flow_id, payload) else {
+        return false;
+    };
+    let Ok(buffered_frame) = BufferedFlowFrame::new(
+        frame,
+        route.flow_buffer.clone(),
+        session_buffer,
+        flow_byte_limit,
+        session_byte_limit,
+    ) else {
+        return false;
+    };
+    route.sender.try_send(buffered_frame).is_ok()
 }
 
 async fn spawn_keepalive(session: Arc<ClientSession>, interval: Duration) {

@@ -4,6 +4,7 @@
 pub const ALPN_PROTOCOL: &[u8] = b"uk/1";
 
 pub mod carrier;
+pub mod datagram;
 pub mod endpoint;
 pub mod error;
 pub mod flow;
@@ -16,7 +17,10 @@ pub mod tcp;
 pub mod udp;
 pub mod varint;
 
-pub use carrier::{BoxedCarrierReader, BoxedCarrierWriter};
+pub use carrier::{
+    BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, DatagramChannel,
+    DatagramSendOutcome,
+};
 pub use endpoint::{EndpointError, validate_host_port_endpoint};
 pub use error::{ProtocolError, ProtocolResult};
 pub use flow::{
