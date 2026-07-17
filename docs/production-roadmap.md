@@ -26,12 +26,12 @@
 
 **目标**:补齐 §19 MVP 剩余项,达成完整 v1 功能面。
 
-- [ ] **QUIC DATAGRAM 原生 UDP(§19.6)**
-  - 将 `quinn::Connection` 经载体抽象穿透到 UDP relay 路径
-  - 定义 flow-id 前缀的数据报封装(datagram 无流内分帧,需自带路由头)
-  - SETTINGS 协商:QUIC 会话 advertise `supports_udp_datagram = 1`,客户端按协商结果选路
-  - 超过 QUIC datagram MTU 的载荷回退 stream 路径
-  - 单测 + e2e:DATAGRAM 往返 + 超限回退 + 与 stream 混跑
+- [x] **QUIC DATAGRAM 原生 UDP(§19.6)** — 已完成
+  - [x] 将 `quinn::Connection` 经 `DatagramChannel` 抽象穿透到 UDP relay 路径
+  - [x] 定义 flow-id 前缀的数据报封装(`uk-proto::datagram`)
+  - [x] SETTINGS 协商:QUIC 会话 advertise `supports_udp_datagram = 1`,客户端按协商结果选路
+  - [x] 超过 QUIC datagram 大小的载荷回退 `UDP_DATA` 帧路径
+  - [x] 单测 + e2e:SOCKS UDP over QUIC 往返 + 超限回退
 - [ ] **QUIC 证书 SIGHUP 热轮换**(当前仅 TLS/TCP)
   - `endpoint.set_server_config()` 接入安全 reload 流程
   - 测试:轮换后新连接用新证书,存量连接不中断

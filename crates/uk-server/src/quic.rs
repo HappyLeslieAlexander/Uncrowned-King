@@ -10,16 +10,56 @@
 //! application data is never accepted: the stream is only opened after the
 //! 1-RTT handshake finishes.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{future::Future, io, net::SocketAddr, pin::Pin, sync::Arc};
 
+use bytes::Bytes;
 use quinn::{
     Endpoint, ServerConfig as QuinnServerConfig, crypto::rustls::QuicServerConfig, default_runtime,
 };
 use rustls::ServerConfig as RustlsServerConfig;
 use uk_auth::EXPORTER_LABEL;
-use uk_proto::{ALPN_PROTOCOL, BoxedCarrierReader, BoxedCarrierWriter};
+use uk_proto::{
+    ALPN_PROTOCOL, BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, DatagramChannel,
+    DatagramSendOutcome,
+};
 
 type QuicError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A [`DatagramChannel`] backed by a QUIC connection, used for UDP relay over
+/// QUIC DATAGRAM.
+struct QuicDatagramChannel {
+    connection: quinn::Connection,
+}
+
+impl DatagramChannel for QuicDatagramChannel {
+    fn send(&self, datagram: Bytes) -> DatagramSendOutcome {
+        match self.connection.send_datagram(datagram) {
+            Ok(()) => DatagramSendOutcome::Sent,
+            Err(quinn::SendDatagramError::TooLarge) => DatagramSendOutcome::TooLarge,
+            Err(_) => DatagramSendOutcome::Unavailable,
+        }
+    }
+
+    fn recv(&self) -> Pin<Box<dyn Future<Output = io::Result<Bytes>> + Send + '_>> {
+        Box::pin(async move {
+            self.connection
+                .read_datagram()
+                .await
+                .map_err(io::Error::other)
+        })
+    }
+
+    fn max_datagram_size(&self) -> Option<usize> {
+        self.connection.max_datagram_size()
+    }
+}
+
+/// Builds a shared datagram channel for an established QUIC connection.
+fn datagram_channel(connection: &quinn::Connection) -> BoxedDatagramChannel {
+    Arc::new(QuicDatagramChannel {
+        connection: connection.clone(),
+    })
+}
 
 /// Builds a QUIC server config from a TLS 1.3 rustls config.
 ///
@@ -82,12 +122,21 @@ fn exporter(connection: &quinn::Connection) -> Result<[u8; 32], QuicError> {
 /// so the stream becomes visible to the client.
 pub async fn accept_carrier(
     connection: &quinn::Connection,
-) -> Result<(BoxedCarrierReader, BoxedCarrierWriter, [u8; 32]), QuicError> {
+) -> Result<
+    (
+        BoxedCarrierReader,
+        BoxedCarrierWriter,
+        [u8; 32],
+        BoxedDatagramChannel,
+    ),
+    QuicError,
+> {
     verify_alpn(connection)?;
     let exporter = exporter(connection)?;
     let (send, recv) = connection
         .open_bi()
         .await
         .map_err(|err| format!("failed to open QUIC control stream: {err}"))?;
-    Ok((Box::new(recv), Box::new(send), exporter))
+    let datagrams = datagram_channel(connection);
+    Ok((Box::new(recv), Box::new(send), exporter, datagrams))
 }

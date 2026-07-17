@@ -36,9 +36,9 @@ use uk_auth::{
     verify_auth_response_identity,
 };
 use uk_proto::{
-    BoxedCarrierReader, BoxedCarrierWriter, ErrorCode, ErrorPayload, Frame, FrameIoError,
-    FrameLimits, FrameType, SettingKey, Settings, read_frame, validate_connection_frame,
-    write_frame,
+    BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, ErrorCode, ErrorPayload, Frame,
+    FrameIoError, FrameLimits, FrameType, SettingKey, Settings, read_frame,
+    validate_connection_frame, write_frame,
 };
 
 use crate::config::ServerConfig;
@@ -738,13 +738,14 @@ async fn handle_quic_connection(
         let connection = incoming
             .await
             .map_err(|err| phase_error("quic accept", HandshakeFailureReason::Tls, err))?;
-        let (reader, writer, exporter) = quic::accept_carrier(&connection)
+        let (reader, writer, exporter, datagrams) = quic::accept_carrier(&connection)
             .await
             .map_err(|err| phase_error("quic carrier", HandshakeFailureReason::Tls, err))?;
         authenticate_carrier(
             reader,
             writer,
             exporter,
+            Some(datagrams),
             authentication,
             replay_cache,
             &config,
@@ -771,6 +772,7 @@ where
             (
                 BoxedCarrierReader,
                 BoxedCarrierWriter,
+                Option<BoxedDatagramChannel>,
                 AuthenticatedIdentity,
             ),
             AnyError,
@@ -804,7 +806,7 @@ where
     let Some(handshake_result) = handshake_result else {
         return Ok(());
     };
-    let (carrier_reader, carrier_writer, identity) = match handshake_result {
+    let (carrier_reader, carrier_writer, datagrams, identity) = match handshake_result {
         Ok(handshake) => handshake,
         Err(err) => {
             runtime
@@ -822,6 +824,7 @@ where
     run_authenticated_session(
         carrier_reader,
         carrier_writer,
+        datagrams,
         identity,
         runtime.security,
         &runtime.config,
@@ -840,6 +843,7 @@ where
 async fn run_authenticated_session(
     carrier_reader: BoxedCarrierReader,
     mut carrier_writer: BoxedCarrierWriter,
+    datagrams: Option<BoxedDatagramChannel>,
     identity: AuthenticatedIdentity,
     security: SecurityState,
     config: &ServerConfig,
@@ -859,9 +863,14 @@ async fn run_authenticated_session(
     let _session_permit = session_permit;
     let _active_session = metrics.begin_session();
 
-    write_server_settings(&mut carrier_writer, config).await?;
+    // Native UDP over QUIC DATAGRAM is available only when the carrier exposes
+    // a datagram channel (QUIC) and the peer enabled the datagram extension.
+    let datagrams = datagrams.filter(|channel| channel.max_datagram_size().is_some());
+    let supports_udp_datagram = datagrams.is_some();
 
-    let carrier = relay::ServerCarrier::new(carrier_reader, carrier_writer);
+    write_server_settings(&mut carrier_writer, config, supports_udp_datagram).await?;
+
+    let carrier = relay::ServerCarrier::new(carrier_reader, carrier_writer, datagrams);
 
     relay::relay_session(
         carrier,
@@ -919,6 +928,7 @@ async fn complete_handshake(
     (
         BoxedCarrierReader,
         BoxedCarrierWriter,
+        Option<BoxedDatagramChannel>,
         AuthenticatedIdentity,
     ),
     AnyError,
@@ -933,10 +943,12 @@ async fn complete_handshake(
     let exporter = tls::exporter(&stream)
         .map_err(|err| phase_error("tls exporter", HandshakeFailureReason::Tls, err))?;
     let (reader, writer) = tokio::io::split(stream);
+    // The TLS/TCP carrier has no datagram channel.
     authenticate_carrier(
         Box::new(reader),
         Box::new(writer),
         exporter,
+        None,
         authentication,
         replay_cache,
         config,
@@ -952,6 +964,7 @@ async fn authenticate_carrier(
     mut reader: BoxedCarrierReader,
     mut writer: BoxedCarrierWriter,
     exporter: [u8; 32],
+    datagrams: Option<BoxedDatagramChannel>,
     authentication: AuthenticationSnapshot,
     replay_cache: Arc<Mutex<ReplayCache>>,
     config: &ServerConfig,
@@ -959,6 +972,7 @@ async fn authenticate_carrier(
     (
         BoxedCarrierReader,
         BoxedCarrierWriter,
+        Option<BoxedDatagramChannel>,
         AuthenticatedIdentity,
     ),
     AnyError,
@@ -1052,14 +1066,18 @@ async fn authenticate_carrier(
         security_generation = authentication.generation
     );
 
-    Ok((reader, writer, identity))
+    Ok((reader, writer, datagrams, identity))
 }
 
-async fn write_server_settings<W>(stream: &mut W, config: &ServerConfig) -> Result<(), AnyError>
+async fn write_server_settings<W>(
+    stream: &mut W,
+    config: &ServerConfig,
+    supports_udp_datagram: bool,
+) -> Result<(), AnyError>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let settings = server_settings(config);
+    let settings = server_settings(config, supports_udp_datagram);
     let mut settings_payload = BytesMut::new();
     settings
         .encode(&mut settings_payload)
@@ -1103,13 +1121,16 @@ fn connection_error_frame(code: ErrorCode) -> Result<Frame, AnyError> {
     Ok(Frame::new(FrameType::Error, 0, 0, payload.freeze())?)
 }
 
-fn server_settings(config: &ServerConfig) -> Settings {
+fn server_settings(config: &ServerConfig, supports_udp_datagram: bool) -> Settings {
     let mut settings = Settings::default();
     settings.set(SettingKey::ProtocolRevision, 1);
     settings.set(SettingKey::MaxFrameSize, config.max_frame_size());
     settings.set(SettingKey::MaxStreams, config.max_streams());
     settings.set(SettingKey::MaxUdpFlows, config.max_udp_flows());
-    settings.set(SettingKey::SupportsUdpDatagram, 0);
+    settings.set(
+        SettingKey::SupportsUdpDatagram,
+        u64::from(supports_udp_datagram && config.max_udp_flows() != 0),
+    );
     settings.set(
         SettingKey::SupportsUdpStreamFallback,
         u64::from(config.max_udp_flows() != 0),
@@ -1274,7 +1295,7 @@ mod tests {
             ..LimitConfig::default()
         });
 
-        let settings = server_settings(&config);
+        let settings = server_settings(&config, false);
 
         assert_eq!(settings.get(SettingKey::ProtocolRevision), Some(1));
         assert_eq!(settings.get(SettingKey::MaxFrameSize), Some(32_768));
@@ -1283,6 +1304,28 @@ mod tests {
         assert_eq!(settings.get(SettingKey::SupportsUdpDatagram), Some(0));
         assert_eq!(settings.get(SettingKey::SupportsUdpStreamFallback), Some(1));
         assert_eq!(settings.get(SettingKey::IdleTimeoutSeconds), Some(42));
+    }
+
+    #[test]
+    fn server_settings_advertise_udp_datagram_on_quic_sessions() {
+        let config = minimal_config();
+
+        let settings = server_settings(&config, true);
+
+        assert_eq!(settings.get(SettingKey::SupportsUdpDatagram), Some(1));
+    }
+
+    #[test]
+    fn server_settings_withhold_udp_datagram_without_udp_flows() {
+        let mut config = minimal_config();
+        config.limits = Some(LimitConfig {
+            max_udp_flows: Some(0),
+            ..LimitConfig::default()
+        });
+
+        let settings = server_settings(&config, true);
+
+        assert_eq!(settings.get(SettingKey::SupportsUdpDatagram), Some(0));
     }
 
     #[test]
@@ -1369,7 +1412,7 @@ mod tests {
             ..LimitConfig::default()
         });
 
-        let settings = server_settings(&config);
+        let settings = server_settings(&config, false);
 
         assert_eq!(settings.get(SettingKey::MaxUdpFlows), Some(0));
         assert_eq!(settings.get(SettingKey::SupportsUdpStreamFallback), Some(0));

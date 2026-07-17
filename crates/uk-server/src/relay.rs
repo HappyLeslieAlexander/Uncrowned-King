@@ -30,10 +30,11 @@ use tracing::{Instrument, Span, debug, info, warn};
 use uk_auth::{AuthenticatedIdentity, unix_now};
 use uk_policy::{PolicyContext, PolicyDecision, PolicySet};
 use uk_proto::{
-    BoxedCarrierReader, BoxedCarrierWriter, ErrorCode, ErrorPayload, Frame, FrameIoError,
-    FrameLimits, FrameType, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target,
-    TcpClose, TcpOpen, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose, UdpOpen,
-    is_client_initiated_flow_id, read_frame, validate_connection_frame, write_frame,
+    BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, DatagramSendOutcome, ErrorCode,
+    ErrorPayload, Frame, FrameIoError, FrameLimits, FrameType, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL,
+    TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose,
+    UdpOpen, datagram, is_client_initiated_flow_id, read_frame, validate_connection_frame,
+    write_frame,
 };
 
 use crate::observability::{
@@ -75,13 +76,19 @@ struct SessionTasks {
 pub(crate) struct ServerCarrier {
     carrier_reader: BoxedCarrierReader,
     carrier_writer: BoxedCarrierWriter,
+    datagrams: Option<BoxedDatagramChannel>,
 }
 
 impl ServerCarrier {
-    pub(crate) fn new(reader: BoxedCarrierReader, writer: BoxedCarrierWriter) -> Self {
+    pub(crate) fn new(
+        reader: BoxedCarrierReader,
+        writer: BoxedCarrierWriter,
+        datagrams: Option<BoxedDatagramChannel>,
+    ) -> Self {
         Self {
             carrier_reader: reader,
             carrier_writer: writer,
+            datagrams,
         }
     }
 }
@@ -249,6 +256,10 @@ enum FlowEvent {
     },
     UdpReadClosed(u64),
     UdpActivity(u64),
+    InboundDatagram {
+        flow_id: u64,
+        payload: Bytes,
+    },
     HalfCloseDrainExpired {
         flow_id: u64,
         token: FlowToken,
@@ -284,6 +295,7 @@ enum SessionTaskKind {
     UdpOpen,
     TargetReader,
     UdpReader,
+    DatagramReader,
     TargetWriter,
     HalfCloseTimer,
 }
@@ -411,6 +423,9 @@ struct RelaySessionContext<'a> {
     open_dial_limiter: OpenDialLimiter,
     flow_tokens: FlowTokenAllocator,
     metrics: Arc<ServerMetrics>,
+    /// Datagram channel for the UDP data plane (QUIC only). `None` disables
+    /// native datagrams; UDP relay then uses `UDP_DATA` frames.
+    datagrams: Option<BoxedDatagramChannel>,
 }
 
 struct TargetOpenTask {
@@ -452,6 +467,7 @@ struct UdpReaderTask {
     target_socket: Arc<UdpSocket>,
     flow_control: TargetFlowControl,
     carrier_writer: CarrierWriter,
+    datagrams: Option<BoxedDatagramChannel>,
     event_tx: FlowEventSender,
     shutdown: SessionShutdown,
     data_frame_size: usize,
@@ -482,6 +498,7 @@ pub(crate) async fn relay_session(
     let ServerCarrier {
         mut carrier_reader,
         carrier_writer,
+        datagrams,
     } = carrier;
     let (event_tx, mut event_rx) = mpsc::channel(session_event_queue_capacity(limits));
     let mut target_writers = FlowTable::new();
@@ -491,6 +508,7 @@ pub(crate) async fn relay_session(
     let open_dial_limiter = OpenDialLimiter::new(limits.max_outbound_dials_per_session);
     let flow_tokens = FlowTokenAllocator::default();
     let carrier_writer = CarrierWriter::new(carrier_writer, shutdown.clone(), Arc::clone(&metrics));
+    maybe_spawn_datagram_reader(&mut session_tasks, datagrams.as_ref(), &event_tx, &shutdown);
     let context = RelaySessionContext {
         identity,
         security,
@@ -502,6 +520,7 @@ pub(crate) async fn relay_session(
         open_dial_limiter,
         flow_tokens,
         metrics,
+        datagrams,
     };
     let mut idle_deadline = next_idle_deadline(idle_timeout);
     let mut udp_idle_interval = udp_idle_interval(limits.udp_flow_idle_timeout);
@@ -634,6 +653,9 @@ async fn handle_flow_event(
             if let Some(target) = udp_target_flow_mut(target_writers, flow_id) {
                 target.record_activity();
             }
+        }
+        Some(FlowEvent::InboundDatagram { flow_id, payload }) => {
+            forward_udp_datagram(flow_id, payload, context, target_writers).await;
         }
         Some(FlowEvent::HalfCloseDrainExpired {
             flow_id,
@@ -872,7 +894,7 @@ fn flow_event_counts_as_session_activity(
 ) -> bool {
     match event {
         Some(FlowEvent::Activity) => true,
-        Some(FlowEvent::UdpActivity(flow_id)) => {
+        Some(FlowEvent::UdpActivity(flow_id) | FlowEvent::InboundDatagram { flow_id, .. }) => {
             matches!(target_writers.get(flow_id), Some(FlowSlot::Udp(_)))
         }
         _ => false,
@@ -1551,6 +1573,34 @@ async fn forward_udp_data_frame(
     Ok(())
 }
 
+/// Forwards an inbound QUIC datagram payload to the target socket.
+///
+/// Unlike the reliable `UDP_DATA` frame path, datagrams are unreliable and
+/// unordered: a datagram for an unknown/closed flow or a failed target send is
+/// dropped silently rather than erroring the session.
+async fn forward_udp_datagram(
+    flow_id: u64,
+    payload: Bytes,
+    context: &RelaySessionContext<'_>,
+    target_writers: &mut FlowTable,
+) {
+    let Some(target) = udp_target_flow_mut(target_writers, flow_id) else {
+        debug!(event = "udp.datagram.unknown_flow", flow_id);
+        return;
+    };
+    target.record_activity();
+    match target.socket.send(&payload).await {
+        Ok(written) => context.metrics.record_relay_bytes(
+            RelayProtocol::Udp,
+            RelayDirection::ClientToTarget,
+            written,
+        ),
+        Err(err) => {
+            debug!(event = "udp.datagram.target_write_error", flow_id, error = %err);
+        }
+    }
+}
+
 async fn handle_udp_close_frame(
     frame: Frame,
     context: &RelaySessionContext<'_>,
@@ -1852,6 +1902,7 @@ async fn accept_open_udp_target(
             target_socket,
             flow_control,
             carrier_writer: context.carrier_writer.clone(),
+            datagrams: context.datagrams.clone(),
             event_tx: context.event_tx.clone(),
             shutdown: context.shutdown.clone(),
             data_frame_size: context.limits.data_frame_size,
@@ -2001,6 +2052,63 @@ fn spawn_target_reader(session_tasks: &mut SessionTasks, task: TargetReaderTask)
     });
 }
 
+/// Starts the datagram receiver before the session loop when the carrier
+/// exposes a datagram channel, so inbound datagrams reach the flow table
+/// through the same event channel as `UDP_DATA` frames. The reliable control
+/// channel still carries `UDP_OPEN`/`UDP_CLOSE`.
+fn maybe_spawn_datagram_reader(
+    session_tasks: &mut SessionTasks,
+    datagrams: Option<&BoxedDatagramChannel>,
+    event_tx: &FlowEventSender,
+    shutdown: &SessionShutdown,
+) {
+    if let Some(channel) = datagrams {
+        spawn_datagram_reader(
+            session_tasks,
+            channel.clone(),
+            event_tx.clone(),
+            shutdown.clone(),
+        );
+    }
+}
+
+/// Receives inbound QUIC datagrams for the session and routes each to the flow
+/// table via the shared flow-event channel, alongside `UDP_DATA` frames.
+fn spawn_datagram_reader(
+    session_tasks: &mut SessionTasks,
+    channel: BoxedDatagramChannel,
+    event_tx: FlowEventSender,
+    shutdown: SessionShutdown,
+) {
+    session_tasks.spawn(SessionTaskKind::DatagramReader, async move {
+        loop {
+            if shutdown.is_closed() {
+                return;
+            }
+            let datagram = tokio::select! {
+                result = channel.recv() => match result {
+                    Ok(datagram) => datagram,
+                    Err(_) => return,
+                },
+                () = shutdown.closed() => return,
+            };
+            match datagram::decode(datagram) {
+                Ok((flow_id, payload)) => {
+                    send_flow_event_or_shutdown(
+                        &event_tx,
+                        FlowEvent::InboundDatagram { flow_id, payload },
+                        &shutdown,
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    debug!(event = "udp.datagram.decode_error", error = %err);
+                }
+            }
+        }
+    });
+}
+
 fn spawn_udp_reader(session_tasks: &mut SessionTasks, task: UdpReaderTask) {
     session_tasks.spawn(SessionTaskKind::UdpReader, async move {
         match relay_udp_target_to_client(
@@ -2008,6 +2116,7 @@ fn spawn_udp_reader(session_tasks: &mut SessionTasks, task: UdpReaderTask) {
             task.target_socket,
             task.flow_control,
             &task.carrier_writer,
+            task.datagrams.as_ref(),
             &task.event_tx,
             &task.shutdown,
             task.data_frame_size,
@@ -2635,11 +2744,13 @@ async fn relay_target_to_client(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn relay_udp_target_to_client(
     flow_id: u64,
     target_socket: Arc<UdpSocket>,
     flow_control: TargetFlowControl,
     carrier_writer: &CarrierWriter,
+    datagrams: Option<&BoxedDatagramChannel>,
     event_tx: &FlowEventSender,
     shutdown: &SessionShutdown,
     data_frame_size: usize,
@@ -2657,27 +2768,93 @@ async fn relay_udp_target_to_client(
         if shutdown.is_closed() || flow_control.is_aborted() {
             return Ok(());
         }
-        if udp_payload_exceeds_frame_limit(read, data_frame_size) {
-            warn!(
-                event = "udp.target.datagram.too_large",
-                flow_id,
-                payload_len = read,
-                max_payload_len = data_frame_size
-            );
-            continue;
+        let payload = &target_buf[..read];
+        match emit_udp_to_client(carrier_writer, datagrams, flow_id, payload, data_frame_size)
+            .await?
+        {
+            UdpEmit::Sent => {
+                carrier_writer.metrics.record_relay_bytes(
+                    RelayProtocol::Udp,
+                    RelayDirection::TargetToClient,
+                    read,
+                );
+                try_record_flow_activity(event_tx, FlowEvent::UdpActivity(flow_id));
+            }
+            UdpEmit::DroppedTooLarge => {
+                warn!(
+                    event = "udp.target.datagram.too_large",
+                    flow_id,
+                    payload_len = read,
+                    max_payload_len = data_frame_size
+                );
+            }
         }
-        send_udp_data(
-            carrier_writer,
-            flow_id,
-            Bytes::copy_from_slice(&target_buf[..read]),
-        )
-        .await?;
-        carrier_writer.metrics.record_relay_bytes(
-            RelayProtocol::Udp,
-            RelayDirection::TargetToClient,
-            read,
-        );
-        try_record_flow_activity(event_tx, FlowEvent::UdpActivity(flow_id));
+    }
+}
+
+/// Outcome of relaying one target-to-client UDP payload.
+enum UdpEmit {
+    /// The payload was sent (via QUIC DATAGRAM or a `UDP_DATA` frame).
+    Sent,
+    /// The payload exceeded both the datagram size and the frame limit and was
+    /// dropped, as UDP permits.
+    DroppedTooLarge,
+}
+
+/// Sends one target-to-client UDP payload, preferring the QUIC DATAGRAM path
+/// and falling back to a reliable `UDP_DATA` frame when datagrams are
+/// unavailable or the payload is too large for the current datagram size.
+async fn emit_udp_to_client(
+    carrier_writer: &CarrierWriter,
+    datagrams: Option<&BoxedDatagramChannel>,
+    flow_id: u64,
+    payload: &[u8],
+    data_frame_size: usize,
+) -> Result<UdpEmit, AnyError> {
+    if let Some(channel) = datagrams {
+        match try_send_udp_datagram(channel, flow_id, payload) {
+            DatagramAttempt::Sent => return Ok(UdpEmit::Sent),
+            DatagramAttempt::FallBack => {}
+        }
+    }
+    if udp_payload_exceeds_frame_limit(payload.len(), data_frame_size) {
+        return Ok(UdpEmit::DroppedTooLarge);
+    }
+    send_udp_data(carrier_writer, flow_id, Bytes::copy_from_slice(payload)).await?;
+    Ok(UdpEmit::Sent)
+}
+
+enum DatagramAttempt {
+    Sent,
+    FallBack,
+}
+
+/// Attempts to send one UDP payload over the datagram channel. Returns
+/// `FallBack` when the datagram is too large for the current size or datagrams
+/// are unavailable, so the caller can use the reliable frame path.
+fn try_send_udp_datagram(
+    channel: &BoxedDatagramChannel,
+    flow_id: u64,
+    payload: &[u8],
+) -> DatagramAttempt {
+    let Some(max_datagram_size) = channel.max_datagram_size() else {
+        return DatagramAttempt::FallBack;
+    };
+    let Ok(overhead) = datagram::overhead(flow_id) else {
+        return DatagramAttempt::FallBack;
+    };
+    if overhead.saturating_add(payload.len()) > max_datagram_size {
+        return DatagramAttempt::FallBack;
+    }
+    let mut encoded = BytesMut::with_capacity(overhead + payload.len());
+    if datagram::encode(flow_id, payload, &mut encoded).is_err() {
+        return DatagramAttempt::FallBack;
+    }
+    match channel.send(encoded.freeze()) {
+        DatagramSendOutcome::Sent => DatagramAttempt::Sent,
+        DatagramSendOutcome::TooLarge | DatagramSendOutcome::Unavailable => {
+            DatagramAttempt::FallBack
+        }
     }
 }
 
