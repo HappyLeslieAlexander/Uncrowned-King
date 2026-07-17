@@ -552,6 +552,15 @@ async fn server_atomically_rotates_tls_identity() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_atomically_rotates_quic_identity() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_server_quic_identity_reload_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn client_atomically_reloads_connection_config() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(15),
@@ -3481,6 +3490,91 @@ async fn run_server_tls_identity_reload_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+async fn run_server_quic_identity_reload_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let server_cert_path = temp_dir.join("server-cert.pem");
+    let server_key_path = temp_dir.join("server-key.pem");
+    let initial_ca_path = temp_dir.join("initial-ca.pem");
+    let rotated_ca_path = temp_dir.join("rotated-ca.pem");
+    let policy_path = temp_dir.join("policy.toml");
+    fs::write(&server_cert_path, CERT_PEM)?;
+    write_private_key(&server_key_path)?;
+    fs::write(&initial_ca_path, CERT_PEM)?;
+    fs::write(&rotated_ca_path, ROTATED_CERT_PEM)?;
+    fs::write(&policy_path, allow_loopback_any_port_policy())?;
+
+    let (target_addr, target_task) = spawn_echo_target().await?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let server_addr = listener.local_addr()?;
+    let quic_addr = unused_udp_loopback_addr().await?;
+    let mut config = test_server_config(
+        server_addr,
+        &server_cert_path,
+        &server_key_path,
+        test_limits(),
+        Some(&policy_path),
+        30,
+    );
+    config.quic_listen = Some(quic_addr.to_string());
+    let reload_config = config.clone();
+    let (reload_handle, reload_rx) = server_reload_channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut server_task = tokio::spawn(run_on_listener_until_shutdown_with_reload(
+        config,
+        listener,
+        reload_rx,
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+    wait_for_listener("uk-server", server_addr, &mut server_task).await?;
+
+    // Establish a QUIC session and open a flow before rotation.
+    let (mut carrier, _settings) =
+        connect_authenticated_carrier(quic_test_client_config(quic_addr, &initial_ca_path, SECRET))
+            .await?;
+    write_frame(&mut carrier, &tcp_open_frame(1, target_addr)?).await?;
+    read_open_ack(&mut carrier, 1).await?;
+
+    // Rotate cert and key together, then reload atomically.
+    fs::write(&server_cert_path, ROTATED_CERT_PEM)?;
+    write_private_key_contents(&server_key_path, ROTATED_KEY_PEM)?;
+    assert_eq!(reload_handle.reload(reload_config).await?, 2);
+
+    // The pre-rotation QUIC connection keeps working.
+    let payload = Bytes::from_static(b"existing quic flow survives identity rotation");
+    write_frame(
+        &mut carrier,
+        &Frame::new(FrameType::TcpData, 0, 1, payload.clone())?,
+    )
+    .await?;
+    let echoed = read_relay_frame(&mut carrier, FrameType::TcpData, 1).await?;
+    assert_eq!(echoed.payload, payload);
+    target_task.await??;
+
+    // New QUIC connections now present the rotated identity: the old CA is
+    // rejected and the rotated CA succeeds.
+    assert!(
+        connect_authenticated_carrier(quic_test_client_config(quic_addr, &initial_ca_path, SECRET))
+            .await
+            .is_err()
+    );
+    let (rotated_carrier, _settings) =
+        connect_authenticated_carrier(quic_test_client_config(quic_addr, &rotated_ca_path, SECRET))
+            .await?;
+
+    drop(carrier);
+    drop(rotated_carrier);
+    shutdown_tx
+        .send(())
+        .map_err(|()| "server shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(3), server_task).await???;
+    let _ = fs::remove_dir_all(temp_dir);
+    Ok(())
+}
+
 async fn run_client_connection_config_reload_e2e() -> Result<(), TestError> {
     let temp_dir = create_temp_dir()?;
     let server_cert_path = temp_dir.join("server-cert.pem");
@@ -5971,6 +6065,12 @@ fn test_server_config(
             policy_group: Some("default".to_owned()),
         }],
     }
+}
+
+fn quic_test_client_config(quic_addr: SocketAddr, cert_path: &Path, secret: &str) -> ClientConfig {
+    let mut config = test_client_config(quic_addr, cert_path, secret);
+    config.server_addr = format!("quic://{quic_addr}");
+    config
 }
 
 fn test_client_config(server_addr: SocketAddr, cert_path: &Path, secret: &str) -> ClientConfig {
