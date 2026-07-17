@@ -34,6 +34,7 @@ must_use_candidate = "allow"
 [workspace.dependencies]
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+criterion = "0.7"
 hmac = "0.12"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 rand = "0.8"

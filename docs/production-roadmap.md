@@ -63,11 +63,12 @@
 
 **目标**:用数据证明满足 §13 性能要求,并验证长时稳定性。
 
-- [ ] **基准测试**(criterion + 真实 socket):吞吐、P50/P99 延迟、多流并发
-  - 核对 §13:32/64 KiB 缓冲复用、批量写、分方向计数器
+- [x] **codec 微基准**(criterion):varint/frame/target/datagram/settings 编解码 — 每包 <100 ns,证明 codec 非瓶颈
+- [x] **§13 对照**:分方向计数器、DATAGRAM、自适应回退已具备(见 `docs/performance.md` 对照表);`RELAY_BUFFER_SIZE` 16→32 KiB 暂缓——首次尝试触发 Linux-only 大载荷/即时关闭 e2e "early eof",改到 e2e 吞吐 harness(可在 Linux 复现)下落地+验证
+- [ ] **端到端吞吐/延迟**(真实 socket,client→server→target):TCP/UDP × QUIC/TLS,P50/P99 + 持续吞吐
 - [ ] **长时 soak(≥24h)+ chaos**:反复断载体、限流边界、句柄/内存监控
 - [ ] **真实互操作**:curl / 浏览器经 SOCKS5 走通 TCP + UDP(DNS),QUIC 与 TLS 各一遍
-- [ ] 记录性能基线到 `docs/performance.md`
+- [x] 记录性能基线到 `docs/performance.md`(codec 基线 + §13 对照 + 待办)
 
 **验收**:达成 §13 目标且有数据;soak 无内存泄漏、无句柄增长、无错误累积。
 
