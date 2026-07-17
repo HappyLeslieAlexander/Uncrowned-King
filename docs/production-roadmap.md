@@ -32,9 +32,9 @@
   - [x] SETTINGS 协商:QUIC 会话 advertise `supports_udp_datagram = 1`,客户端按协商结果选路
   - [x] 超过 QUIC datagram 大小的载荷回退 `UDP_DATA` 帧路径
   - [x] 单测 + e2e:SOCKS UDP over QUIC 往返 + 超限回退
-- [ ] **QUIC 证书 SIGHUP 热轮换**(当前仅 TLS/TCP)
-  - `endpoint.set_server_config()` 接入安全 reload 流程
-  - 测试:轮换后新连接用新证书,存量连接不中断
+- [x] **QUIC 证书 SIGHUP 热轮换** — 已完成
+  - [x] `endpoint.set_server_config()` 接入安全 reload 流程(先构建两碳载体 crypto 再原子替换)
+  - [x] e2e:轮换后新连接用新证书(旧 CA 拒绝/新 CA 成功),存量 QUIC 连接不中断
 - [ ] **客户端连接池(§13)**
   - 维护 1 条暖控制连接 + 至多 N 条活跃载体
   - 延迟敏感与批量流量分载体(避免同一 TLS/TCP 载体上混跑)

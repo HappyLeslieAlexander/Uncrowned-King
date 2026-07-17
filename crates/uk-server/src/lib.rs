@@ -352,10 +352,7 @@ where
 
     info!(event = "server.listen", listen = %listen);
 
-    let quic_endpoint = build_quic_endpoint(&config)?;
-    if let Some(endpoint) = &quic_endpoint {
-        info!(event = "server.listen.quic", listen = %endpoint.local_addr()?);
-    }
+    let quic_endpoint = bind_and_log_quic_endpoint(&config)?;
 
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
     let (observability_shutdown_tx, observability_shutdown_rx) = watch::channel(false);
@@ -375,7 +372,13 @@ where
             }
             reload = receive_reload(&mut reload_rx) => {
                 if let Some(request) = reload {
-                    handle_reload_request(&config, &security, &metrics, request);
+                    handle_reload_request(
+                        &config,
+                        &security,
+                        quic_endpoint.as_ref(),
+                        &metrics,
+                        request,
+                    );
                 } else {
                     reload_rx = None;
                     debug!(event = "server.config.reload_channel_closed");
@@ -428,6 +431,15 @@ where
     Ok(())
 }
 
+/// Builds the QUIC endpoint (when configured) and logs its listen address.
+fn bind_and_log_quic_endpoint(config: &ServerConfig) -> Result<Option<quinn::Endpoint>, AnyError> {
+    let endpoint = build_quic_endpoint(config)?;
+    if let Some(endpoint) = &endpoint {
+        info!(event = "server.listen.quic", listen = %endpoint.local_addr()?);
+    }
+    Ok(endpoint)
+}
+
 /// Builds the QUIC server endpoint when `quic_listen` is configured.
 fn build_quic_endpoint(config: &ServerConfig) -> Result<Option<quinn::Endpoint>, AnyError> {
     let Some(listen) = &config.quic_listen else {
@@ -453,10 +465,11 @@ async fn accept_quic(endpoint: Option<&quinn::Endpoint>) -> Option<quinn::Incomi
 fn handle_reload_request(
     config: &ServerConfig,
     security: &SecurityState,
+    quic_endpoint: Option<&quinn::Endpoint>,
     metrics: &ServerMetrics,
     request: ServerReloadRequest,
 ) {
-    match apply_security_reload(config, security, request.config) {
+    match apply_security_reload(config, security, quic_endpoint, request.config) {
         Ok(generation) => {
             metrics.record_config_reload_success(generation);
             info!(
@@ -566,20 +579,40 @@ fn take_runtime_credentials(
 fn apply_security_reload(
     current: &ServerConfig,
     security: &SecurityState,
+    quic_endpoint: Option<&quinn::Endpoint>,
     mut candidate: ServerConfig,
 ) -> Result<u64, AnyError> {
     ensure_reload_compatible(current, &candidate)?;
     candidate.validate_sensitive_paths()?;
-    let tls_config = tls::server_config(&candidate.cert_path, &candidate.key_path)?;
-    let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    // Build both carrier crypto configs before touching any live state so an
+    // invalid certificate or key fails the reload atomically, leaving the
+    // running TLS and QUIC identities in place.
+    let tls_acceptor = TlsAcceptor::from(Arc::new(tls::server_config(
+        &candidate.cert_path,
+        &candidate.key_path,
+    )?));
+    let quic_config = if quic_endpoint.is_some() {
+        Some(quic::server_config(tls::server_config(
+            &candidate.cert_path,
+            &candidate.key_path,
+        )?)?)
+    } else {
+        None
+    };
     let credentials = take_runtime_credentials(&mut candidate)?;
     let policy_set = candidate.policy_set()?;
-    Ok(security.replace(
+    let generation = security.replace(
         tls_acceptor,
         credentials,
         policy_set,
         Duration::from_secs(candidate.auth_skew_seconds()),
-    ))
+    );
+    // Rotate the QUIC identity for new connections; existing QUIC connections
+    // keep the config they were accepted with.
+    if let (Some(endpoint), Some(quic_config)) = (quic_endpoint, quic_config) {
+        endpoint.set_server_config(Some(quic_config));
+    }
+    Ok(generation)
 }
 
 fn ensure_reload_compatible(
@@ -1363,7 +1396,7 @@ mod tests {
         let mut candidate = current.clone();
         candidate.listen = "127.0.0.1:2".to_owned();
 
-        let error = apply_security_reload(&current, &security, candidate)
+        let error = apply_security_reload(&current, &security, None, candidate)
             .unwrap_err()
             .to_string();
 
@@ -1384,7 +1417,7 @@ mod tests {
         let mut candidate = current.clone();
         candidate.credentials[0].secret = "too-short".to_owned();
 
-        assert!(apply_security_reload(&current, &security, candidate).is_err());
+        assert!(apply_security_reload(&current, &security, None, candidate).is_err());
         assert_eq!(security.generation(), 1);
         assert_eq!(
             security.authentication_snapshot().credentials[0].key_id,

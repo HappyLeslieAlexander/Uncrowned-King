@@ -27,7 +27,8 @@ The repository currently focuses on the first runnable v0.1 TLS/TCP carrier:
 - graceful Ctrl+C/SIGTERM shutdown for long-running client and server listeners
 - capped exponential retry for transient client and server listener accept errors
 - bounded client and server health, readiness, and Prometheus metrics endpoints
-- atomic SIGHUP reload for server and client TLS/auth configuration
+- atomic SIGHUP reload for server and client TLS/auth configuration, rotating
+  both the TLS/TCP and QUIC server identities for new connections
 - nonce-matched PING/PONG keepalive for active relay flows
 - negotiated UDP flow limits and idle UDP flow cleanup on both client and server
 - SETTINGS-advertised UDP stream fallback capability for the TLS/TCP carrier
@@ -69,9 +70,10 @@ server_addr = "quic://server.example.com:9443"
 server_addrs = ["tls://server.example.com:9443"]
 ```
 
-Changing `quic_listen` requires a server restart, like `listen`. QUIC uses the
-certificate loaded at startup; SIGHUP identity rotation currently applies to the
-TLS/TCP carrier only.
+Changing `quic_listen` requires a server restart, like `listen`. SIGHUP
+identity rotation applies to both carriers: a reload atomically rotates the
+TLS/TCP acceptor and the QUIC endpoint's certificate for new connections, while
+existing connections keep the identity they were accepted with.
 
 Server policy is deny-all unless `policy_path` is set in the server config. A
 minimal public-domain policy should deny private resolved addresses before
