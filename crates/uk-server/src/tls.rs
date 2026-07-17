@@ -1,8 +1,11 @@
 //! TLS helpers for the server carrier.
 
-use std::{fs::File, io::BufReader};
+use std::fs;
 
-use rustls::{ServerConfig, pki_types::PrivateKeyDer};
+use rustls::{
+    ServerConfig,
+    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+};
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 use uk_auth::EXPORTER_LABEL;
@@ -45,12 +48,10 @@ fn ensure_alpn(protocol: Option<&[u8]>) -> Result<(), TlsError> {
     }
 }
 
-fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, TlsError> {
-    let mut reader = BufReader::new(
-        File::open(path)
-            .map_err(|err| format!("failed to open certificate chain {path}: {err}"))?,
-    );
-    let certs = rustls_pemfile::certs(&mut reader)
+fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, TlsError> {
+    let pem =
+        fs::read(path).map_err(|err| format!("failed to open certificate chain {path}: {err}"))?;
+    let certs = CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| format!("invalid certificate chain {path}: {err}"))?;
     if certs.is_empty() {
@@ -61,12 +62,9 @@ fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'stati
 }
 
 fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>, TlsError> {
-    let mut reader = BufReader::new(
-        File::open(path).map_err(|err| format!("failed to open private key {path}: {err}"))?,
-    );
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|err| format!("invalid private key {path}: {err}"))?
-        .ok_or_else(|| format!("missing private key in {path}").into())
+    let pem = fs::read(path).map_err(|err| format!("failed to open private key {path}: {err}"))?;
+    PrivateKeyDer::from_pem_slice(&pem)
+        .map_err(|err| format!("invalid private key {path}: {err}").into())
 }
 
 #[cfg(test)]

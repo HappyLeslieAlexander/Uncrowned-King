@@ -35,7 +35,7 @@ hmac = "0.12"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 rand = "0.8"
 rustls = "0.23"
-rustls-pemfile = "2"
+rustls-pki-types = { version = "1.11", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2"
