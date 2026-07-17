@@ -1627,6 +1627,159 @@ async fn run_large_payload_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+/// Volume relayed by the throughput benchmarks. Large enough to be
+/// representative on loopback, small enough to stay well within the test
+/// timeout on CI.
+const THROUGHPUT_BYTES: usize = 32 * 1024 * 1024;
+const THROUGHPUT_CHUNK: usize = 64 * 1024;
+
+// A single-flow bulk throughput test exists for QUIC only: transport flow
+// control paces the source to the consumer. Over one TLS/TCP flow the shared
+// carrier reader sheds a flow whose bounded per-flow queue (32 frames ×
+// RELAY_BUFFER_SIZE ≈ 512 KiB) overflows, rather than head-of-line-blocking
+// other flows, so a single TLS/TCP flow cannot sustain unbounded bulk. That
+// limitation and its mitigation are documented in docs/performance.md and
+// drive the §13 connection-pool work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn measures_quic_carrier_throughput() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(30), run_quic_throughput_e2e()).await?
+}
+
+async fn run_quic_throughput_e2e() -> Result<(), TestError> {
+    // QUIC transport flow control paces the source to the consumer, so a single
+    // flow sustains the full volume without shedding.
+    run_throughput_e2e(true, THROUGHPUT_BYTES).await
+}
+
+/// Server + client limits with generous relay buffers, so a bulk benchmark
+/// measures steady-state throughput rather than the per-flow shed-load cap.
+const THROUGHPUT_BUFFER_BYTES: u64 = 16 * 1024 * 1024;
+
+fn throughput_limits() -> LimitConfig {
+    LimitConfig {
+        max_buffered_bytes_per_session: Some(THROUGHPUT_BUFFER_BYTES),
+        max_buffered_bytes_per_flow: Some(THROUGHPUT_BUFFER_BYTES),
+        ..test_limits()
+    }
+}
+
+async fn run_throughput_e2e(use_quic: bool, volume: usize) -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, target_task) = spawn_source_target(volume).await?;
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    let policy_path = temp_dir.join("policy.toml");
+    fs::write(&cert_path, CERT_PEM)?;
+    write_private_key(&key_path)?;
+    fs::write(&policy_path, allow_loopback_policy(target_addr.port()))?;
+
+    let quic_addr = if use_quic {
+        Some(unused_udp_loopback_addr().await?)
+    } else {
+        None
+    };
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut config = test_server_config(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        &cert_path,
+        &key_path,
+        throughput_limits(),
+        Some(&policy_path),
+        30,
+    );
+    if let Some(quic_addr) = quic_addr {
+        config.quic_listen = Some(quic_addr.to_string());
+    }
+    let (server_addr, server_task) = start_uk_server_until_shutdown(config, async {
+        let _ = shutdown_rx.await;
+    })
+    .await?;
+
+    let mut client_config = test_client_config(server_addr, &cert_path, SECRET);
+    if let Some(quic_addr) = quic_addr {
+        client_config.server_addr = format!("quic://{quic_addr}");
+    }
+    client_config.max_buffered_bytes_per_session = Some(THROUGHPUT_BUFFER_BYTES);
+    client_config.max_buffered_bytes_per_flow = Some(THROUGHPUT_BUFFER_BYTES);
+    let (socks_addr, client_task) = start_socks5_listener(client_config).await?;
+
+    let (socks, connect_reply) = open_socks_connect(socks_addr, target_addr).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+    let carrier = if use_quic { "quic" } else { "tls" };
+    let mib_per_s = measure_download_throughput(socks, volume).await?;
+    eprintln!("throughput[{carrier}]: {mib_per_s:.1} MiB/s over {volume} bytes");
+
+    target_task.await??;
+    shutdown_tx
+        .send(())
+        .map_err(|()| "server shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(5), server_task).await???;
+    client_task.abort();
+    let _ = fs::remove_dir_all(temp_dir);
+    Ok(())
+}
+
+/// Measures unidirectional download throughput (target → client) in MiB/s.
+///
+/// The client only reads, so the relay's per-flow select loop is not contended
+/// by a simultaneous upload — this measures the sustained relay rate for the
+/// common download-heavy proxy workload. The client closes only after reading
+/// every byte, so there is no dependency on close ordering.
+#[allow(clippy::cast_precision_loss)] // total is a few MiB, well within f64.
+async fn measure_download_throughput(socks: TcpStream, total: usize) -> Result<f64, TestError> {
+    socks.set_nodelay(true)?;
+    let (mut read_half, _write_half) = socks.into_split();
+    let start = std::time::Instant::now();
+
+    let mut received = 0;
+    let mut buf = vec![0_u8; THROUGHPUT_CHUNK];
+    while received < total {
+        let read = read_half.read(&mut buf).await?;
+        if read == 0 {
+            break;
+        }
+        received += read;
+    }
+    let elapsed = start.elapsed();
+
+    if received != total {
+        return Err(format!("throughput mismatch: received {received} of {total} bytes").into());
+    }
+    // `_write_half` and `read_half` drop here, closing the connection and
+    // letting the source target's trailing read observe EOF.
+    let mib = total as f64 / (1024.0 * 1024.0);
+    Ok(mib / elapsed.as_secs_f64())
+}
+
+/// A target that streams `total` bytes to the connecting relay, then holds the
+/// connection open until the client closes (so the download completes before
+/// any close is propagated).
+async fn spawn_source_target(
+    total: usize,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<Result<(), TestError>>), TestError> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        stream.set_nodelay(true)?;
+        let chunk = vec![0x5a_u8; THROUGHPUT_CHUNK];
+        let mut sent = 0;
+        while sent < total {
+            let len = THROUGHPUT_CHUNK.min(total - sent);
+            stream.write_all(&chunk[..len]).await?;
+            sent += len;
+        }
+        // Hold open until the client closes, so the full download is delivered.
+        let mut drain = [0_u8; 1];
+        let _ = stream.read(&mut drain).await?;
+        Ok(())
+    });
+    Ok((addr, task))
+}
+
 async fn run_small_frame_limit_e2e() -> Result<(), TestError> {
     init_tracing();
 
