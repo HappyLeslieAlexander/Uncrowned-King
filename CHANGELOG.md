@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Linux release binaries are now fully-static **musl** builds
+  (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`) instead of glibc,
+  so they run on any Linux without a matching system libc. Both macOS targets
+  build on `macos-14` (Apple Silicon), which also cross-compiles the x86_64
+  target and avoids the retiring `macos-13` Intel runner.
+
 ## [0.1.0] - 2026-07-18
 
 First runnable release of the Uncrowned King v0.1 proxy: an authenticated,
