@@ -41,8 +41,22 @@ use crate::{
 };
 
 const FLOW_ID_ALLOCATION_ATTEMPTS: usize = 1024;
-const FLOW_FRAME_QUEUE_CAPACITY: usize = 32;
+/// Floor, ceiling, and nominal frame size used to size a flow's inbound frame
+/// queue from its byte limit (see [`flow_frame_queue_capacity`]).
+const FLOW_FRAME_QUEUE_MIN_CAPACITY: usize = 64;
+const FLOW_FRAME_QUEUE_MAX_CAPACITY: usize = 8192;
+const FLOW_FRAME_QUEUE_NOMINAL_FRAME_BYTES: usize = 1024;
 const UDP_ASSOCIATION_EVENT_QUEUE_CAPACITY: usize = 128;
+
+/// Depth of a flow's inbound frame queue, derived from its per-flow byte limit
+/// so the configured byte budget — not a small fixed frame count — governs when
+/// an overwhelmed flow is shed. Memory stays bounded by the byte accounting
+/// (`BufferedFlowFrame` reserves and releases against the byte limits), so a
+/// deeper queue only raises the shed threshold for a momentarily-slow consumer.
+fn flow_frame_queue_capacity(max_buffered_bytes_per_flow: usize) -> usize {
+    (max_buffered_bytes_per_flow / FLOW_FRAME_QUEUE_NOMINAL_FRAME_BYTES)
+        .clamp(FLOW_FRAME_QUEUE_MIN_CAPACITY, FLOW_FRAME_QUEUE_MAX_CAPACITY)
+}
 const UDP_SEND_ATTEMPTS: usize = 2;
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const UDP_ASSOCIATION_BUFFER_SIZE: usize = 65_536;
@@ -1619,7 +1633,8 @@ impl ClientSession {
         &self,
         protocol: FlowProtocol,
     ) -> Result<Option<(u64, mpsc::Receiver<BufferedFlowFrame>)>, AnyError> {
-        let (sender, frames) = mpsc::channel(FLOW_FRAME_QUEUE_CAPACITY);
+        let (sender, frames) =
+            mpsc::channel(flow_frame_queue_capacity(self.max_buffered_bytes_per_flow));
         let mut flows = self.flows.lock().await;
         if self.is_draining() {
             return Err(Box::new(SessionDrainingError));
@@ -4681,5 +4696,22 @@ mod tests {
             ClientConnectionState::Closed,
             ClientConnectionState::Relaying
         ));
+    }
+
+    #[test]
+    fn flow_frame_queue_capacity_tracks_byte_limit() {
+        // A tiny byte limit falls back to the floor.
+        assert_eq!(
+            flow_frame_queue_capacity(1024),
+            FLOW_FRAME_QUEUE_MIN_CAPACITY
+        );
+        // The default 2 MiB per-flow limit derives a queue the byte budget can
+        // fill (2 MiB / 1 KiB), far above the old fixed depth of 32.
+        assert_eq!(flow_frame_queue_capacity(2 * 1024 * 1024), 2048);
+        // A large limit is clamped to the ceiling.
+        assert_eq!(
+            flow_frame_queue_capacity(64 * 1024 * 1024),
+            FLOW_FRAME_QUEUE_MAX_CAPACITY
+        );
     }
 }
