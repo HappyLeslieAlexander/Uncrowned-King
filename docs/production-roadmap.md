@@ -35,10 +35,11 @@
 - [x] **QUIC 证书 SIGHUP 热轮换** — 已完成
   - [x] `endpoint.set_server_config()` 接入安全 reload 流程(先构建两碳载体 crypto 再原子替换)
   - [x] e2e:轮换后新连接用新证书(旧 CA 拒绝/新 CA 成功),存量 QUIC 连接不中断
-- [ ] **客户端连接池(§13)**
-  - 维护 1 条暖控制连接 + 至多 N 条活跃载体
-  - 延迟敏感与批量流量分载体(避免同一 TLS/TCP 载体上混跑)
-  - 复用/回收测试
+- [x] **客户端连接池(§13)** — 已完成
+  - [x] 至多 `max_carrier_sessions`(默认 4)条活跃载体的有界连接池(`ClientSessionManager.pool`)
+  - [x] 新流按最少负载(least-loaded)选载体;当所有活跃载体达 `max_streams` 且池未满时按需新开载体,从而把批量流的 shed/背压隔离到单条载体,不拖累其他载体上的延迟敏感流(§13 "避免同一 TLS/TCP 载体上混跑" 的有界近似)
+  - [x] 池满且饱和时回退到最少负载载体,由每会话 `max_streams` 施加背压;reload 时整池 drain、按新代重建;失败载体从池中剔除并重连
+  - [x] 复用/回收:关闭载体惰性剔除;e2e `grows_carrier_pool_when_session_stream_limit_is_reached`(max_streams=1 下两条并发流经两条载体成功)+ 配置校验单测
 
 **验收**:§19 MVP 12 项全绿;新增 e2e 覆盖 DATAGRAM;全量测试 + clippy + fmt 绿。
 

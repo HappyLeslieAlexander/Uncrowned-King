@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Client connection pool** (whitepaper §13): the client keeps a bounded pool
+  of up to `max_carrier_sessions` (default 4) authenticated carriers and places
+  each new flow on the least-loaded one, opening another carrier when the others
+  reach their stream limit. This confines a bulk flow's shedding/backpressure to
+  a single carrier instead of stalling latency-sensitive flows on the others.
+  New client config key `max_carrier_sessions`.
+
 ## [0.1.0] - unreleased
 
 First runnable release of the Uncrowned King v0.1 proxy: an authenticated,

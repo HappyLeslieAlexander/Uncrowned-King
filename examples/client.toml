@@ -20,3 +20,7 @@ max_pending_open_bytes = 65536
 max_socks_connections = 1024
 max_buffered_bytes_per_session = 16777216
 max_buffered_bytes_per_flow = 2097152
+# Connection pool: up to this many concurrent carrier sessions. New flows are
+# placed on the least-loaded carrier, so a bulk transfer that sheds/backpressures
+# on one carrier does not stall latency-sensitive flows on the others.
+max_carrier_sessions = 4

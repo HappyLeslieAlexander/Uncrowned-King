@@ -139,7 +139,12 @@ struct ClientSession {
 struct ClientSessionManager {
     config: ClientConfigState,
     metrics: Arc<ClientMetrics>,
-    current: Mutex<Option<Arc<ClientSession>>>,
+    /// Bounded pool of live authenticated carrier sessions of the current
+    /// config generation. New flows are placed least-loaded across the pool so
+    /// a bulk flow's shedding on one carrier does not stall latency-sensitive
+    /// flows on the others (whitepaper §13). Draining sessions are removed here
+    /// and kept alive only by their remaining flows.
+    pool: Mutex<Vec<Arc<ClientSession>>>,
     connect_lock: Mutex<()>,
     config_publish_lock: Mutex<()>,
     recent_connect_failure: Mutex<Option<CachedConnectFailure>>,
@@ -874,7 +879,7 @@ impl ClientSessionManager {
         Self {
             config,
             metrics,
-            current: Mutex::new(None),
+            pool: Mutex::new(Vec::new()),
             connect_lock: Mutex::new(()),
             config_publish_lock: Mutex::new(()),
             recent_connect_failure: Mutex::new(None),
@@ -890,9 +895,9 @@ impl ClientSessionManager {
             ensure_reload_compatible(&current.config, &candidate)?;
             let generation = self.config.replace(candidate);
             self.clear_connect_failure().await;
-            let previous = self.current.lock().await.take();
-            if let Some(previous) = previous {
-                previous.begin_drain().await;
+            let previous: Vec<Arc<ClientSession>> = self.pool.lock().await.drain(..).collect();
+            for session in previous {
+                session.begin_drain().await;
             }
             Ok(generation)
         }
@@ -918,7 +923,7 @@ impl ClientSessionManager {
         let mut last_error = None;
         for attempt in 0..2 {
             let session = tokio::select! {
-                result = self.current_session() => result?,
+                result = self.session_for_new_flow() => result?,
                 changed = shutdown_rx.changed() => {
                     let _ = changed;
                     return Ok(OpenOutcome::Cancelled);
@@ -960,7 +965,7 @@ impl ClientSessionManager {
                 return Ok(OpenOutcome::Cancelled);
             }
             let session = tokio::select! {
-                result = self.current_session() => result?,
+                result = self.session_for_new_flow() => result?,
                 changed = shutdown_rx.changed() => {
                     let _ = changed;
                     return Ok(OpenOutcome::Cancelled);
@@ -988,12 +993,16 @@ impl ClientSessionManager {
         Err(last_error.unwrap_or_else(|| "failed to open uk udp flow".into()))
     }
 
+    /// Returns any live session, connecting a new one only if the pool is empty.
+    ///
+    /// Used for session-wide capability queries and as the connect primitive.
+    /// Flow placement goes through [`Self::session_for_new_flow`] instead.
     async fn current_session(&self) -> Result<Arc<ClientSession>, AnyError> {
         loop {
             if self.is_closed() {
                 return Err("client session manager is shutting down".into());
             }
-            if let Some(session) = self.current_session_if_live().await {
+            if let Some(session) = self.first_live_session().await {
                 return Ok(session);
             }
             if let Some(failure) = self.recent_connect_failure_if_active().await {
@@ -1004,69 +1013,157 @@ impl ClientSessionManager {
             if self.is_closed() {
                 return Err("client session manager is shutting down".into());
             }
-            if let Some(session) = self.current_session_if_live().await {
+            if let Some(session) = self.first_live_session().await {
                 return Ok(session);
             }
             if let Some(failure) = self.recent_connect_failure_if_active().await {
                 return Err(cached_connect_failure_error(failure));
             }
 
-            let snapshot = self.config.snapshot();
-            info!(
-                event = "client.session.connect",
-                config_generation = snapshot.generation
-            );
-            self.metrics.record_session_connect_attempt();
-            let session = match ClientSession::connect(&snapshot, Arc::clone(&self.metrics)).await {
-                Ok(session) => session,
-                Err(err) => {
-                    self.metrics.record_session_connect_failure();
-                    if self.remember_connect_failure(&snapshot, &err).await {
-                        return Err(err);
-                    }
-                    continue;
-                }
-            };
-
-            let publish_guard = self.config_publish_lock.lock().await;
-            if self.config.generation() != snapshot.generation {
-                drop(publish_guard);
-                session.close_and_wait().await;
-                continue;
+            if let Some(session) = self.connect_and_pool().await? {
+                return Ok(session);
             }
-            self.clear_connect_failure().await;
-            if self.is_closed() {
-                drop(publish_guard);
-                session.close_and_wait().await;
-                return Err("client session manager is shutting down".into());
-            }
-            let mut current = self.current.lock().await;
-            if self.is_closed() {
-                drop(current);
-                drop(publish_guard);
-                session.close_and_wait().await;
-                return Err("client session manager is shutting down".into());
-            }
-            *current = Some(Arc::clone(&session));
-            return Ok(session);
         }
     }
 
-    async fn current_session_if_live(&self) -> Option<Arc<ClientSession>> {
-        let stale = {
-            let mut current = self.current.lock().await;
-            if let Some(session) = current.as_ref() {
-                if !session.is_closed() {
-                    return Some(Arc::clone(session));
-                }
+    /// Selects the least-loaded pooled session that can admit another flow,
+    /// growing the pool up to `max_carrier_sessions` when every live session is
+    /// at its stream ceiling. When the pool is full and saturated it returns the
+    /// least-loaded session so the per-session stream limit applies backpressure.
+    async fn session_for_new_flow(&self) -> Result<Arc<ClientSession>, AnyError> {
+        loop {
+            if self.is_closed() {
+                return Err("client session manager is shutting down".into());
+            }
+            if let Some(session) = self.pick_admitting_session().await {
+                return Ok(session);
             }
 
-            current.take()
-        };
-        if let Some(stale) = stale {
-            stale.close_and_wait().await;
+            let _connect_guard = self.connect_lock.lock().await;
+            if self.is_closed() {
+                return Err("client session manager is shutting down".into());
+            }
+            // Re-check under the connect lock: another task may have added a
+            // session or freed capacity while we waited.
+            if let Some(session) = self.pick_admitting_session().await {
+                return Ok(session);
+            }
+
+            let live = self.live_sessions().await;
+            if live.len() >= self.max_pool_size() {
+                if let Some(session) = least_loaded_session(&live).await {
+                    return Ok(session);
+                }
+                // The pool is nominally full but held only closed sessions,
+                // which `live_sessions` just pruned; fall through and connect.
+            }
+
+            if let Some(failure) = self.recent_connect_failure_if_active().await {
+                return Err(cached_connect_failure_error(failure));
+            }
+
+            if let Some(session) = self.connect_and_pool().await? {
+                return Ok(session);
+            }
         }
-        None
+    }
+
+    /// Connects a new carrier session and publishes it into the pool.
+    ///
+    /// Must be called while holding `connect_lock` so dials are serialized.
+    /// Returns `Ok(None)` when the connect should be retried (transient connect
+    /// failure with retry disabled, or the config generation changed underneath).
+    async fn connect_and_pool(&self) -> Result<Option<Arc<ClientSession>>, AnyError> {
+        let snapshot = self.config.snapshot();
+        info!(
+            event = "client.session.connect",
+            config_generation = snapshot.generation
+        );
+        self.metrics.record_session_connect_attempt();
+        let session = match ClientSession::connect(&snapshot, Arc::clone(&self.metrics)).await {
+            Ok(session) => session,
+            Err(err) => {
+                self.metrics.record_session_connect_failure();
+                if self.remember_connect_failure(&snapshot, &err).await {
+                    return Err(err);
+                }
+                return Ok(None);
+            }
+        };
+
+        let publish_guard = self.config_publish_lock.lock().await;
+        if self.config.generation() != snapshot.generation {
+            drop(publish_guard);
+            session.close_and_wait().await;
+            return Ok(None);
+        }
+        self.clear_connect_failure().await;
+        if self.is_closed() {
+            drop(publish_guard);
+            session.close_and_wait().await;
+            return Err("client session manager is shutting down".into());
+        }
+        let mut pool = self.pool.lock().await;
+        if self.is_closed() {
+            drop(pool);
+            drop(publish_guard);
+            session.close_and_wait().await;
+            return Err("client session manager is shutting down".into());
+        }
+        pool.push(Arc::clone(&session));
+        Ok(Some(session))
+    }
+
+    /// Maximum number of pooled sessions for the current config generation.
+    fn max_pool_size(&self) -> usize {
+        usize::try_from(self.config.snapshot().config.max_carrier_sessions())
+            .unwrap_or(usize::MAX)
+            .max(1)
+    }
+
+    /// Returns the live (non-closed) pooled sessions, pruning and reaping any
+    /// closed ones from the pool.
+    async fn live_sessions(&self) -> Vec<Arc<ClientSession>> {
+        let mut stale = Vec::new();
+        let live = {
+            let mut pool = self.pool.lock().await;
+            pool.retain(|session| {
+                if session.is_closed() {
+                    stale.push(Arc::clone(session));
+                    false
+                } else {
+                    true
+                }
+            });
+            pool.clone()
+        };
+        for session in stale {
+            session.close_and_wait().await;
+        }
+        live
+    }
+
+    /// Returns the first live pooled session, if any.
+    async fn first_live_session(&self) -> Option<Arc<ClientSession>> {
+        self.live_sessions().await.into_iter().next()
+    }
+
+    /// Picks the least-loaded live, non-draining session that still has stream
+    /// capacity for another flow, spreading load across the pool.
+    async fn pick_admitting_session(&self) -> Option<Arc<ClientSession>> {
+        let mut best: Option<(usize, Arc<ClientSession>)> = None;
+        for session in self.live_sessions().await {
+            if session.is_draining() {
+                continue;
+            }
+            let load = session.flow_count().await;
+            if (load as u64) < session.max_streams
+                && best.as_ref().is_none_or(|(best_load, _)| load < *best_load)
+            {
+                best = Some((load, session));
+            }
+        }
+        best.map(|(_, session)| session)
     }
 
     async fn recent_connect_failure_if_active(&self) -> Option<CachedConnectFailure> {
@@ -1112,19 +1209,13 @@ impl ClientSessionManager {
     }
 
     async fn invalidate(&self, session: &Arc<ClientSession>) {
-        let removed_current = {
-            let mut current = self.current.lock().await;
-            if current
-                .as_ref()
-                .is_some_and(|current| Arc::ptr_eq(current, session))
-            {
-                *current = None;
-                true
-            } else {
-                false
-            }
+        let removed = {
+            let mut pool = self.pool.lock().await;
+            let before = pool.len();
+            pool.retain(|pooled| !Arc::ptr_eq(pooled, session));
+            pool.len() != before
         };
-        if removed_current {
+        if removed {
             session.close_and_wait().await;
         } else {
             session.close().await;
@@ -1133,8 +1224,8 @@ impl ClientSessionManager {
 
     async fn shutdown(&self) {
         self.closed.store(true, Ordering::SeqCst);
-        let session = { self.current.lock().await.take() };
-        if let Some(session) = session {
+        let sessions: Vec<Arc<ClientSession>> = { self.pool.lock().await.drain(..).collect() };
+        for session in sessions {
             session.close_and_wait().await;
         }
     }
@@ -1303,6 +1394,11 @@ impl ClientSession {
 
     async fn has_open_flows(&self) -> bool {
         !self.flows.lock().await.is_empty()
+    }
+
+    /// Current number of open flows on this session (its pool load).
+    async fn flow_count(&self) -> usize {
+        self.flows.lock().await.len()
     }
 
     async fn close(&self) {
@@ -1838,6 +1934,27 @@ impl ClientSession {
         }
         result
     }
+}
+
+/// Returns the least-loaded session among `sessions`, preferring non-draining
+/// ones. Used as the saturated-pool fallback so backpressure lands on the
+/// carrier already carrying the fewest flows.
+async fn least_loaded_session(sessions: &[Arc<ClientSession>]) -> Option<Arc<ClientSession>> {
+    let mut best: Option<(bool, usize, Arc<ClientSession>)> = None;
+    for session in sessions {
+        let draining = session.is_draining();
+        let load = session.flow_count().await;
+        // Rank key: prefer non-draining (draining = true sorts worse), then
+        // fewer flows.
+        let better = match &best {
+            None => true,
+            Some((best_draining, best_load, _)) => (draining, load) < (*best_draining, *best_load),
+        };
+        if better {
+            best = Some((draining, load, Arc::clone(session)));
+        }
+    }
+    best.map(|(_, _, session)| session)
 }
 
 fn reserve_flow_slot(
@@ -3401,6 +3518,7 @@ mod tests {
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
+            max_carrier_sessions: None,
         }
     }
 
