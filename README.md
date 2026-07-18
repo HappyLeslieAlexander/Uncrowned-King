@@ -325,3 +325,29 @@ UK_SOAK_SECONDS=86400 cargo test -p uk-client --test tcp_relay_e2e --release -- 
 
 Report vulnerabilities privately via GitHub's "Report a vulnerability" — not a
 public issue. See [`SECURITY.md`](SECURITY.md).
+
+## Releases and container images
+
+Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which creates a
+GitHub release from `CHANGELOG.md`, uploads cross-platform binaries
+(linux/macOS × x86_64/arm64) with SHA-256 checksums, attaches a CycloneDX SBOM,
+and builds, pushes, and signs (cosign, keyless) multi-arch container images.
+
+The `Dockerfile` builds minimal, non-root [distroless](https://github.com/GoogleContainerTools/distroless)
+images for the server and client:
+
+```sh
+docker build --target server -t uncrowned-king-server .
+docker build --target client -t uncrowned-king-client .
+
+# server (mount a config)
+docker run --rm -v "$PWD/server.toml:/etc/uncrowned-king/server.toml:ro" \
+  -p 9443:9443/tcp -p 9443:9443/udp uncrowned-king-server
+
+# client SOCKS5 on 0.0.0.0:1080 inside the container
+docker run --rm -v "$PWD/client.toml:/etc/uncrowned-king/client.toml:ro" \
+  -p 1080:1080 uncrowned-king-client
+```
+
+Published images: `ghcr.io/happylesliealexander/uncrowned-king-server` and
+`…-client`.

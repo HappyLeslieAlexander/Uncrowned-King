@@ -1,0 +1,125 @@
+name: Release
+
+# Runs on a semver tag push (e.g. v0.1.0): creates a GitHub release from the
+# CHANGELOG, builds and uploads cross-platform binaries with checksums, attaches
+# a CycloneDX SBOM, and builds, pushes, and signs multi-arch container images.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write # create the release and upload assets
+  packages: write # push images to GHCR
+  id-token: write # cosign keyless signing
+
+env:
+  SERVER_IMAGE: ghcr.io/happylesliealexander/uncrowned-king-server
+  CLIENT_IMAGE: ghcr.io/happylesliealexander/uncrowned-king-client
+
+jobs:
+  create-release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Create release from CHANGELOG
+        uses: taiki-e/create-gh-release-action@v1
+        with:
+          changelog: CHANGELOG.md
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  binaries:
+    name: Binaries (${{ matrix.target }})
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and upload binaries
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: uk-server,uk-client
+          target: ${{ matrix.target }}
+          archive: uncrowned-king-$tag-$target
+          include: LICENSE,README.md
+          checksum: sha256
+          locked: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  sbom:
+    name: SBOM (CycloneDX)
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+      - name: Generate SBOM
+        run: |
+          cargo cyclonedx --format json --all
+          mkdir -p sbom
+          find crates -name '*.cdx.json' -exec cp {} sbom/ \;
+          tar -czf "uncrowned-king-${GITHUB_REF_NAME}-sbom.tar.gz" -C sbom .
+      - name: Upload SBOM to release
+        run: gh release upload "${GITHUB_REF_NAME}" "uncrowned-king-${GITHUB_REF_NAME}-sbom.tar.gz"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  containers:
+    name: Container images
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: sigstore/cosign-installer@v3
+      - name: Build and push server image
+        id: server
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: server
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: true
+          sbom: true
+          tags: |
+            ${{ env.SERVER_IMAGE }}:${{ github.ref_name }}
+            ${{ env.SERVER_IMAGE }}:latest
+      - name: Build and push client image
+        id: client
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: client
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: true
+          sbom: true
+          tags: |
+            ${{ env.CLIENT_IMAGE }}:${{ github.ref_name }}
+            ${{ env.CLIENT_IMAGE }}:latest
+      - name: Sign images (keyless)
+        run: |
+          cosign sign --yes "${SERVER_IMAGE}@${{ steps.server.outputs.digest }}"
+          cosign sign --yes "${CLIENT_IMAGE}@${{ steps.client.outputs.digest }}"
