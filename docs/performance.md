@@ -145,14 +145,40 @@ accumulation, and the session survived the interleaved denied flows. For a
 production soak, run for hours and watch max RSS / file descriptors under
 `/usr/bin/time -l` (macOS) or `-v` (Linux).
 
+## Connection pool isolation
+
+`measures_connection_pool_latency_isolation` (`#[ignore]`d) quantifies the
+bulk/latency isolation the client connection pool (§13) buys. It measures the
+round-trip latency of a small interactive flow while a bulk upload flow
+saturates, comparing two carrier layouts that both admit exactly two flows:
+
+- **co-located**: `max_carrier_sessions = 1`, `max_streams = 2` — both flows
+  share one carrier (and its writer mutex / reader).
+- **pooled**: `max_carrier_sessions = 2`, `max_streams = 1` — one carrier each.
+
+```sh
+cargo test -p uk-client --test tcp_relay_e2e --release -- \
+    --ignored --nocapture measures_connection_pool_latency_isolation
+```
+
+Observed (Apple-silicon dev machine, 400 interactive round-trips):
+
+| Carrier layout | Interactive p50 | Interactive p99 |
+| --- | ---: | ---: |
+| co-located (1 carrier) | ~0.23 ms | ~0.55–0.62 ms |
+| pooled (2 carriers) | ~0.12 ms | ~0.21–0.24 ms |
+
+The pool roughly halves median interactive latency and cuts the p99 tail by
+~2.6× under a saturating bulk flow — the interactive flow no longer contends for
+the shared per-session writer and carrier reader. This is the measurable payoff
+of the §13 bulk/latency separation.
+
 ## Outstanding performance work
 
-1. **Quantify the pool's isolation** — the bounded least-loaded connection pool
-   (§13) is now implemented; re-run this harness with a mixed bulk +
-   latency-sensitive workload to measure the tail-latency improvement the pool
-   gives versus a single carrier, and to confirm the frame-queue / buffer tuning
-   holds across multiple carriers.
-2. **Vectored/coalesced writes** across frames (measure with the harness first).
+1. **Vectored/coalesced writes** across frames (measure with the harness first).
+2. **Latency-class hinting** — the pool spreads by load only; a future signal
+   could pin known-bulk flows to a dedicated carrier explicitly rather than
+   statistically.
 
-The previously-outstanding client connection pool item is done; see the §13
-conformance table above.
+The previously-outstanding client connection pool item is done and measured; see
+the §13 conformance table and the isolation numbers above.

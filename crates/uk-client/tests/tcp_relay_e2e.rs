@@ -7,7 +7,7 @@ use std::{
     process,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU16, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -1663,6 +1663,187 @@ async fn run_quic_throughput_e2e() -> Result<(), TestError> {
     // starvation the app-level per-flow queue can still overflow and shed
     // (hence this is a manual, `#[ignore]`d benchmark).
     run_throughput_e2e(true, THROUGHPUT_BYTES).await
+}
+
+const ISOLATION_SAMPLES: usize = 400;
+const ISOLATION_PING_BYTES: usize = 256;
+const ISOLATION_BULK_CHUNK: usize = 64 * 1024;
+
+// Manual benchmark — NOT a CI gate. Quantifies the connection pool's bulk/latency
+// isolation (whitepaper §13): it measures the round-trip latency of a small
+// interactive flow while a bulk upload flow saturates, comparing two carrier
+// layouts that both admit exactly two flows:
+//
+//   * co-located: max_carrier_sessions = 1, max_streams = 2  (one shared carrier)
+//   * pooled:     max_carrier_sessions = 2, max_streams = 1  (a carrier each)
+//
+// On one shared carrier the interactive flow contends for the per-session writer
+// mutex (and the single carrier reader) with the bulk flow; the pool puts it on
+// its own carrier. Timing-sensitive, so `#[ignore]`d and run on demand:
+//
+//     cargo test -p uk-client --test tcp_relay_e2e --release -- --ignored --nocapture measures_connection_pool_latency_isolation
+//
+// See docs/performance.md for observed numbers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "load-sensitive latency benchmark; run manually with --ignored"]
+async fn measures_connection_pool_latency_isolation() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(60), run_pool_isolation_benchmark()).await?
+}
+
+async fn run_pool_isolation_benchmark() -> Result<(), TestError> {
+    let colocated = run_pool_isolation_e2e(1, 2).await?;
+    let pooled = run_pool_isolation_e2e(2, 1).await?;
+
+    eprintln!(
+        "pool-isolation interactive latency under a saturating bulk flow \
+         ({ISOLATION_SAMPLES} round-trips):"
+    );
+    eprintln!(
+        "  co-located (1 carrier, max_streams=2): p50={:.2}ms p99={:.2}ms",
+        millis(colocated.0),
+        millis(colocated.1)
+    );
+    eprintln!(
+        "  pooled     (2 carriers, max_streams=1): p50={:.2}ms p99={:.2}ms",
+        millis(pooled.0),
+        millis(pooled.1)
+    );
+    let p99_ratio = colocated.1.as_secs_f64() / pooled.1.as_secs_f64().max(f64::MIN_POSITIVE);
+    eprintln!("  p99 improvement (co-located / pooled): {p99_ratio:.1}x");
+    Ok(())
+}
+
+/// Runs the isolation scenario for one carrier layout and returns the interactive
+/// flow's (p50, p99) round-trip latency while a bulk upload flow saturates.
+async fn run_pool_isolation_e2e(
+    max_carrier_sessions: u64,
+    max_streams: u64,
+) -> Result<(Duration, Duration), TestError> {
+    init_tracing();
+
+    let (echo_addr, echo_task) = spawn_multi_echo_target().await?;
+    let (sink_addr, sink_task) = spawn_sink_target().await?;
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    let policy_path = temp_dir.join("policy.toml");
+    fs::write(&cert_path, CERT_PEM)?;
+    write_private_key(&key_path)?;
+    fs::write(&policy_path, allow_loopback_any_port_policy())?;
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut limits = throughput_limits();
+    limits.max_streams = Some(max_streams);
+    let config = test_server_config(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        &cert_path,
+        &key_path,
+        limits,
+        Some(&policy_path),
+        30,
+    );
+    let (server_addr, server_task) = start_uk_server_until_shutdown(config, async {
+        let _ = shutdown_rx.await;
+    })
+    .await?;
+
+    let mut client_config = test_client_config(server_addr, &cert_path, SECRET);
+    client_config.max_buffered_bytes_per_session = Some(THROUGHPUT_BUFFER_BYTES);
+    client_config.max_buffered_bytes_per_flow = Some(THROUGHPUT_BUFFER_BYTES);
+    client_config.max_carrier_sessions = Some(max_carrier_sessions);
+    let (socks_addr, client_task) = start_socks5_listener(client_config).await?;
+
+    // Open the bulk flow first so it occupies the first carrier, then saturate it.
+    let (bulk_socks, bulk_reply) = open_socks_connect(socks_addr, sink_addr).await?;
+    assert_eq!(bulk_reply[1], SOCKS_REPLY_SUCCEEDED);
+    let bulk_stop = Arc::new(AtomicBool::new(false));
+    let bulk_task = spawn_bulk_upload(bulk_socks, Arc::clone(&bulk_stop));
+    // Let the bulk flow ramp up before sampling.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let (mut ping_socks, ping_reply) = open_socks_connect(socks_addr, echo_addr).await?;
+    assert_eq!(ping_reply[1], SOCKS_REPLY_SUCCEEDED);
+    ping_socks.set_nodelay(true)?;
+    let request = patterned_payload(ISOLATION_PING_BYTES);
+    let mut echoed = vec![0_u8; ISOLATION_PING_BYTES];
+    let mut samples = Vec::with_capacity(ISOLATION_SAMPLES);
+    for _ in 0..ISOLATION_SAMPLES {
+        let start = std::time::Instant::now();
+        ping_socks.write_all(&request).await?;
+        ping_socks.read_exact(&mut echoed).await?;
+        samples.push(start.elapsed());
+        assert_eq!(echoed, request, "interactive echo payload mismatch");
+    }
+
+    bulk_stop.store(true, Ordering::SeqCst);
+    drop(ping_socks);
+    let _ = bulk_task.await;
+
+    shutdown_tx
+        .send(())
+        .map_err(|()| "server shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(5), server_task).await???;
+    client_task.abort();
+    echo_task.abort();
+    sink_task.abort();
+    let _ = fs::remove_dir_all(temp_dir);
+
+    samples.sort_unstable();
+    Ok((percentile(&samples, 50.0), percentile(&samples, 99.0)))
+}
+
+/// A target that accepts one connection and drains everything sent to it,
+/// letting a bulk upload flow run without backpressure from the target.
+async fn spawn_sink_target()
+-> Result<(SocketAddr, tokio::task::JoinHandle<Result<(), TestError>>), TestError> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
+        let mut buf = vec![0_u8; ISOLATION_BULK_CHUNK];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        Ok(())
+    });
+    Ok((addr, task))
+}
+
+/// Continuously uploads through `socks` until `stop` is set, saturating the
+/// carrier the bulk flow lives on.
+fn spawn_bulk_upload(mut socks: TcpStream, stop: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let _ = socks.set_nodelay(true);
+        let chunk = vec![0x5a_u8; ISOLATION_BULK_CHUNK];
+        while !stop.load(Ordering::SeqCst) {
+            if socks.write_all(&chunk).await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn percentile(sorted: &[Duration], pct: f64) -> Duration {
+    if sorted.is_empty() {
+        return Duration::ZERO;
+    }
+    let index = ((pct / 100.0) * (sorted.len() - 1) as f64).round() as usize;
+    sorted[index.min(sorted.len() - 1)]
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn millis(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1e3
 }
 
 /// Server + client limits with generous relay buffers, so a bulk benchmark
