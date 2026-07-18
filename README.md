@@ -309,6 +309,10 @@ Real-client interop and performance checks (require `curl`, `python3`,
 # single-flow download throughput benchmark (see docs/performance.md)
 cargo test -p uk-client --test tcp_relay_e2e --release -- \
     --ignored --nocapture measures_quic_carrier_throughput
+
+# soak / chaos: persistent flows + denied-flow injection (set UK_SOAK_SECONDS)
+UK_SOAK_SECONDS=86400 cargo test -p uk-client --test tcp_relay_e2e --release -- \
+    --ignored --nocapture soak_sustained_relay_and_chaos
 ```
 
 ## Security

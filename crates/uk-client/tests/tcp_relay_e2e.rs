@@ -1788,6 +1788,142 @@ async fn spawn_source_target(
     Ok((addr, task))
 }
 
+// Soak / chaos: keep a set of long-lived flows continuously relaying through one
+// client session while periodically injecting denied-target flows, then confirm
+// the session stays healthy with every byte intact. Uses persistent flows
+// (steady request/response) rather than connect churn, so it does not exhaust
+// ephemeral ports over a long run. Not a CI gate (duration-based); run manually
+// and set the duration via UK_SOAK_SECONDS (default 2s):
+//
+//     UK_SOAK_SECONDS=86400 cargo test -p uk-client --test tcp_relay_e2e --release \
+//         -- --ignored --nocapture soak_sustained_relay_and_chaos
+//
+// For memory / file-descriptor monitoring, run it under `/usr/bin/time -l`
+// (macOS) or `/usr/bin/time -v` (Linux) and watch max RSS across a long run.
+const SOAK_CONCURRENCY: usize = 16;
+
+fn soak_limits() -> LimitConfig {
+    // Enough concurrent streams for the persistent flows plus injected chaos.
+    LimitConfig {
+        max_streams: Some(64),
+        ..test_limits()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "duration-based soak/chaos; run manually with --ignored (UK_SOAK_SECONDS)"]
+async fn soak_sustained_relay_and_chaos() -> Result<(), TestError> {
+    init_tracing();
+
+    let seconds: u64 = std::env::var("UK_SOAK_SECONDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2);
+
+    let (target_addr, target_task) = spawn_multi_echo_target().await?;
+    let harness = RelayHarness::start_with_limits(
+        Some(allow_loopback_policy(target_addr.port())),
+        soak_limits(),
+    )
+    .await?;
+    let denied_addr = unused_loopback_addr().await?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+
+    // Persistent flows, each ping-ponging a payload for the whole duration.
+    let mut flows = Vec::with_capacity(SOAK_CONCURRENCY);
+    for index in 0..SOAK_CONCURRENCY {
+        let socks_addr = harness.socks_addr;
+        flows.push(tokio::spawn(async move {
+            let (mut socks, connect_reply) = open_socks_connect(socks_addr, target_addr).await?;
+            assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+            let payload = format!("uncrowned king soak flow {index}").into_bytes();
+            let mut echoed = vec![0_u8; payload.len()];
+            let mut round_trips = 0_u64;
+            while std::time::Instant::now() < deadline {
+                socks.write_all(&payload).await?;
+                socks.read_exact(&mut echoed).await?;
+                if echoed != payload {
+                    return Err("soak payload corrupted".into());
+                }
+                round_trips += 1;
+            }
+            Ok::<u64, TestError>(round_trips)
+        }));
+    }
+
+    // Chaos: inject denied flows at a bounded rate; each must fail without
+    // tearing down the shared session that the persistent flows depend on.
+    let mut denied = 0_u64;
+    while std::time::Instant::now() < deadline {
+        expect_denied_flow(harness.socks_addr, denied_addr).await?;
+        denied += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let mut total_round_trips = 0_u64;
+    for flow in flows {
+        total_round_trips += flow.await??;
+    }
+    assert!(total_round_trips > 0, "no round trips completed");
+
+    // The long-lived session survived the chaos; a fresh flow still works.
+    let (mut socks, connect_reply) = open_socks_connect(harness.socks_addr, target_addr).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+    let probe = b"soak final health probe";
+    socks.write_all(probe).await?;
+    let mut echoed = vec![0_u8; probe.len()];
+    socks.read_exact(&mut echoed).await?;
+    assert_eq!(echoed, probe);
+
+    eprintln!(
+        "soak: {total_round_trips} round trips across {SOAK_CONCURRENCY} flows + {denied} \
+         denied-flow chaos over {seconds}s; session healthy"
+    );
+    target_task.abort();
+    Ok(())
+}
+
+/// A denied SOCKS CONNECT must fail (policy denial or dropped connection) rather
+/// than succeed, and must not tear down the shared client session.
+async fn expect_denied_flow(
+    socks_addr: SocketAddr,
+    denied_addr: SocketAddr,
+) -> Result<(), TestError> {
+    match open_socks_connect(socks_addr, denied_addr).await {
+        Ok((_socks, connect_reply)) if connect_reply[1] == SOCKS_REPLY_SUCCEEDED => {
+            Err("denied target unexpectedly succeeded".into())
+        }
+        // A non-success reply or a dropped connection are both acceptable.
+        _ => Ok(()),
+    }
+}
+
+async fn spawn_multi_echo_target()
+-> Result<(SocketAddr, tokio::task::JoinHandle<Result<(), TestError>>), TestError> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await?;
+            tokio::spawn(async move {
+                let _ = stream.set_nodelay(true);
+                let mut buf = vec![0_u8; 16 * 1024];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            if stream.write_all(&buf[..read]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    Ok((addr, task))
+}
+
 async fn run_small_frame_limit_e2e() -> Result<(), TestError> {
     init_tracing();
 
