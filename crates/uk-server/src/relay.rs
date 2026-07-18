@@ -45,7 +45,11 @@ use crate::security::SecurityState;
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const TARGET_CONNECT_PARALLELISM: usize = 4;
 const TARGET_RESOLUTION_ADDR_LIMIT: usize = 64;
-const TARGET_WRITE_QUEUE_CAPACITY: usize = 32;
+/// Floor, ceiling, and nominal frame size used to size the target-writer queue
+/// from a flow's byte limit (see [`target_write_queue_capacity`]).
+const TARGET_WRITE_QUEUE_MIN_CAPACITY: usize = 64;
+const TARGET_WRITE_QUEUE_MAX_CAPACITY: usize = 8192;
+const TARGET_WRITE_QUEUE_NOMINAL_FRAME_BYTES: usize = 1024;
 const SESSION_EVENT_QUEUE_BASE_CAPACITY: usize = 64;
 const SESSION_EVENT_QUEUE_PER_FLOW_CAPACITY: usize = 4;
 const SESSION_EVENT_QUEUE_MAX_CAPACITY: usize = 4096;
@@ -1840,6 +1844,18 @@ async fn handle_udp_open_completed(
     Ok(())
 }
 
+/// Depth of the client-to-target write queue, derived from a flow's per-flow
+/// byte limit so the configured byte budget — not a small fixed frame count —
+/// governs when an overwhelmed upload is shed. Memory stays bounded by the byte
+/// accounting, so a deeper queue only raises the shed threshold for a
+/// momentarily-slow target.
+fn target_write_queue_capacity(max_buffered_bytes_per_flow: usize) -> usize {
+    (max_buffered_bytes_per_flow / TARGET_WRITE_QUEUE_NOMINAL_FRAME_BYTES).clamp(
+        TARGET_WRITE_QUEUE_MIN_CAPACITY,
+        TARGET_WRITE_QUEUE_MAX_CAPACITY,
+    )
+}
+
 async fn accept_open_target(
     flow_id: u64,
     target: Target,
@@ -1848,7 +1864,9 @@ async fn accept_open_target(
     session_tasks: &mut SessionTasks,
 ) -> Result<TargetFlow, AnyError> {
     let (target_reader, target_writer) = target_stream.into_split();
-    let (target_writer_tx, target_writer_rx) = mpsc::channel(TARGET_WRITE_QUEUE_CAPACITY);
+    let (target_writer_tx, target_writer_rx) = mpsc::channel(target_write_queue_capacity(
+        context.limits.max_buffered_bytes_per_flow,
+    ));
     let flow_control = TargetFlowControl::new(context.session_buffer.clone());
     let token = context.flow_tokens.next();
     let identity = TargetFlowIdentity { flow_id, token };
@@ -4636,5 +4654,18 @@ mod tests {
             ServerSessionState::Closed,
             ServerSessionState::Relaying
         ));
+    }
+
+    #[test]
+    fn target_write_queue_capacity_tracks_byte_limit() {
+        assert_eq!(
+            target_write_queue_capacity(1024),
+            TARGET_WRITE_QUEUE_MIN_CAPACITY
+        );
+        assert_eq!(target_write_queue_capacity(2 * 1024 * 1024), 2048);
+        assert_eq!(
+            target_write_queue_capacity(64 * 1024 * 1024),
+            TARGET_WRITE_QUEUE_MAX_CAPACITY
+        );
     }
 }

@@ -82,18 +82,29 @@ head-of-line-blocking every other flow on that carrier.
   to 32 KiB (larger reads → larger bursts → overflow sooner). It is **not** a
   half-close bug; carrier byte ordering is correct.
 
-**Mitigations (future work, in priority order):**
+**Mitigation applied — the byte limit now governs, not a fixed frame count.**
+Both per-flow queues (the client's inbound frame queue and the server's
+client-to-target write queue) were a fixed 32 frames, so for 16 KiB frames a
+flow was shed at ≈ 512 KiB regardless of the configured byte budget. They are
+now sized from `max_buffered_bytes_per_flow` (`flow_frame_queue_capacity` /
+`target_write_queue_capacity`), so the configured per-flow byte limit is the
+real shed threshold — the default 2 MiB (up to 16 MiB) instead of 512 KiB.
+Memory stays bounded by the existing byte accounting, which reserves and
+releases against the limit; a deeper queue only raises the threshold for a
+momentarily-slow consumer. This makes single-flow bulk far more robust on both
+carriers; a flow is shed only after it has genuinely buffered its full byte
+budget.
 
-1. **Bounded per-flow backpressure** that does not head-of-line-block other
-   flows — e.g., pause reading a flow's frames off the shared carrier while its
-   queue is full, up to the per-flow byte limit, only shedding past that. This
-   is the correctness-preserving fix so a momentarily-slow consumer is throttled
-   rather than dropped.
-2. **Bulk/latency separation via the client connection pool (§13)** — put a
-   bulk flow on its own carrier so its backpressure never affects
-   latency-sensitive flows on other carriers.
-3. **Raise `FLOW_FRAME_QUEUE_CAPACITY`** as an interim knob (bounded by the
-   per-flow byte limit to cap memory).
+**Remaining future work:**
+
+1. **Bulk/latency separation via the client connection pool (§13)** — put a
+   bulk flow on its own carrier so its shedding/backpressure never affects
+   latency-sensitive flows on other carriers. Still the principled isolation
+   fix; the byte-limit sizing above raises the single-flow ceiling but one
+   shared carrier still shares a byte budget.
+2. **True per-flow backpressure** (pause reading one flow off the shared
+   carrier without head-of-line-blocking others) if even the byte-limited
+   ceiling proves too low for some workloads.
 
 ## §13 buffer bump revisited
 
