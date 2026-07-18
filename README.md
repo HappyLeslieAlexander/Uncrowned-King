@@ -299,6 +299,18 @@ binaries on stable, audits `Cargo.lock` against RustSec advisories and runs
 `cargo-deny` (licenses, sources, bans) on dependency changes and a daily
 schedule, and fuzzes the strict parsers when they change.
 
+Real-client interop and performance checks (require `curl`, `python3`,
+`openssl`):
+
+```sh
+# curl -> uk-client (SOCKS5) -> uk-server -> HTTP target, over TLS/TCP and QUIC
+./scripts/interop-curl.sh
+
+# single-flow download throughput benchmark (see docs/performance.md)
+cargo test -p uk-client --test tcp_relay_e2e --release -- \
+    --ignored --nocapture measures_quic_carrier_throughput
+```
+
 ## Security
 
 - Threat model, security invariants, and residual risks:
