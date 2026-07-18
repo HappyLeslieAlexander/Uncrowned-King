@@ -78,13 +78,13 @@
 
 **目标**:一键产出可分发、可验证的发布产物(容器 + 二进制双轨)。
 
-- [ ] 语义化版本 + `CHANGELOG.md` + 打 `v0.1.0` tag
-- [ ] **跨平台 release 工作流**:linux/macos × x86_64/arm64 静态二进制
-- [ ] **容器镜像**:distroless / 非 root,多架构(amd64/arm64)
-- [ ] **SBOM**(cargo-cyclonedx)+ 产物 SHA256 校验和 + 签名(cosign/minisign)
-- [ ] 发布产物冒烟:容器与二进制各起一次 `config-check` + 端到端连通
+- [x] 语义化版本 + `CHANGELOG.md`(0.1.0 段落已就绪;`v0.1.0` tag 由维护者推)
+- [x] **跨平台 release 工作流** `.github/workflows/release.yml`:tag 触发,linux/macos × x86_64/arm64 二进制(taiki-e 交叉编译 + 打包)
+- [x] **容器镜像** `Dockerfile`:distroless / 非 root(uid 65532),server/client 双 target;工作流 buildx 多架构(amd64/arm64)推 GHCR
+- [x] **SBOM**(cargo-cyclonedx)+ SHA256 校验和(taiki-e checksum)+ 签名(cosign keyless + 镜像 provenance/sbom attestation)
+- [x] 冒烟(本地可验证部分):release 二进制构建 + `--version`;SBOM 本地生成通过;端到端连通由 `scripts/interop-curl.sh` 覆盖。**工作流本身在首个 tag 推送时由 CI 验证**(交叉编译/多架构镜像/签名无法本地跑)
 
-**验收**:tag 触发 release,自动产出并发布镜像 + 二进制 + SBOM + 校验和。
+**验收**:tag 触发 release,自动产出并发布镜像 + 二进制 + SBOM + 校验和。 — **产物就绪,待首个 tag 验证**
 
 ---
 

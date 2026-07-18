@@ -1,0 +1,13 @@
+target/
+.git/
+.github/
+docs/
+examples/
+scripts/
+tests/
+*.md
+.gitignore
+.dockerignore
+Dockerfile
+rustfmt.toml
+crates/*/fuzz/
