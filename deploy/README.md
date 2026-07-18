@@ -65,7 +65,15 @@ sidecar/loopback listener).
 ## Observability
 
 The metrics endpoint (`/metrics`) is unauthenticated — keep it on loopback (bare
-metal) or off the public Service (Kubernetes). Prometheus alert rules and a
-Grafana dashboard for the exported metrics live in
-[`../deploy/monitoring/`](monitoring/); the operations runbook is
+metal) or off the public Service (Kubernetes). Prometheus alert rules, an
+Alertmanager routing example, and a Grafana dashboard for the exported metrics
+live in [`../deploy/monitoring/`](monitoring/); the operations runbook is
 [`../docs/operations.md`](../docs/operations.md).
+
+## Going live
+
+[`../docs/launch-gate.md`](../docs/launch-gate.md) covers the release gate:
+SLOs, canary rollout with promote/abort criteria, the rollback playbook,
+alert-delivery verification, and a go-live checklist. The K8s Deployment ships
+with a safe rollout strategy (`maxUnavailable: 0`, surge one, `minReadySeconds`)
+and a PodDisruptionBudget so a canary never drops capacity.

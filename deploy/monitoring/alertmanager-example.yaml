@@ -1,0 +1,55 @@
+# Example Alertmanager routing for the Uncrowned King alert rules
+# (deploy/monitoring/prometheus-alerts.yaml). Adapt receivers to your paging
+# stack; the alertname values below match the rules exactly.
+#
+# Validate:  amtool check-config deploy/monitoring/alertmanager-example.yaml
+#
+# Delivery test (send a synthetic alert end to end, no real outage needed):
+#   amtool alert add \
+#     alertname=UncrownedKingServerNotReady severity=critical \
+#     instance=canary-0 --alertmanager.url=http://<alertmanager>:9093
+# Confirm it routes to the critical receiver and pages. Then resolve it:
+#   amtool alert add alertname=UncrownedKingServerNotReady severity=critical \
+#     instance=canary-0 --end="$(date -Iseconds)" \
+#     --alertmanager.url=http://<alertmanager>:9093
+route:
+  receiver: default
+  group_by: ["alertname", "instance"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Page immediately on anything that means the service is down / not serving.
+    - matchers:
+        - severity = "critical"
+      receiver: pager
+      group_wait: 0s
+      repeat_interval: 1h
+    # Warnings (limit saturation, elevated failures, reload rejected) go to chat.
+    - matchers:
+        - severity = "warning"
+      receiver: chat
+
+receivers:
+  - name: default
+    # A catch-all so nothing is silently dropped.
+    webhook_configs:
+      - url: "http://REPLACE_ME/alerts"
+
+  - name: pager
+    # Replace with your PagerDuty/OpsGenie integration.
+    webhook_configs:
+      - url: "http://REPLACE_ME/page"
+
+  - name: chat
+    # Replace with your Slack/Teams webhook.
+    webhook_configs:
+      - url: "http://REPLACE_ME/chat"
+
+inhibit_rules:
+  # If the whole target is down, suppress the derived readiness alert to cut noise.
+  - source_matchers:
+      - alertname = "UncrownedKingServerDown"
+    target_matchers:
+      - alertname = "UncrownedKingServerNotReady"
+    equal: ["instance"]
