@@ -103,10 +103,10 @@
 
 ## Phase 6 — 上线 Gate(~2-3 天)
 
-- [ ] 金丝雀/灰度方案(小流量 → 观察指标 → 放量)
-- [ ] 回滚预案(镜像/二进制回退 + 配置回退)
-- [ ] 监控告警接入生产 Prometheus/Alertmanager 并验证触达
-- [ ] 上线检查清单签核
+- [x] 金丝雀/灰度方案(小流量 → 观察指标 → 放量)— `docs/launch-gate.md`:SLO 表 + 单金丝雀 promote/abort 判据;K8s Deployment 配 `RollingUpdate`(`maxUnavailable:0`、surge 1、`minReadySeconds`)+ `PodDisruptionBudget`(`minAvailable:1`),金丝雀期间不掉容量
+- [x] 回滚预案(镜像/二进制回退 + 配置回退)— `docs/launch-gate.md` 回滚手册:K8s `rollout undo`、systemd 二进制/配置回退(先 `config-check`)、纯配置回归走原子 reload(坏候选被拒、运行态不变)
+- [x] 监控告警接入生产 Prometheus/Alertmanager 并验证触达 — `deploy/monitoring/alertmanager-example.yaml`(critical→pager、warning→chat、inhibit)+ 用 `amtool alert add` 发合成告警端到端验证触达再 resolve 的流程
+- [x] 上线检查清单签核 — `docs/launch-gate.md` go-live checklist(功能/安全、发布产物、部署运维、可观测/灰度四组,含签核栏)
 
 ---
 

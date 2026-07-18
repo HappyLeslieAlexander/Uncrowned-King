@@ -67,6 +67,15 @@ metadata:
     app.kubernetes.io/name: uncrowned-king-server
 spec:
   replicas: 2
+  # Never drop below full capacity during a rollout, and admit a new pod only
+  # after it passes readiness (/readyz). Combined with the PodDisruptionBudget
+  # below, this gives a safe canary/gradual rollout.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  minReadySeconds: 10
   selector:
     matchLabels:
       app.kubernetes.io/name: uncrowned-king-server
@@ -168,3 +177,18 @@ spec:
       port: 9443
       targetPort: uk-quic
       protocol: UDP
+---
+# Keep at least one server reachable during voluntary disruptions (node drains,
+# rollouts). With replicas: 2 this permits exactly one pod down at a time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: uncrowned-king-server
+  namespace: uncrowned-king
+  labels:
+    app.kubernetes.io/name: uncrowned-king-server
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: uncrowned-king-server
