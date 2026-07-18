@@ -200,7 +200,11 @@ response arrives.
 `max_socks_connections = 1024` bounds concurrent local SOCKS connections before
 and during relay. `max_buffered_bytes_per_session = 16777216` and
 `max_buffered_bytes_per_flow = 2097152` bound queued server-to-local relay bytes
-per UK session and per flow.
+per UK session and per flow. `max_carrier_sessions = 4` bounds the client
+connection pool: new flows are placed on the least-loaded carrier and a new
+carrier is opened (up to this many) when the others are at their stream limit,
+so a bulk transfer that sheds or backpressures on one carrier does not stall
+latency-sensitive flows on the others (whitepaper §13).
 
 Example configs live under `examples/`; see `examples/README.md` for local
 certificate generation. Relative file paths inside config files are resolved

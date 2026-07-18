@@ -84,6 +84,7 @@ mod tests {
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
+            max_carrier_sessions: None,
         }
     }
 

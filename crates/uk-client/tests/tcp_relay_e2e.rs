@@ -683,6 +683,11 @@ async fn maps_stream_limit_to_socks_general_failure() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grows_carrier_pool_when_session_stream_limit_is_reached() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_pool_growth_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enforces_server_session_limit() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_server_session_limit_e2e()).await?
 }
@@ -1047,6 +1052,7 @@ async fn run_udp_associate_server_unavailable_e2e() -> Result<(), TestError> {
         max_socks_connections: None,
         max_buffered_bytes_per_session: None,
         max_buffered_bytes_per_flow: None,
+        max_carrier_sessions: None,
     })
     .await?;
 
@@ -1975,9 +1981,14 @@ async fn run_stream_limit_e2e() -> Result<(), TestError> {
     init_tracing();
 
     let (target_addr, target_task) = spawn_read_to_eof_target().await?;
-    let harness = RelayHarness::start_with_limits(
+    // Pin the pool to a single carrier so the per-session stream limit is the
+    // binding constraint; otherwise the pool would open a second carrier for the
+    // second flow. Pool growth under the stream limit is covered separately by
+    // `grows_carrier_pool_when_session_stream_limit_is_reached`.
+    let harness = RelayHarness::start_with_limits_and_pool(
         Some(allow_loopback_policy(target_addr.port())),
         test_limits_with_max_streams(1),
+        1,
     )
     .await?;
 
@@ -1992,6 +2003,59 @@ async fn run_stream_limit_e2e() -> Result<(), TestError> {
     first_socks.shutdown().await?;
     let target_received = target_task.await??;
     assert_eq!(target_received, b"x");
+    Ok(())
+}
+
+async fn run_pool_growth_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    // Each server session admits only one flow. Two concurrently-open flows can
+    // therefore only both succeed if the client pool grows to a second carrier.
+    let first_payload = patterned_payload(4097);
+    let mut second_payload = patterned_payload(7003);
+    second_payload.reverse();
+    let barrier = Arc::new(Barrier::new(2));
+    let (first_target_addr, first_target_task) =
+        spawn_barrier_echo_target(first_payload.len(), Arc::clone(&barrier)).await?;
+    let (second_target_addr, second_target_task) =
+        spawn_barrier_echo_target(second_payload.len(), Arc::clone(&barrier)).await?;
+    let harness = RelayHarness::start_with_limits_and_pool(
+        Some(allow_loopback_any_port_policy()),
+        test_limits_with_max_streams(1),
+        2,
+    )
+    .await?;
+
+    let first_open = open_socks_connect(harness.socks_addr, first_target_addr);
+    let second_open = open_socks_connect(harness.socks_addr, second_target_addr);
+    let ((mut first_socks, first_reply), (mut second_socks, second_reply)) =
+        tokio::try_join!(first_open, second_open)?;
+    assert_eq!(
+        first_reply[1], SOCKS_REPLY_SUCCEEDED,
+        "first flow should open on the first carrier"
+    );
+    assert_eq!(
+        second_reply[1], SOCKS_REPLY_SUCCEEDED,
+        "second flow should open on a second pooled carrier despite max_streams=1"
+    );
+
+    tokio::try_join!(
+        first_socks.write_all(&first_payload),
+        second_socks.write_all(&second_payload)
+    )?;
+    let mut first_echo = vec![0_u8; first_payload.len()];
+    let mut second_echo = vec![0_u8; second_payload.len()];
+    tokio::try_join!(
+        first_socks.read_exact(&mut first_echo),
+        second_socks.read_exact(&mut second_echo)
+    )?;
+    assert_eq!(first_echo, first_payload);
+    assert_eq!(second_echo, second_payload);
+
+    first_socks.shutdown().await?;
+    second_socks.shutdown().await?;
+    assert_eq!(first_target_task.await??, first_payload);
+    assert_eq!(second_target_task.await??, second_payload);
     Ok(())
 }
 
@@ -3213,6 +3277,7 @@ async fn run_server_observability_e2e() -> Result<(), TestError> {
         max_socks_connections: None,
         max_buffered_bytes_per_session: None,
         max_buffered_bytes_per_flow: None,
+        max_carrier_sessions: None,
     })
     .await?;
 
@@ -3299,6 +3364,7 @@ async fn quic_carrier_round_trips_tcp_relay() -> Result<(), TestError> {
         max_socks_connections: None,
         max_buffered_bytes_per_session: None,
         max_buffered_bytes_per_flow: None,
+        max_carrier_sessions: None,
     })
     .await?;
 
@@ -3374,6 +3440,7 @@ async fn quic_carrier_relays_udp_over_datagram() -> Result<(), TestError> {
         max_socks_connections: None,
         max_buffered_bytes_per_session: None,
         max_buffered_bytes_per_flow: None,
+        max_carrier_sessions: None,
     })
     .await?;
 
@@ -3456,6 +3523,7 @@ async fn quic_carrier_falls_back_to_udp_frame_for_large_payload() -> Result<(), 
         max_socks_connections: None,
         max_buffered_bytes_per_session: None,
         max_buffered_bytes_per_flow: None,
+        max_carrier_sessions: None,
     })
     .await?;
 
@@ -4193,6 +4261,7 @@ async fn run_server_active_session_shutdown_e2e() -> Result<(), TestError> {
         max_socks_connections: None,
         max_buffered_bytes_per_session: None,
         max_buffered_bytes_per_flow: None,
+        max_carrier_sessions: None,
     })
     .await?
     .0;
@@ -4237,6 +4306,7 @@ async fn run_socks_listener_shutdown_e2e() -> Result<(), TestError> {
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
+            max_carrier_sessions: None,
         },
         async {
             let _ = shutdown_rx.await;
@@ -4290,6 +4360,7 @@ async fn run_socks_listener_shutdown_cancels_pending_open_e2e() -> Result<(), Te
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
+            max_carrier_sessions: None,
         },
         async {
             let _ = shutdown_rx.await;
@@ -4356,6 +4427,7 @@ async fn run_socks_listener_shutdown_cancels_pending_udp_open_e2e() -> Result<()
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
+            max_carrier_sessions: None,
         },
         async {
             let _ = shutdown_rx.await;
@@ -4441,6 +4513,7 @@ async fn run_socks_listener_shutdown_during_connect_with_request(
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
+            max_carrier_sessions: None,
         },
         async {
             let _ = shutdown_rx.await;
@@ -4513,6 +4586,7 @@ async fn run_socks_udp_datagram_shutdown_during_reconnect_e2e() -> Result<(), Te
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
+            max_carrier_sessions: None,
         },
         async {
             let _ = shutdown_rx.await;
@@ -4578,6 +4652,7 @@ async fn run_udp_carrier_recovery_e2e() -> Result<(), TestError> {
         max_socks_connections: None,
         max_buffered_bytes_per_session: None,
         max_buffered_bytes_per_flow: None,
+        max_carrier_sessions: None,
     })
     .await?;
 
@@ -4694,6 +4769,7 @@ impl ServerHarness {
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
+            max_carrier_sessions: None,
         }
     }
 }
@@ -4828,6 +4904,7 @@ impl MalformedFrameServerHarness {
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
+            max_carrier_sessions: None,
         })
         .await?;
 
@@ -4898,6 +4975,7 @@ impl ClientBufferedLimitServerHarness {
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: Some(1),
+            max_carrier_sessions: None,
         })
         .await?;
 
@@ -4983,6 +5061,7 @@ impl UdpStreamFallbackDisabledServerHarness {
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
+            max_carrier_sessions: None,
         })
         .await?;
 
@@ -5066,6 +5145,7 @@ impl AckGatedOpenServerHarness {
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
+            max_carrier_sessions: None,
         })
         .await?;
 
@@ -5154,6 +5234,7 @@ impl PendingOpenCancelServerHarness {
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
+            max_carrier_sessions: None,
         })
         .await?;
 
@@ -5227,6 +5308,7 @@ impl PendingUdpOpenCancelServerHarness {
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
+            max_carrier_sessions: None,
         })
         .await?;
 
@@ -5327,6 +5409,7 @@ impl MissingPongServerHarness {
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
+            max_carrier_sessions: None,
         })
         .await?;
 
@@ -5923,6 +6006,7 @@ impl RelayHarness {
             3,
             Some(max_socks_connections),
             None,
+            None,
         )
         .await
     }
@@ -5937,6 +6021,7 @@ impl RelayHarness {
             socks_handshake_timeout_seconds,
             None,
             None,
+            None,
         )
         .await
     }
@@ -5945,7 +6030,23 @@ impl RelayHarness {
         policy_toml: Option<String>,
         limits: LimitConfig,
     ) -> Result<Self, TestError> {
-        Self::start_with_client_options(policy_toml, limits, 3, None, None).await
+        Self::start_with_client_options(policy_toml, limits, 3, None, None, None).await
+    }
+
+    async fn start_with_limits_and_pool(
+        policy_toml: Option<String>,
+        limits: LimitConfig,
+        max_carrier_sessions: u64,
+    ) -> Result<Self, TestError> {
+        Self::start_with_client_options(
+            policy_toml,
+            limits,
+            3,
+            None,
+            None,
+            Some(max_carrier_sessions),
+        )
+        .await
     }
 
     async fn start_with_client_udp_idle_timeout(
@@ -5959,6 +6060,7 @@ impl RelayHarness {
             3,
             None,
             Some(udp_flow_idle_timeout_seconds),
+            None,
         )
         .await
     }
@@ -5969,6 +6071,7 @@ impl RelayHarness {
         socks_handshake_timeout_seconds: u64,
         max_socks_connections: Option<u64>,
         udp_flow_idle_timeout_seconds: Option<u64>,
+        max_carrier_sessions: Option<u64>,
     ) -> Result<Self, TestError> {
         let temp_dir = create_temp_dir()?;
         let cert_path = temp_dir.join("server-cert.pem");
@@ -6012,6 +6115,7 @@ impl RelayHarness {
             max_socks_connections,
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
+            max_carrier_sessions,
         })
         .await?;
 
@@ -6389,6 +6493,7 @@ fn test_client_config(server_addr: SocketAddr, cert_path: &Path, secret: &str) -
         max_socks_connections: None,
         max_buffered_bytes_per_session: None,
         max_buffered_bytes_per_flow: None,
+        max_carrier_sessions: None,
     }
 }
 

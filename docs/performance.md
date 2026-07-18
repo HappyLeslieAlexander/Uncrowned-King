@@ -41,8 +41,8 @@ header and slices the payload without copying.
 | Reusable buffers (32–64 KiB) | ◑ | `RELAY_BUFFER_SIZE = 16 KiB` today (a reusable boxed buffer per reader task); UDP uses a 64 KiB datagram buffer. Raising it to 32 KiB is **not** a standalone win — see "§13 buffer bump revisited" below: larger reads enlarge bursts and lower the single-flow shed threshold, so it must be tuned together with the per-flow queue and the pool. |
 | Per-direction rate counters | ✅ | `record_relay_bytes` tracks bytes by protocol (TCP/UDP) and direction (client↔target), exported as Prometheus counters. |
 | Batched writes where possible | ◑ | Each relay frame is one `write_frame`; the payload is copied once and written behind the carrier's buffered writer. Vectored/coalesced writes across frames are a future optimization (measure with the e2e harness first). |
-| Connection pooling on the client | ⏳ | Deferred to complete this phase — see below. The client currently multiplexes all flows over one carrier; QUIC already avoids head-of-line blocking at the stream level. |
-| Separate latency-sensitive vs bulk carriers | ⏳ | Tied to connection pooling. SOCKS5 carries no latency-class signal, so a bounded least-loaded pool is the planned approximation. |
+| Connection pooling on the client | ✅ | Bounded pool of up to `max_carrier_sessions` (default 4) authenticated carriers (`ClientSessionManager.pool`). New flows go to the least-loaded carrier; a new carrier is opened when the others are at `max_streams` and the pool is not full. |
+| Separate latency-sensitive vs bulk carriers | ✅ | Implemented as the bounded least-loaded pool above. SOCKS5 carries no latency-class signal, so least-loaded placement is the principled approximation: a bulk flow that sheds/backpressures on one carrier shares it with at most `max_streams − 1` others rather than every flow, and lone flows tend to land on their own carrier. |
 | QUIC DATAGRAM for UDP | ✅ | UDP data plane uses QUIC DATAGRAM on QUIC sessions, with automatic fallback to `UDP_DATA` frames for oversized payloads. |
 | Adaptive fallback when a carrier fails | ✅ | Per-endpoint `quic://`/`tls://` selection with ordered retry gives QUIC-preferred connection and automatic TLS fallback. |
 
@@ -95,16 +95,22 @@ momentarily-slow consumer. This makes single-flow bulk far more robust on both
 carriers; a flow is shed only after it has genuinely buffered its full byte
 budget.
 
+**Bulk/latency separation — implemented (client connection pool, §13).** The
+client now keeps a bounded pool of up to `max_carrier_sessions` (default 4)
+carriers and places each new flow on the least-loaded one, opening another
+carrier when the rest are at their stream limit. A bulk flow's shedding or
+backpressure is therefore confined to its own carrier instead of every flow, and
+a lone bulk flow tends to sit on its own carrier. See
+`ClientSessionManager::session_for_new_flow` in `crates/uk-client/src/relay.rs`.
+
 **Remaining future work:**
 
-1. **Bulk/latency separation via the client connection pool (§13)** — put a
-   bulk flow on its own carrier so its shedding/backpressure never affects
-   latency-sensitive flows on other carriers. Still the principled isolation
-   fix; the byte-limit sizing above raises the single-flow ceiling but one
-   shared carrier still shares a byte budget.
-2. **True per-flow backpressure** (pause reading one flow off the shared
-   carrier without head-of-line-blocking others) if even the byte-limited
-   ceiling proves too low for some workloads.
+1. **True per-flow backpressure** (pause reading one flow off a shared carrier
+   without head-of-line-blocking others) if even the byte-limited ceiling plus
+   pool isolation proves too low for some workloads on a single carrier.
+2. **Latency-class hinting** — the pool spreads by load only; SOCKS5 exposes no
+   latency class. A future protocol/UX signal could pin known-bulk flows to a
+   dedicated carrier explicitly rather than statistically.
 
 ## §13 buffer bump revisited
 
@@ -141,9 +147,12 @@ production soak, run for hours and watch max RSS / file descriptors under
 
 ## Outstanding performance work
 
-1. **Client connection pool** (§13): implement the bounded least-loaded pool
-   with bulk/latency separation, then re-run this harness to quantify the
-   single-flow TLS/TCP throughput it unlocks and validate the frame-queue /
-   buffer tuning.
+1. **Quantify the pool's isolation** — the bounded least-loaded connection pool
+   (§13) is now implemented; re-run this harness with a mixed bulk +
+   latency-sensitive workload to measure the tail-latency improvement the pool
+   gives versus a single carrier, and to confirm the frame-queue / buffer tuning
+   holds across multiple carriers.
+2. **Vectored/coalesced writes** across frames (measure with the harness first).
 
-These are the remaining Phase 3 items in `docs/production-roadmap.md`.
+The previously-outstanding client connection pool item is done; see the §13
+conformance table above.

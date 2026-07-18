@@ -11,6 +11,9 @@ use uk_auth::{AuthError, validate_key_id, validate_shared_secret};
 use uk_proto::{MAX_FRAME_PAYLOAD_SIZE, validate_host_port_endpoint};
 use zeroize::Zeroize;
 
+/// Default number of concurrent carrier sessions in the client connection pool.
+const DEFAULT_MAX_CARRIER_SESSIONS: u64 = 4;
+
 /// Client TOML configuration.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +52,11 @@ pub struct ClientConfig {
     pub max_buffered_bytes_per_session: Option<u64>,
     /// Optional maximum queued server-to-local bytes per TCP flow.
     pub max_buffered_bytes_per_flow: Option<u64>,
+    /// Optional maximum number of concurrent authenticated carrier sessions the
+    /// client keeps in its connection pool. New flows are spread least-loaded
+    /// across the pool so a bulk flow's shedding/backpressure on one carrier
+    /// does not stall latency-sensitive flows on the others (whitepaper §13).
+    pub max_carrier_sessions: Option<u64>,
 }
 
 impl Drop for ClientConfig {
@@ -97,6 +105,7 @@ impl fmt::Debug for ClientConfig {
                 "max_buffered_bytes_per_flow",
                 &self.max_buffered_bytes_per_flow,
             )
+            .field("max_carrier_sessions", &self.max_carrier_sessions)
             .finish()
     }
 }
@@ -163,6 +172,12 @@ impl ClientConfig {
     /// Maximum queued server-to-local bytes per TCP flow.
     pub fn max_buffered_bytes_per_flow(&self) -> u64 {
         self.max_buffered_bytes_per_flow.unwrap_or(2_097_152)
+    }
+
+    /// Maximum number of concurrent carrier sessions kept in the client pool.
+    pub fn max_carrier_sessions(&self) -> u64 {
+        self.max_carrier_sessions
+            .unwrap_or(DEFAULT_MAX_CARRIER_SESSIONS)
     }
 
     /// Validates local authentication material before opening a network session.
@@ -246,6 +261,12 @@ impl ClientConfig {
             )
             .into());
         }
+        let max_carrier_sessions = self.max_carrier_sessions();
+        if max_carrier_sessions == 0 {
+            return Err("max_carrier_sessions must be greater than zero".into());
+        }
+        usize::try_from(max_carrier_sessions)
+            .map_err(|_| "max_carrier_sessions is too large for this platform")?;
         Ok(())
     }
 
@@ -359,6 +380,7 @@ mod tests {
             max_socks_connections: None,
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
+            max_carrier_sessions: None,
         }
     }
 
@@ -1027,5 +1049,35 @@ secret = "secret"
             config.validate_auth_material(),
             Err(AuthError::SecretTooShort)
         );
+    }
+
+    #[test]
+    fn defaults_max_carrier_sessions_to_pool_default() {
+        let config = minimal_config();
+
+        assert_eq!(config.max_carrier_sessions(), DEFAULT_MAX_CARRIER_SESSIONS);
+    }
+
+    #[test]
+    fn honors_configured_max_carrier_sessions() {
+        let mut config = minimal_config();
+        config.max_carrier_sessions = Some(9);
+
+        assert_eq!(config.max_carrier_sessions(), 9);
+    }
+
+    #[test]
+    fn rejects_zero_max_carrier_sessions() {
+        let mut config = minimal_config();
+        config.max_carrier_sessions = Some(0);
+
+        let error = config.validate_resource_limits().unwrap_err().to_string();
+
+        assert!(error.contains("max_carrier_sessions"));
+    }
+
+    #[test]
+    fn accepts_default_resource_limits() {
+        assert!(minimal_config().validate_resource_limits().is_ok());
     }
 }
