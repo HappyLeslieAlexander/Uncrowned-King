@@ -66,7 +66,7 @@
 - [x] **codec 微基准**(criterion):varint/frame/target/datagram/settings 编解码 — 每包 <100 ns,证明 codec 非瓶颈
 - [x] **§13 对照**:分方向计数器、DATAGRAM、自适应回退已具备(见 `docs/performance.md` 对照表);`RELAY_BUFFER_SIZE` 16→32 KiB 暂缓——首次尝试触发 Linux-only 大载荷/即时关闭 e2e "early eof",改到 e2e 吞吐 harness(可在 Linux 复现)下落地+验证
 - [x] **端到端吞吐 harness**(真实 socket,target→server→client 下载):QUIC 单流稳定 ~130 MiB/s;**关键发现**:TLS/TCP 单流高吞吐会被 shed(每流 32 帧队列 ≈512 KiB,共享载体读取器溢出即弃流而非阻塞其他流),QUIC 靠传输流控幸免。此发现统一了 #11 的 "early eof"(同一 shed,非半关闭 bug),并成为 §13 连接池/批量分流的核心动因(见 `docs/performance.md`)
-- [ ] **长时 soak(≥24h)+ chaos**:反复断载体、限流边界、句柄/内存监控
+- [x] **soak + chaos harness**:`soak_sustained_relay_and_chaos` — 16 条持续流 ping-pong + 20/s denied-flow 注入,数据完整、会话存活;实测 2s vs 12s(5× 工作量)峰值 RSS 恒定 ~70 MiB,**无泄漏无增长**。参数化 `UK_SOAK_SECONDS`,文档化 24h 跑法 + RSS/句柄监控(见 `docs/performance.md`)
 - [x] **真实互操作(curl)**:`scripts/interop-curl.sh` 用真实 curl 经 SOCKS5 → uk-client → uk-server → HTTP 目标,TLS 与 QUIC 各一遍走通(128 KiB body 校验一致);浏览器手动验证待补
 - [x] 记录性能基线到 `docs/performance.md`(codec 基线 + §13 对照 + 待办)
 

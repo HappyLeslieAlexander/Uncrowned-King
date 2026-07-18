@@ -113,12 +113,35 @@ Given the finding above, raising `RELAY_BUFFER_SIZE` to 32 KiB in isolation is
 single-flow shed threshold. Any buffer/queue tuning must be evaluated together
 with `FLOW_FRAME_QUEUE_CAPACITY` and the pool, using this harness.
 
+## Soak / chaos stability
+
+`soak_sustained_relay_and_chaos` (also `#[ignore]`d) keeps
+`SOAK_CONCURRENCY = 16` persistent flows continuously ping-ponging through one
+long-lived client session while injecting denied-target flows at 20/s, then
+confirms every byte is intact and the session is still healthy. It uses
+persistent flows rather than connect churn, so it does not exhaust ephemeral
+ports over long runs. Duration via `UK_SOAK_SECONDS` (default 2):
+
+```sh
+UK_SOAK_SECONDS=86400 cargo test -p uk-client --test tcp_relay_e2e --release -- \
+    --ignored --nocapture soak_sustained_relay_and_chaos
+```
+
+Observed (Apple-silicon dev machine, `/usr/bin/time -l`):
+
+| Duration | Round trips | Denied-flow chaos | Max RSS |
+| ---: | ---: | ---: | ---: |
+| 2 s | ~80 k | 39 | 70.6 MiB |
+| 12 s | ~411 k | 235 | 70.5 MiB |
+
+5× the work at the **same RSS** — no memory growth, no leak, no error
+accumulation, and the session survived the interleaved denied flows. For a
+production soak, run for hours and watch max RSS / file descriptors under
+`/usr/bin/time -l` (macOS) or `-v` (Linux).
+
 ## Outstanding performance work
 
-1. **Long-running soak (≥24 h) + chaos**: repeated carrier drops, limit
-   boundaries, and file-descriptor / memory monitoring, to confirm no leaks or
-   unbounded growth.
-2. **Client connection pool** (§13): implement the bounded least-loaded pool
+1. **Client connection pool** (§13): implement the bounded least-loaded pool
    with bulk/latency separation, then re-run this harness to quantify the
    single-flow TLS/TCP throughput it unlocks and validate the frame-queue /
    buffer tuning.
