@@ -6,16 +6,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added
-
-- **Client connection pool** (whitepaper §13): the client keeps a bounded pool
-  of up to `max_carrier_sessions` (default 4) authenticated carriers and places
-  each new flow on the least-loaded one, opening another carrier when the others
-  reach their stream limit. This confines a bulk flow's shedding/backpressure to
-  a single carrier instead of stalling latency-sensitive flows on the others.
-  New client config key `max_carrier_sessions`.
-
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-07-18
 
 First runnable release of the Uncrowned King v0.1 proxy: an authenticated,
 policy-enforced SOCKS5 → UK → target relay over TLS/TCP and QUIC.
@@ -38,6 +29,11 @@ policy-enforced SOCKS5 → UK → target relay over TLS/TCP and QUIC.
   the reliable `UDP_DATA` frame path for oversized payloads.
 - **Client carrier selection and fallback**: per-endpoint `tls://` / `quic://`
   scheme with ordered retry (QUIC-preferred, automatic TLS fallback).
+- **Client connection pool** (whitepaper §13): a bounded pool of up to
+  `max_carrier_sessions` (default 4) authenticated carriers, placing each new
+  flow on the least-loaded one and opening another carrier when the others reach
+  their stream limit, so a bulk flow's shedding/backpressure stays confined to
+  one carrier instead of stalling latency-sensitive flows on the others.
 - **SOCKS5 front end**: CONNECT and UDP ASSOCIATE, loopback-guarded by default.
 - **Multiplexed TCP and UDP relay** over both carriers, with bounded UDP flow
   recovery after a carrier disconnect.
@@ -63,8 +59,10 @@ policy-enforced SOCKS5 → UK → target relay over TLS/TCP and QUIC.
 
 - Codec micro-benchmarks (per-packet cost < 100 ns); an e2e download throughput
   harness (QUIC ~130 MiB/s single flow); per-flow queue depth derived from the
-  byte limit to avoid premature single-flow shedding; and a soak/chaos harness
-  showing flat memory across sustained load. See `docs/performance.md`.
+  byte limit to avoid premature single-flow shedding; a connection-pool
+  latency-isolation benchmark (pool cuts interactive p99 ~2.6× under a
+  saturating bulk flow); and a soak/chaos harness showing flat memory across
+  sustained load. See `docs/performance.md`.
 
 [Unreleased]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/HappyLeslieAlexander/Uncrowned-King/releases/tag/v0.1.0
