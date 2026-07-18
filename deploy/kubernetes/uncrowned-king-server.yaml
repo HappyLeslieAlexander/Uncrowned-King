@@ -1,0 +1,170 @@
+# Uncrowned King server on Kubernetes.
+#
+# Before applying, replace every REPLACE_ME below with real values (base a
+# secret on `kubectl create secret generic ... --dry-run=client -o yaml` in
+# practice; never commit real secrets). Then:
+#
+#   kubectl apply -f deploy/kubernetes/uncrowned-king-server.yaml
+#
+# The image is built and pushed by .github/workflows/release.yml.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: uncrowned-king
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: uncrowned-king-policy
+  namespace: uncrowned-king
+data:
+  # Deny private/reserved ranges first, then allow your real targets.
+  policy.toml: |
+    [[rules]]
+    action = "deny"
+    private = true
+
+    [[rules]]
+    action = "allow"
+    domain_suffix = ".example.com"
+    port_start = 443
+    port_end = 443
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: uncrowned-king-server
+  namespace: uncrowned-king
+type: Opaque
+stringData:
+  # Observability binds to 0.0.0.0 so the kubelet can reach the probes; it is
+  # NOT exposed by the Service. The listeners bind all interfaces inside the pod.
+  server.toml: |
+    listen = "0.0.0.0:9443"
+    quic_listen = "0.0.0.0:9443"
+    observability_listen = "0.0.0.0:9090"
+    cert_path = "/etc/uncrowned-king/server-cert.pem"
+    key_path = "/etc/uncrowned-king/server-key.pem"
+    policy_path = "/etc/uncrowned-king/policy.toml"
+
+    [[credentials]]
+    key_id = "REPLACE_ME"
+    secret = "REPLACE_ME_WITH_A_LONG_RANDOM_SECRET"
+    status = "active"
+    policy_group = "default"
+  server-cert.pem: |
+    REPLACE_ME_WITH_PEM_CERTIFICATE_CHAIN
+  server-key.pem: |
+    REPLACE_ME_WITH_PEM_PRIVATE_KEY
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: uncrowned-king-server
+  namespace: uncrowned-king
+  labels:
+    app.kubernetes.io/name: uncrowned-king-server
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: uncrowned-king-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: uncrowned-king-server
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: uk-server
+          image: ghcr.io/happylesliealexander/uncrowned-king-server:latest
+          args:
+            - "--config"
+            - "/etc/uncrowned-king/server.toml"
+            - "serve"
+          ports:
+            - name: uk-tcp
+              containerPort: 9443
+              protocol: TCP
+            - name: uk-quic
+              containerPort: 9443
+              protocol: UDP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "1"
+              memory: "256Mi"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/uncrowned-king/server.toml
+              subPath: server.toml
+              readOnly: true
+            - name: config
+              mountPath: /etc/uncrowned-king/server-cert.pem
+              subPath: server-cert.pem
+              readOnly: true
+            - name: config
+              mountPath: /etc/uncrowned-king/server-key.pem
+              subPath: server-key.pem
+              readOnly: true
+            - name: policy
+              mountPath: /etc/uncrowned-king/policy.toml
+              subPath: policy.toml
+              readOnly: true
+      volumes:
+        - name: config
+          secret:
+            secretName: uncrowned-king-server
+            defaultMode: 0400
+        - name: policy
+          configMap:
+            name: uncrowned-king-policy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: uncrowned-king-server
+  namespace: uncrowned-king
+  labels:
+    app.kubernetes.io/name: uncrowned-king-server
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: uncrowned-king-server
+  ports:
+    - name: uk-tcp
+      port: 9443
+      targetPort: uk-tcp
+      protocol: TCP
+    - name: uk-quic
+      port: 9443
+      targetPort: uk-quic
+      protocol: UDP

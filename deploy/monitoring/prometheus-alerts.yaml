@@ -1,0 +1,78 @@
+# Prometheus alerting rules for the Uncrowned King server, based on the metrics
+# exported at /metrics. Load via a PrometheusRule (Operator) or rule_files.
+#
+# Validate: promtool check rules deploy/monitoring/prometheus-alerts.yaml
+groups:
+  - name: uncrowned-king-server
+    rules:
+      - alert: UncrownedKingServerNotReady
+        expr: uncrowned_king_server_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "UK server not ready ({{ $labels.instance }})"
+          description: "Readiness has been 0 for 2m — the instance is shutting down or failed to start."
+
+      - alert: UncrownedKingServerDown
+        expr: up{job=~".*uncrowned.*king.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "UK server scrape target down ({{ $labels.instance }})"
+          description: "Prometheus cannot scrape the instance for 2m."
+
+      - alert: UncrownedKingHandshakeFailureSpike
+        expr: >
+          sum(rate(uncrowned_king_server_failed_handshakes_total[5m])) by (instance)
+            > 5
+          and
+          sum(rate(uncrowned_king_server_failed_handshakes_total[5m])) by (instance)
+            > 0.2 * sum(rate(uncrowned_king_server_accepted_connections_total[5m])) by (instance)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated UK handshake failures ({{ $labels.instance }})"
+          description: "More than 20% of accepted connections are failing the handshake (>5/s). Check the failure reason breakdown (uncrowned_king_server_handshake_failures_total by reason): tls/auth/protocol/timeout."
+
+      - alert: UncrownedKingHandshakeLimitSaturation
+        expr: sum(rate(uncrowned_king_server_rejected_handshakes_total[5m])) by (instance) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "UK handshake concurrency limit rejecting connections ({{ $labels.instance }})"
+          description: "Connections are being rejected by max_handshakes. Raise the limit or scale out."
+
+      - alert: UncrownedKingSessionLimitSaturation
+        expr: sum(rate(uncrowned_king_server_rejected_sessions_total[5m])) by (instance) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "UK session limit rejecting sessions ({{ $labels.instance }})"
+          description: "Authenticated sessions are being rejected by max_sessions. Raise the limit or scale out."
+
+      - alert: UncrownedKingFlowOpenFailureSpike
+        expr: >
+          sum(rate(uncrowned_king_server_flow_open_failures_total[5m])) by (instance)
+            > 0.5 * sum(rate(uncrowned_king_server_flow_open_requests_total[5m])) by (instance)
+          and
+          sum(rate(uncrowned_king_server_flow_open_requests_total[5m])) by (instance) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Majority of UK flow opens failing ({{ $labels.instance }})"
+          description: "Over half of flow-open requests fail. Check the failure reasons (policy denial, resource limit, target unavailable/timeout)."
+
+      - alert: UncrownedKingConfigReloadFailed
+        expr: increase(uncrowned_king_server_config_reload_failures_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "UK config reload failed ({{ $labels.instance }})"
+          description: "A SIGHUP reload was rejected in the last 15m — the running config is unchanged. Check the candidate config/cert/key and server logs (server.config.reload_failure)."

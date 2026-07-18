@@ -1,0 +1,63 @@
+# Hardened systemd unit for the Uncrowned King client (local SOCKS5 front end).
+#
+# Install:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin uncrowned-king
+#   sudo install -m 0755 target/release/uk-client /usr/local/bin/uk-client
+#   sudo install -d -m 0750 -o uncrowned-king -g uncrowned-king /etc/uncrowned-king
+#   sudo install -m 0640 -o uncrowned-king -g uncrowned-king \
+#       client.toml server-cert.pem /etc/uncrowned-king/
+#   sudo cp deploy/systemd/uncrowned-king-client.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now uncrowned-king-client
+#
+# The SOCKS5 listener defaults to loopback. Exposing it beyond loopback requires
+# `--allow-non-loopback` AND your own network access control — edit ExecStart.
+
+[Unit]
+Description=Uncrowned King client (SOCKS5)
+Documentation=https://github.com/HappyLeslieAlexander/Uncrowned-King
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/uk-client --config /etc/uncrowned-king/client.toml socks5 --listen 127.0.0.1:1080
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+
+User=uncrowned-king
+Group=uncrowned-king
+
+# --- Sandboxing / hardening --------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# --- Resource limits ---------------------------------------------------------
+LimitNOFILE=65536
+TasksMax=1024
+
+[Install]
+WantedBy=multi-user.target

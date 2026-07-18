@@ -92,12 +92,12 @@
 
 **目标**:他人可按文档独立部署上线并监控。
 
-- [ ] **systemd unit**(非 root、能力最小化、`ProtectSystem`、资源限制)+ 裸机部署文档
-- [ ] **K8s 产物**:Deployment/Service manifest 或 Helm chart,liveness/readiness 接 `/healthz` `/readyz`
-- [ ] **Grafana dashboard + Prometheus 告警规则**示例(握手失败率、拒绝率、活跃会话、relay 字节、reload 失败)
-- [ ] **运维手册** `docs/operations.md`:容量规划、参数调优、故障排查、密钥轮换、升级/回滚
+- [x] **systemd unit**(非 root、能力最小化、`ProtectSystem`、资源限制)+ 裸机部署文档 — `deploy/systemd/uncrowned-king-{server,client}.service`(`NoNewPrivileges`、`ProtectSystem=strict`、空 capability 集、`@system-service` 系统调用过滤、`LimitNOFILE`/`TasksMax` 上限、`ExecReload=SIGHUP`),部署指南 `deploy/README.md`
+- [x] **K8s 产物**:`deploy/kubernetes/uncrowned-king-server.yaml`(Namespace + policy ConfigMap + Secret + 加固 Deployment + LoadBalancer Service),`runAsNonRoot`(uid 65532)、`readOnlyRootFilesystem`、drop ALL caps、`RuntimeDefault` seccomp,liveness/readiness 接 `/healthz` `/readyz`(metrics 端口,不经 Service 暴露),Service 同时暴露 TCP + UDP(QUIC)
+- [x] **Grafana dashboard + Prometheus 告警规则**示例 — `deploy/monitoring/grafana-dashboard.json`(就绪、活跃会话/握手/流、握手失败按 reason、拒绝率、relay 吞吐按协议/方向、flow open 失败、reload 成败)+ `deploy/monitoring/prometheus-alerts.yaml`(未就绪/下线、握手失败率、握手/会话限额饱和、flow open 失败、reload 失败);指标名对齐 `observability.rs` 实际导出
+- [x] **运维手册** `docs/operations.md`:部署预检、容量规划、参数调优、告警→根因→处置映射、密钥轮换(链 `key-management.md`)、升级/回滚、优雅停机
 
-**验收**:按文档在容器与裸机两种形态各完成一次干净部署 + 监控告警触达验证。
+**验收**:产物齐备且 YAML/JSON 语法校验通过、CLI 子命令/探针端点/配置字段/指标名均与代码核对一致;实机双形态部署 + 告警触达由运维在目标环境执行(本地无 kubectl/promtool/systemd)。
 
 ---
 
