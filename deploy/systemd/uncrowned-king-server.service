@@ -1,0 +1,71 @@
+# Hardened systemd unit for the Uncrowned King server.
+#
+# Install:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin uncrowned-king
+#   sudo install -m 0755 target/release/uk-server /usr/local/bin/uk-server
+#   sudo install -d -m 0750 -o uncrowned-king -g uncrowned-king /etc/uncrowned-king
+#   sudo install -m 0640 -o uncrowned-king -g uncrowned-king \
+#       server.toml server-cert.pem server-key.pem /etc/uncrowned-king/
+#   sudo cp deploy/systemd/uncrowned-king-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now uncrowned-king-server
+#
+# Reload credentials / policy / TLS+QUIC identity without dropping connections:
+#   sudo systemctl reload uncrowned-king-server
+
+[Unit]
+Description=Uncrowned King server
+Documentation=https://github.com/HappyLeslieAlexander/Uncrowned-King
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/uk-server --config /etc/uncrowned-king/server.toml serve
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+
+# Dedicated unprivileged account.
+User=uncrowned-king
+Group=uncrowned-king
+
+# --- Sandboxing / hardening --------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+# No capabilities are needed for the default port (9443). To listen below 1024,
+# add: AmbientCapabilities=CAP_NET_BIND_SERVICE and drop it from the bounding
+# set removal below.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# The config directory holds the config, certificate, and key; the process only
+# reads them (ProtectSystem=strict already makes the filesystem read-only).
+
+# --- Resource limits ---------------------------------------------------------
+LimitNOFILE=65536
+TasksMax=1024
+
+[Install]
+WantedBy=multi-user.target
