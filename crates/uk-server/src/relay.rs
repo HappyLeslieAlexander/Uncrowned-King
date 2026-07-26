@@ -3013,10 +3013,31 @@ fn close_target_flows(target_writers: &mut FlowTable) {
     }
 }
 
+/// Closes the carrier write half, best-effort.
+///
+/// This runs inside session teardown, which the session permit outlives, so it
+/// must not be able to block on the peer that caused the teardown: a client that
+/// has stopped reading cannot accept `close_notify`, and waiting for it here
+/// would hold the session slot open — the same leak the write deadline exists to
+/// prevent, just moved into the close path. A missed `close_notify` only costs
+/// the peer a clean shutdown signal; dropping the writer still closes the
+/// socket.
 async fn shutdown_carrier_writer(carrier_writer: &CarrierWriter) {
-    let mut writer = carrier_writer.inner.lock().await;
-    if let Err(err) = writer.shutdown().await {
-        debug!(event = "server.session.shutdown.error", error = %err);
+    let close = async {
+        let mut writer = carrier_writer.inner.lock().await;
+        if let Err(err) = writer.shutdown().await {
+            debug!(event = "server.session.shutdown.error", error = %err);
+        }
+    };
+    let Some(timeout) = carrier_writer.write_timeout else {
+        close.await;
+        return;
+    };
+    if time::timeout(timeout, close).await.is_err() {
+        warn!(
+            event = "server.session.shutdown.timeout",
+            timeout_seconds = timeout.as_secs()
+        );
     }
 }
 
@@ -3550,10 +3571,38 @@ fn tcp_data_frame_size(limits: FrameLimits) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
     use super::*;
 
     const TEST_FLOW_TOKEN: FlowToken = FlowToken(1);
     const STALE_FLOW_TOKEN: FlowToken = FlowToken(2);
+
+    /// Stands in for a peer whose socket buffers are full: it never accepts a
+    /// byte and never finishes shutting down. `tokio::io::duplex` cannot model
+    /// this, because its `poll_shutdown` completes immediately.
+    struct StallingWriter;
+
+    impl AsyncWrite for StallingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
 
     fn test_target_flow() -> TargetFlow {
         test_target_flow_with_token(TEST_FLOW_TOKEN)
@@ -4068,6 +4117,22 @@ mod tests {
             .unwrap_err();
         let io_error = queued_err.downcast_ref::<io::Error>().unwrap();
         assert_eq!(io_error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    /// Teardown runs while the session permit is still held, so closing the
+    /// carrier must not block on a peer that has stopped reading.
+    #[tokio::test]
+    async fn carrier_shutdown_gives_up_on_a_peer_that_stops_reading() {
+        let carrier = CarrierWriter::new(
+            Box::new(StallingWriter),
+            SessionShutdown::default(),
+            Arc::new(ServerMetrics::default()),
+            Some(Duration::from_millis(200)),
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), shutdown_carrier_writer(&carrier))
+            .await
+            .expect("carrier shutdown must not block teardown forever");
     }
 
     #[tokio::test]

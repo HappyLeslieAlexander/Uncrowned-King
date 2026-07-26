@@ -25,6 +25,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   what releases the writers queued behind it. The session loop now watches for
   that condition and stops immediately instead of idling until its timeout.
 
+  Session teardown was a second instance of the same leak: `shutdown_carrier_writer`
+  took the carrier lock and awaited `close_notify` with no deadline, and the
+  session permit outlives teardown — so a client that stopped reading pinned its
+  slot from the close path even once the relay writes were bounded. Closing the
+  carrier is now bounded by the same setting; a missed `close_notify` only costs
+  the peer a clean shutdown signal, whereas blocking cost the server a slot.
+
 ### Security
 
 - **Policy bypass via alternative IPv4-in-IPv6 encodings.** `private = true`

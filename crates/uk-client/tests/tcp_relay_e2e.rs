@@ -3381,9 +3381,11 @@ async fn run_carrier_write_timeout_reclaims_session_e2e() -> Result<(), TestErro
     )
     .await?;
 
-    // 32 MiB is comfortably more than the loopback socket buffers on either
-    // side, so the server blocks writing to a client that never reads.
-    let (target_addr, target_task) = spawn_source_target(32 * 1024 * 1024).await?;
+    // Effectively unbounded: the server must block writing to a client that
+    // never reads, whatever the socket buffer sizes happen to be on this host.
+    // The target itself blocks once the server stops draining it, so this costs
+    // one buffer, not a gigabyte.
+    let (target_addr, target_task) = spawn_source_target(usize::MAX).await?;
 
     let stalled = {
         let (mut carrier, _settings) =
