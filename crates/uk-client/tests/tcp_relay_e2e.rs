@@ -515,6 +515,15 @@ async fn reports_protocol_error_for_nonzero_id_ping() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reclaims_session_slot_from_a_client_that_stops_reading() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        run_carrier_write_timeout_reclaims_session_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn responds_to_authenticated_ping() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_authenticated_ping_pong_e2e()).await?
 }
@@ -3349,6 +3358,64 @@ async fn run_nonzero_id_ping_error_e2e() -> Result<(), TestError> {
         ErrorPayload::decode(&mut payload)?.code,
         ErrorCode::Protocol
     );
+    Ok(())
+}
+
+/// A client that authenticates, starts a download, and then stops reading must
+/// not be able to hold its session slot indefinitely.
+///
+/// Carrier writes are serialised behind one lock, so before the write deadline
+/// existed the server's target-reader task parked in `write_all` forever while
+/// holding it. The session loop could not make progress either, so the idle
+/// timeout never fired and the slot was pinned for the process lifetime —
+/// repeat `max_sessions` times and the server stops accepting anyone.
+async fn run_carrier_write_timeout_reclaims_session_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    // One session slot, so a leaked session is immediately observable, and a
+    // write deadline far below the 30s idle timeout, so only the deadline can
+    // explain the slot coming back.
+    let harness = ServerHarness::start_with_policy(
+        test_limits_with_carrier_write_timeout(1, 1),
+        Some(allow_loopback_any_port_policy()),
+    )
+    .await?;
+
+    // 32 MiB is comfortably more than the loopback socket buffers on either
+    // side, so the server blocks writing to a client that never reads.
+    let (target_addr, target_task) = spawn_source_target(32 * 1024 * 1024).await?;
+
+    let stalled = {
+        let (mut carrier, _settings) =
+            connect_authenticated_carrier(harness.client_config(SECRET)).await?;
+        write_frame(&mut carrier, &tcp_open_frame(1, target_addr)?).await?;
+        // Deliberately never read: the open ack and the download pile up until
+        // the server's carrier write blocks.
+        carrier
+    };
+
+    // The slot must come back on its own, without the stalled client going away.
+    // The server rejects rather than queues when it is at `max_sessions`, so
+    // poll: every attempt fails until the stalled session is reaped.
+    // Generous, because the deadline only has to beat "never": the stall itself
+    // depends on socket buffers filling, which is slower on a loaded runner.
+    // A healthy server reclaims the slot in a few seconds.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let mut admitted = None;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(session) = connect_authenticated_carrier(harness.client_config(SECRET)).await {
+            admitted = Some(session);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let (second, _settings) =
+        admitted.ok_or("server never reclaimed the session slot from the stalled client")?;
+
+    drop(second);
+    drop(stalled);
+    target_task.abort();
+    let _ = fs::remove_dir_all(&harness.temp_dir);
     Ok(())
 }
 
@@ -7358,11 +7425,26 @@ fn test_limits() -> LimitConfig {
         handshake_timeout_seconds: Some(3),
         target_connect_timeout_seconds: Some(3),
         tcp_half_close_timeout_seconds: Some(3),
+        carrier_write_timeout_seconds: None,
         udp_flow_idle_timeout_seconds: None,
         shutdown_timeout_seconds: None,
         replay_cache_window_seconds: None,
         replay_cache_max_entries: None,
     }
+}
+
+fn test_limits_with_carrier_write_timeout(
+    max_sessions: u64,
+    carrier_write_timeout_seconds: u64,
+) -> LimitConfig {
+    let mut limits = test_limits();
+    limits.max_sessions = Some(max_sessions);
+    limits.carrier_write_timeout_seconds = Some(carrier_write_timeout_seconds);
+    // Bound session teardown too: otherwise `drain_session_tasks` waits forever
+    // for the stalled tasks and the slot comes back only once they happen to
+    // finish, which is exactly the open-ended wait this test is checking for.
+    limits.shutdown_timeout_seconds = Some(3);
+    limits
 }
 
 fn test_limits_with_max_streams(max_streams: u64) -> LimitConfig {

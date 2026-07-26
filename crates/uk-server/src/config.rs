@@ -310,6 +310,18 @@ impl ServerConfig {
             .unwrap_or(30)
     }
 
+    /// Deadline for a single frame write to the client carrier. Zero disables it.
+    ///
+    /// Carrier writes are serialised behind one lock, so a client that stops
+    /// reading would otherwise park the writer — and everything queued behind
+    /// it — for the lifetime of the process, pinning the session slot.
+    pub fn carrier_write_timeout_seconds(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.carrier_write_timeout_seconds)
+            .unwrap_or(30)
+    }
+
     /// UDP flow idle timeout in seconds. Zero disables it.
     pub fn udp_flow_idle_timeout_seconds(&self) -> u64 {
         self.limits
@@ -428,6 +440,8 @@ pub struct LimitConfig {
     pub target_connect_timeout_seconds: Option<u64>,
     /// TCP half-close drain timeout in seconds.
     pub tcp_half_close_timeout_seconds: Option<u64>,
+    /// Deadline for a single frame write to the client carrier.
+    pub carrier_write_timeout_seconds: Option<u64>,
     /// UDP flow idle timeout in seconds.
     pub udp_flow_idle_timeout_seconds: Option<u64>,
     /// Graceful listener shutdown timeout in seconds.
@@ -1201,6 +1215,49 @@ target_connect_timeout_seconds = 7
     #[test]
     fn defaults_tcp_half_close_timeout() {
         assert_eq!(minimal_config().tcp_half_close_timeout_seconds(), 30);
+    }
+
+    #[test]
+    fn defaults_carrier_write_timeout() {
+        assert_eq!(minimal_config().carrier_write_timeout_seconds(), 30);
+    }
+
+    #[test]
+    fn parses_carrier_write_timeout() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+carrier_write_timeout_seconds = 9
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.carrier_write_timeout_seconds(), 9);
+        config.validate_limits().unwrap();
+    }
+
+    #[test]
+    fn accepts_disabled_carrier_write_timeout() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+carrier_write_timeout_seconds = 0
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.carrier_write_timeout_seconds(), 0);
+        config.validate_limits().unwrap();
     }
 
     #[test]

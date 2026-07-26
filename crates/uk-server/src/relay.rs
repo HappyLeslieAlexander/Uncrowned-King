@@ -102,6 +102,7 @@ struct CarrierWriter {
     inner: Arc<Mutex<BoxedCarrierWriter>>,
     shutdown: SessionShutdown,
     metrics: Arc<ServerMetrics>,
+    write_timeout: Option<Duration>,
 }
 
 impl CarrierWriter {
@@ -109,11 +110,13 @@ impl CarrierWriter {
         inner: BoxedCarrierWriter,
         shutdown: SessionShutdown,
         metrics: Arc<ServerMetrics>,
+        write_timeout: Option<Duration>,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(inner)),
             shutdown,
             metrics,
+            write_timeout,
         }
     }
 }
@@ -189,6 +192,7 @@ pub(crate) struct RelayLimits {
     max_buffered_bytes_per_flow: usize,
     target_connect_timeout: Option<Duration>,
     tcp_half_close_timeout: Option<Duration>,
+    carrier_write_timeout: Option<Duration>,
     udp_flow_idle_timeout: Option<Duration>,
     session_task_shutdown_timeout: Option<Duration>,
 }
@@ -203,6 +207,7 @@ pub(crate) struct RelayLimitConfig {
     pub(crate) max_buffered_bytes_per_flow: usize,
     pub(crate) target_connect_timeout: Option<Duration>,
     pub(crate) tcp_half_close_timeout: Option<Duration>,
+    pub(crate) carrier_write_timeout: Option<Duration>,
     pub(crate) udp_flow_idle_timeout: Option<Duration>,
     pub(crate) session_task_shutdown_timeout: Option<Duration>,
 }
@@ -294,6 +299,8 @@ enum SessionEvent {
     UdpIdleMaintenance,
     PeerClosed,
     Shutdown,
+    /// The carrier was declared unusable by a writer (see `write_frame_locked`).
+    CarrierFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -520,7 +527,12 @@ pub(crate) async fn relay_session(
     let session_buffer = SessionBufferControl::default();
     let open_dial_limiter = OpenDialLimiter::new(limits.max_outbound_dials_per_session);
     let flow_tokens = FlowTokenAllocator::default();
-    let carrier_writer = CarrierWriter::new(carrier_writer, shutdown.clone(), Arc::clone(&metrics));
+    let carrier_writer = CarrierWriter::new(
+        carrier_writer,
+        shutdown.clone(),
+        Arc::clone(&metrics),
+        limits.carrier_write_timeout,
+    );
     maybe_spawn_datagram_reader(&mut session_tasks, datagrams.as_ref(), &event_tx, &shutdown);
     let context = RelaySessionContext {
         identity,
@@ -546,6 +558,7 @@ pub(crate) async fn relay_session(
             idle_deadline,
             &mut udp_idle_interval,
             &mut shutdown_rx,
+            &shutdown,
         )
         .await
         {
@@ -636,6 +649,13 @@ async fn handle_session_event(
         SessionEvent::Shutdown => {
             info!(event = "server.session.shutdown");
             return SessionStep::Stop(Ok(()));
+        }
+        SessionEvent::CarrierFailed => {
+            // A writer hit its deadline and gave up on the carrier. Stop now
+            // rather than idling until the session timeout: the carrier may be
+            // desynchronised, and the session slot should go back immediately.
+            warn!(event = "server.session.carrier_failed");
+            return SessionStep::Stop(Err(carrier_unusable_error().into()));
         }
     };
     SessionStep::Continue { counts_as_activity }
@@ -889,6 +909,7 @@ async fn next_session_event(
     idle_deadline: Option<time::Instant>,
     udp_idle_interval: &mut Option<time::Interval>,
     shutdown_rx: &mut watch::Receiver<bool>,
+    session_shutdown: &SessionShutdown,
 ) -> Result<SessionEvent, AnyError> {
     if *shutdown_rx.borrow() {
         return Ok(SessionEvent::Shutdown);
@@ -906,6 +927,7 @@ async fn next_session_event(
                 Ok(SessionEvent::Shutdown)
             }
             () = time::sleep_until(idle_deadline) => Ok(SessionEvent::IdleTimeout),
+            () = session_shutdown.closed() => Ok(SessionEvent::CarrierFailed),
             () = tick_udp_idle_interval(udp_idle_interval), if udp_idle_interval.is_some() => {
                 Ok(SessionEvent::UdpIdleMaintenance)
             }
@@ -924,6 +946,7 @@ async fn next_session_event(
             () = tick_udp_idle_interval(udp_idle_interval), if udp_idle_interval.is_some() => {
                 Ok(SessionEvent::UdpIdleMaintenance)
             }
+            () = session_shutdown.closed() => Ok(SessionEvent::CarrierFailed),
         }
     }
 }
@@ -2380,6 +2403,7 @@ impl RelayLimits {
             max_buffered_bytes_per_flow: config.max_buffered_bytes_per_flow,
             target_connect_timeout: config.target_connect_timeout,
             tcp_half_close_timeout: config.tcp_half_close_timeout,
+            carrier_write_timeout: config.carrier_write_timeout,
             udp_flow_idle_timeout: config.udp_flow_idle_timeout,
             session_task_shutdown_timeout: config.session_task_shutdown_timeout,
         }
@@ -3423,16 +3447,58 @@ async fn write_pong(writer: &CarrierWriter, request_frame: &Frame) -> Result<(),
     write_frame_locked(writer, &pong_frame).await
 }
 
+/// Writes one frame to the carrier, serialised against the other writers.
+///
+/// The deadline covers only the write itself, not the wait for the lock. A peer
+/// that stops reading stalls whichever writer holds the lock, so measuring the
+/// holder is what detects it; timing out the waiters as well would fail healthy
+/// sessions merely because several flows queued behind one large frame. Waiters
+/// need no deadline of their own because the timeout closes the session, and
+/// their `shutdown` arm then releases them immediately.
 async fn write_frame_locked(writer: &CarrierWriter, frame: &Frame) -> Result<(), AnyError> {
     let mut guard = tokio::select! {
-        writer = writer.inner.lock() => writer,
+        guard = writer.inner.lock() => guard,
         () = writer.shutdown.closed() => return Err(session_shutdown_error().into()),
     };
     if writer.shutdown.is_closed() {
         return Err(session_shutdown_error().into());
     }
-    write_frame_or_shutdown(&mut *guard, frame, &writer.shutdown).await?;
+    let write = write_frame_or_shutdown(&mut *guard, frame, &writer.shutdown);
+    let Some(timeout) = writer.write_timeout else {
+        write.await?;
+        return Ok(());
+    };
+    let Ok(result) = time::timeout(timeout, write).await else {
+        // An unknown-length prefix of the frame may already be on the wire, so
+        // the carrier can never be trusted again. Closing the session is both
+        // the correct response and what releases the writers queued behind this
+        // one, along with the session slot and its sockets.
+        writer.shutdown.close();
+        warn!(
+            event = "server.carrier.write_timeout",
+            timeout_seconds = timeout.as_secs()
+        );
+        return Err(carrier_write_timeout_error(timeout).into());
+    };
+    result?;
     Ok(())
+}
+
+fn carrier_unusable_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "carrier is unusable after a write deadline expired",
+    )
+}
+
+fn carrier_write_timeout_error(timeout: Duration) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "carrier write exceeded {}s; peer is not reading",
+            timeout.as_secs()
+        ),
+    )
 }
 
 async fn write_frame_or_shutdown<W>(
@@ -3531,6 +3597,7 @@ mod tests {
             max_buffered_bytes_per_flow: 1024,
             target_connect_timeout: None,
             tcp_half_close_timeout: None,
+            carrier_write_timeout: None,
             udp_flow_idle_timeout: None,
             session_task_shutdown_timeout: None,
         }
@@ -3923,6 +3990,83 @@ mod tests {
             .unwrap()
             .unwrap_err();
         let io_error = err.downcast_ref::<io::Error>().unwrap();
+        assert_eq!(io_error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    /// A peer that stops reading must not be able to park a carrier write for
+    /// the lifetime of the process: the write is bounded, and blowing the
+    /// deadline closes the session so its slot and sockets are released.
+    #[tokio::test]
+    async fn carrier_write_gives_up_on_a_peer_that_stops_reading() {
+        let (writer, _reader) = tokio::io::duplex(1);
+        let shutdown = SessionShutdown::default();
+        let carrier = CarrierWriter::new(
+            Box::new(writer),
+            shutdown.clone(),
+            Arc::new(ServerMetrics::default()),
+            Some(Duration::from_millis(200)),
+        );
+        let frame = Frame::new(FrameType::TcpData, 0, 1, Bytes::from(vec![0xaa; 4096])).unwrap();
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            write_frame_locked(&carrier, &frame),
+        )
+        .await
+        .expect("a stalled carrier write must not block forever")
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("carrier write"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            shutdown.is_closed(),
+            "a timed-out write leaves the carrier desynchronised, so the session must be closed"
+        );
+    }
+
+    /// Writers queued behind a stalled one carry no deadline of their own, so
+    /// they must be released by the timeout closing the session. Otherwise a
+    /// stalled peer would strand every flow task on the carrier lock.
+    #[tokio::test]
+    async fn carrier_write_timeout_releases_writers_queued_behind_it() {
+        let (writer, _reader) = tokio::io::duplex(1);
+        let shutdown = SessionShutdown::default();
+        let carrier = CarrierWriter::new(
+            Box::new(writer),
+            shutdown.clone(),
+            Arc::new(ServerMetrics::default()),
+            Some(Duration::from_millis(200)),
+        );
+        let frame = Frame::new(FrameType::TcpData, 0, 1, Bytes::from(vec![0xaa; 4096])).unwrap();
+
+        let stalled = {
+            let carrier = carrier.clone();
+            let frame = frame.clone();
+            tokio::spawn(async move { write_frame_locked(&carrier, &frame).await })
+        };
+        // Let the first writer take the lock and park inside the write.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let queued = {
+            let carrier = carrier.clone();
+            let frame = frame.clone();
+            tokio::spawn(async move { write_frame_locked(&carrier, &frame).await })
+        };
+
+        let stalled_err = tokio::time::timeout(Duration::from_secs(5), stalled)
+            .await
+            .expect("the holder must hit its deadline")
+            .unwrap()
+            .unwrap_err();
+        assert!(stalled_err.to_string().contains("carrier write"));
+
+        let queued_err = tokio::time::timeout(Duration::from_secs(5), queued)
+            .await
+            .expect("the queued writer must be released, not left on the lock")
+            .unwrap()
+            .unwrap_err();
+        let io_error = queued_err.downcast_ref::<io::Error>().unwrap();
         assert_eq!(io_error.kind(), io::ErrorKind::Interrupted);
     }
 
