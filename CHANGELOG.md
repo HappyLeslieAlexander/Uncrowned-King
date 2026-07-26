@@ -6,6 +6,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A client that stopped reading could pin its session slot for the lifetime of
+  the process.** Carrier writes are serialised behind a single lock and had no
+  deadline, so a peer that authenticated, started a download and then stopped
+  reading parked the target-reader task inside `write_all` while holding that
+  lock. The session loop could not make progress either — a `PING` would block
+  it on the same lock — so the idle timeout never fired and the session, its
+  slot, its target sockets and its buffered bytes were never released. Repeated
+  `max_sessions` times, the server stopped admitting anyone.
+
+  Carrier writes now honour `carrier_write_timeout_seconds` (new, default 30,
+  `0` disables). The deadline covers the write itself rather than the wait for
+  the lock, so queuing behind a large frame cannot fail a healthy session;
+  exceeding it closes the session, which is both correct — an unknown-length
+  prefix of the frame is already on the wire, so the carrier is unusable — and
+  what releases the writers queued behind it. The session loop now watches for
+  that condition and stops immediately instead of idling until its timeout.
+
+  Session teardown was a second instance of the same leak: `shutdown_carrier_writer`
+  took the carrier lock and awaited `close_notify` with no deadline, and the
+  session permit outlives teardown — so a client that stopped reading pinned its
+  slot from the close path even once the relay writes were bounded. Closing the
+  carrier is now bounded by the same setting; a missed `close_notify` only costs
+  the peer a clean shutdown signal, whereas blocking cost the server a slot.
+
 ### Security
 
 - **Policy bypass via alternative IPv4-in-IPv6 encodings.** `private = true`

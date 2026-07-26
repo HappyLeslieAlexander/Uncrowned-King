@@ -121,6 +121,7 @@ max_buffered_bytes_per_flow = 2097152
 handshake_timeout_seconds = 10
 target_connect_timeout_seconds = 10
 tcp_half_close_timeout_seconds = 30
+carrier_write_timeout_seconds = 30
 udp_flow_idle_timeout_seconds = 120
 shutdown_timeout_seconds = 30
 replay_cache_window_seconds = 300
@@ -131,6 +132,12 @@ Set `idle_timeout_seconds = 0` to disable the relay session idle timeout.
 Set `handshake_timeout_seconds = 0` to disable the TLS/auth handshake timeout.
 Set `target_connect_timeout_seconds = 0` to disable the server target dial timeout.
 Set `tcp_half_close_timeout_seconds = 0` to disable the TCP half-close drain timeout.
+`carrier_write_timeout_seconds = 30` bounds a single frame write to the client
+carrier. Carrier writes are serialised, so a client that stops reading would
+otherwise park the writer — and every flow queued behind it — indefinitely,
+holding its session slot. Exceeding the deadline closes that session, since a
+partly written frame leaves the carrier unusable. Set it to `0` to disable the
+deadline (not recommended for internet-facing servers).
 Set `udp_flow_idle_timeout_seconds = 0` to disable server-side UDP flow idle cleanup.
 Set `shutdown_timeout_seconds = 0` to wait indefinitely for listener and relay
 session tasks to finish after shutdown; otherwise remaining tasks are aborted

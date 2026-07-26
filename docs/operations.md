@@ -44,8 +44,13 @@ around 70 MiB (see `docs/performance.md`). Set `LimitNOFILE` well above
   prefer QUIC, which paces per-stream.
 - **Idle/timeout knobs** (`idle_timeout_seconds`, `handshake_timeout_seconds`,
   `target_connect_timeout_seconds`, `tcp_half_close_timeout_seconds`,
-  `udp_flow_idle_timeout_seconds`, `shutdown_timeout_seconds`) trade resource
-  reclamation against tolerance for slow peers. `0` disables each.
+  `carrier_write_timeout_seconds`, `udp_flow_idle_timeout_seconds`,
+  `shutdown_timeout_seconds`) trade resource reclamation against tolerance for
+  slow peers. `0` disables each. `carrier_write_timeout_seconds` is the one that
+  bounds a peer which stops reading: without it such a client pins its session
+  slot indefinitely, so raise it for genuinely slow links rather than disabling
+  it. A breach is logged as `server.carrier.write_timeout` and closes the
+  session (`server.session.carrier_failed`).
 - Reloadable via SIGHUP: credentials, policy, and the TLS/QUIC identity.
   **Not** reloadable (need a restart): `listen`, `quic_listen`, all limits and
   timeouts, and the observability listener.

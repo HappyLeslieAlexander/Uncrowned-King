@@ -648,7 +648,7 @@ fn changed_static_config_field(
     }
 }
 
-fn reload_static_limits(config: &ServerConfig) -> [(&'static str, u64); 17] {
+fn reload_static_limits(config: &ServerConfig) -> [(&'static str, u64); 18] {
     [
         ("max_pre_auth_bytes", config.max_pre_auth_bytes()),
         ("max_frame_size", config.max_frame_size()),
@@ -680,6 +680,10 @@ fn reload_static_limits(config: &ServerConfig) -> [(&'static str, u64); 17] {
         (
             "tcp_half_close_timeout_seconds",
             config.tcp_half_close_timeout_seconds(),
+        ),
+        (
+            "carrier_write_timeout_seconds",
+            config.carrier_write_timeout_seconds(),
         ),
         (
             "udp_flow_idle_timeout_seconds",
@@ -929,6 +933,7 @@ async fn run_authenticated_session(
             )?,
             target_connect_timeout: target_connect_timeout(config.target_connect_timeout_seconds()),
             tcp_half_close_timeout: tcp_half_close_timeout(config.tcp_half_close_timeout_seconds()),
+            carrier_write_timeout: carrier_write_timeout(config.carrier_write_timeout_seconds()),
             udp_flow_idle_timeout: udp_flow_idle_timeout(config.udp_flow_idle_timeout_seconds()),
             session_task_shutdown_timeout: listener_shutdown_timeout(
                 config.shutdown_timeout_seconds(),
@@ -1197,6 +1202,10 @@ fn target_connect_timeout(seconds: u64) -> Option<Duration> {
 }
 
 fn tcp_half_close_timeout(seconds: u64) -> Option<Duration> {
+    (seconds != 0).then(|| Duration::from_secs(seconds))
+}
+
+fn carrier_write_timeout(seconds: u64) -> Option<Duration> {
     (seconds != 0).then(|| Duration::from_secs(seconds))
 }
 
