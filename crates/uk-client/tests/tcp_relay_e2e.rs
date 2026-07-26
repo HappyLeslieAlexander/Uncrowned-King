@@ -163,6 +163,7 @@ const SOCKS_REPLY_SUCCEEDED: u8 = 0x00;
 const SOCKS_REPLY_GENERAL_FAILURE: u8 = 0x01;
 const SOCKS_REPLY_NOT_ALLOWED: u8 = 0x02;
 const SOCKS_REPLY_HOST_UNREACHABLE: u8 = 0x04;
+const SOCKS_REPLY_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const HALF_CLOSE_REQUEST: &[u8] = b"Uncrowned King half-close request";
 const HALF_CLOSE_RESPONSE: &[u8] = b"Uncrowned King half-close response";
 const TARGET_HALF_CLOSE_GREETING: &[u8] = b"Uncrowned King target half-close greeting";
@@ -1006,7 +1007,7 @@ async fn run_udp_stream_fallback_disabled_e2e() -> Result<(), TestError> {
 
     let mut harness = UdpStreamFallbackDisabledServerHarness::start().await?;
     let (mut socks_control, head) = open_socks_udp_associate_reply(harness.socks_addr).await?;
-    assert_eq!(head[1], SOCKS_REPLY_GENERAL_FAILURE);
+    assert_eq!(head[1], SOCKS_REPLY_COMMAND_NOT_SUPPORTED);
     let bound_addr = read_socks_reply_addr(&mut socks_control, head[3]).await?;
     assert_eq!(bound_addr, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
 
@@ -1019,7 +1020,7 @@ async fn run_udp_zero_flow_capacity_fallback_disabled_e2e() -> Result<(), TestEr
 
     let mut harness = UdpStreamFallbackDisabledServerHarness::start_zero_flow_capacity().await?;
     let (mut socks_control, head) = open_socks_udp_associate_reply(harness.socks_addr).await?;
-    assert_eq!(head[1], SOCKS_REPLY_GENERAL_FAILURE);
+    assert_eq!(head[1], SOCKS_REPLY_COMMAND_NOT_SUPPORTED);
     let bound_addr = read_socks_reply_addr(&mut socks_control, head[3]).await?;
     assert_eq!(bound_addr, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
 
@@ -1071,7 +1072,7 @@ async fn run_zero_udp_flow_limit_associate_e2e() -> Result<(), TestError> {
 
     let harness = RelayHarness::start_with_limits(None, test_limits_with_max_udp_flows(0)).await?;
     let (mut socks_control, head) = open_socks_udp_associate_reply(harness.socks_addr).await?;
-    assert_eq!(head[1], SOCKS_REPLY_GENERAL_FAILURE);
+    assert_eq!(head[1], SOCKS_REPLY_COMMAND_NOT_SUPPORTED);
     let bound_addr = read_socks_reply_addr(&mut socks_control, head[3]).await?;
     assert_eq!(bound_addr, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
     Ok(())
@@ -1730,7 +1731,7 @@ async fn run_pool_isolation_e2e(
     let policy_path = temp_dir.join("policy.toml");
     fs::write(&cert_path, CERT_PEM)?;
     write_private_key(&key_path)?;
-    fs::write(&policy_path, allow_loopback_any_port_policy())?;
+    write_policy_file(&policy_path, allow_loopback_any_port_policy())?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let mut limits = throughput_limits();
@@ -1869,7 +1870,7 @@ async fn run_throughput_e2e(use_quic: bool, volume: usize) -> Result<(), TestErr
     let policy_path = temp_dir.join("policy.toml");
     fs::write(&cert_path, CERT_PEM)?;
     write_private_key(&key_path)?;
-    fs::write(&policy_path, allow_loopback_policy(target_addr.port()))?;
+    write_policy_file(&policy_path, allow_loopback_policy(target_addr.port()))?;
 
     let quic_addr = if use_quic {
         Some(unused_udp_loopback_addr().await?)
@@ -2678,7 +2679,10 @@ async fn run_all_handshake_endpoints_failed_e2e() -> Result<(), TestError> {
 async fn run_expired_auth_challenge_e2e() -> Result<(), TestError> {
     init_tracing();
 
-    let harness = ServerHarness::start_with_auth_skew(test_limits(), None, 0).await?;
+    // The smallest skew the server accepts; answering more than a second late
+    // puts the challenge outside the window. (`0` is rejected at config load:
+    // it would only admit responses whose timestamp matched exactly.)
+    let harness = ServerHarness::start_with_auth_skew(test_limits(), None, 1).await?;
     let mut carrier = connect_tls_carrier(&harness).await?;
     let exporter = client_exporter(&carrier)?;
 
@@ -2687,7 +2691,7 @@ async fn run_expired_auth_challenge_e2e() -> Result<(), TestError> {
     let mut challenge_payload = challenge_frame.payload;
     let challenge = AuthChallenge::decode(&mut challenge_payload)?;
 
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    tokio::time::sleep(Duration::from_millis(2100)).await;
     let response = AuthResponse::for_challenge(
         KEY_ID.as_bytes(),
         SECRET.as_bytes(),
@@ -3410,7 +3414,7 @@ async fn run_server_observability_e2e() -> Result<(), TestError> {
     let policy_path = temp_dir.join("policy.toml");
     fs::write(&cert_path, CERT_PEM)?;
     write_private_key(&key_path)?;
-    fs::write(&policy_path, allow_loopback_any_port_policy())?;
+    write_policy_file(&policy_path, allow_loopback_any_port_policy())?;
     let (tcp_target_addr, tcp_target_task) = spawn_echo_target().await?;
     let (udp_target_addr, udp_target_task) = spawn_udp_echo_target().await?;
     let observability_addr = unused_loopback_addr().await?;
@@ -3486,6 +3490,18 @@ async fn run_server_observability_e2e() -> Result<(), TestError> {
     assert_eq!(udp_echo.payload, udp_payload);
     udp_target_task.await??;
 
+    // Byte counters are recorded after the carrier write completes, so receiving
+    // the echo does not imply it has been counted. Wait for the last counter in
+    // the data path before scraping.
+    wait_for_server_metric(
+        observability_addr,
+        &format!(
+            "uncrowned_king_server_relay_bytes_total{{protocol=\"udp\",direction=\"target_to_client\"}} {}\n",
+            udp_payload.len()
+        ),
+    )
+    .await?;
+
     let metrics = http_get(observability_addr, "/metrics").await?;
     assert_observability_relay_metrics(&metrics, tcp_payload.len(), udp_payload.len());
 
@@ -3508,7 +3524,7 @@ async fn quic_carrier_round_trips_tcp_relay() -> Result<(), TestError> {
     let policy_path = temp_dir.join("policy.toml");
     fs::write(&cert_path, CERT_PEM)?;
     write_private_key(&key_path)?;
-    fs::write(&policy_path, allow_loopback_any_port_policy())?;
+    write_policy_file(&policy_path, allow_loopback_any_port_policy())?;
     let (tcp_target_addr, tcp_target_task) = spawn_echo_target().await?;
 
     let quic_addr = unused_udp_loopback_addr().await?;
@@ -3585,7 +3601,7 @@ async fn quic_carrier_relays_udp_over_datagram() -> Result<(), TestError> {
     let policy_path = temp_dir.join("policy.toml");
     fs::write(&cert_path, CERT_PEM)?;
     write_private_key(&key_path)?;
-    fs::write(&policy_path, allow_loopback_policy(target_addr.port()))?;
+    write_policy_file(&policy_path, allow_loopback_policy(target_addr.port()))?;
 
     let quic_addr = unused_udp_loopback_addr().await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -3668,7 +3684,7 @@ async fn quic_carrier_falls_back_to_udp_frame_for_large_payload() -> Result<(), 
     let policy_path = temp_dir.join("policy.toml");
     fs::write(&cert_path, CERT_PEM)?;
     write_private_key(&key_path)?;
-    fs::write(&policy_path, allow_loopback_policy(target_addr.port()))?;
+    write_policy_file(&policy_path, allow_loopback_policy(target_addr.port()))?;
 
     let quic_addr = unused_udp_loopback_addr().await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -3745,7 +3761,7 @@ async fn run_client_observability_e2e() -> Result<(), TestError> {
     let policy_path = temp_dir.join("policy.toml");
     fs::write(&cert_path, CERT_PEM)?;
     write_private_key(&key_path)?;
-    fs::write(&policy_path, allow_loopback_any_port_policy())?;
+    write_policy_file(&policy_path, allow_loopback_any_port_policy())?;
 
     let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
     let (server_addr, server_task) = start_uk_server_until_shutdown(
@@ -3813,6 +3829,7 @@ async fn run_client_observability_e2e() -> Result<(), TestError> {
         "uncrowned_king_client_active_sessions 2\n",
     )
     .await?;
+    wait_for_client_tcp_relay_bytes(observability_addr, tcp_payload.len()).await?;
 
     let metrics = http_get(observability_addr, "/metrics").await?;
     assert_client_observability_metrics(&metrics, tcp_payload.len(), udp_payload.len());
@@ -3851,7 +3868,7 @@ async fn run_server_access_control_reload_e2e() -> Result<(), TestError> {
     let policy_path = temp_dir.join("policy.toml");
     fs::write(&cert_path, CERT_PEM)?;
     write_private_key(&key_path)?;
-    fs::write(&policy_path, allow_loopback_any_port_policy())?;
+    write_policy_file(&policy_path, allow_loopback_any_port_policy())?;
     let (target_addr, target_task) = spawn_echo_target().await?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let server_addr = listener.local_addr()?;
@@ -3960,7 +3977,7 @@ async fn run_server_tls_identity_reload_e2e() -> Result<(), TestError> {
     write_private_key(&server_key_path)?;
     fs::write(&initial_ca_path, CERT_PEM)?;
     fs::write(&rotated_ca_path, ROTATED_CERT_PEM)?;
-    fs::write(&policy_path, allow_loopback_any_port_policy())?;
+    write_policy_file(&policy_path, allow_loopback_any_port_policy())?;
 
     let (target_addr, target_task) = spawn_echo_target().await?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -4049,7 +4066,7 @@ async fn run_server_quic_identity_reload_e2e() -> Result<(), TestError> {
     write_private_key(&server_key_path)?;
     fs::write(&initial_ca_path, CERT_PEM)?;
     fs::write(&rotated_ca_path, ROTATED_CERT_PEM)?;
-    fs::write(&policy_path, allow_loopback_any_port_policy())?;
+    write_policy_file(&policy_path, allow_loopback_any_port_policy())?;
 
     let (target_addr, target_task) = spawn_echo_target().await?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -4132,7 +4149,7 @@ async fn run_client_connection_config_reload_e2e() -> Result<(), TestError> {
     write_private_key(&server_key_path)?;
     fs::write(&initial_ca_path, CERT_PEM)?;
     fs::write(&rotated_ca_path, ROTATED_CERT_PEM)?;
-    fs::write(&policy_path, allow_loopback_any_port_policy())?;
+    write_policy_file(&policy_path, allow_loopback_any_port_policy())?;
 
     let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let server_addr = server_listener.local_addr()?;
@@ -4256,7 +4273,7 @@ async fn run_client_reload_during_handshake_e2e() -> Result<(), TestError> {
     let policy_path = temp_dir.join("policy.toml");
     fs::write(&cert_path, CERT_PEM)?;
     write_private_key(&key_path)?;
-    fs::write(&policy_path, allow_loopback_any_port_policy())?;
+    write_policy_file(&policy_path, allow_loopback_any_port_policy())?;
 
     let server_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let server_addr = server_listener.local_addr()?;
@@ -4908,7 +4925,7 @@ impl ServerHarness {
         write_private_key(&key_path)?;
         let policy_path = if let Some(policy_toml) = policy_toml {
             let policy_path = temp_dir.join("policy.toml");
-            fs::write(&policy_path, policy_toml)?;
+            write_policy_file(&policy_path, policy_toml)?;
             Some(policy_path)
         } else {
             None
@@ -6262,7 +6279,7 @@ impl RelayHarness {
 
         let policy_path = if let Some(policy_toml) = policy_toml {
             let policy_path = temp_dir.join("policy.toml");
-            fs::write(&policy_path, policy_toml)?;
+            write_policy_file(&policy_path, policy_toml)?;
             Some(policy_path)
         } else {
             None
@@ -6608,6 +6625,22 @@ async fn wait_for_server_metric(addr: SocketAddr, expected: &str) -> Result<(), 
 
 async fn wait_for_client_metric(addr: SocketAddr, expected: &str) -> Result<(), TestError> {
     wait_for_server_metric(addr, expected).await
+}
+
+/// Waits until the client has counted `bytes` relayed from the server to the
+/// local socket.
+///
+/// The counter is recorded *after* the payload is written to that socket, so an
+/// echo roundtrip returning only means the bytes arrived — not that they have
+/// been counted. Scraping without this wait races the record on a loaded runner.
+async fn wait_for_client_tcp_relay_bytes(addr: SocketAddr, bytes: usize) -> Result<(), TestError> {
+    wait_for_client_metric(
+        addr,
+        &format!(
+            "uncrowned_king_client_relay_bytes_total{{protocol=\"tcp\",direction=\"server_to_local\"}} {bytes}\n"
+        ),
+    )
+    .await
 }
 
 async fn wait_for_active_server_sessions(
@@ -7400,6 +7433,16 @@ fn create_temp_dir() -> Result<PathBuf, TestError> {
     let dir = std::env::temp_dir().join(format!("uk-e2e-{}-{now}-{id}", process::id()));
     fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// Writes a policy file the server will accept.
+///
+/// The server rejects a policy file that is writable by group or other, so the
+/// mode is set explicitly rather than left to whatever umask the test runner
+/// happens to have (a `002` umask would otherwise yield `0664` and fail).
+fn write_policy_file(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
+    fs::write(path, contents)?;
+    restrict_private_key_permissions(path)
 }
 
 fn write_private_key(path: &Path) -> io::Result<()> {

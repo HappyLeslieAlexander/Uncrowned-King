@@ -33,10 +33,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # Pinned, not floating. Nightlies from 2026-07-24 onwards ICE while
+      # building tokio under `-Zsanitizer=address`, which cargo-fuzz always
+      # enables:
+      #   rustc_codegen_ssa/src/mir/operand.rs: "not immediate: OperandRef(Uninit
+      #   @ ... UnsafeCell<MaybeUninit<runtime::task::Notified<...>>>)"
+      # This is a compiler bug, not a fault in the fuzz targets — it broke the
+      # scheduled run on main three days running while nothing in this repo
+      # changed. 2026-07-23 is the last channel observed green here. Revisit
+      # once upstream lands a fix; unpinning is a one-line change.
       - name: Install nightly toolchain
         run: |
-          rustup toolchain install nightly --profile minimal
-          rustup default nightly
+          rustup toolchain install nightly-2026-07-23 --profile minimal
+          rustup default nightly-2026-07-23
+          rustc --version
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked

@@ -32,7 +32,7 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 use tracing::{Instrument, debug, info, info_span, warn};
 use uk_auth::{
-    AuthChallenge, AuthResponse, AuthenticatedIdentity, ReplayCache, unix_now,
+    AuthChallenge, AuthResponse, AuthenticatedIdentity, ReplayCache, try_unix_now,
     verify_auth_response_identity,
 };
 use uk_proto::{
@@ -1010,7 +1010,17 @@ async fn authenticate_carrier(
     ),
     AnyError,
 > {
-    let challenge = AuthChallenge::generate(unix_now());
+    // Refuse to authenticate rather than stamping the challenge with a
+    // placeholder: every downstream check (credential validity windows, skew
+    // bounds, replay expiry) is only meaningful against a real clock.
+    let now = try_unix_now().ok_or_else(|| {
+        phase_error(
+            "read system clock",
+            HandshakeFailureReason::Auth,
+            "system clock is before the Unix epoch",
+        )
+    })?;
+    let challenge = AuthChallenge::generate(now);
 
     let mut payload = BytesMut::new();
     challenge
@@ -1068,7 +1078,6 @@ async fn authenticate_carrier(
             ));
         }
     };
-    let now = unix_now();
     let verification = {
         let mut replay_cache = replay_cache.lock().await;
         verify_auth_response_identity(

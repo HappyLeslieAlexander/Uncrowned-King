@@ -84,13 +84,62 @@ spec:
       labels:
         app.kubernetes.io/name: uncrowned-king-server
     spec:
+      # Nothing in this pod talks to the Kubernetes API server.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
+        # fsGroup makes the projected Secret group-readable by uid 65532 so the
+        # initContainer below can read it. Do NOT mount the Secret straight into
+        # the server: uk-server rejects a config or private key with any bit of
+        # 0o077 set, and a projected Secret is at best root:65532 mode 0440
+        # (kubelet ORs in group-read under fsGroup) — which is rejected. Without
+        # fsGroup it is root:root 0400, unreadable by uid 65532. Neither works.
         fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
+      # Stage the Secret/ConfigMap into an emptyDir owned by uid 65532 at mode
+      # 0600, which is the only layout uk-server accepts. Do not "simplify" this
+      # away by mounting the Secret directly — the pod will CrashLoopBackOff with
+      # "must not be accessible by group or other users".
+      initContainers:
+        - name: stage-config
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              cp /staging/secret/server.toml \
+                 /staging/secret/server-cert.pem \
+                 /staging/secret/server-key.pem \
+                 /etc/uncrowned-king/
+              cp /staging/policy/policy.toml /etc/uncrowned-king/
+              chmod 0600 /etc/uncrowned-king/server.toml \
+                         /etc/uncrowned-king/server-cert.pem \
+                         /etc/uncrowned-king/server-key.pem \
+                         /etc/uncrowned-king/policy.toml
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "32Mi"
+          volumeMounts:
+            - name: config
+              mountPath: /staging/secret
+              readOnly: true
+            - name: policy
+              mountPath: /staging/policy
+              readOnly: true
+            - name: runtime-config
+              mountPath: /etc/uncrowned-king
       containers:
         - name: uk-server
           image: ghcr.io/happylesliealexander/uncrowned-king-server:latest
@@ -132,23 +181,17 @@ spec:
               cpu: "1"
               memory: "256Mi"
           volumeMounts:
-            - name: config
-              mountPath: /etc/uncrowned-king/server.toml
-              subPath: server.toml
-              readOnly: true
-            - name: config
-              mountPath: /etc/uncrowned-king/server-cert.pem
-              subPath: server-cert.pem
-              readOnly: true
-            - name: config
-              mountPath: /etc/uncrowned-king/server-key.pem
-              subPath: server-key.pem
-              readOnly: true
-            - name: policy
-              mountPath: /etc/uncrowned-king/policy.toml
-              subPath: policy.toml
+            # The staged copy, not the Secret itself. NOTE: because the files are
+            # copied at pod start, editing the Secret or ConfigMap does NOT reach
+            # a running pod, so SIGHUP hot-reload of credentials/policy/TLS
+            # cannot pick up new content here — roll the Deployment
+            # (`kubectl rollout restart`) to apply changed secrets or policy.
+            - name: runtime-config
+              mountPath: /etc/uncrowned-king
               readOnly: true
       volumes:
+        # Source material, mounted only into the initContainer. defaultMode 0400
+        # plus fsGroup lands as root:65532 0440, which uid 65532 can read.
         - name: config
           secret:
             secretName: uncrowned-king-server
@@ -156,6 +199,12 @@ spec:
         - name: policy
           configMap:
             name: uncrowned-king-policy
+        # The mode-0600 copy the server actually reads. Memory-backed so the key
+        # never touches node disk.
+        - name: runtime-config
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
 ---
 apiVersion: v1
 kind: Service

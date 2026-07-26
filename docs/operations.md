@@ -10,8 +10,9 @@ Operating the Uncrowned King server and client in production. See also
 - Validate config before every start/rollout: `uk-server --config … config-check`
   (and the client equivalent). It checks the config, credentials, policy, and
   TLS files without listening.
-- Secrets and keys must be `0600`/`0640` and owned by the service user; the
-  process refuses to start otherwise (Unix).
+- Secrets and keys must be `0600` and owned by the service user; the process
+  refuses to start otherwise (Unix). Any group or other permission bit is
+  rejected — `0640` and `0644` do **not** work.
 - Keep `/metrics` (and the whole observability listener) off the public network
   — it is unauthenticated. Bind it to loopback (bare metal) or leave it out of
   the Service (Kubernetes); the kubelet still reaches it in-pod for probes.

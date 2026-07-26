@@ -96,7 +96,7 @@ Gate the release on all of the following. Record who signed and when.
 **Functionality & security**
 - [ ] MVP §19 suite green on the release commit, including QUIC DATAGRAM.
 - [ ] Threat model reviewed; `cargo-deny` + audit + fuzz smoke green in CI.
-- [ ] TLS identity and credentials issued per [`docs/key-management.md`](key-management.md); files `0600`/`0640`, owned by the service user.
+- [ ] TLS identity and credentials issued per [`docs/key-management.md`](key-management.md); files `0600` (any group/other bit is rejected at startup), owned by the service user.
 - [ ] Policy denies private/reserved ranges first; allow-list scoped to real targets.
 
 **Release artifacts**
