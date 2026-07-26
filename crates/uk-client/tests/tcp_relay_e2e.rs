@@ -3490,6 +3490,18 @@ async fn run_server_observability_e2e() -> Result<(), TestError> {
     assert_eq!(udp_echo.payload, udp_payload);
     udp_target_task.await??;
 
+    // Byte counters are recorded after the carrier write completes, so receiving
+    // the echo does not imply it has been counted. Wait for the last counter in
+    // the data path before scraping.
+    wait_for_server_metric(
+        observability_addr,
+        &format!(
+            "uncrowned_king_server_relay_bytes_total{{protocol=\"udp\",direction=\"target_to_client\"}} {}\n",
+            udp_payload.len()
+        ),
+    )
+    .await?;
+
     let metrics = http_get(observability_addr, "/metrics").await?;
     assert_observability_relay_metrics(&metrics, tcp_payload.len(), udp_payload.len());
 
@@ -3817,6 +3829,7 @@ async fn run_client_observability_e2e() -> Result<(), TestError> {
         "uncrowned_king_client_active_sessions 2\n",
     )
     .await?;
+    wait_for_client_tcp_relay_bytes(observability_addr, tcp_payload.len()).await?;
 
     let metrics = http_get(observability_addr, "/metrics").await?;
     assert_client_observability_metrics(&metrics, tcp_payload.len(), udp_payload.len());
@@ -6612,6 +6625,22 @@ async fn wait_for_server_metric(addr: SocketAddr, expected: &str) -> Result<(), 
 
 async fn wait_for_client_metric(addr: SocketAddr, expected: &str) -> Result<(), TestError> {
     wait_for_server_metric(addr, expected).await
+}
+
+/// Waits until the client has counted `bytes` relayed from the server to the
+/// local socket.
+///
+/// The counter is recorded *after* the payload is written to that socket, so an
+/// echo roundtrip returning only means the bytes arrived — not that they have
+/// been counted. Scraping without this wait races the record on a loaded runner.
+async fn wait_for_client_tcp_relay_bytes(addr: SocketAddr, bytes: usize) -> Result<(), TestError> {
+    wait_for_client_metric(
+        addr,
+        &format!(
+            "uncrowned_king_client_relay_bytes_total{{protocol=\"tcp\",direction=\"server_to_local\"}} {bytes}\n"
+        ),
+    )
+    .await
 }
 
 async fn wait_for_active_server_sessions(
