@@ -123,6 +123,14 @@ configuration on both the server and the client.
 Verify a reload succeeded via the `server.config.reload_success` log event and
 the security-generation / reload-success metrics before retiring old material.
 
+**Kubernetes caveat**: the shipped manifest
+([`deploy/kubernetes/uncrowned-king-server.yaml`](../deploy/kubernetes/uncrowned-king-server.yaml))
+stages the Secret and policy ConfigMap into an `emptyDir` via an initContainer,
+because a directly mounted Secret can never satisfy the `0600` permission check.
+Copies are made at pod start, so an edited Secret/ConfigMap does **not** reach a
+running pod and SIGHUP cannot pick it up. Roll the Deployment instead:
+`kubectl rollout restart deployment/uncrowned-king-server`.
+
 ## 4. Checklist
 
 - [ ] Secrets ≥ 32 bytes entropy, unique `key_id` per client.

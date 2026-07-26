@@ -348,10 +348,20 @@ docker build --target client -t uncrowned-king-client .
 docker run --rm -v "$PWD/server.toml:/etc/uncrowned-king/server.toml:ro" \
   -p 9443:9443/tcp -p 9443:9443/udp uncrowned-king-server
 
-# client SOCKS5 on 0.0.0.0:1080 inside the container
+# client SOCKS5 inside the container (the image CMD binds 0.0.0.0:1080 and
+# passes --allow-non-loopback; 0.0.0.0 is the container's own namespace)
 docker run --rm -v "$PWD/client.toml:/etc/uncrowned-king/client.toml:ro" \
-  -p 1080:1080 uncrowned-king-client
+  -p 127.0.0.1:1080:1080 uncrowned-king-client
 ```
+
+The mounted `client.toml`/`server.toml` (and the server private key) must be
+mode `0600` on the host — any group or other permission bit makes the process
+refuse to start.
+
+> **Warning:** the SOCKS5 listener is unauthenticated. Publishing it as
+> `-p 1080:1080` binds every host interface and hands an open proxy to anyone
+> who can reach the host. Publish to loopback (`-p 127.0.0.1:1080:1080`, as
+> above), or put your own access control in front of it.
 
 Published images: `ghcr.io/happylesliealexander/uncrowned-king-server` and
 `…-client`.

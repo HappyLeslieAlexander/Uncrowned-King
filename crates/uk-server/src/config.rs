@@ -18,6 +18,13 @@ use zeroize::Zeroize;
 /// Default accepted authentication timestamp skew in seconds.
 pub const DEFAULT_AUTH_SKEW_SECONDS: u64 = 30;
 
+/// Largest accepted authentication timestamp skew in seconds.
+///
+/// The skew is the freshness guarantee for challenges and responses, so a large
+/// value effectively disables timestamp checking. Five minutes is generous for
+/// NTP-synchronised hosts while keeping the replay window small.
+pub const MAX_AUTH_SKEW_SECONDS: u64 = 300;
+
 /// Server TOML configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -78,6 +85,7 @@ impl ServerConfig {
         let Some(path) = &self.policy_path else {
             return Ok(PolicySet::default());
         };
+        validate_owner_only_writable_file(Path::new(path), "policy file")?;
         let text = fs::read_to_string(path)
             .map_err(|err| format!("failed to read policy file {path}: {err}"))?;
         PolicySet::from_toml(&text)
@@ -146,6 +154,31 @@ impl ServerConfig {
         )?;
         reject_zero_limit("replay_cache_max_entries", self.replay_cache_max_entries())?;
         reject_usize_limit("replay_cache_max_entries", self.replay_cache_max_entries())?;
+        reject_zero_limit("auth_skew_seconds", self.auth_skew_seconds())?;
+        reject_large_limit(
+            "auth_skew_seconds",
+            self.auth_skew_seconds(),
+            MAX_AUTH_SKEW_SECONDS,
+        )?;
+        self.validate_replay_cache_covers_auth_skew()?;
+        Ok(())
+    }
+
+    /// Ensures the replay cache outlives the whole accepted timestamp window.
+    ///
+    /// A response is accepted anywhere in `now ± auth_skew_seconds`, so a cache
+    /// that forgets a nonce pair sooner than `2 * auth_skew_seconds` would let
+    /// that pair be replayed while it is still considered fresh.
+    fn validate_replay_cache_covers_auth_skew(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let skew = self.auth_skew_seconds();
+        let required_window = skew.saturating_mul(2);
+        if self.replay_cache_window_seconds() < required_window {
+            return Err(format!(
+                "replay_cache_window_seconds ({}) must be at least twice auth_skew_seconds ({skew}), that is {required_window}",
+                self.replay_cache_window_seconds()
+            )
+            .into());
+        }
         Ok(())
     }
 
@@ -512,6 +545,46 @@ fn validate_sensitive_file_permissions(
     Ok(())
 }
 
+/// Rejects a file that another local user could rewrite.
+///
+/// Unlike [`validate_sensitive_file_permissions`] this does not require the file
+/// to be secret; a policy file holds no key material and is commonly world
+/// readable but root owned. What matters is integrity, so only group and other
+/// *write* bits are refused. The path itself must be a regular file, which also
+/// rejects a symlink planted where the policy file is expected.
+#[cfg(unix)]
+fn validate_owner_only_writable_file(
+    path: &Path,
+    label: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| format!("failed to read {label} metadata {}: {err}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "{label} {} must be a regular file, not a symlink or directory",
+            path.display()
+        )
+        .into());
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "{label} {} must not be writable by group or other users",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_owner_only_writable_file(
+    _path: &Path,
+    _label: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    Ok(())
+}
+
 fn config_base_dir(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -544,6 +617,15 @@ mod tests {
             credentials: Vec::new(),
         }
     }
+
+    #[cfg(unix)]
+    const VALID_POLICY_TOML: &str = r#"
+[[rules]]
+action = "allow"
+domain = "example.com"
+port_start = 443
+port_end = 443
+"#;
 
     #[cfg(unix)]
     static NEXT_TEMP_PATH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1622,6 +1704,154 @@ replay_cache_max_entries = 0
         .unwrap();
 
         assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_auth_skew() {
+        let mut config = minimal_config();
+        config.auth_skew_seconds = Some(0);
+
+        let error = config.validate_limits().unwrap_err().to_string();
+
+        assert!(error.contains("auth_skew_seconds"));
+        assert!(error.contains("greater than zero"));
+    }
+
+    #[test]
+    fn rejects_too_large_auth_skew() {
+        let mut config = minimal_config();
+        config.auth_skew_seconds = Some(MAX_AUTH_SKEW_SECONDS + 1);
+        config.limits = Some(LimitConfig {
+            replay_cache_window_seconds: Some(u64::MAX),
+            ..LimitConfig::default()
+        });
+
+        let error = config.validate_limits().unwrap_err().to_string();
+
+        assert!(error.contains("auth_skew_seconds"));
+        assert!(error.contains(&MAX_AUTH_SKEW_SECONDS.to_string()));
+    }
+
+    #[test]
+    fn rejects_unbounded_auth_skew() {
+        let mut config = minimal_config();
+        config.auth_skew_seconds = Some(u64::MAX);
+
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
+    fn accepts_auth_skew_at_the_documented_ceiling() {
+        let mut config = minimal_config();
+        config.auth_skew_seconds = Some(MAX_AUTH_SKEW_SECONDS);
+        config.limits = Some(LimitConfig {
+            replay_cache_window_seconds: Some(MAX_AUTH_SKEW_SECONDS * 2),
+            ..LimitConfig::default()
+        });
+
+        assert!(config.validate_limits().is_ok());
+    }
+
+    #[test]
+    fn rejects_replay_cache_window_shorter_than_twice_auth_skew() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+auth_skew_seconds = 60
+credentials = []
+
+[limits]
+replay_cache_window_seconds = 119
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate_limits().unwrap_err().to_string();
+
+        assert!(error.contains("replay_cache_window_seconds"));
+        assert!(error.contains("auth_skew_seconds"));
+    }
+
+    #[test]
+    fn accepts_replay_cache_window_of_exactly_twice_auth_skew() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+auth_skew_seconds = 60
+credentials = []
+
+[limits]
+replay_cache_window_seconds = 120
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate_limits().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_set_accepts_world_readable_owner_only_writable_policy_file() {
+        let path = write_temp_file("policy", "toml", VALID_POLICY_TOML, 0o644);
+        let mut config = minimal_config();
+        config.policy_path = Some(path.to_string_lossy().into_owned());
+
+        let result = config.policy_set();
+        let _ = fs::remove_file(&path);
+
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_set_rejects_group_writable_policy_file() {
+        let path = write_temp_file("policy", "toml", VALID_POLICY_TOML, 0o664);
+        let path_text = path.to_string_lossy().into_owned();
+        let mut config = minimal_config();
+        config.policy_path = Some(path_text.clone());
+
+        let error = config.policy_set().unwrap_err().to_string();
+        let _ = fs::remove_file(&path);
+
+        assert!(error.contains("policy file"));
+        assert!(error.contains(&path_text));
+        assert!(error.contains("writable by group or other"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_set_rejects_world_writable_policy_file() {
+        let path = write_temp_file("policy", "toml", VALID_POLICY_TOML, 0o646);
+        let mut config = minimal_config();
+        config.policy_path = Some(path.to_string_lossy().into_owned());
+
+        let error = config.policy_set().unwrap_err().to_string();
+        let _ = fs::remove_file(&path);
+
+        assert!(error.contains("writable by group or other"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_set_rejects_symlinked_policy_path() {
+        let target = write_temp_file("policy-target", "toml", VALID_POLICY_TOML, 0o644);
+        let link = temp_path("policy-link", "toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let link_text = link.to_string_lossy().into_owned();
+        let mut config = minimal_config();
+        config.policy_path = Some(link_text.clone());
+
+        let error = config.policy_set().unwrap_err().to_string();
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_file(&target);
+
+        assert!(error.contains("policy file"));
+        assert!(error.contains(&link_text));
+        assert!(error.contains("regular file"));
     }
 
     #[test]

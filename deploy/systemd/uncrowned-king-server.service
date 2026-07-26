@@ -4,8 +4,13 @@
 #   sudo useradd --system --no-create-home --shell /usr/sbin/nologin uncrowned-king
 #   sudo install -m 0755 target/release/uk-server /usr/local/bin/uk-server
 #   sudo install -d -m 0750 -o uncrowned-king -g uncrowned-king /etc/uncrowned-king
-#   sudo install -m 0640 -o uncrowned-king -g uncrowned-king \
+#   sudo install -m 0600 -o uncrowned-king -g uncrowned-king \
 #       server.toml server-cert.pem server-key.pem /etc/uncrowned-king/
+#
+# The mode MUST be 0600: uk-server rejects a server config or private key that
+# is accessible by group or other users (any bit in 0o077) and exits at startup.
+# 0640 does NOT work. The certificate is not secret, but installing all three at
+# 0600 keeps one rule to remember; the 0750 directory already scopes access.
 #   sudo cp deploy/systemd/uncrowned-king-server.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now uncrowned-king-server
 #
@@ -43,7 +48,14 @@ ProtectClock=true
 ProtectHostname=true
 ProtectProc=invisible
 ProcSubset=pid
-RestrictAddressFamilies=AF_INET AF_INET6
+# AF_INET/AF_INET6 carry the proxy traffic. AF_UNIX and AF_NETLINK are needed by
+# the glibc resolver when resolving target hostnames: nsswitch.conf backends such
+# as systemd-resolved/nscd are reached over an AF_UNIX socket, and glibc uses
+# AF_NETLINK to enumerate local addresses for source-address selection. The
+# published Linux release binaries are static musl (UDP-only resolver) and do not
+# need them, but a locally built glibc binary — what the install steps above
+# produce — loses DNS without them.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true

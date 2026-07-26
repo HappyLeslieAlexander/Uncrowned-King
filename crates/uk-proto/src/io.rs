@@ -25,7 +25,27 @@ pub enum FrameIoError {
     Protocol(#[from] ProtocolError),
 }
 
+/// Largest amount of buffer capacity reserved ahead of the bytes actually read.
+///
+/// A frame header is as small as six bytes but may declare a payload up to
+/// `max_frame_size`. Reserving the whole declared payload up front would let a
+/// peer commit that much memory per session without sending any of it, so
+/// capacity grows in bounded steps as the payload actually arrives.
+const READ_RESERVE_CHUNK: usize = 16 * 1024;
+
+/// Smallest amount of spare capacity offered to a single read.
+const MIN_READ_RESERVE: usize = 64;
+
 /// Reads one complete frame from an async stream.
+///
+/// # Cancellation safety
+///
+/// This function is **not** cancellation safe. Partially decoded state lives in
+/// the returned future, so dropping it — which `tokio::select!` does to every
+/// branch that loses the race — discards any bytes it had already taken from
+/// `reader` and desynchronises the frame stream. Use it only where the future
+/// is awaited to completion, or where the carrier is discarded on cancellation.
+/// Use [`FrameReader`] inside `select!`.
 pub async fn read_frame<R>(reader: &mut R, limits: FrameLimits) -> FrameIoResult<Frame>
 where
     R: AsyncRead + Unpin,
@@ -56,7 +76,135 @@ where
     })
 }
 
+/// A buffered frame reader whose decode state survives cancellation.
+///
+/// [`read_frame`] keeps the bytes it has consumed so far inside the future, so
+/// dropping that future mid-frame destroys them and the next read resynchronises
+/// part-way through a frame. `FrameReader` keeps those bytes in the struct
+/// instead, so a cancelled read loses nothing and the next call resumes exactly
+/// where the previous one stopped.
+#[derive(Debug)]
+pub struct FrameReader<R> {
+    reader: R,
+    buffer: BytesMut,
+    limits: FrameLimits,
+}
+
+impl<R> FrameReader<R> {
+    /// Wraps `reader`, decoding frames under `limits`.
+    pub fn new(reader: R, limits: FrameLimits) -> Self {
+        Self {
+            reader,
+            buffer: BytesMut::new(),
+            limits,
+        }
+    }
+
+    /// Returns the frame limits applied to decoded headers.
+    pub fn limits(&self) -> FrameLimits {
+        self.limits
+    }
+
+    /// Returns true when buffered bytes are still waiting to be decoded.
+    pub fn has_buffered_bytes(&self) -> bool {
+        !self.buffer.is_empty()
+    }
+}
+
+impl<R> FrameReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    /// Reads one complete frame, buffering across calls.
+    ///
+    /// # Cancellation safety
+    ///
+    /// This method is cancellation safe. Bytes read from the underlying stream
+    /// are appended to an internal buffer before any of them are decoded, so
+    /// dropping the returned future — for example when another `tokio::select!`
+    /// branch completes first — never discards data. The next call resumes from
+    /// the buffered prefix.
+    pub async fn read_frame(&mut self) -> FrameIoResult<Frame> {
+        loop {
+            if let Some(frame) = self.take_buffered_frame()? {
+                return Ok(frame);
+            }
+            self.reserve_for_pending_frame();
+
+            // `read_buf` is itself cancellation safe: if it is dropped before
+            // completing, nothing has been read and nothing is lost.
+            let read = match self.reader.read_buf(&mut self.buffer).await {
+                Ok(read) => read,
+                // rustls reports a missing close_notify this way; treat it as a
+                // plain end of stream, matching `read_optional_one`.
+                Err(err) if err.kind() == ErrorKind::UnexpectedEof => 0,
+                Err(err) => return Err(err.into()),
+            };
+            if read == 0 {
+                return if self.buffer.is_empty() {
+                    Err(FrameIoError::Closed)
+                } else {
+                    Err(ProtocolError::Truncated.into())
+                };
+            }
+        }
+    }
+
+    /// Decodes one frame from the buffer, or returns `None` if more bytes are
+    /// needed. The buffer is left untouched unless a whole frame is removed.
+    fn take_buffered_frame(&mut self) -> FrameIoResult<Option<Frame>> {
+        let mut cursor = &self.buffer[..];
+        let header = match FrameHeader::decode(&mut cursor, self.limits) {
+            Ok(header) => header,
+            Err(ProtocolError::Truncated) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let header_len = self.buffer.len() - cursor.len();
+        let payload_len =
+            usize::try_from(header.length).map_err(|_| ProtocolError::InvalidVarint)?;
+        let total = header_len
+            .checked_add(payload_len)
+            .ok_or(ProtocolError::InvalidVarint)?;
+        if self.buffer.len() < total {
+            return Ok(None);
+        }
+
+        let mut frame = self.buffer.split_to(total);
+        let payload = frame.split_off(header_len).freeze();
+        Ok(Some(Frame { header, payload }))
+    }
+
+    /// Grows the buffer towards the pending frame in bounded steps.
+    fn reserve_for_pending_frame(&mut self) {
+        let mut cursor = &self.buffer[..];
+        let wanted = match FrameHeader::decode(&mut cursor, self.limits) {
+            Ok(header) => {
+                let header_len = self.buffer.len() - cursor.len();
+                usize::try_from(header.length)
+                    .ok()
+                    .and_then(|payload_len| header_len.checked_add(payload_len))
+                    .and_then(|total| total.checked_sub(self.buffer.len()))
+                    .unwrap_or(READ_RESERVE_CHUNK)
+            }
+            // The header itself is still incomplete, so only a few bytes are
+            // outstanding; any error here resurfaces from `take_buffered_frame`.
+            Err(_) => 1,
+        };
+        // Floor the request so an incomplete header does not degenerate into
+        // single-byte reads; `reserve` is a no-op when the spare capacity is
+        // already large enough.
+        self.buffer
+            .reserve(wanted.clamp(MIN_READ_RESERVE, READ_RESERVE_CHUNK));
+    }
+}
+
 /// Writes one complete frame to an async stream.
+///
+/// # Cancellation safety
+///
+/// This function is **not** cancellation safe: dropping the returned future can
+/// leave a partially written frame on the wire. Callers that race it against a
+/// shutdown signal must discard the carrier rather than write to it again.
 pub async fn write_frame<W>(writer: &mut W, frame: &Frame) -> FrameIoResult<()>
 where
     W: AsyncWrite + Unpin,
@@ -238,6 +386,149 @@ mod tests {
         let mut remaining = [0_u8; 3];
         reader.read_exact(&mut remaining).await.unwrap();
         assert_eq!(&remaining, b"abc");
+    }
+
+    #[tokio::test]
+    async fn frame_reader_roundtrips_frames_split_across_reads() {
+        let (mut peer, carrier) = tokio::io::duplex(128);
+        let frame = Frame::new(FrameType::TcpData, 0, 1, Bytes::from_static(b"abcdef")).unwrap();
+        let wire = frame.encode().unwrap();
+        let mut reader = FrameReader::new(carrier, FrameLimits::default());
+
+        peer.write_all(&wire[..3]).await.unwrap();
+        peer.write_all(&wire[3..]).await.unwrap();
+
+        assert_eq!(reader.read_frame().await.unwrap(), frame);
+    }
+
+    #[tokio::test]
+    async fn frame_reader_reads_two_frames_from_one_segment() {
+        let (mut peer, carrier) = tokio::io::duplex(128);
+        let first = Frame::new(FrameType::TcpData, 0, 1, Bytes::from_static(b"aa")).unwrap();
+        let second = Frame::new(FrameType::TcpData, 0, 3, Bytes::from_static(b"bb")).unwrap();
+        let mut wire = first.encode().unwrap().to_vec();
+        wire.extend_from_slice(&second.encode().unwrap());
+        let mut reader = FrameReader::new(carrier, FrameLimits::default());
+
+        peer.write_all(&wire).await.unwrap();
+
+        assert_eq!(reader.read_frame().await.unwrap(), first);
+        assert_eq!(reader.read_frame().await.unwrap(), second);
+    }
+
+    /// The regression this type exists for: a read cancelled part-way through a
+    /// frame must not consume the bytes it had already taken from the stream.
+    #[tokio::test]
+    async fn frame_reader_read_is_cancel_safe_mid_frame() {
+        let (mut peer, carrier) = tokio::io::duplex(128);
+        let frame = Frame::new(FrameType::TcpData, 0, 1, Bytes::from_static(b"abcdef")).unwrap();
+        let wire = frame.encode().unwrap();
+        let mut reader = FrameReader::new(carrier, FrameLimits::default());
+
+        peer.write_all(&wire[..4]).await.unwrap();
+        peer.flush().await.unwrap();
+
+        // Cancel repeatedly while the frame is incomplete.
+        for _ in 0..8 {
+            let cancelled =
+                tokio::time::timeout(std::time::Duration::from_millis(20), reader.read_frame())
+                    .await;
+            assert!(
+                cancelled.is_err(),
+                "frame is incomplete, read must not finish"
+            );
+        }
+
+        peer.write_all(&wire[4..]).await.unwrap();
+        peer.flush().await.unwrap();
+
+        assert_eq!(reader.read_frame().await.unwrap(), frame);
+    }
+
+    #[tokio::test]
+    async fn frame_reader_losing_a_select_race_keeps_partial_frame() {
+        let (mut peer, carrier) = tokio::io::duplex(128);
+        let frame = Frame::new(FrameType::TcpData, 0, 1, Bytes::from_static(b"payload")).unwrap();
+        let wire = frame.encode().unwrap();
+        let mut reader = FrameReader::new(carrier, FrameLimits::default());
+
+        peer.write_all(&wire[..5]).await.unwrap();
+        peer.flush().await.unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<u8>(1);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = tx.send(1).await;
+        });
+        let lost_race = tokio::select! {
+            biased;
+            _ = reader.read_frame() => false,
+            _ = rx.recv() => true,
+        };
+        assert!(lost_race, "the competing branch should win while mid-frame");
+
+        peer.write_all(&wire[5..]).await.unwrap();
+        peer.flush().await.unwrap();
+
+        assert_eq!(reader.read_frame().await.unwrap(), frame);
+    }
+
+    #[tokio::test]
+    async fn frame_reader_reports_closed_on_clean_eof() {
+        let (peer, carrier) = tokio::io::duplex(64);
+        drop(peer);
+        let mut reader = FrameReader::new(carrier, FrameLimits::default());
+
+        assert!(matches!(
+            reader.read_frame().await.unwrap_err(),
+            FrameIoError::Closed
+        ));
+    }
+
+    #[tokio::test]
+    async fn frame_reader_reports_truncated_on_eof_mid_frame() {
+        let (mut peer, carrier) = tokio::io::duplex(64);
+        peer.write_all(&[0x01, 0x11, 0x00, 0x00, 0x01, 0x03, b'a'])
+            .await
+            .unwrap();
+        drop(peer);
+        let mut reader = FrameReader::new(carrier, FrameLimits::default());
+
+        assert!(matches!(
+            reader.read_frame().await.unwrap_err(),
+            FrameIoError::Protocol(ProtocolError::Truncated)
+        ));
+    }
+
+    #[tokio::test]
+    async fn frame_reader_rejects_oversized_frame() {
+        let (mut peer, carrier) = tokio::io::duplex(64);
+        peer.write_all(&[0x01, 0x11, 0x00, 0x00, 0x01, 0x03, b'a', b'b', b'c'])
+            .await
+            .unwrap();
+        let mut reader = FrameReader::new(carrier, FrameLimits { max_frame_size: 2 });
+
+        assert!(matches!(
+            reader.read_frame().await.unwrap_err(),
+            FrameIoError::Protocol(ProtocolError::OversizedFrame {
+                length: 3,
+                limit: 2
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn frame_reader_rejects_bad_version_without_hanging() {
+        let (mut peer, carrier) = tokio::io::duplex(64);
+        peer.write_all(&[0x09, 0x11, 0x00, 0x00, 0x01, 0x00])
+            .await
+            .unwrap();
+        let mut reader = FrameReader::new(carrier, FrameLimits::default());
+
+        assert!(matches!(
+            reader.read_frame().await.unwrap_err(),
+            FrameIoError::Protocol(ProtocolError::UnsupportedVersion(9))
+        ));
     }
 
     #[tokio::test]

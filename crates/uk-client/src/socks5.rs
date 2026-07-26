@@ -213,10 +213,13 @@ where
     match head.command {
         CMD_CONNECT => {
             let endpoint = read_endpoint(stream, head.addr_type).await?;
+            // A malformed target (zero port, empty or over-long domain) is a bad
+            // request, not an unreachable host: `HostUnreachable` (0x04) makes
+            // clients retry the same broken address.
             let target = match target_from_endpoint(endpoint) {
                 Ok(target) => target,
                 Err(err) => {
-                    send_reply(stream, Reply::HostUnreachable).await?;
+                    send_reply(stream, Reply::GeneralFailure).await?;
                     return Err(err);
                 }
             };
@@ -225,7 +228,7 @@ where
         CMD_UDP_ASSOCIATE => {
             let endpoint = read_endpoint(stream, head.addr_type).await?;
             if let Err(err) = validate_udp_associate_endpoint(&endpoint) {
-                send_reply(stream, Reply::HostUnreachable).await?;
+                send_reply(stream, Reply::GeneralFailure).await?;
                 return Err(err);
             }
             Ok(Request::UdpAssociate(endpoint))
@@ -282,8 +285,11 @@ where
             let mut domain = vec![0_u8; usize::from(len[0])];
             read_request_exact(stream, &mut domain).await?;
             let port = read_port(stream).await?;
+            // The DOMAINNAME address type itself is supported, so this is a
+            // malformed request rather than `AddressTypeNotSupported` — and
+            // certainly not a reachability problem.
             let Ok(domain) = String::from_utf8(domain) else {
-                send_reply(stream, Reply::HostUnreachable).await?;
+                send_reply(stream, Reply::GeneralFailure).await?;
                 return Err(protocol_error("socks domain is not utf-8"));
             };
             Ok(SocksEndpoint::Domain(domain, port))
@@ -927,7 +933,7 @@ mod tests {
 
         let mut reply = [0_u8; 10];
         client.read_exact(&mut reply).await.unwrap();
-        assert_eq!(reply[1], Reply::HostUnreachable.code());
+        assert_eq!(reply[1], Reply::GeneralFailure.code());
         assert!(server_task.await.unwrap().is_err());
     }
 
@@ -949,7 +955,7 @@ mod tests {
 
         let mut reply = [0_u8; 10];
         client.read_exact(&mut reply).await.unwrap();
-        assert_eq!(reply[1], Reply::HostUnreachable.code());
+        assert_eq!(reply[1], Reply::GeneralFailure.code());
         assert!(server_task.await.unwrap().is_err());
     }
 
@@ -969,7 +975,71 @@ mod tests {
 
         let mut reply = [0_u8; 10];
         client.read_exact(&mut reply).await.unwrap();
-        assert_eq!(reply[1], Reply::HostUnreachable.code());
+        assert_eq!(reply[1], Reply::GeneralFailure.code());
+        assert!(server_task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_targets_are_never_answered_host_unreachable() {
+        // 0x04 tells the client the address is fine but the host is down, which
+        // makes it retry; every one of these is a malformed request instead.
+        let requests: [&[u8]; 3] = [
+            // zero port
+            &[
+                0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x00, 0x00,
+            ],
+            // non-utf-8 domain
+            &[
+                0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, 0x01, 0xff, 0x00, 0x50,
+            ],
+            // empty domain
+            &[0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, 0x00, 0x00, 0x50],
+        ];
+
+        for request in requests {
+            let (mut client, mut server) = tokio::io::duplex(128);
+            let server_task = tokio::spawn(async move { negotiate_connect(&mut server).await });
+
+            client.write_all(request).await.unwrap();
+
+            let mut method_response = [0_u8; 2];
+            client.read_exact(&mut method_response).await.unwrap();
+
+            let mut reply = [0_u8; 10];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_ne!(reply[1], Reply::HostUnreachable.code());
+            assert!(server_task.await.unwrap().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_udp_associate_endpoint_with_failure_reply() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let server_task = tokio::spawn(async move { negotiate_request(&mut server).await });
+
+        client
+            .write_all(&[
+                0x05,
+                0x01,
+                0x00,
+                0x05,
+                CMD_UDP_ASSOCIATE,
+                0x00,
+                ATYP_DOMAIN,
+                0x00,
+                0x00,
+                0x50,
+            ])
+            .await
+            .unwrap();
+
+        let mut method_response = [0_u8; 2];
+        client.read_exact(&mut method_response).await.unwrap();
+        assert_eq!(method_response, [0x05, 0x00]);
+
+        let mut reply = [0_u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], Reply::GeneralFailure.code());
         assert!(server_task.await.unwrap().is_err());
     }
 }

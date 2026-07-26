@@ -18,7 +18,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::{Mutex, Notify, Semaphore, mpsc, watch},
+    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
     task::{Id, JoinError, JoinSet},
     time,
 };
@@ -115,6 +115,7 @@ struct ClientSession {
     data_frame_size: usize,
     max_streams: u64,
     max_udp_flows: u64,
+    admission: FlowAdmissionControl,
     supports_udp_stream_fallback: bool,
     supports_udp_datagram: bool,
     datagrams: Option<BoxedDatagramChannel>,
@@ -175,6 +176,23 @@ struct CachedConnectFailureError {
 #[derive(Debug)]
 struct SessionDrainingError;
 
+/// Owns a freshly connected session until it is published into the pool.
+///
+/// [`ClientSession::connect`] returns with the carrier-reader, datagram-reader
+/// and keepalive tasks already spawned, each holding its own
+/// `Arc<ClientSession>` — a reference cycle that only `close()` breaks. The
+/// publish path then awaits several locks, so a dropped `connect_and_pool`
+/// future (shutdown, `abort_all`) would otherwise strand a fully authenticated
+/// session: its reader parked forever on a `shutdown.closed()` that never
+/// fires, and invisible to [`ClientSessionManager::shutdown`].
+///
+/// Dropping this guard without [`PendingClientSession::into_session`] therefore
+/// tears the session down. The success path calls `into_session`, so a pooled
+/// session is never closed by the guard.
+struct PendingClientSession {
+    session: Option<Arc<ClientSession>>,
+}
+
 struct ClientSessionTasks {
     tasks: JoinSet<ClientSessionTaskKind>,
     kinds: HashMap<Id, ClientSessionTaskKind>,
@@ -199,6 +217,53 @@ impl fmt::Display for SessionDrainingError {
 }
 
 impl Error for SessionDrainingError {}
+
+impl PendingClientSession {
+    fn new(session: Arc<ClientSession>) -> Self {
+        Self {
+            session: Some(session),
+        }
+    }
+
+    /// Publishes the session to the caller, disarming the guard.
+    fn into_session(mut self) -> Arc<ClientSession> {
+        self.session
+            .take()
+            .expect("pending client session is taken exactly once")
+    }
+
+    /// Tears the session down on a path that can await, avoiding the spawned
+    /// fallback in [`Drop`].
+    async fn close_and_wait(mut self) {
+        if let Some(session) = self.session.take() {
+            session.close_and_wait().await;
+        }
+    }
+}
+
+impl Drop for PendingClientSession {
+    fn drop(&mut self) {
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        warn!(
+            event = "client.session.connect_cancelled",
+            correlation_id = session.correlation_id
+        );
+        // A destructor cannot await, so hand the teardown to the runtime. With
+        // no runtime left there is nothing to run it on either, so fall back to
+        // flipping the shutdown flag: that alone wakes the session's tasks off
+        // their `shutdown.closed()` wait so they can exit.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move { session.close_and_wait().await });
+            }
+            Err(_) => {
+                session.shutdown.close();
+            }
+        }
+    }
+}
 
 impl Default for ClientSessionTasks {
     fn default() -> Self {
@@ -262,12 +327,120 @@ struct ClientFlow {
     session: Arc<ClientSession>,
     pending_local_data: Vec<Bytes>,
     metric_guard: Option<ActiveFlowGuard>,
+    /// Session admission slot held for the flow's whole life; dropping the flow
+    /// returns the capacity to its session (see [`FlowAdmissionControl`]).
+    _slot: FlowSlot,
 }
 
 impl Drop for ClientFlow {
     fn drop(&mut self) {
         let _ = self.metric_guard.take();
     }
+}
+
+/// Admission control for one carrier session's flow ceilings.
+///
+/// Holding a permit *is* the reservation. Selecting a session used to read
+/// `flow_count()`, drop the lock, and only reserve the slot much later inside
+/// the open path, so a burst of concurrent SOCKS handlers all observed
+/// `load < max_streams` on the same session, `max_streams` of them won the late
+/// reservation and the rest were rejected — while the pool never grew, because
+/// growth was gated on selection returning nothing. Reserving here instead
+/// makes admission atomic against the server's `max_streams` and `max_udp_flows`
+/// while still letting the pool grow to `max_carrier_sessions`.
+///
+/// Permits are released when the [`FlowSlot`] is dropped, so no error,
+/// rejection or cancellation path can leak a reservation, and no async
+/// destructor is needed.
+#[derive(Debug)]
+struct FlowAdmissionControl {
+    streams: Arc<Semaphore>,
+    udp_flows: Arc<Semaphore>,
+}
+
+/// A reserved flow slot. Dropping it returns the capacity to its session.
+#[derive(Debug)]
+struct FlowSlot {
+    _stream: OwnedSemaphorePermit,
+    _udp_flow: Option<OwnedSemaphorePermit>,
+}
+
+/// A flow slot already reserved on a specific session, handed from session
+/// selection to the open path.
+struct FlowAdmission {
+    session: Arc<ClientSession>,
+    slot: FlowSlot,
+}
+
+/// Why one session refused to admit a flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionRefusal {
+    /// The session is draining or closed.
+    Unavailable,
+    /// The session is at the negotiated `max_streams`.
+    StreamLimit,
+    /// The session has stream capacity but is at `max_udp_flows`.
+    UdpFlowLimit,
+}
+
+/// Why no pooled session could admit a flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolAdmissionRefusal {
+    /// No live session has stream capacity, so growing the pool may help.
+    StreamLimit,
+    /// A live session has stream capacity but is at `max_udp_flows`. That is a
+    /// per-session server limit, so dialling another carrier to work around it
+    /// is not the client's call — reject the request instead.
+    UdpFlowLimit,
+}
+
+impl FlowAdmissionControl {
+    fn new(max_streams: u64, max_udp_flows: u64) -> Self {
+        Self {
+            streams: Arc::new(Semaphore::new(semaphore_permits(max_streams))),
+            udp_flows: Arc::new(Semaphore::new(semaphore_permits(max_udp_flows))),
+        }
+    }
+
+    /// Atomically reserves a flow slot, or reports which ceiling refused it.
+    ///
+    /// A UDP flow consumes both a stream slot and a UDP-flow slot; when the UDP
+    /// ceiling is full the stream permit taken first is dropped here, so a
+    /// refused UDP admission costs no stream capacity.
+    fn try_admit(&self, protocol: FlowProtocol) -> Result<FlowSlot, AdmissionRefusal> {
+        let stream = Arc::clone(&self.streams)
+            .try_acquire_owned()
+            .map_err(|_| AdmissionRefusal::StreamLimit)?;
+        let udp_flow = match protocol {
+            FlowProtocol::Tcp => None,
+            FlowProtocol::Udp => Some(
+                Arc::clone(&self.udp_flows)
+                    .try_acquire_owned()
+                    .map_err(|_| AdmissionRefusal::UdpFlowLimit)?,
+            ),
+        };
+        Ok(FlowSlot {
+            _stream: stream,
+            _udp_flow: udp_flow,
+        })
+    }
+
+    #[cfg(test)]
+    fn available_streams(&self) -> usize {
+        self.streams.available_permits()
+    }
+
+    #[cfg(test)]
+    fn available_udp_flows(&self) -> usize {
+        self.udp_flows.available_permits()
+    }
+}
+
+/// Clamps a negotiated flow ceiling to what a [`Semaphore`] can represent.
+fn semaphore_permits(limit: u64) -> usize {
+    usize::try_from(limit)
+        .unwrap_or(Semaphore::MAX_PERMITS)
+        .min(Semaphore::MAX_PERMITS)
 }
 
 struct UdpAssociation {
@@ -282,6 +455,15 @@ struct UdpAssociation {
 #[derive(Debug, Clone)]
 struct UdpClientEndpoint {
     requested: socks5::SocksEndpoint,
+    /// Source IP of the SOCKS control connection that created this association.
+    ///
+    /// RFC 1928 lets a client that does not yet know the source address it will
+    /// send UDP from advertise all zeros, and virtually every client does. The
+    /// association socket is bound to the SOCKS listener's IP rather than
+    /// loopback, so without this the first datagram from *any* host that can
+    /// reach the bound port would be "learned" as the client and would then
+    /// relay UDP under the real client's credentials.
+    control_peer_ip: IpAddr,
     learned: Option<SocketAddr>,
 }
 
@@ -922,15 +1104,30 @@ impl ClientSessionManager {
         let mut pending_local_data = PendingOpenLocalData::default();
         let mut last_error = None;
         for attempt in 0..2 {
-            let session = tokio::select! {
-                result = self.session_for_new_flow() => result?,
+            let admission = tokio::select! {
+                result = self.admission_for_new_flow(FlowProtocol::Tcp) => result?,
                 changed = shutdown_rx.changed() => {
                     let _ = changed;
                     return Ok(OpenOutcome::Cancelled);
                 }
             };
+            let Some(admission) = admission else {
+                warn!(
+                    event = "client.session.open.capacity_exhausted",
+                    attempt,
+                    max_carrier_sessions = self.max_pool_size()
+                );
+                return Ok(OpenOutcome::Rejected(socks5::Reply::GeneralFailure));
+            };
+            let session = Arc::clone(&admission.session);
             match session
-                .open_flow(target.clone(), local, &mut pending_local_data, shutdown_rx)
+                .open_flow(
+                    target.clone(),
+                    admission,
+                    local,
+                    &mut pending_local_data,
+                    shutdown_rx,
+                )
                 .await
             {
                 Ok(outcome) => return Ok(outcome),
@@ -964,15 +1161,24 @@ impl ClientSessionManager {
             if *shutdown_rx.borrow() {
                 return Ok(OpenOutcome::Cancelled);
             }
-            let session = tokio::select! {
-                result = self.session_for_new_flow() => result?,
+            let admission = tokio::select! {
+                result = self.admission_for_new_flow(FlowProtocol::Udp) => result?,
                 changed = shutdown_rx.changed() => {
                     let _ = changed;
                     return Ok(OpenOutcome::Cancelled);
                 }
             };
+            let Some(admission) = admission else {
+                warn!(
+                    event = "client.session.udp_open.capacity_exhausted",
+                    attempt,
+                    max_carrier_sessions = self.max_pool_size()
+                );
+                return Ok(OpenOutcome::Rejected(socks5::Reply::GeneralFailure));
+            };
+            let session = Arc::clone(&admission.session);
             match session
-                .open_udp_flow(target.clone(), local, tcp_buf, shutdown_rx)
+                .open_udp_flow(target.clone(), admission, local, tcp_buf, shutdown_rx)
                 .await
             {
                 Ok(outcome) => return Ok(outcome),
@@ -996,7 +1202,7 @@ impl ClientSessionManager {
     /// Returns any live session, connecting a new one only if the pool is empty.
     ///
     /// Used for session-wide capability queries and as the connect primitive.
-    /// Flow placement goes through [`Self::session_for_new_flow`] instead.
+    /// Flow placement goes through [`Self::admission_for_new_flow`] instead.
     async fn current_session(&self) -> Result<Arc<ClientSession>, AnyError> {
         loop {
             if self.is_closed() {
@@ -1026,17 +1232,26 @@ impl ClientSessionManager {
         }
     }
 
-    /// Selects the least-loaded pooled session that can admit another flow,
-    /// growing the pool up to `max_carrier_sessions` when every live session is
-    /// at its stream ceiling. When the pool is full and saturated it returns the
-    /// least-loaded session so the per-session stream limit applies backpressure.
-    async fn session_for_new_flow(&self) -> Result<Arc<ClientSession>, AnyError> {
+    /// Reserves a slot for a new flow, growing the pool up to
+    /// `max_carrier_sessions` when every live session is at its ceiling.
+    ///
+    /// Returns `Ok(None)` when no session can take the flow and growing the
+    /// pool would not help: the pool is already at `max_carrier_sessions` and
+    /// saturated, or a live session is at the per-session `max_udp_flows`. That
+    /// is genuine capacity exhaustion rather than a lost race, so the caller
+    /// rejects the request instead of retrying.
+    async fn admission_for_new_flow(
+        &self,
+        protocol: FlowProtocol,
+    ) -> Result<Option<FlowAdmission>, AnyError> {
         loop {
             if self.is_closed() {
                 return Err("client session manager is shutting down".into());
             }
-            if let Some(session) = self.pick_admitting_session().await {
-                return Ok(session);
+            match self.admit_flow(protocol).await {
+                Ok(admission) => return Ok(Some(admission)),
+                Err(PoolAdmissionRefusal::UdpFlowLimit) => return Ok(None),
+                Err(PoolAdmissionRefusal::StreamLimit) => {}
             }
 
             let _connect_guard = self.connect_lock.lock().await;
@@ -1045,17 +1260,16 @@ impl ClientSessionManager {
             }
             // Re-check under the connect lock: another task may have added a
             // session or freed capacity while we waited.
-            if let Some(session) = self.pick_admitting_session().await {
-                return Ok(session);
+            match self.admit_flow(protocol).await {
+                Ok(admission) => return Ok(Some(admission)),
+                Err(PoolAdmissionRefusal::UdpFlowLimit) => return Ok(None),
+                Err(PoolAdmissionRefusal::StreamLimit) => {}
             }
 
-            let live = self.live_sessions().await;
-            if live.len() >= self.max_pool_size() {
-                if let Some(session) = least_loaded_session(&live).await {
-                    return Ok(session);
-                }
-                // The pool is nominally full but held only closed sessions,
-                // which `live_sessions` just pruned; fall through and connect.
+            // `live_sessions` has just pruned closed sessions, so a full pool
+            // here really is `max_carrier_sessions` saturated live carriers.
+            if self.live_sessions().await.len() >= self.max_pool_size() {
+                return Ok(None);
             }
 
             if let Some(failure) = self.recent_connect_failure_if_active().await {
@@ -1063,7 +1277,13 @@ impl ClientSessionManager {
             }
 
             if let Some(session) = self.connect_and_pool().await? {
-                return Ok(session);
+                match session.try_admit(protocol) {
+                    Ok(admission) => return Ok(Some(admission)),
+                    Err(AdmissionRefusal::UdpFlowLimit) => return Ok(None),
+                    // The fresh session was drained or filled before we could
+                    // use it; loop, which finds capacity or hits the pool cap.
+                    Err(AdmissionRefusal::StreamLimit | AdmissionRefusal::Unavailable) => {}
+                }
             }
         }
     }
@@ -1080,8 +1300,8 @@ impl ClientSessionManager {
             config_generation = snapshot.generation
         );
         self.metrics.record_session_connect_attempt();
-        let session = match ClientSession::connect(&snapshot, Arc::clone(&self.metrics)).await {
-            Ok(session) => session,
+        let pending = match ClientSession::connect(&snapshot, Arc::clone(&self.metrics)).await {
+            Ok(session) => PendingClientSession::new(session),
             Err(err) => {
                 self.metrics.record_session_connect_failure();
                 if self.remember_connect_failure(&snapshot, &err).await {
@@ -1094,22 +1314,26 @@ impl ClientSessionManager {
         let publish_guard = self.config_publish_lock.lock().await;
         if self.config.generation() != snapshot.generation {
             drop(publish_guard);
-            session.close_and_wait().await;
+            pending.close_and_wait().await;
             return Ok(None);
         }
         self.clear_connect_failure().await;
         if self.is_closed() {
             drop(publish_guard);
-            session.close_and_wait().await;
+            pending.close_and_wait().await;
             return Err("client session manager is shutting down".into());
         }
         let mut pool = self.pool.lock().await;
         if self.is_closed() {
             drop(pool);
             drop(publish_guard);
-            session.close_and_wait().await;
+            pending.close_and_wait().await;
             return Err("client session manager is shutting down".into());
         }
+        // Take ownership only once publishing is certain: there is no `.await`
+        // between here and the push, so the guard covers every cancellation
+        // point on the way in.
+        let session = pending.into_session();
         pool.push(Arc::clone(&session));
         Ok(Some(session))
     }
@@ -1148,22 +1372,38 @@ impl ClientSessionManager {
         self.live_sessions().await.into_iter().next()
     }
 
-    /// Picks the least-loaded live, non-draining session that still has stream
-    /// capacity for another flow, spreading load across the pool.
-    async fn pick_admitting_session(&self) -> Option<Arc<ClientSession>> {
-        let mut best: Option<(usize, Arc<ClientSession>)> = None;
+    /// Atomically admits a flow on the least-loaded live, non-draining session
+    /// that still has capacity, spreading load across the pool.
+    ///
+    /// Candidates are ranked by current load and then admitted with an atomic
+    /// `try_admit`, so a session that fills up between the ranking and the
+    /// reservation simply hands the slot to the next candidate instead of
+    /// producing a spurious rejection. A refusal reports whether the pool could
+    /// usefully grow (see [`PoolAdmissionRefusal`]).
+    async fn admit_flow(
+        &self,
+        protocol: FlowProtocol,
+    ) -> Result<FlowAdmission, PoolAdmissionRefusal> {
+        let mut candidates = Vec::new();
         for session in self.live_sessions().await {
             if session.is_draining() {
                 continue;
             }
-            let load = session.flow_count().await;
-            if (load as u64) < session.max_streams
-                && best.as_ref().is_none_or(|(best_load, _)| load < *best_load)
-            {
-                best = Some((load, session));
+            candidates.push((session.flow_count().await, session));
+        }
+        candidates.sort_by_key(|(load, _)| *load);
+
+        let mut refusal = PoolAdmissionRefusal::StreamLimit;
+        for (_, session) in &candidates {
+            match session.try_admit(protocol) {
+                Ok(admission) => return Ok(admission),
+                Err(AdmissionRefusal::UdpFlowLimit) => {
+                    refusal = PoolAdmissionRefusal::UdpFlowLimit;
+                }
+                Err(AdmissionRefusal::StreamLimit | AdmissionRefusal::Unavailable) => {}
             }
         }
-        best.map(|(_, session)| session)
+        Err(refusal)
     }
 
     async fn recent_connect_failure_if_active(&self) -> Option<CachedConnectFailure> {
@@ -1301,6 +1541,7 @@ impl ClientSession {
             data_frame_size: tcp_data_frame_size(limits),
             max_streams: negotiated.max_streams,
             max_udp_flows: negotiated.max_udp_flows,
+            admission: FlowAdmissionControl::new(negotiated.max_streams, negotiated.max_udp_flows),
             supports_udp_stream_fallback: negotiated.udp_stream_fallback_enabled(),
             supports_udp_datagram,
             datagrams,
@@ -1401,6 +1642,21 @@ impl ClientSession {
         self.flows.lock().await.len()
     }
 
+    /// Atomically admits one new flow on this session, or reports why it could
+    /// not: unavailable (draining or closed), or at one of its ceilings.
+    fn try_admit(
+        self: &Arc<Self>,
+        protocol: FlowProtocol,
+    ) -> Result<FlowAdmission, AdmissionRefusal> {
+        if self.is_draining() || self.is_closed() {
+            return Err(AdmissionRefusal::Unavailable);
+        }
+        Ok(FlowAdmission {
+            session: Arc::clone(self),
+            slot: self.admission.try_admit(protocol)?,
+        })
+    }
+
     async fn close(&self) {
         if self.shutdown.close() {
             let was_draining = {
@@ -1428,13 +1684,24 @@ impl ClientSession {
         drain_client_session_tasks(&mut tasks, self.task_shutdown_timeout).await;
     }
 
+    /// Opens a TCP flow against a slot already reserved by
+    /// [`ClientSessionManager::admission_for_new_flow`].
+    ///
+    /// `admission` carries the session's capacity permit; it is moved into the
+    /// returned [`ClientFlow`] on success and dropped — releasing the slot — on
+    /// every rejection, error and cancellation path.
     async fn open_flow(
         self: &Arc<Self>,
         target: Target,
+        admission: FlowAdmission,
         local: &mut TcpStream,
         pending_local_data: &mut PendingOpenLocalData,
         shutdown_rx: &mut watch::Receiver<bool>,
     ) -> Result<OpenOutcome, AnyError> {
+        debug_assert!(
+            Arc::ptr_eq(self, &admission.session),
+            "flow admission belongs to another session"
+        );
         if self.is_draining() {
             return Err(Box::new(SessionDrainingError));
         }
@@ -1442,6 +1709,8 @@ impl ClientSession {
             return Err("uk session is closed".into());
         }
         let Some((flow_id, frames)) = self.reserve_flow(FlowProtocol::Tcp).await? else {
+            // Unreachable while the admission permit is held: the flow table
+            // can never hold more routes than there are permits handed out.
             return Ok(OpenOutcome::Rejected(socks5::Reply::GeneralFailure));
         };
         if self.is_closed() {
@@ -1461,6 +1730,7 @@ impl ClientSession {
             session: Arc::clone(self),
             pending_local_data: Vec::new(),
             metric_guard: None,
+            _slot: admission.slot,
         };
         let frame = match self
             .wait_for_open_frame(
@@ -1497,13 +1767,21 @@ impl ClientSession {
         }
     }
 
+    /// Opens a UDP flow against a slot already reserved by
+    /// [`ClientSessionManager::admission_for_new_flow`]; see [`Self::open_flow`]
+    /// for the admission ownership rules.
     async fn open_udp_flow(
         self: &Arc<Self>,
         target: Target,
+        admission: FlowAdmission,
         local: &mut TcpStream,
         tcp_buf: &mut [u8; 1],
         shutdown_rx: &mut watch::Receiver<bool>,
     ) -> Result<OpenOutcome, AnyError> {
+        debug_assert!(
+            Arc::ptr_eq(self, &admission.session),
+            "flow admission belongs to another session"
+        );
         if self.is_draining() {
             return Err(Box::new(SessionDrainingError));
         }
@@ -1511,9 +1789,10 @@ impl ClientSession {
             return Err("uk session is closed".into());
         }
         if !self.supports_udp_stream_fallback {
-            return Ok(OpenOutcome::Rejected(socks5::Reply::GeneralFailure));
+            return Ok(OpenOutcome::Rejected(socks5::Reply::CommandNotSupported));
         }
         let Some((flow_id, frames)) = self.reserve_flow(FlowProtocol::Udp).await? else {
+            // Unreachable while the admission permit is held; see `open_flow`.
             return Ok(OpenOutcome::Rejected(socks5::Reply::GeneralFailure));
         };
         if self.is_closed() {
@@ -1532,6 +1811,7 @@ impl ClientSession {
             session: Arc::clone(self),
             pending_local_data: Vec::new(),
             metric_guard: None,
+            _slot: admission.slot,
         };
         let frame = match self
             .wait_for_udp_open_frame(flow_id, &mut flow.frames, local, tcp_buf, shutdown_rx)
@@ -1934,27 +2214,6 @@ impl ClientSession {
         }
         result
     }
-}
-
-/// Returns the least-loaded session among `sessions`, preferring non-draining
-/// ones. Used as the saturated-pool fallback so backpressure lands on the
-/// carrier already carrying the fewest flows.
-async fn least_loaded_session(sessions: &[Arc<ClientSession>]) -> Option<Arc<ClientSession>> {
-    let mut best: Option<(bool, usize, Arc<ClientSession>)> = None;
-    for session in sessions {
-        let draining = session.is_draining();
-        let load = session.flow_count().await;
-        // Rank key: prefer non-draining (draining = true sorts worse), then
-        // fewer flows.
-        let better = match &best {
-            None => true,
-            Some((best_draining, best_load, _)) => (draining, load) < (*best_draining, *best_load),
-        };
-        if better {
-            best = Some((draining, load, Arc::clone(session)));
-        }
-    }
-    best.map(|(_, _, session)| session)
 }
 
 fn reserve_flow_slot(
@@ -2610,7 +2869,10 @@ async fn relay_udp_association(
     match supports_udp_stream_fallback {
         Ok(true) => {}
         Ok(false) => {
-            socks5::send_reply(&mut local, socks5::Reply::GeneralFailure).await?;
+            // The server does not offer UDP relay at all, which is exactly what
+            // `CommandNotSupported` (0x07) means; 0x01 would invite the client
+            // to retry the same unsupported command.
+            socks5::send_reply(&mut local, socks5::Reply::CommandNotSupported).await?;
             return Ok(());
         }
         Err(err) => {
@@ -2619,6 +2881,9 @@ async fn relay_udp_association(
         }
     }
 
+    // The association is only ever usable by the host that opened this control
+    // connection, so pin the accepted datagram source to its IP.
+    let control_peer_ip = local.peer_addr()?.ip();
     let bind_addr = udp_association_bind_addr(local.local_addr()?);
     let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
     let bound_endpoint = socks5::SocksEndpoint::from(socket.local_addr()?);
@@ -2630,6 +2895,7 @@ async fn relay_udp_association(
         sessions.udp_flow_idle_timeout(),
         flow_event_tx,
         client_endpoint,
+        control_peer_ip,
     );
     let mut idle_interval = udp_idle_interval(association.idle_timeout);
     let mut udp_buf = vec![0_u8; UDP_ASSOCIATION_BUFFER_SIZE].into_boxed_slice();
@@ -2685,12 +2951,13 @@ impl UdpAssociation {
         idle_timeout: Option<Duration>,
         flow_event_tx: mpsc::Sender<UdpAssociationFlowEvent>,
         client_endpoint: socks5::SocksEndpoint,
+        control_peer_ip: IpAddr,
     ) -> Self {
         Self {
             socket,
             idle_timeout,
             flow_event_tx,
-            client_endpoint: UdpClientEndpoint::new(client_endpoint),
+            client_endpoint: UdpClientEndpoint::new(client_endpoint, control_peer_ip),
             flows_by_target: HashMap::new(),
             flow_tasks: JoinSet::new(),
         }
@@ -2718,6 +2985,24 @@ impl UdpAssociation {
             }
         };
 
+        // Size the datagram *before* touching a flow: `flow_for_target` opens a
+        // UK UDP flow on demand, so checking afterwards would leave an idle
+        // flow holding a `max_udp_flows` slot for the whole idle timeout every
+        // time a client's first datagram to a target is oversized.
+        // Sizing a first datagram may have to wait for a session, so keep the
+        // wait cancellable: shutdown must not be held up by a pending dial.
+        let max_payload_len = tokio::select! {
+            result = self.max_udp_payload_len(&datagram.target, sessions) => result?,
+            changed = shutdown_rx.changed() => {
+                let _ = changed;
+                return Ok(false);
+            }
+        };
+        if udp_payload_exceeds_frame_limit(datagram.payload.len(), max_payload_len) {
+            warn_oversized_udp_datagram(&datagram.target, datagram.payload.len(), max_payload_len);
+            return Ok(true);
+        }
+
         let mut last_error = None;
         for attempt in 0..UDP_SEND_ATTEMPTS {
             let flow = match self
@@ -2734,15 +3019,6 @@ impl UdpAssociation {
                 UdpAssociationFlowLookup::NoFlow => return Ok(true),
                 UdpAssociationFlowLookup::Cancelled => return Ok(false),
             };
-            let max_payload_len = flow.session.data_frame_size;
-            if udp_payload_exceeds_frame_limit(datagram.payload.len(), max_payload_len) {
-                warn_oversized_udp_datagram(
-                    &datagram.target,
-                    datagram.payload.len(),
-                    max_payload_len,
-                );
-                return Ok(true);
-            }
             match flow
                 .session
                 .send_udp_data(flow.id, datagram.payload.clone())
@@ -2769,6 +3045,21 @@ impl UdpAssociation {
 
     fn accept_client_endpoint(&mut self, peer: SocketAddr) -> bool {
         self.client_endpoint.accepts(peer)
+    }
+
+    /// Largest UDP payload this association can relay to `target`: the data
+    /// frame size of the target's existing flow, or — for a target with no flow
+    /// yet — of a session that could carry one. Queried without opening a flow
+    /// so an oversized datagram cannot strand UDP flow capacity.
+    async fn max_udp_payload_len(
+        &self,
+        target: &Target,
+        sessions: &ClientSessionManager,
+    ) -> Result<usize, AnyError> {
+        match self.flows_by_target.get(target) {
+            Some(flow) => Ok(flow.session.data_frame_size),
+            None => Ok(sessions.current_session().await?.data_frame_size),
+        }
     }
 
     async fn flow_for_target(
@@ -2946,9 +3237,10 @@ fn udp_flow_id_matches(current_flow_id: Option<u64>, candidate_flow_id: u64) -> 
 }
 
 impl UdpClientEndpoint {
-    fn new(requested: socks5::SocksEndpoint) -> Self {
+    fn new(requested: socks5::SocksEndpoint, control_peer_ip: IpAddr) -> Self {
         Self {
             requested,
+            control_peer_ip,
             learned: None,
         }
     }
@@ -2970,26 +3262,56 @@ impl UdpClientEndpoint {
         self.learned
     }
 
+    /// Decides whether `peer` may be the client of this association.
+    ///
+    /// An explicitly advertised address is honoured as-is. An unspecified
+    /// address — and the domain form, which names the client rather than a
+    /// source the datagrams can be checked against — falls back to the control
+    /// connection's peer IP so only the host that authenticated the association
+    /// can use it. The port stays learnable either way, since a client that
+    /// advertised `0` genuinely does not know it yet.
     fn matches_requested(&self, peer: SocketAddr) -> bool {
         match &self.requested {
             socks5::SocksEndpoint::Ipv4(addr, port) => {
-                matches_requested_ip_port(peer, IpAddr::V4(*addr), *port)
+                self.matches_source_ip(peer, Some(IpAddr::V4(*addr)))
+                    && matches_requested_port(peer, *port)
             }
             socks5::SocksEndpoint::Ipv6(addr, port) => {
-                matches_requested_ip_port(peer, IpAddr::V6(*addr), *port)
+                self.matches_source_ip(peer, Some(IpAddr::V6(*addr)))
+                    && matches_requested_port(peer, *port)
             }
-            socks5::SocksEndpoint::Domain(_, port) => matches_requested_port(peer, *port),
+            socks5::SocksEndpoint::Domain(_, port) => {
+                self.matches_source_ip(peer, None) && matches_requested_port(peer, *port)
+            }
+        }
+    }
+
+    fn matches_source_ip(&self, peer: SocketAddr, requested_ip: Option<IpAddr>) -> bool {
+        match requested_ip {
+            Some(requested_ip) if !requested_ip.is_unspecified() => {
+                ip_matches(peer.ip(), requested_ip)
+            }
+            _ => ip_matches(peer.ip(), self.control_peer_ip),
         }
     }
 }
 
-fn matches_requested_ip_port(peer: SocketAddr, requested_ip: IpAddr, requested_port: u16) -> bool {
-    (requested_ip.is_unspecified() || peer.ip() == requested_ip)
-        && matches_requested_port(peer, requested_port)
-}
-
 fn matches_requested_port(peer: SocketAddr, requested_port: u16) -> bool {
     requested_port == 0 || peer.port() == requested_port
+}
+
+/// Compares two IPs, treating an IPv4-mapped IPv6 address as its IPv4 form so a
+/// dual-stack SOCKS listener (whose control peer reads as `::ffff:a.b.c.d`)
+/// still matches the plain IPv4 source of the same client's datagrams.
+fn ip_matches(left: IpAddr, right: IpAddr) -> bool {
+    canonical_ip(left) == canonical_ip(right)
+}
+
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(addr) => addr.to_ipv4_mapped().map_or(IpAddr::V6(addr), IpAddr::V4),
+        IpAddr::V4(addr) => IpAddr::V4(addr),
+    }
 }
 
 fn udp_payload_exceeds_frame_limit(payload_len: usize, max_payload_len: usize) -> bool {
@@ -3133,6 +3455,15 @@ async fn relay_tcp(
         tokio::select! {
             changed = shutdown_rx.changed() => {
                 let _ = changed;
+                // Hand over what the server already delivered before the FIN:
+                // dropping it would turn up to `max_buffered_bytes_per_flow` of
+                // received data into a clean EOF for the local application.
+                flush_buffered_frames_before_shutdown(
+                    &mut local,
+                    &mut flow.frames,
+                    &flow.session.metrics,
+                )
+                .await?;
                 local.shutdown().await?;
                 local_to_remote_open = false;
                 remote_to_local_open = false;
@@ -3205,6 +3536,22 @@ async fn relay_tcp(
     Ok(())
 }
 
+/// How long a payload already being written to the local socket may keep
+/// draining after shutdown is signalled, before the flow is failed instead.
+const LOCAL_WRITE_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Writes one relayed payload to the local socket, honouring shutdown.
+///
+/// `write_all` is not cancellation safe, so racing it against the shutdown
+/// signal and dropping the loser would leave an unknown-length prefix on the
+/// socket — and the clean FIN below would then tell the local peer that the
+/// truncated stream had ended normally. Instead the write future is pinned and
+/// resumed, so a shutdown arriving mid-write never discards progress.
+///
+/// A local peer that has stopped reading cannot be waited on forever, so the
+/// post-shutdown completion is bounded. Exceeding the grace period is an error
+/// rather than a short write, so the caller tears the flow down instead of
+/// finishing it with a clean FIN.
 async fn write_all_or_shutdown<W>(
     writer: &mut W,
     payload: &[u8],
@@ -3213,17 +3560,73 @@ async fn write_all_or_shutdown<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    tokio::select! {
-        result = writer.write_all(payload) => {
-            result?;
-            Ok(true)
+    write_all_or_shutdown_within(writer, payload, shutdown_rx, LOCAL_WRITE_SHUTDOWN_GRACE).await
+}
+
+async fn write_all_or_shutdown_within<W>(
+    writer: &mut W,
+    payload: &[u8],
+    shutdown_rx: &mut watch::Receiver<bool>,
+    grace: Duration,
+) -> Result<bool, AnyError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let shutting_down = {
+        let mut write = std::pin::pin!(writer.write_all(payload));
+        tokio::select! {
+            result = &mut write => {
+                result?;
+                *shutdown_rx.borrow()
+            }
+            changed = shutdown_rx.changed() => {
+                let _ = changed;
+                time::timeout(grace, &mut write)
+                    .await
+                    .map_err(|_| -> AnyError {
+                        "timed out flushing local socket during shutdown".into()
+                    })??;
+                true
+            }
         }
-        changed = shutdown_rx.changed() => {
-            let _ = changed;
-            writer.shutdown().await?;
-            Ok(false)
-        }
+    };
+    if shutting_down {
+        writer.shutdown().await?;
+        return Ok(false);
     }
+    Ok(true)
+}
+
+/// Drains the frames a flow has *already* received into the local socket, so a
+/// graceful shutdown never puts a clean FIN behind data it silently dropped.
+///
+/// Only what is queued right now is drained (`try_recv` never waits on the
+/// server), so this is bounded by the per-flow byte budget and cannot delay
+/// shutdown on a stalled carrier. Draining stops at the first non-data frame:
+/// closes and status frames end the flow anyway, and the caller is about to
+/// shut the socket down.
+async fn flush_buffered_frames_before_shutdown<W>(
+    writer: &mut W,
+    frames: &mut mpsc::Receiver<BufferedFlowFrame>,
+    metrics: &ClientMetrics,
+) -> Result<(), AnyError>
+where
+    W: AsyncWrite + Unpin,
+{
+    while let Ok(buffered) = frames.try_recv() {
+        let frame = buffered.into_frame()?;
+        if frame.header.frame_type != FrameType::TcpData {
+            break;
+        }
+        let payload_len = frame.payload.len();
+        writer.write_all(&frame.payload).await?;
+        metrics.record_relay_bytes(
+            RelayProtocol::Tcp,
+            RelayDirection::ServerToLocal,
+            payload_len,
+        );
+    }
+    Ok(())
 }
 
 async fn flush_pending_local_data(flow: &mut ClientFlow) -> Result<(), AnyError> {
@@ -3487,6 +3890,7 @@ mod tests {
     use super::*;
 
     const FLOW_ID: u64 = 1;
+    const CONTROL_PEER_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
     fn negotiated_settings_with_idle_timeout(idle_timeout_seconds: u64) -> NegotiatedSettings {
         NegotiatedSettings {
@@ -3524,6 +3928,43 @@ mod tests {
 
     fn test_session_manager(config: ClientConfig) -> ClientSessionManager {
         ClientSessionManager::new(config, Arc::new(ClientMetrics::default()))
+    }
+
+    /// Builds a session that is structurally complete but carries no live
+    /// carrier tasks, for exercising admission and teardown without a server.
+    fn test_session(max_streams: u64, max_udp_flows: u64) -> Arc<ClientSession> {
+        let limits = FrameLimits::default();
+        let (carrier_writer, _carrier_reader) = tokio::io::duplex(64);
+        Arc::new(ClientSession {
+            correlation_id: 1,
+            config_generation: 1,
+            writer: Arc::new(Mutex::new(Box::new(carrier_writer))),
+            flows: Arc::new(Mutex::new(HashMap::new())),
+            limits,
+            data_frame_size: tcp_data_frame_size(limits),
+            max_streams,
+            max_udp_flows,
+            admission: FlowAdmissionControl::new(max_streams, max_udp_flows),
+            supports_udp_stream_fallback: true,
+            supports_udp_datagram: false,
+            datagrams: None,
+            max_pending_open_bytes: 1024,
+            max_buffered_bytes_per_session: 1024,
+            max_buffered_bytes_per_flow: 1024,
+            session_buffer: ClientSessionBufferControl::default(),
+            open_timeout: None,
+            task_shutdown_timeout: Some(Duration::from_millis(50)),
+            tasks: Mutex::new(ClientSessionTasks::default()),
+            shutdown: ClientSessionShutdown::default(),
+            draining: AtomicBool::new(false),
+            metrics: Arc::new(ClientMetrics::default()),
+            metric_state: StdMutex::new(ClientSessionMetricState::Active),
+            next_flow_id: AtomicU64::new(FIRST_CLIENT_FLOW_ID),
+            next_ping_nonce: AtomicU64::new(0),
+            outstanding_ping_nonce: AtomicU64::new(0),
+            last_pong_nonce: AtomicU64::new(0),
+            pong_notify: Notify::new(),
+        })
     }
 
     fn boxed_io_error(kind: io::ErrorKind) -> AnyError {
@@ -4308,10 +4749,10 @@ mod tests {
     fn udp_client_endpoint_learns_unspecified_peer() {
         let first_peer = SocketAddr::from(([127, 0, 0, 1], 41000));
         let second_peer = SocketAddr::from(([127, 0, 0, 1], 41001));
-        let mut endpoint = UdpClientEndpoint::new(socks5::SocksEndpoint::Ipv4(
-            std::net::Ipv4Addr::UNSPECIFIED,
-            0,
-        ));
+        let mut endpoint = UdpClientEndpoint::new(
+            socks5::SocksEndpoint::Ipv4(std::net::Ipv4Addr::UNSPECIFIED, 0),
+            CONTROL_PEER_IP,
+        );
 
         assert!(endpoint.accepts(first_peer));
         assert_eq!(endpoint.learned(), Some(first_peer));
@@ -4323,10 +4764,10 @@ mod tests {
     fn udp_client_endpoint_ignores_peer_that_misses_declared_port() {
         let expected_peer = SocketAddr::from(([127, 0, 0, 1], 41000));
         let wrong_peer = SocketAddr::from(([127, 0, 0, 1], 41001));
-        let mut endpoint = UdpClientEndpoint::new(socks5::SocksEndpoint::Ipv4(
-            std::net::Ipv4Addr::LOCALHOST,
-            expected_peer.port(),
-        ));
+        let mut endpoint = UdpClientEndpoint::new(
+            socks5::SocksEndpoint::Ipv4(std::net::Ipv4Addr::LOCALHOST, expected_peer.port()),
+            CONTROL_PEER_IP,
+        );
 
         assert!(!endpoint.accepts(wrong_peer));
         assert_eq!(endpoint.learned(), None);
@@ -4338,13 +4779,84 @@ mod tests {
     fn udp_client_endpoint_matches_declared_domain_port() {
         let expected_peer = SocketAddr::from(([127, 0, 0, 1], 41000));
         let wrong_peer = SocketAddr::from(([127, 0, 0, 1], 41001));
-        let mut endpoint = UdpClientEndpoint::new(socks5::SocksEndpoint::Domain(
-            "client.local".to_owned(),
-            41000,
-        ));
+        let mut endpoint = UdpClientEndpoint::new(
+            socks5::SocksEndpoint::Domain("client.local".to_owned(), 41000),
+            CONTROL_PEER_IP,
+        );
 
         assert!(!endpoint.accepts(wrong_peer));
         assert!(endpoint.accepts(expected_peer));
+    }
+
+    #[test]
+    fn udp_client_endpoint_rejects_foreign_source_for_unspecified_request() {
+        // RFC 1928 lets the client advertise all zeros, but the association
+        // socket is bound to the SOCKS listener's IP, so only the host that
+        // opened the control connection may claim it.
+        let foreign_peer = SocketAddr::from(([192, 0, 2, 10], 41000));
+        let client_peer = SocketAddr::from(([127, 0, 0, 1], 41000));
+        let mut endpoint = UdpClientEndpoint::new(
+            socks5::SocksEndpoint::Ipv4(std::net::Ipv4Addr::UNSPECIFIED, 0),
+            CONTROL_PEER_IP,
+        );
+
+        assert!(!endpoint.accepts(foreign_peer));
+        assert_eq!(endpoint.learned(), None);
+        assert!(endpoint.accepts(client_peer));
+        assert_eq!(endpoint.learned(), Some(client_peer));
+    }
+
+    #[test]
+    fn udp_client_endpoint_rejects_foreign_source_for_unspecified_ipv6_request() {
+        let foreign_peer = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 41000));
+        let client_peer = SocketAddr::from(([127, 0, 0, 1], 41000));
+        let mut endpoint = UdpClientEndpoint::new(
+            socks5::SocksEndpoint::Ipv6(std::net::Ipv6Addr::UNSPECIFIED, 0),
+            CONTROL_PEER_IP,
+        );
+
+        assert!(!endpoint.accepts(foreign_peer));
+        assert!(endpoint.accepts(client_peer));
+    }
+
+    #[test]
+    fn udp_client_endpoint_rejects_foreign_source_for_domain_request() {
+        // The domain form names the client but says nothing checkable about the
+        // datagram source, so it falls back to the control connection's IP.
+        let foreign_peer = SocketAddr::from(([192, 0, 2, 10], 41000));
+        let client_peer = SocketAddr::from(([127, 0, 0, 1], 41000));
+        let mut endpoint = UdpClientEndpoint::new(
+            socks5::SocksEndpoint::Domain("client.local".to_owned(), 0),
+            CONTROL_PEER_IP,
+        );
+
+        assert!(!endpoint.accepts(foreign_peer));
+        assert!(endpoint.accepts(client_peer));
+    }
+
+    #[test]
+    fn udp_client_endpoint_still_honours_an_explicit_client_address() {
+        let declared_peer = SocketAddr::from(([203, 0, 113, 5], 41000));
+        let control_peer = SocketAddr::from(([127, 0, 0, 1], 41000));
+        let mut endpoint = UdpClientEndpoint::new(
+            socks5::SocksEndpoint::Ipv4(std::net::Ipv4Addr::new(203, 0, 113, 5), 0),
+            CONTROL_PEER_IP,
+        );
+
+        assert!(!endpoint.accepts(control_peer));
+        assert!(endpoint.accepts(declared_peer));
+    }
+
+    #[test]
+    fn udp_client_endpoint_matches_an_ipv4_mapped_control_peer() {
+        let client_peer = SocketAddr::from(([127, 0, 0, 1], 41000));
+        let mapped_control_ip = IpAddr::V6(std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped());
+        let mut endpoint = UdpClientEndpoint::new(
+            socks5::SocksEndpoint::Ipv4(std::net::Ipv4Addr::UNSPECIFIED, 0),
+            mapped_control_ip,
+        );
+
+        assert!(endpoint.accepts(client_peer));
     }
 
     #[test]
@@ -4364,25 +4876,6 @@ mod tests {
         assert!(!is_clean_socks_disconnect(&boxed_io_error(
             io::ErrorKind::InvalidData
         )));
-    }
-
-    #[tokio::test]
-    async fn local_write_exits_when_shutdown_notifies() {
-        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        let (mut writer, _reader) = tokio::io::duplex(1);
-        let payload = vec![0x42; 1024];
-        let task = tokio::spawn(async move {
-            write_all_or_shutdown(&mut writer, &payload, &mut shutdown_rx).await
-        });
-
-        shutdown_tx.send(true).unwrap();
-        let wrote_payload = tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-
-        assert!(!wrote_payload);
     }
 
     #[tokio::test]
@@ -4831,5 +5324,402 @@ mod tests {
             flow_frame_queue_capacity(64 * 1024 * 1024),
             FLOW_FRAME_QUEUE_MAX_CAPACITY
         );
+    }
+
+    #[test]
+    fn flow_admission_reserves_up_to_the_stream_ceiling() {
+        let admission = FlowAdmissionControl::new(2, 2);
+
+        let first = admission.try_admit(FlowProtocol::Tcp).unwrap();
+        let second = admission.try_admit(FlowProtocol::Tcp).unwrap();
+
+        assert_eq!(admission.available_streams(), 0);
+        assert_eq!(
+            admission.try_admit(FlowProtocol::Tcp).unwrap_err(),
+            AdmissionRefusal::StreamLimit
+        );
+
+        drop(first);
+        assert_eq!(admission.available_streams(), 1);
+        assert!(admission.try_admit(FlowProtocol::Tcp).is_ok());
+        drop(second);
+    }
+
+    #[test]
+    fn concurrent_flow_admission_never_oversubscribes_a_session() {
+        // The old "read `flow_count()`, reserve later" shape let every waiting
+        // opener observe spare capacity; reservation at selection time cannot.
+        let admission = FlowAdmissionControl::new(64, 64);
+        let slots: Vec<FlowSlot> = (0..200)
+            .filter_map(|_| admission.try_admit(FlowProtocol::Tcp).ok())
+            .collect();
+
+        assert_eq!(slots.len(), 64);
+        assert_eq!(admission.available_streams(), 0);
+
+        drop(slots);
+        assert_eq!(admission.available_streams(), 64);
+    }
+
+    #[test]
+    fn udp_admission_consumes_both_ceilings() {
+        let admission = FlowAdmissionControl::new(4, 1);
+
+        let slot = admission.try_admit(FlowProtocol::Udp).unwrap();
+
+        assert_eq!(admission.available_streams(), 3);
+        assert_eq!(admission.available_udp_flows(), 0);
+
+        drop(slot);
+        assert_eq!(admission.available_streams(), 4);
+        assert_eq!(admission.available_udp_flows(), 1);
+    }
+
+    #[test]
+    fn refused_udp_admission_releases_the_stream_slot() {
+        let admission = FlowAdmissionControl::new(4, 1);
+        let _held = admission.try_admit(FlowProtocol::Udp).unwrap();
+
+        assert_eq!(
+            admission.try_admit(FlowProtocol::Udp).unwrap_err(),
+            AdmissionRefusal::UdpFlowLimit
+        );
+        // The stream permit taken before the UDP ceiling was checked must not
+        // be leaked, or repeated UDP refusals would starve TCP flows.
+        assert_eq!(admission.available_streams(), 3);
+        assert!(admission.try_admit(FlowProtocol::Tcp).is_ok());
+    }
+
+    #[test]
+    fn tcp_admission_ignores_the_udp_flow_ceiling() {
+        let admission = FlowAdmissionControl::new(4, 0);
+
+        assert_eq!(
+            admission.try_admit(FlowProtocol::Udp).unwrap_err(),
+            AdmissionRefusal::UdpFlowLimit
+        );
+        assert!(admission.try_admit(FlowProtocol::Tcp).is_ok());
+    }
+
+    #[test]
+    fn clamps_unrepresentable_flow_ceilings_to_the_semaphore_limit() {
+        assert_eq!(semaphore_permits(0), 0);
+        assert_eq!(semaphore_permits(64), 64);
+        assert_eq!(semaphore_permits(u64::MAX), Semaphore::MAX_PERMITS);
+    }
+
+    #[tokio::test]
+    async fn session_admission_reserves_a_slot_on_a_live_session() {
+        let session = test_session(1, 1);
+
+        let admission = session.try_admit(FlowProtocol::Tcp).unwrap();
+
+        assert!(Arc::ptr_eq(&admission.session, &session));
+        assert!(matches!(
+            session.try_admit(FlowProtocol::Tcp),
+            Err(AdmissionRefusal::StreamLimit)
+        ));
+
+        drop(admission);
+        assert!(session.try_admit(FlowProtocol::Tcp).is_ok());
+    }
+
+    #[tokio::test]
+    async fn draining_or_closed_sessions_admit_no_flows() {
+        let draining = test_session(4, 4);
+        draining.begin_drain().await;
+        assert!(matches!(
+            draining.try_admit(FlowProtocol::Tcp),
+            Err(AdmissionRefusal::Unavailable)
+        ));
+
+        let closed = test_session(4, 4);
+        closed.close().await;
+        assert!(matches!(
+            closed.try_admit(FlowProtocol::Tcp),
+            Err(AdmissionRefusal::Unavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn manager_admits_flows_on_the_least_loaded_pooled_session() {
+        let manager = test_session_manager(minimal_config());
+        let busy = test_session(4, 4);
+        let idle = test_session(4, 4);
+        // Give `busy` a flow so the ranking has something to order by.
+        assert!(
+            busy.reserve_flow(FlowProtocol::Tcp)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        manager
+            .pool
+            .lock()
+            .await
+            .extend([Arc::clone(&busy), Arc::clone(&idle)]);
+
+        let admission = manager.admit_flow(FlowProtocol::Tcp).await.unwrap();
+
+        assert!(Arc::ptr_eq(&admission.session, &idle));
+    }
+
+    #[tokio::test]
+    async fn manager_falls_through_to_the_next_session_when_one_is_saturated() {
+        let manager = test_session_manager(minimal_config());
+        let full = test_session(1, 1);
+        let spare = test_session(4, 4);
+        let _held = full.try_admit(FlowProtocol::Tcp).unwrap();
+        manager
+            .pool
+            .lock()
+            .await
+            .extend([Arc::clone(&full), Arc::clone(&spare)]);
+
+        let admission = manager.admit_flow(FlowProtocol::Tcp).await.unwrap();
+
+        assert!(Arc::ptr_eq(&admission.session, &spare));
+    }
+
+    #[tokio::test]
+    async fn manager_rejects_new_flows_when_the_whole_pool_is_saturated() {
+        let mut config = minimal_config();
+        config.max_carrier_sessions = Some(1);
+        let manager = test_session_manager(config);
+        let full = test_session(1, 1);
+        let _held = full.try_admit(FlowProtocol::Tcp).unwrap();
+        manager.pool.lock().await.push(Arc::clone(&full));
+
+        // Genuine exhaustion, not a lost race: no dial past
+        // `max_carrier_sessions` and no error, so the caller replies to SOCKS.
+        let admission = manager
+            .admission_for_new_flow(FlowProtocol::Tcp)
+            .await
+            .unwrap();
+
+        assert!(admission.is_none());
+    }
+
+    #[tokio::test]
+    async fn manager_rejects_udp_flows_at_the_per_session_udp_ceiling() {
+        // `max_carrier_sessions` still has room, but `max_udp_flows` is a
+        // per-session server limit: dialling another carrier to get around it
+        // would work around the server's policy, so reject instead. (The pool
+        // is deliberately left able to grow, and `minimal_config` cannot dial,
+        // so a dial attempt would surface as an error rather than `None`.)
+        let manager = test_session_manager(minimal_config());
+        let session = test_session(4, 1);
+        let _held = session.try_admit(FlowProtocol::Udp).unwrap();
+        manager.pool.lock().await.push(Arc::clone(&session));
+
+        let admission = manager
+            .admission_for_new_flow(FlowProtocol::Udp)
+            .await
+            .unwrap();
+
+        assert!(admission.is_none());
+        // A TCP flow is still admitted on the same session.
+        assert!(
+            manager
+                .admission_for_new_flow(FlowProtocol::Tcp)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_admits_without_dialling_while_the_pool_has_capacity() {
+        // `minimal_config` cannot connect (its CA file is missing), so an
+        // admission that succeeds here proves no dial was attempted.
+        let manager = test_session_manager(minimal_config());
+        manager.pool.lock().await.push(test_session(4, 4));
+
+        assert!(
+            manager
+                .admission_for_new_flow(FlowProtocol::Udp)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_pending_session_is_torn_down() {
+        let session = test_session(4, 4);
+
+        drop(PendingClientSession::new(Arc::clone(&session)));
+
+        // `Drop` cannot await, so the teardown is handed to the runtime.
+        for _ in 0..100 {
+            if session.is_closed() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(session.is_closed());
+    }
+
+    #[tokio::test]
+    async fn pooled_pending_session_is_not_torn_down() {
+        let session = test_session(4, 4);
+        let pending = PendingClientSession::new(Arc::clone(&session));
+
+        let published = pending.into_session();
+
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(Arc::ptr_eq(&published, &session));
+        assert!(!session.is_closed());
+    }
+
+    #[tokio::test]
+    async fn explicitly_closed_pending_session_is_torn_down() {
+        let session = test_session(4, 4);
+
+        PendingClientSession::new(Arc::clone(&session))
+            .close_and_wait()
+            .await;
+
+        assert!(session.is_closed());
+    }
+
+    #[tokio::test]
+    async fn local_write_finishes_the_payload_before_honouring_shutdown() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (mut writer, mut reader) = tokio::io::duplex(4);
+        let payload = vec![0x42_u8; 1024];
+        let task = tokio::spawn(async move {
+            write_all_or_shutdown(&mut writer, &payload, &mut shutdown_rx).await
+        });
+
+        shutdown_tx.send(true).unwrap();
+
+        // The whole payload lands even though shutdown was signalled mid-write;
+        // a cancelled `write_all` would have left a short, unknown-length prefix
+        // behind an otherwise clean FIN.
+        let mut received = vec![0_u8; 1024];
+        tokio::time::timeout(Duration::from_secs(1), reader.read_exact(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, vec![0x42_u8; 1024]);
+
+        let keep_relaying = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!keep_relaying);
+    }
+
+    /// A local peer that stops reading must not hold shutdown open forever: the
+    /// in-flight write gets a bounded grace period and then fails the flow,
+    /// rather than blocking or capping a short write with a clean FIN.
+    #[tokio::test]
+    async fn local_write_gives_up_on_a_local_peer_that_stops_reading() {
+        let grace = Duration::from_millis(50);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let payload = vec![0x42_u8; 1024];
+        let task = tokio::spawn(async move {
+            write_all_or_shutdown_within(&mut writer, &payload, &mut shutdown_rx, grace).await
+        });
+
+        shutdown_tx.send(true).unwrap();
+
+        let err = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the write must not outlive the grace period")
+            .unwrap()
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("timed out flushing local socket"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_write_keeps_relaying_without_shutdown() {
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+
+        let keep_relaying = write_all_or_shutdown(&mut writer, b"payload", &mut shutdown_rx)
+            .await
+            .unwrap();
+
+        let mut received = [0_u8; 7];
+        reader.read_exact(&mut received).await.unwrap();
+        assert!(keep_relaying);
+        assert_eq!(&received, b"payload");
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_already_buffered_frames_before_closing_local() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let (sender, mut frames) = mpsc::channel(4);
+        let metrics = ClientMetrics::default();
+        for payload in [b"first".as_slice(), b"second".as_slice()] {
+            sender
+                .try_send(buffered_flow_frame(data_frame(
+                    FLOW_ID,
+                    Bytes::copy_from_slice(payload),
+                )))
+                .unwrap();
+        }
+        drop(sender);
+
+        flush_buffered_frames_before_shutdown(&mut writer, &mut frames, &metrics)
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"firstsecond");
+    }
+
+    #[tokio::test]
+    async fn shutdown_flush_stops_at_a_non_data_frame() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let (sender, mut frames) = mpsc::channel(4);
+        let metrics = ClientMetrics::default();
+        sender
+            .try_send(buffered_flow_frame(data_frame(
+                FLOW_ID,
+                Bytes::from_static(b"first"),
+            )))
+            .unwrap();
+        sender
+            .try_send(buffered_flow_frame(close_frame(TCP_CLOSE_NORMAL)))
+            .unwrap();
+        drop(sender);
+
+        flush_buffered_frames_before_shutdown(&mut writer, &mut frames, &metrics)
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"first");
+    }
+
+    #[tokio::test]
+    async fn shutdown_flush_is_a_no_op_without_buffered_frames() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let (_sender, mut frames) = mpsc::channel(1);
+        let metrics = ClientMetrics::default();
+
+        flush_buffered_frames_before_shutdown(&mut writer, &mut frames, &metrics)
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).await.unwrap();
+        assert!(received.is_empty());
     }
 }

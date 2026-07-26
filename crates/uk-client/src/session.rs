@@ -158,6 +158,10 @@ struct EndpointAttemptError {
 #[derive(Debug)]
 struct ConnectAttemptsError {
     attempts: Vec<EndpointAttemptError>,
+    /// Set when the endpoint loop stopped early because the server definitively
+    /// rejected the configured credentials, so the remaining endpoints were
+    /// never dialled.
+    credential_rejection: bool,
 }
 
 impl fmt::Display for ConnectAttemptsError {
@@ -176,6 +180,11 @@ impl fmt::Display for ConnectAttemptsError {
                 formatter,
                 "; [{}] {}: {}",
                 attempt.index, attempt.endpoint, attempt.error
+            )?;
+        }
+        if self.credential_rejection {
+            formatter.write_str(
+                "; the server rejected these credentials, so the remaining endpoints were not tried",
             )?;
         }
         Ok(())
@@ -260,6 +269,7 @@ where
     let connector = tls::connector(&config.ca_cert_path)?;
     let server_name = tls::server_name(config.server_name.clone())?;
     let mut attempts = Vec::new();
+    let mut credential_rejection = false;
 
     for (index, endpoint) in config.server_endpoints().into_iter().enumerate() {
         match connect_authenticated_endpoint_with_timeout(
@@ -277,12 +287,14 @@ where
             }
             Err(err) => {
                 let failure_phase = endpoint_failure_phase(&err);
+                credential_rejection = is_credential_rejection(&err);
                 observe(EndpointAttemptOutcome::Failed(failure_phase));
                 warn!(
                     event = "client.session.connect_endpoint_failed",
                     attempt = index,
                     server_addr = %endpoint,
                     failure_phase = failure_phase.label(),
+                    credential_rejection,
                     error = %err
                 );
                 attempts.push(EndpointAttemptError {
@@ -290,11 +302,21 @@ where
                     endpoint: endpoint.to_owned(),
                     error: err,
                 });
+                if credential_rejection {
+                    // The credentials, not this carrier, are what the server
+                    // refused. Every remaining endpoint would replay the same
+                    // full handshake only to be rejected identically, costing
+                    // another `handshake_timeout` per SOCKS connection.
+                    break;
+                }
             }
         }
     }
 
-    Err(Box::new(ConnectAttemptsError { attempts }))
+    Err(Box::new(ConnectAttemptsError {
+        attempts,
+        credential_rejection,
+    }))
 }
 
 async fn connect_authenticated_endpoint_with_timeout(
@@ -539,6 +561,26 @@ fn endpoint_failure_phase(error: &AnyError) -> EndpointFailurePhase {
     EndpointFailurePhase::Other
 }
 
+/// Reports whether the server structurally refused the configured credentials,
+/// i.e. answered the `AuthResponse` with `ERROR{AuthFailed}`.
+///
+/// Keyed on [`ServerHandshakeError`] rather than [`EndpointFailurePhase::Auth`]
+/// on purpose: that phase is also produced by plain I/O failures while reading
+/// or writing the auth frames (a reset carrier, a truncated challenge), which
+/// are per-endpoint problems and must still fall back to the next carrier. Only
+/// a decoded rejection from the server proves the next endpoint would fail the
+/// same way.
+fn is_credential_rejection(error: &AnyError) -> bool {
+    let mut current = Some(error.as_ref() as &(dyn Error + 'static));
+    while let Some(source) = current {
+        if let Some(rejection) = source.downcast_ref::<ServerHandshakeError>() {
+            return matches!(rejection.code, ErrorCode::AuthFailed);
+        }
+        current = source.source();
+    }
+    false
+}
+
 fn handshake_timeout(seconds: u64) -> Option<Duration> {
     (seconds != 0).then(|| Duration::from_secs(seconds))
 }
@@ -596,18 +638,39 @@ mod tests {
                 attempt_error(0, "127.0.0.1:1", "connection refused"),
                 attempt_error(1, "127.0.0.1:2", "handshake timeout"),
             ],
+            credential_rejection: false,
         };
         let text = error.to_string();
 
         assert!(text.contains("2 endpoint attempt"));
         assert!(text.contains("[0] 127.0.0.1:1: connection refused"));
         assert!(text.contains("[1] 127.0.0.1:2: handshake timeout"));
+        assert!(!text.contains("remaining endpoints were not tried"));
+    }
+
+    #[test]
+    fn endpoint_attempt_error_reports_an_abandoned_endpoint_fallback() {
+        let error = ConnectAttemptsError {
+            attempts: vec![attempt_error(
+                0,
+                "quic://127.0.0.1:1",
+                "authentication failed",
+            )],
+            credential_rejection: true,
+        };
+        let text = error.to_string();
+
+        assert!(text.contains("1 endpoint attempt"));
+        assert!(text.contains("[0] quic://127.0.0.1:1: authentication failed"));
+        assert!(text.contains("the server rejected these credentials"));
+        assert!(text.contains("remaining endpoints were not tried"));
     }
 
     #[test]
     fn empty_endpoint_attempt_error_reports_no_endpoints() {
         let error = ConnectAttemptsError {
             attempts: Vec::new(),
+            credential_rejection: false,
         };
 
         assert_eq!(error.to_string(), "no server endpoints configured");
@@ -667,6 +730,57 @@ mod tests {
                 .to_string()
                 .contains("server returned handshake error")
         );
+    }
+
+    #[test]
+    fn treats_server_auth_rejection_as_a_credential_rejection() {
+        let error = decode_server_settings_frame(error_frame(ErrorCode::AuthFailed)).unwrap_err();
+
+        assert!(is_credential_rejection(&error));
+    }
+
+    #[test]
+    fn treats_nested_server_auth_rejection_as_a_credential_rejection() {
+        let rejection: AnyError = Box::new(ServerHandshakeError {
+            code: ErrorCode::AuthFailed,
+        });
+        let error = phase_error(
+            "decode server settings",
+            EndpointFailurePhase::Settings,
+            rejection,
+        );
+
+        assert!(is_credential_rejection(&error));
+    }
+
+    #[test]
+    fn does_not_treat_auth_phase_io_errors_as_a_credential_rejection() {
+        // These are the `EndpointFailurePhase::Auth` errors that a broken
+        // carrier produces; the next endpoint must still be tried.
+        for phase in [
+            "read auth challenge",
+            "write auth response",
+            "read server settings",
+        ] {
+            let error = phase_error(
+                phase,
+                EndpointFailurePhase::Auth,
+                std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+            );
+
+            assert_eq!(endpoint_failure_phase(&error), EndpointFailurePhase::Auth);
+            assert!(
+                !is_credential_rejection(&error),
+                "{phase} must stay retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_treat_other_server_handshake_errors_as_a_credential_rejection() {
+        let error = decode_server_settings_frame(error_frame(ErrorCode::Protocol)).unwrap_err();
+
+        assert!(!is_credential_rejection(&error));
     }
 
     #[test]

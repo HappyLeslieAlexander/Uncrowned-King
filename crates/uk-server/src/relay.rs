@@ -31,10 +31,10 @@ use uk_auth::{AuthenticatedIdentity, unix_now};
 use uk_policy::{PolicyContext, PolicyDecision, PolicySet};
 use uk_proto::{
     BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, DatagramSendOutcome, ErrorCode,
-    ErrorPayload, Frame, FrameIoError, FrameLimits, FrameType, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL,
-    TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose,
-    UdpOpen, datagram, is_client_initiated_flow_id, read_frame, validate_connection_frame,
-    write_frame,
+    ErrorPayload, Frame, FrameIoError, FrameLimits, FrameReader, FrameType, TCP_CLOSE_ERROR,
+    TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR,
+    UDP_CLOSE_NORMAL, UdpClose, UdpOpen, datagram, is_client_initiated_flow_id,
+    validate_connection_frame, write_frame,
 };
 
 use crate::observability::{
@@ -258,7 +258,10 @@ enum FlowEvent {
         flow_id: u64,
         token: FlowToken,
     },
-    UdpReadClosed(u64),
+    UdpReadClosed {
+        flow_id: u64,
+        token: FlowToken,
+    },
     UdpActivity(u64),
     InboundDatagram {
         flow_id: u64,
@@ -404,6 +407,10 @@ struct TargetFlow {
 
 #[derive(Debug)]
 struct UdpTargetFlow {
+    /// Identifies this incarnation of the flow id, so a reader task that
+    /// finishes after the id has been closed and re-opened cannot act on the
+    /// new flow. Mirrors `TargetFlow::token`.
+    token: FlowToken,
     socket: Arc<UdpSocket>,
     control: TargetFlowControl,
     last_activity: time::Instant,
@@ -468,6 +475,7 @@ struct TargetReaderTask {
 
 struct UdpReaderTask {
     flow_id: u64,
+    token: FlowToken,
     target_socket: Arc<UdpSocket>,
     flow_control: TargetFlowControl,
     carrier_writer: CarrierWriter,
@@ -500,10 +508,11 @@ pub(crate) async fn relay_session(
     transition(&mut state, ServerSessionState::Relaying);
 
     let ServerCarrier {
-        mut carrier_reader,
+        carrier_reader,
         carrier_writer,
         datagrams,
     } = carrier;
+    let mut carrier_reader = FrameReader::new(carrier_reader, limits.frame);
     let (event_tx, mut event_rx) = mpsc::channel(session_event_queue_capacity(limits));
     let mut target_writers = FlowTable::new();
     let mut session_tasks = SessionTasks::default();
@@ -534,7 +543,6 @@ pub(crate) async fn relay_session(
             &mut carrier_reader,
             &mut event_rx,
             &mut session_tasks,
-            limits.frame,
             idle_deadline,
             &mut udp_idle_interval,
             &mut shutdown_rx,
@@ -544,59 +552,115 @@ pub(crate) async fn relay_session(
             Ok(event) => event,
             Err(err) => break Err(err),
         };
-        let counts_as_activity = match event {
-            SessionEvent::Flow(event) => {
-                let counts_as_activity =
-                    flow_event_counts_as_session_activity(event.as_ref(), &target_writers);
-                handle_flow_event(event, &context, &mut target_writers, &mut session_tasks).await?;
-                counts_as_activity
-            }
-            SessionEvent::Frame(frame) => {
-                if let Err(err) =
-                    handle_session_frame(frame, &context, &mut target_writers, &mut session_tasks)
-                        .await
-                {
-                    break Err(err);
-                }
-                session_has_activity_flows(&target_writers)
-            }
-            SessionEvent::SessionTaskCompleted => false,
-            SessionEvent::UdpIdleMaintenance => {
-                if let Err(err) = close_idle_udp_flows(&context, &mut target_writers).await {
-                    break Err(err);
-                }
-                false
-            }
-            SessionEvent::FrameReadError(err) => {
-                report_frame_io_error(context.carrier_writer, &err).await;
-                break Err(err.into());
-            }
-            SessionEvent::IdleTimeout => {
-                info!(event = "server.session.idle_timeout");
-                break Ok(());
-            }
-            SessionEvent::PeerClosed => {
-                info!(event = "server.session.peer_closed");
-                break Ok(());
-            }
-            SessionEvent::Shutdown => {
-                info!(event = "server.session.shutdown");
-                break Ok(());
-            }
-        };
-
-        if counts_as_activity {
-            idle_deadline = next_idle_deadline(idle_timeout);
+        match handle_session_event(event, &context, &mut target_writers, &mut session_tasks).await {
+            SessionStep::Continue {
+                counts_as_activity: true,
+            } => idle_deadline = next_idle_deadline(idle_timeout),
+            SessionStep::Continue {
+                counts_as_activity: false,
+            } => {}
+            SessionStep::Stop(result) => break result,
         }
     };
 
-    transition(&mut state, ServerSessionState::Closing);
-    shutdown.close();
-    close_target_flows(&mut target_writers);
-    drain_session_tasks(&mut session_tasks, limits.session_task_shutdown_timeout).await;
-    shutdown_carrier_writer(&carrier_writer).await;
-    transition(&mut state, ServerSessionState::Closed);
+    close_session(
+        &mut state,
+        &shutdown,
+        &mut target_writers,
+        &mut session_tasks,
+        &carrier_writer,
+        limits.session_task_shutdown_timeout,
+    )
+    .await;
     result
+}
+
+/// What the session loop should do after handling one event.
+enum SessionStep {
+    /// Keep relaying; `counts_as_activity` refreshes the idle deadline.
+    Continue { counts_as_activity: bool },
+    /// Leave the loop with this outcome, then run the shared teardown.
+    Stop(Result<(), AnyError>),
+}
+
+/// Applies one session event.
+///
+/// Failures are returned as `SessionStep::Stop(Err(..))` rather than propagated
+/// with `?`, so the caller always reaches [`close_session`]. Returning early
+/// here would leave target writers mid-write, kill spawned tasks via
+/// `JoinSet::drop` instead of draining them, and drop the carrier without a
+/// clean shutdown.
+async fn handle_session_event(
+    event: SessionEvent,
+    context: &RelaySessionContext<'_>,
+    target_writers: &mut FlowTable,
+    session_tasks: &mut SessionTasks,
+) -> SessionStep {
+    let counts_as_activity = match event {
+        SessionEvent::Flow(event) => {
+            let counts_as_activity =
+                flow_event_counts_as_session_activity(event.as_ref(), target_writers);
+            if let Err(err) = handle_flow_event(event, context, target_writers, session_tasks).await
+            {
+                return SessionStep::Stop(Err(err));
+            }
+            counts_as_activity
+        }
+        SessionEvent::Frame(frame) => {
+            if let Err(err) =
+                handle_session_frame(frame, context, target_writers, session_tasks).await
+            {
+                return SessionStep::Stop(Err(err));
+            }
+            session_has_activity_flows(target_writers)
+        }
+        SessionEvent::SessionTaskCompleted => false,
+        SessionEvent::UdpIdleMaintenance => {
+            if let Err(err) = close_idle_udp_flows(context, target_writers).await {
+                return SessionStep::Stop(Err(err));
+            }
+            false
+        }
+        SessionEvent::FrameReadError(err) => {
+            report_frame_io_error(context.carrier_writer, &err).await;
+            return SessionStep::Stop(Err(err.into()));
+        }
+        SessionEvent::IdleTimeout => {
+            info!(event = "server.session.idle_timeout");
+            return SessionStep::Stop(Ok(()));
+        }
+        SessionEvent::PeerClosed => {
+            info!(event = "server.session.peer_closed");
+            return SessionStep::Stop(Ok(()));
+        }
+        SessionEvent::Shutdown => {
+            info!(event = "server.session.shutdown");
+            return SessionStep::Stop(Ok(()));
+        }
+    };
+    SessionStep::Continue { counts_as_activity }
+}
+
+/// Tears a session down in order: stop accepting work, close the target flows,
+/// drain the spawned tasks, then shut the carrier writer down cleanly.
+///
+/// Every exit from the session loop must run this, which is why the loop breaks
+/// with a value rather than returning early — a `?` would skip it and leave
+/// target writers mid-write and the carrier closed without a clean shutdown.
+async fn close_session(
+    state: &mut ServerSessionState,
+    shutdown: &SessionShutdown,
+    target_writers: &mut FlowTable,
+    session_tasks: &mut SessionTasks,
+    carrier_writer: &CarrierWriter,
+    task_shutdown_timeout: Option<Duration>,
+) {
+    transition(state, ServerSessionState::Closing);
+    shutdown.close();
+    close_target_flows(target_writers);
+    drain_session_tasks(session_tasks, task_shutdown_timeout).await;
+    shutdown_carrier_writer(carrier_writer).await;
+    transition(state, ServerSessionState::Closed);
 }
 
 async fn handle_flow_event(
@@ -647,11 +711,8 @@ async fn handle_flow_event(
                 session_tasks,
             );
         }
-        Some(FlowEvent::UdpReadClosed(flow_id)) => {
-            if matches!(target_writers.get(&flow_id), Some(FlowSlot::Udp(_))) {
-                remove_flow_slot(target_writers, flow_id);
-                info!(event = "udp.closed", flow_id);
-            }
+        Some(FlowEvent::UdpReadClosed { flow_id, token }) => {
+            handle_udp_read_closed(flow_id, token, target_writers);
         }
         Some(FlowEvent::UdpActivity(flow_id)) => {
             if let Some(target) = udp_target_flow_mut(target_writers, flow_id) {
@@ -675,6 +736,31 @@ async fn handle_flow_event(
         Some(FlowEvent::Activity) | None => {}
     }
     Ok(())
+}
+
+/// Retires a UDP flow whose reader task has finished.
+///
+/// The token must match the flow currently occupying `flow_id`: a reader that
+/// finishes after its id was closed and re-opened would otherwise tear down the
+/// new association, leaving the client sending into a flow the server no longer
+/// knows about.
+fn handle_udp_read_closed(flow_id: u64, token: FlowToken, target_writers: &mut FlowTable) {
+    if matches!(
+        target_writers.get(&flow_id),
+        Some(FlowSlot::Udp(target)) if target.token == token
+    ) {
+        remove_flow_slot(target_writers, flow_id);
+        info!(event = "udp.closed", flow_id);
+    }
+}
+
+/// Whether a `TCP_CLOSE(NORMAL)` should start a half-close drain timer.
+///
+/// Only the close that actually half-closes the flow qualifies. Testing the
+/// target read side alone would arm a fresh timer for every duplicate
+/// `TCP_CLOSE`, since a repeat leaves the slot in place with that side open.
+const fn should_start_half_close_drain(target: &TargetFlow) -> bool {
+    target.client_to_target_open && target.target_to_client_open
 }
 
 fn handle_target_read_closed(
@@ -788,11 +874,18 @@ fn handle_target_write_closed(flow_id: u64, token: FlowToken, target_writers: &m
     }
 }
 
+/// Waits for the next thing the session loop has to act on.
+///
+/// Every future used as a branch here must be cancellation safe, because
+/// `select!` drops the losers. `FrameReader::read_frame` buffers inside the
+/// reader rather than inside the future, so a frame that is still arriving when
+/// another branch fires is resumed intact on the next call; using the free
+/// `read_frame` function here would discard the bytes already taken from the
+/// carrier and resynchronise part-way through a frame.
 async fn next_session_event(
-    carrier_reader: &mut BoxedCarrierReader,
+    carrier_reader: &mut FrameReader<BoxedCarrierReader>,
     event_rx: &mut FlowEventReceiver,
     session_tasks: &mut SessionTasks,
-    limits: FrameLimits,
     idle_deadline: Option<time::Instant>,
     udp_idle_interval: &mut Option<time::Interval>,
     shutdown_rx: &mut watch::Receiver<bool>,
@@ -804,7 +897,7 @@ async fn next_session_event(
     if let Some(idle_deadline) = idle_deadline {
         tokio::select! {
             event = event_rx.recv() => Ok(SessionEvent::Flow(event)),
-            frame = read_frame(carrier_reader, limits) => Ok(map_frame_event(frame)),
+            frame = carrier_reader.read_frame() => Ok(map_frame_event(frame)),
             () = session_tasks.join_next(), if !session_tasks.is_empty() => {
                 Ok(SessionEvent::SessionTaskCompleted)
             }
@@ -820,7 +913,7 @@ async fn next_session_event(
     } else {
         tokio::select! {
             event = event_rx.recv() => Ok(SessionEvent::Flow(event)),
-            frame = read_frame(carrier_reader, limits) => Ok(map_frame_event(frame)),
+            frame = carrier_reader.read_frame() => Ok(map_frame_event(frame)),
             () = session_tasks.join_next(), if !session_tasks.is_empty() => {
                 Ok(SessionEvent::SessionTaskCompleted)
             }
@@ -1109,7 +1202,7 @@ async fn handle_tcp_close_frame(
         Some(FlowSlot::OpeningTcp(_)) => true,
         Some(FlowSlot::Tcp(target)) => {
             if close.close_code == TCP_CLOSE_NORMAL {
-                let should_start_drain_timer = target.target_to_client_open;
+                let should_start_drain_timer = should_start_half_close_drain(target);
                 let token = target.token;
                 target.close_client_to_target();
                 if should_start_drain_timer {
@@ -1910,13 +2003,15 @@ async fn accept_open_udp_target(
 ) -> Result<UdpTargetFlow, AnyError> {
     let target_socket = Arc::new(target_socket);
     let flow_control = TargetFlowControl::new(context.session_buffer.clone());
+    let token = context.flow_tokens.next();
     send_udp_data(context.carrier_writer, flow_id, Bytes::new()).await?;
-    let target_flow = UdpTargetFlow::new(Arc::clone(&target_socket), flow_control.clone())
+    let target_flow = UdpTargetFlow::new(token, Arc::clone(&target_socket), flow_control.clone())
         .track_metrics(context.metrics.begin_flow(RelayProtocol::Udp));
     spawn_udp_reader(
         session_tasks,
         UdpReaderTask {
             flow_id,
+            token,
             target_socket,
             flow_control,
             carrier_writer: context.carrier_writer.clone(),
@@ -2152,7 +2247,10 @@ fn spawn_udp_reader(session_tasks: &mut SessionTasks, task: UdpReaderTask) {
         }
         send_flow_event_or_shutdown(
             &task.event_tx,
-            FlowEvent::UdpReadClosed(task.flow_id),
+            FlowEvent::UdpReadClosed {
+                flow_id: task.flow_id,
+                token: task.token,
+            },
             &task.shutdown,
         )
         .await;
@@ -2670,8 +2768,9 @@ impl Drop for TargetFlow {
 }
 
 impl UdpTargetFlow {
-    fn new(socket: Arc<UdpSocket>, control: TargetFlowControl) -> Self {
+    fn new(token: FlowToken, socket: Arc<UdpSocket>, control: TargetFlowControl) -> Self {
         Self {
+            token,
             socket,
             control,
             last_activity: time::Instant::now(),
@@ -3412,8 +3511,12 @@ mod tests {
     }
 
     async fn test_udp_flow() -> UdpTargetFlow {
+        test_udp_flow_with_token(FlowToken(0)).await
+    }
+
+    async fn test_udp_flow_with_token(token: FlowToken) -> UdpTargetFlow {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        UdpTargetFlow::new(Arc::new(socket), TargetFlowControl::default())
+        UdpTargetFlow::new(token, Arc::new(socket), TargetFlowControl::default())
     }
 
     fn test_relay_limits(max_streams: u64) -> RelayLimits {
@@ -3554,6 +3657,59 @@ mod tests {
         let target = open_target_flow_mut(&mut target_writers, 1).expect("flow should remain open");
         assert!(target.target_to_client_open);
         assert!(target.client_to_target_open);
+    }
+
+    #[tokio::test]
+    async fn stale_udp_read_close_does_not_remove_reused_flow_id() {
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(
+            1,
+            FlowSlot::Udp(test_udp_flow_with_token(TEST_FLOW_TOKEN).await),
+        );
+
+        handle_udp_read_closed(1, STALE_FLOW_TOKEN, &mut target_writers);
+
+        assert!(
+            matches!(target_writers.get(&1), Some(FlowSlot::Udp(_))),
+            "a stale reader must not retire the re-opened flow"
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_udp_read_close_removes_flow() {
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(
+            1,
+            FlowSlot::Udp(test_udp_flow_with_token(TEST_FLOW_TOKEN).await),
+        );
+
+        handle_udp_read_closed(1, TEST_FLOW_TOKEN, &mut target_writers);
+
+        assert!(!target_writers.contains_key(&1));
+    }
+
+    #[test]
+    fn half_close_drain_timer_starts_once_per_flow() {
+        let mut flow = test_target_flow_with_token(TEST_FLOW_TOKEN);
+        assert!(
+            should_start_half_close_drain(&flow),
+            "the first client close half-closes the flow"
+        );
+
+        flow.close_client_to_target();
+
+        assert!(
+            !should_start_half_close_drain(&flow),
+            "a duplicate TCP_CLOSE must not arm another drain timer"
+        );
+    }
+
+    #[test]
+    fn half_close_drain_timer_skipped_when_target_read_already_closed() {
+        let mut flow = test_target_flow_with_token(TEST_FLOW_TOKEN);
+        flow.mark_target_to_client_closed();
+
+        assert!(!should_start_half_close_drain(&flow));
     }
 
     #[test]
@@ -4166,7 +4322,15 @@ mod tests {
         let shutdown_handle = shutdown.clone();
 
         let sender = tokio::spawn(async move {
-            send_flow_event_or_shutdown(&event_tx, FlowEvent::UdpReadClosed(1), &shutdown).await;
+            send_flow_event_or_shutdown(
+                &event_tx,
+                FlowEvent::UdpReadClosed {
+                    flow_id: 1,
+                    token: FlowToken(0),
+                },
+                &shutdown,
+            )
+            .await;
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!sender.is_finished());

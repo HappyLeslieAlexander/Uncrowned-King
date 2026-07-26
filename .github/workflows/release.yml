@@ -24,6 +24,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # Both binaries report CARGO_PKG_VERSION as `--version`, so a tag that
+      # disagrees with the workspace version ships binaries that misreport
+      # themselves. Every other job `needs:` this one, so failing here aborts
+      # the whole release.
+      - name: Verify tag matches workspace version
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version ${version} in Cargo.toml"
+            exit 1
+          fi
+          echo "tag ${GITHUB_REF_NAME} matches workspace version ${version}"
       - name: Create release from CHANGELOG
         uses: taiki-e/create-gh-release-action@v1
         with:

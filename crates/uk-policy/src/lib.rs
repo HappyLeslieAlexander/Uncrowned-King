@@ -27,7 +27,9 @@ pub enum PolicyError {
     #[error("invalid policy action {0}")]
     InvalidAction(String),
     /// Invalid domain predicate.
-    #[error("invalid policy domain {0}")]
+    #[error(
+        "invalid policy domain {0} (expected a bare hostname or suffix; glob wildcards, URL schemes, ports and IP literals are not supported and would never match)"
+    )]
     InvalidDomain(String),
     /// Invalid key id predicate.
     #[error("invalid policy key id {0}")]
@@ -323,6 +325,7 @@ fn validate_domain_match(domain: String) -> PolicyResult<String> {
     if normalized.is_empty()
         || normalized.starts_with('.')
         || domain.bytes().any(|byte| byte.is_ascii_control())
+        || is_unmatchable_domain_pattern(&normalized)
     {
         Err(PolicyError::InvalidDomain(domain))
     } else {
@@ -332,11 +335,37 @@ fn validate_domain_match(domain: String) -> PolicyResult<String> {
 
 fn validate_domain_suffix_match(suffix: String) -> PolicyResult<String> {
     let normalized = normalize_domain(&suffix);
-    if normalized.is_empty() || suffix.bytes().any(|byte| byte.is_ascii_control()) {
+    if normalized.is_empty()
+        || suffix.bytes().any(|byte| byte.is_ascii_control())
+        || is_unmatchable_domain_pattern(&normalized)
+    {
         Err(PolicyError::InvalidDomain(suffix))
     } else {
         Ok(suffix)
     }
+}
+
+/// Characters that can never appear in the hostname of a `Target::Domain`.
+///
+/// A pattern containing one of them is dead: it parses, passes `config-check`
+/// and then silently never matches, which turns a deny rule into a no-op. The
+/// common mistakes are glob syntax (`*.internal.corp`), a URL instead of a host
+/// (`http://x.com`, `x.com:443`) and a mail-style address (`user@x.com`).
+const UNMATCHABLE_DOMAIN_CHARS: [char; 4] = ['*', '/', ':', '@'];
+
+/// Returns true when `normalized` can never match a domain target.
+///
+/// IP literals are rejected as well: an IP target decodes to `Target::Ipv4` or
+/// `Target::Ipv6`, so `target_domain` returns `None` and a `domain` predicate
+/// holding an address is likewise dead. Use a `cidr` predicate instead.
+fn is_unmatchable_domain_pattern(normalized: &str) -> bool {
+    normalized
+        .chars()
+        .any(|character| character.is_whitespace() || UNMATCHABLE_DOMAIN_CHARS.contains(&character))
+        || normalized.parse::<IpAddr>().is_ok()
+        || normalized
+            .strip_prefix('.')
+            .is_some_and(|stripped| stripped.parse::<IpAddr>().is_ok())
 }
 
 fn domain_matches_exact(domain: &str, want: &str) -> bool {
@@ -404,7 +433,7 @@ fn is_metadata_service_ip(ip: IpAddr) -> bool {
             ip == Ipv4Addr::new(169, 254, 169, 254) || ip == Ipv4Addr::new(100, 100, 100, 200)
         }
         IpAddr::V6(ip) => {
-            ipv4_mapped(ip).is_some_and(|ip| is_metadata_service_ip(IpAddr::V4(ip)))
+            embedded_ipv4(ip).is_some_and(|ip| is_metadata_service_ip(IpAddr::V4(ip)))
                 || ip == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)
         }
     }
@@ -426,13 +455,15 @@ fn is_private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => is_restricted_ipv4(ip),
         IpAddr::V6(ip) => {
-            ipv4_mapped(ip).is_some_and(|ip| is_private(IpAddr::V4(ip)))
+            embedded_ipv4(ip).is_some_and(|ip| is_private(IpAddr::V4(ip)))
                 || ip.is_unique_local()
                 || ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_multicast()
                 || is_ipv6_unicast_link_local(ip)
+                || is_ipv6_site_local(ip)
                 || is_ipv6_documentation(ip)
+                || is_ipv6_orchid(ip)
         }
     }
 }
@@ -447,6 +478,8 @@ fn is_restricted_ipv4(ip: Ipv4Addr) -> bool {
         || is_ipv4_documentation(ip)
         || is_ipv4_shared_address(ip)
         || is_ipv4_benchmarking(ip)
+        || is_ipv4_protocol_assignment(ip)
+        || is_ipv4_6to4_relay_anycast(ip)
         || is_ipv4_reserved(ip)
 }
 
@@ -467,6 +500,17 @@ fn is_ipv4_benchmarking(ip: Ipv4Addr) -> bool {
     first == 198 && matches!(second, 18 | 19)
 }
 
+/// 192.0.0.0/24, the IETF protocol assignments block. It holds the NAT64
+/// well-known addresses (192.0.0.170/171) and DS-Lite (192.0.0.0/29).
+fn is_ipv4_protocol_assignment(ip: Ipv4Addr) -> bool {
+    matches!(ip.octets(), [192, 0, 0, _])
+}
+
+/// 192.88.99.0/24, the deprecated 6to4 relay anycast block.
+fn is_ipv4_6to4_relay_anycast(ip: Ipv4Addr) -> bool {
+    matches!(ip.octets(), [192, 88, 99, _])
+}
+
 fn is_ipv4_reserved(ip: Ipv4Addr) -> bool {
     ip.octets()[0] >= 240
 }
@@ -475,20 +519,72 @@ fn is_ipv6_unicast_link_local(ip: Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xffc0) == 0xfe80
 }
 
+/// fec0::/10, the deprecated site-local unicast range.
+fn is_ipv6_site_local(ip: Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfec0
+}
+
+/// 2001:db8::/32 (RFC 3849) and 3fff::/20 (RFC 9637) documentation ranges.
 fn is_ipv6_documentation(ip: Ipv6Addr) -> bool {
     let segments = ip.segments();
-    segments[0] == 0x2001 && segments[1] == 0x0db8
+    (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || (segments[0] == 0x3fff && (segments[1] & 0xf000) == 0)
+}
+
+/// 2001:10::/28, the ORCHID range (RFC 4843).
+fn is_ipv6_orchid(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0x2001 && (segments[1] & 0xfff0) == 0x0010
+}
+
+/// Returns the IPv4 address embedded in `ip` by any known transition format.
+///
+/// Deliberately broader than [`ipv4_mapped`], and used only by the deny-side
+/// classifiers [`is_private`] and [`is_metadata_service_ip`]: those must be
+/// maximally inclusive, since recognizing one extra embedding can only ever add
+/// a denial. [`Cidr::contains`] keeps using the strict [`ipv4_mapped`] form
+/// because a CIDR predicate also drives allow-rules, where "this IPv6 address is
+/// equivalent to that IPv4 address" must stay precise; treating a NAT64 or 6to4
+/// address as an address inside `10.0.0.0/8` there would wrongly *allow*
+/// traffic, not deny it.
+fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let segments = ip.segments();
+    if let Some(mapped) = ipv4_mapped(ip) {
+        return Some(mapped);
+    }
+    // RFC 6052 well-known NAT64 prefix. The specification also permits
+    // network-specific prefixes at /32, /40, /48, /56, /64 and /96; those are
+    // site configuration and cannot be recognized from the address alone.
+    if segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+        return Some(ipv4_from_segments(segments[6], segments[7]));
+    }
+    // RFC 4291 IPv4-compatible addresses (deprecated). The unspecified address
+    // and the loopback address share this prefix but are not IPv4 embeddings,
+    // so they keep their own classification instead of decoding to 0.0.0.0/1.
+    if segments[..6] == [0, 0, 0, 0, 0, 0] && !(segments[6] == 0 && segments[7] <= 1) {
+        return Some(ipv4_from_segments(segments[6], segments[7]));
+    }
+    // RFC 3056 6to4, which carries the IPv4 address in the second and third
+    // segments rather than the last two.
+    if segments[0] == 0x2002 {
+        return Some(ipv4_from_segments(segments[1], segments[2]));
+    }
+    None
 }
 
 fn ipv4_mapped(ip: Ipv6Addr) -> Option<Ipv4Addr> {
     let segments = ip.segments();
     if segments[..5] == [0, 0, 0, 0, 0] && segments[5] == 0xffff {
-        let high = segments[6].to_be_bytes();
-        let low = segments[7].to_be_bytes();
-        Some(Ipv4Addr::new(high[0], high[1], low[0], low[1]))
+        Some(ipv4_from_segments(segments[6], segments[7]))
     } else {
         None
     }
+}
+
+fn ipv4_from_segments(high: u16, low: u16) -> Ipv4Addr {
+    let high = high.to_be_bytes();
+    let low = low.to_be_bytes();
+    Ipv4Addr::new(high[0], high[1], low[0], low[1])
 }
 
 fn ipv4_mask(prefix: u8) -> u32 {
@@ -886,6 +982,164 @@ mod tests {
     }
 
     #[test]
+    fn denies_embedded_ipv4_metadata_targets() {
+        let rule = PolicyRule::new(PolicyDecision::Allow);
+        let policy = PolicySet::new(vec![rule]);
+        let embedded = [
+            "::ffff:169.254.169.254",
+            "64:ff9b::169.254.169.254",
+            "::169.254.169.254",
+            "2002:a9fe:a9fe::",
+            "64:ff9b::100.100.100.200",
+            "2002:6464:64c8::",
+        ];
+
+        for ip in embedded {
+            let target = Target::Ipv6(ip.parse().unwrap(), 80);
+            assert_eq!(
+                policy.evaluate(&context(&target, Some("default"), &[])),
+                PolicyDecision::Deny,
+                "{ip} reached the metadata service"
+            );
+        }
+    }
+
+    #[test]
+    fn denies_embedded_private_ipv4_by_private_rule() {
+        let mut deny_rule = PolicyRule::new(PolicyDecision::Deny);
+        deny_rule.private = Some(true);
+        let allow_rule = PolicyRule::new(PolicyDecision::Allow);
+        let policy = PolicySet::new(vec![deny_rule, allow_rule]);
+        let embedded = [
+            "::ffff:10.0.0.1",
+            "64:ff9b::10.0.0.1",
+            "::10.0.0.1",
+            "2002:0a00:0001::",
+            "64:ff9b::127.0.0.1",
+            "::192.168.1.1",
+        ];
+
+        for ip in embedded {
+            let target = Target::Ipv6(ip.parse().unwrap(), 443);
+            assert_eq!(
+                policy.evaluate(&context(&target, Some("default"), &[])),
+                PolicyDecision::Deny,
+                "{ip} escaped the private deny rule"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_public_embedded_ipv4_public() {
+        let mut deny_rule = PolicyRule::new(PolicyDecision::Deny);
+        deny_rule.private = Some(true);
+        let allow_rule = PolicyRule::new(PolicyDecision::Allow);
+        let policy = PolicySet::new(vec![deny_rule, allow_rule]);
+        let public = [
+            "64:ff9b::93.184.216.34",
+            "::93.184.216.34",
+            "2002:5db8:d822::",
+            "2606:4700::1111",
+        ];
+
+        for ip in public {
+            let target = Target::Ipv6(ip.parse().unwrap(), 443);
+            assert_eq!(
+                policy.evaluate(&context(&target, Some("default"), &[])),
+                PolicyDecision::Allow,
+                "{ip} was wrongly classified as private"
+            );
+        }
+    }
+
+    #[test]
+    fn denies_reserved_ipv6_ranges_by_private_rule() {
+        let mut rule = PolicyRule::new(PolicyDecision::Deny);
+        rule.private = Some(true);
+        let policy = PolicySet::new(vec![rule]);
+        let reserved = [
+            "fec0::1",
+            "2001:10::1",
+            "2001:1f:ffff::1",
+            "3fff::1",
+            "3fff:fff:ffff::1",
+        ];
+
+        for ip in reserved {
+            let target = Target::Ipv6(ip.parse().unwrap(), 443);
+            assert_eq!(
+                policy.evaluate(&context(&target, Some("default"), &[])),
+                PolicyDecision::Deny,
+                "{ip} escaped the private deny rule"
+            );
+        }
+    }
+
+    #[test]
+    fn denies_reserved_ipv4_ranges_by_private_rule() {
+        let mut rule = PolicyRule::new(PolicyDecision::Deny);
+        rule.private = Some(true);
+        let policy = PolicySet::new(vec![rule]);
+        let reserved = [
+            Ipv4Addr::new(192, 0, 0, 170),
+            Ipv4Addr::new(192, 0, 0, 1),
+            Ipv4Addr::new(192, 88, 99, 1),
+        ];
+
+        for ip in reserved {
+            let target = Target::Ipv4(ip, 443);
+            assert_eq!(
+                policy.evaluate(&context(&target, Some("default"), &[])),
+                PolicyDecision::Deny,
+                "{ip} escaped the private deny rule"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_unspecified_and_loopback_classification() {
+        assert_eq!(embedded_ipv4(Ipv6Addr::UNSPECIFIED), None);
+        assert_eq!(embedded_ipv4(Ipv6Addr::LOCALHOST), None);
+        assert!(is_private(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+        assert!(is_private(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(!is_metadata_service_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+        assert!(!is_metadata_service_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn keeps_cidr_matching_limited_to_ipv4_mapped() {
+        let cidr: Cidr = "10.0.0.0/8".parse().unwrap();
+
+        assert!(cidr.contains(IpAddr::V6("::ffff:10.0.0.1".parse().unwrap())));
+        // NAT64 and 6to4 addresses are not members of an IPv4 network, so an
+        // allow-rule CIDR must not treat them as equivalent.
+        assert!(!cidr.contains(IpAddr::V6("64:ff9b::10.0.0.1".parse().unwrap())));
+        assert!(!cidr.contains(IpAddr::V6("2002:0a00:0001::".parse().unwrap())));
+        assert!(!cidr.contains(IpAddr::V6("::10.0.0.1".parse().unwrap())));
+    }
+
+    #[test]
+    fn denies_domain_resolving_to_embedded_metadata_ip() {
+        let rule = PolicyRule::new(PolicyDecision::Allow);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Domain("metadata.example".to_owned(), 80);
+        let embedded = [
+            "64:ff9b::169.254.169.254",
+            "::169.254.169.254",
+            "2002:a9fe:a9fe::",
+        ];
+
+        for ip in embedded {
+            let resolved = [IpAddr::V6(ip.parse().unwrap())];
+            assert_eq!(
+                policy.evaluate(&context(&target, Some("default"), &resolved)),
+                PolicyDecision::Deny,
+                "{ip} reached the metadata service"
+            );
+        }
+    }
+
+    #[test]
     fn denies_unmatched_target() {
         let policy = PolicySet::default();
         let target = Target::Domain("example.com".to_owned(), 443);
@@ -1070,5 +1324,91 @@ mod tests {
             err,
             PolicyError::InvalidDomain("bad\nname.example".to_owned())
         );
+    }
+
+    #[test]
+    fn rejects_unmatchable_policy_domain_patterns() {
+        let unmatchable = [
+            "*.internal.corp",
+            "*",
+            "10.0.0.1",
+            "10.0.0.1.",
+            "::1",
+            "2001:db8::1",
+            "[::1]",
+            "http://x.com",
+            "x.com/path",
+            "x.com:443",
+            "user@x.com",
+            "internal corp",
+        ];
+
+        for pattern in unmatchable {
+            let err = PolicySet::from_toml(&format!(
+                r#"
+                [[rules]]
+                action = "deny"
+                domain = "{pattern}"
+                "#
+            ))
+            .unwrap_err();
+
+            assert_eq!(
+                err,
+                PolicyError::InvalidDomain(pattern.to_owned()),
+                "domain = {pattern} was accepted"
+            );
+
+            let err = PolicySet::from_toml(&format!(
+                r#"
+                [[rules]]
+                action = "deny"
+                domain_suffix = "{pattern}"
+                "#
+            ))
+            .unwrap_err();
+
+            assert_eq!(
+                err,
+                PolicyError::InvalidDomain(pattern.to_owned()),
+                "domain_suffix = {pattern} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_ip_literal_policy_domain_suffix() {
+        let err = PolicySet::from_toml(
+            r#"
+            [[rules]]
+            action = "deny"
+            domain_suffix = ".10.0.0.1"
+            "#,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, PolicyError::InvalidDomain(".10.0.0.1".to_owned()));
+    }
+
+    #[test]
+    fn keeps_accepting_plain_policy_domain_patterns() {
+        let policy = PolicySet::from_toml(
+            r#"
+            [[rules]]
+            action = "allow"
+            domain = "api.example.com"
+
+            [[rules]]
+            action = "allow"
+            domain_suffix = ".example.com"
+
+            [[rules]]
+            action = "allow"
+            domain_suffix = "internal-1.corp."
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(policy.rules.len(), 3);
     }
 }

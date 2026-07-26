@@ -1,7 +1,7 @@
 //! Challenge-response authentication for Uncrowned King.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -361,11 +361,16 @@ impl AuthResponse {
 }
 
 /// In-memory replay cache for accepted nonce pairs.
+///
+/// Insertion order is tracked next to the lookup map so that expiry and
+/// capacity eviction never scan the whole cache: one insert costs O(1) plus the
+/// number of entries it actually removes.
 #[derive(Clone)]
 pub struct ReplayCache {
     window: Duration,
     max_entries: usize,
     entries: HashMap<ReplayKey, u64>,
+    order: VecDeque<(u64, ReplayKey)>,
 }
 
 impl ReplayCache {
@@ -382,6 +387,7 @@ impl ReplayCache {
             window,
             max_entries: max_entries.max(1),
             entries: HashMap::new(),
+            order: VecDeque::new(),
         }
     }
 
@@ -400,27 +406,41 @@ impl ReplayCache {
         if self.entries.contains_key(&key) {
             return Err(AuthError::Replay);
         }
-        if self.entries.len() >= self.max_entries {
-            self.evict_oldest();
+        while self.entries.len() >= self.max_entries {
+            if !self.evict_oldest() {
+                break;
+            }
         }
         self.entries.insert(key, now);
+        self.order.push_back((now, key));
         Ok(())
     }
 
+    /// Drops entries whose retention window has elapsed.
+    ///
+    /// Entries leave in insertion order, so this stops at the first live entry
+    /// instead of walking the map. A clock that steps backwards can leave an
+    /// expired entry behind the front of the queue; that only over-retains, and
+    /// the capacity bound still applies.
     fn prune(&mut self, now: u64) {
         let window = self.window.as_secs();
-        self.entries
-            .retain(|_, inserted_at| now.saturating_sub(*inserted_at) <= window);
+        while let Some(&(inserted_at, key)) = self.order.front() {
+            if now.saturating_sub(inserted_at) <= window {
+                break;
+            }
+            self.order.pop_front();
+            self.entries.remove(&key);
+        }
     }
 
-    fn evict_oldest(&mut self) {
-        if let Some(oldest_key) = self
-            .entries
-            .iter()
-            .min_by_key(|(_, inserted_at)| **inserted_at)
-            .map(|(key, _)| *key)
-        {
-            self.entries.remove(&oldest_key);
+    /// Removes the least recently inserted entry, returning whether one went.
+    fn evict_oldest(&mut self) -> bool {
+        match self.order.pop_front() {
+            Some((_, key)) => {
+                self.entries.remove(&key);
+                true
+            }
+            None => false,
         }
     }
 }
@@ -432,7 +452,7 @@ impl fmt::Debug for ReplayCache {
             .field("window", &self.window)
             .field("max_entries", &self.max_entries)
             .field("entry_count", &self.entries.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -632,11 +652,36 @@ fn read_varbytes(src: &mut impl Buf, name: &'static str) -> AuthResult<Vec<u8>> 
     Ok(src.copy_to_bytes(len).to_vec())
 }
 
+/// Timestamp substituted by [`unix_now`] when the host clock is unreadable.
+///
+/// Every timestamp comparison in this crate fails closed for this value: it is
+/// outside any credential validity window, outside any accepted clock skew, and
+/// older than any replay cache window.
+pub const UNREADABLE_CLOCK: u64 = u64::MAX;
+
+/// Returns the current unix time in seconds, or `None` when the host clock
+/// predates the Unix epoch.
+///
+/// Callers must treat `None` as a hard failure: refuse to issue a challenge and
+/// fail the handshake instead of substituting a placeholder timestamp.
+pub fn try_unix_now() -> Option<u64> {
+    unix_seconds_since_epoch(SystemTime::now())
+}
+
 /// Returns the current unix time in seconds.
+///
+/// Prefer [`try_unix_now`], which reports an unreadable clock explicitly. When
+/// the host clock predates the Unix epoch this returns [`UNREADABLE_CLOCK`],
+/// which fails every freshness, validity window, and replay window check,
+/// rather than the plausible-looking `0` of a real epoch timestamp.
 pub fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
+    try_unix_now().unwrap_or(UNREADABLE_CLOCK)
+}
+
+fn unix_seconds_since_epoch(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
 }
 
 #[cfg(test)]
@@ -1241,6 +1286,69 @@ mod tests {
     }
 
     #[test]
+    fn replay_cache_keeps_order_queue_aligned_with_entries() {
+        let mut replay_cache = ReplayCache::with_max_entries(Duration::from_secs(10), 3);
+
+        for index in 0..64_u8 {
+            replay_cache
+                .check_and_insert(u64::from(index), [index; 32], [index; 32])
+                .unwrap();
+            assert_eq!(replay_cache.order.len(), replay_cache.entries.len());
+            assert!(replay_cache.entries.len() <= 3);
+        }
+    }
+
+    #[test]
+    fn replay_cache_rejects_duplicate_after_many_inserts() {
+        let mut replay_cache = ReplayCache::with_max_entries(Duration::from_secs(300), 1024);
+        let server_nonce = [0x90; 32];
+        let client_nonce = [0x91; 32];
+        replay_cache
+            .check_and_insert(100, server_nonce, client_nonce)
+            .unwrap();
+
+        for index in 0..512_u16 {
+            let filler = [u8::try_from(index % 251).unwrap(); 32];
+            let mut other = [0_u8; 32];
+            other[0..2].copy_from_slice(&index.to_be_bytes());
+            replay_cache.check_and_insert(100, filler, other).unwrap();
+        }
+
+        assert_eq!(
+            replay_cache.check_and_insert(100, server_nonce, client_nonce),
+            Err(AuthError::Replay)
+        );
+    }
+
+    #[test]
+    fn replay_cache_prunes_only_expired_front_entries() {
+        let mut replay_cache = ReplayCache::with_max_entries(Duration::from_secs(10), 8);
+        let expired = ReplayKey {
+            server_nonce: [0xa0; 32],
+            client_nonce: [0xb0; 32],
+        };
+        let live = ReplayKey {
+            server_nonce: [0xa1; 32],
+            client_nonce: [0xb1; 32],
+        };
+
+        replay_cache
+            .check_and_insert(100, expired.server_nonce, expired.client_nonce)
+            .unwrap();
+        replay_cache
+            .check_and_insert(105, live.server_nonce, live.client_nonce)
+            .unwrap();
+        replay_cache
+            .check_and_insert(112, [0xa2; 32], [0xb2; 32])
+            .unwrap();
+
+        assert!(!replay_cache.entries.contains_key(&expired));
+        assert!(replay_cache.entries.contains_key(&live));
+        assert_eq!(replay_cache.entries.len(), 2);
+        assert_eq!(replay_cache.order.len(), 2);
+    }
+
+    #[test]
     fn replay_cache_treats_zero_capacity_as_one_entry() {
         let mut replay_cache = ReplayCache::with_max_entries(Duration::from_secs(300), 0);
         let first = ReplayKey {
@@ -1262,5 +1370,63 @@ mod tests {
         assert!(!replay_cache.entries.contains_key(&first));
         assert!(replay_cache.entries.contains_key(&second));
         assert_eq!(replay_cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn reports_unreadable_clock_before_the_unix_epoch() {
+        let before_epoch = UNIX_EPOCH - Duration::from_secs(1);
+
+        assert_eq!(unix_seconds_since_epoch(before_epoch), None);
+    }
+
+    #[test]
+    fn reads_clock_at_and_after_the_unix_epoch() {
+        assert_eq!(unix_seconds_since_epoch(UNIX_EPOCH), Some(0));
+        assert_eq!(
+            unix_seconds_since_epoch(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            Some(1_700_000_000)
+        );
+        assert!(try_unix_now().is_some());
+    }
+
+    #[test]
+    fn unreadable_clock_sentinel_fails_every_timestamp_check() {
+        let (mut credential, exporter, challenge, response) = fixture();
+        credential.not_after = Some(1_700_000_100);
+        let mut replay_cache = ReplayCache::default();
+
+        assert!(!credential.is_active_at(UNREADABLE_CLOCK));
+        assert!(!timestamp_within_skew(
+            challenge.server_time,
+            UNREADABLE_CLOCK,
+            Duration::from_secs(30)
+        ));
+        assert_eq!(
+            verify_auth_response(
+                &[credential],
+                &exporter,
+                &challenge,
+                &response,
+                UNREADABLE_CLOCK,
+                Duration::from_secs(30),
+                &mut replay_cache
+            ),
+            Err(AuthError::CredentialNotActive)
+        );
+    }
+
+    #[test]
+    fn unreadable_clock_sentinel_expires_the_replay_cache() {
+        let mut replay_cache = ReplayCache::with_max_entries(Duration::from_secs(300), 8);
+        replay_cache
+            .check_and_insert(1_700_000_000, [0xc0; 32], [0xd0; 32])
+            .unwrap();
+
+        replay_cache
+            .check_and_insert(UNREADABLE_CLOCK, [0xc1; 32], [0xd1; 32])
+            .unwrap();
+
+        assert_eq!(replay_cache.entries.len(), 1);
+        assert_eq!(replay_cache.order.len(), 1);
     }
 }
