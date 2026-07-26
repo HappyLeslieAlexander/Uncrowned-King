@@ -1292,7 +1292,9 @@ dependencies = [
  "hmac",
  "rand 0.8.6",
  "sha2",
+ "subtle",
  "thiserror",
+ "tracing",
  "uk-proto",
  "zeroize",
 ]
@@ -1351,6 +1353,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "serde",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "toml",

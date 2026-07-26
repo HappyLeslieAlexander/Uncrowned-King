@@ -648,7 +648,7 @@ fn changed_static_config_field(
     }
 }
 
-fn reload_static_limits(config: &ServerConfig) -> [(&'static str, u64); 18] {
+fn reload_static_limits(config: &ServerConfig) -> [(&'static str, u64); 19] {
     [
         ("max_pre_auth_bytes", config.max_pre_auth_bytes()),
         ("max_frame_size", config.max_frame_size()),
@@ -685,6 +685,7 @@ fn reload_static_limits(config: &ServerConfig) -> [(&'static str, u64); 18] {
             "carrier_write_timeout_seconds",
             config.carrier_write_timeout_seconds(),
         ),
+        ("tcp_keepalive_seconds", config.tcp_keepalive_seconds()),
         (
             "udp_flow_idle_timeout_seconds",
             config.udp_flow_idle_timeout_seconds(),
@@ -747,6 +748,7 @@ async fn handle_connection(
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AnyError> {
     tcp.set_nodelay(true)?;
+    apply_tcp_keepalive(&tcp, runtime.config.tcp_keepalive_seconds(), peer);
     if *shutdown_rx.borrow() {
         return Ok(());
     }
@@ -1205,6 +1207,31 @@ fn tcp_half_close_timeout(seconds: u64) -> Option<Duration> {
     (seconds != 0).then(|| Duration::from_secs(seconds))
 }
 
+/// Enables TCP keepalive on an accepted carrier.
+///
+/// A peer that disappears without closing (power loss, a NAT dropping the
+/// mapping) leaves a half-open connection that reads never complete on, so the
+/// session and its slot are otherwise held until `idle_timeout_seconds` — five
+/// minutes by default. Keepalive turns that into a transport-level error. This
+/// is best-effort: a socket that rejects the option is still usable, so a
+/// failure is logged rather than failing the connection.
+fn apply_tcp_keepalive(tcp: &TcpStream, seconds: u64, peer: SocketAddr) {
+    if seconds == 0 {
+        return;
+    }
+    let idle = Duration::from_secs(seconds);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(idle)
+        .with_interval(idle);
+    if let Err(err) = socket2::SockRef::from(tcp).set_tcp_keepalive(&keepalive) {
+        debug!(
+            event = "server.tcp.keepalive_error",
+            peer = %peer,
+            error = %err
+        );
+    }
+}
+
 fn carrier_write_timeout(seconds: u64) -> Option<Duration> {
     (seconds != 0).then(|| Duration::from_secs(seconds))
 }
@@ -1313,6 +1340,38 @@ mod tests {
     use super::*;
     use crate::config::{CredentialConfig, LimitConfig};
     use crate::security::test_tls_acceptor;
+
+    /// Keepalive must actually reach the socket — a silent no-op would leave
+    /// half-open sessions holding their slot until the idle timeout.
+    #[tokio::test]
+    async fn applies_tcp_keepalive_to_accepted_carriers() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move { TcpStream::connect(addr).await });
+        let (accepted, peer) = listener.accept().await.unwrap();
+        let _client = client.await.unwrap().unwrap();
+
+        assert!(!socket2::SockRef::from(&accepted).keepalive().unwrap());
+        apply_tcp_keepalive(&accepted, 42, peer);
+        assert!(socket2::SockRef::from(&accepted).keepalive().unwrap());
+    }
+
+    #[tokio::test]
+    async fn zero_disables_tcp_keepalive() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move { TcpStream::connect(addr).await });
+        let (accepted, peer) = listener.accept().await.unwrap();
+        let _client = client.await.unwrap().unwrap();
+
+        apply_tcp_keepalive(&accepted, 0, peer);
+
+        assert!(!socket2::SockRef::from(&accepted).keepalive().unwrap());
+    }
 
     fn minimal_config() -> ServerConfig {
         ServerConfig {

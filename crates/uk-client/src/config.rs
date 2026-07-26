@@ -7,9 +7,9 @@ use std::os::unix::fs::PermissionsExt;
 
 use serde::Deserialize;
 use tokio::sync::Semaphore;
-use uk_auth::{AuthError, validate_key_id, validate_shared_secret};
+use uk_auth::{AuthError, validate_key_id, validate_shared_secret, warn_on_low_secret_diversity};
 use uk_proto::{MAX_FRAME_PAYLOAD_SIZE, validate_host_port_endpoint};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Default number of concurrent carrier sessions in the client connection pool.
 const DEFAULT_MAX_CARRIER_SESSIONS: u64 = 4;
@@ -115,11 +115,18 @@ impl ClientConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let path = path.as_ref();
         validate_sensitive_file_permissions(path, "client config")?;
-        let text = fs::read_to_string(path)
-            .map_err(|err| format!("failed to read client config {}: {err}", path.display()))?;
+        // The file holds the shared secret in cleartext, so the buffer is
+        // scrubbed when it drops rather than being left in freed heap. Only this
+        // buffer is reachable: serde's own intermediate allocations are not.
+        let text =
+            Zeroizing::new(fs::read_to_string(path).map_err(|err| {
+                format!("failed to read client config {}: {err}", path.display())
+            })?);
         let mut config: Self = toml::from_str(&text)
             .map_err(|err| format!("invalid client config {}: {err}", path.display()))?;
         config.resolve_paths(config_base_dir(path));
+        // Advisory only, and emitted once per load rather than once per session.
+        warn_on_low_secret_diversity(config.secret.as_bytes());
         Ok(config)
     }
 
@@ -1049,6 +1056,52 @@ secret = "secret"
             config.validate_auth_material(),
             Err(AuthError::SecretTooShort)
         );
+    }
+
+    #[test]
+    fn rejects_secret_of_one_repeated_byte() {
+        let mut config = minimal_config();
+        config.secret = "a".repeat(32);
+
+        assert_eq!(
+            config.validate_auth_material(),
+            Err(AuthError::SecretNotRandom)
+        );
+    }
+
+    #[test]
+    fn accepts_but_warns_about_a_low_diversity_secret() {
+        let mut config = minimal_config();
+        config.secret = "ab".repeat(16);
+
+        // Low diversity is a warning, never an error: rejecting it would be a
+        // breaking config change.
+        assert!(config.validate_auth_material().is_ok());
+        warn_on_low_secret_diversity(config.secret.as_bytes());
+    }
+
+    #[test]
+    fn config_file_buffer_is_scrubbed_after_parsing() {
+        // `load` reads the file into this wrapper: the parse borrows it and the
+        // wrapper scrubs the cleartext on drop. Freed heap cannot be inspected
+        // from safe Rust, so this pins the mechanism rather than the aftermath.
+        let mut text = Zeroizing::new(
+            r#"
+server_addr = "127.0.0.1:443"
+server_name = "localhost"
+ca_cert_path = "ca.pem"
+key_id = "client"
+secret = "0123456789abcdef0123456789abcdef"
+"#
+            .to_owned(),
+        );
+
+        let config: ClientConfig = toml::from_str(&text).unwrap();
+        assert!(config.validate_auth_material().is_ok());
+
+        text.zeroize();
+
+        assert!(text.is_empty());
     }
 
     #[test]

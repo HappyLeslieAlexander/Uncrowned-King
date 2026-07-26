@@ -6,6 +6,88 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **`varint::decode` now rejects non-minimal encodings.** RFC 9000 permits a
+  value to be encoded in any width at least as wide as the minimum; UK's parsers
+  are deliberately strict (whitepaper §20), so one logical frame has exactly one
+  wire form. This is a **receiver-side protocol tightening**: the bundled client
+  and server only ever emit minimal encodings, so no bundled peer is affected,
+  but a third-party implementation relying on that latitude will now be rejected
+  with `InvalidVarint`. It also makes `MIN_TCP_RELAY_FRAME_SIZE` a real bound
+  rather than one that assumed minimal encoding.
+
+### Security
+
+- **Authentication no longer leaks key ids or the server clock through timing.**
+  Credential lookup compared `key_id` with a short-circuiting `==` and returned
+  before any HMAC, and the timestamp-skew check ran *before* tag verification —
+  so an attacker with no credentials could distinguish a known key id from an
+  unknown one and binary-search the server's clock. Lookup is now constant-time
+  over all credentials, and the MAC runs before the activity and skew checks,
+  against a per-process random dummy secret when nothing matches. Each probe
+  still costs a full TLS handshake, so this was low severity.
+- Secret-bearing types no longer derive `PartialEq`: `Credential`, `AuthResponse`
+  and `AuthChallenge` now compare secrets, tags and nonces in constant time.
+  Production code never compared them, but the derive left the trap in place for
+  any future call site.
+- Config files are read into a `Zeroizing` buffer, so the plaintext holding every
+  credential secret is scrubbed after parsing rather than left in freed heap.
+  (serde's own intermediate allocations remain out of reach.)
+- A shared secret consisting of a single repeated byte is now rejected, and one
+  whose byte diversity is implausibly low for its length is warned about at load.
+  Neither can fire on a secret generated as `docs/key-management.md` prescribes.
+- Replay-cache retention is now monotonic (`Instant`) rather than wall-clock, so
+  an NTP step or VM resume can no longer flush the cache or over-retain.
+- `Target::log_safe` now escapes space and `=`. A domain such as
+  `a event=auth.bypass x` could otherwise forge extra fields in the default
+  logfmt output; JSON logging was unaffected.
+
+### Fixed
+
+- **A hung server could stall every new SOCKS connection on the client.**
+  `ClientSession::close` awaited `close_notify` with no deadline, and pruning a
+  dead session ran that teardown *inline* on the flow-open path — twice while
+  holding `connect_lock`. One blackholed carrier therefore blocked all new
+  connections, and a config reload drove the same unbounded close from the
+  listener's accept loop. Closing is now bounded by `shutdown_timeout_seconds`
+  and pruning is reaped in the background, tracked so shutdown still waits for it.
+  This is the client-side twin of the carrier-write deadline added for the server.
+- **A stale connect result could be attached to a re-opened flow id.**
+  `OpenCompleted`/`UdpOpenCompleted` carried no flow token, unlike every other
+  flow lifecycle event, so a connect task finishing after its id was closed and
+  re-opened had its stream wired into the *new* flow — connecting the client to a
+  target it did not request on that open, and recording the wrong target in logs
+  and metrics.
+- **One unreachable UDP target no longer tears down the whole association.** A
+  send failure propagated out of the relay loop, killing the SOCKS control
+  connection and every other target's flow; an application using one UDP
+  ASSOCIATE for all its DNS lost everything. The datagram is now dropped, which
+  is what UDP semantics call for and matches the reliable path's per-flow
+  handling.
+- **Shutdown no longer truncates frames.** Carrier writes and target writes were
+  raced against the shutdown signal in `select!`; `write_all` is not cancellation
+  safe, so losing that race left an unknown-length prefix on the wire (or in the
+  target's byte stream) while still reporting success. Both now complete, bounded
+  by the carrier write deadline.
+- **UDP relay now works against a server that offers DATAGRAM without the stream
+  fallback.** Flow creation was gated on the stream-fallback setting alone, which
+  conflated "can open a UDP flow" with "can carry UDP data on the stream" and
+  disabled UDP entirely against such a peer, leaving the datagram path dead code.
+  Payload sizing now reflects whichever data path the session actually has.
+- **TCP keepalive on accepted carriers** (`tcp_keepalive_seconds`, default 60,
+  `0` disables). A peer that vanished without closing left a half-open connection
+  that no read or write deadline can observe, so its session slot was held until
+  `idle_timeout_seconds` — five minutes by default. QUIC carriers are unaffected;
+  quinn enforces its own transport idle timeout.
+- Client TLS configuration is built once per CA path and shared, instead of being
+  re-read and re-parsed on every dial and every QUIC endpoint attempt, and config
+  validation during reload runs on a blocking thread. A slow or hung filesystem
+  holding the CA bundle no longer stalls a runtime worker or the accept loop.
+- `Target::decode` no longer risks a wrapping length check on 32-bit targets, and
+  out-of-range CIDR prefixes are clamped rather than panicking or silently
+  producing a wider mask than requested.
+
 ### Fixed
 
 - **A client that stopped reading could pin its session slot for the lifetime of

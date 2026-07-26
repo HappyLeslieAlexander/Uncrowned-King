@@ -32,7 +32,7 @@ impl Target {
     /// Returns a stable, escaped target string suitable for logs.
     pub fn log_safe(&self) -> String {
         match self {
-            Self::Domain(domain, port) => format!("domain:{}:{port}", domain.escape_debug()),
+            Self::Domain(domain, port) => format!("domain:{}:{port}", escape_log_domain(domain)),
             Self::Ipv4(addr, port) => format!("ipv4:{addr}:{port}"),
             Self::Ipv6(addr, port) => format!("ipv6:[{addr}]:{port}"),
         }
@@ -73,7 +73,11 @@ impl Target {
         let addr_type = src.get_u8();
         let host_len =
             usize::try_from(varint::decode(src)?).map_err(|_| ProtocolError::InvalidVarint)?;
-        if src.remaining() < host_len + 2 {
+        // `host_len` is attacker-controlled and only bounded by `usize`: on a
+        // 32-bit target `usize::try_from` accepts values up to `u32::MAX`, where
+        // a plain `+ 2` would wrap to a tiny number, pass this check and panic
+        // in `copy_to_bytes` below.
+        if src.remaining() < host_len.saturating_add(2) {
             return Err(ProtocolError::Truncated);
         }
         let host = src.copy_to_bytes(host_len);
@@ -107,6 +111,24 @@ impl Target {
             _ => Err(ProtocolError::InvalidTarget("unknown address type")),
         }
     }
+}
+
+// Renders a domain so it can never introduce a field boundary in a logfmt-style
+// line. `escape_debug` covers quotes, backslashes and control characters, but
+// leaves the space and `=` that `validate_domain` also permits, so a requested
+// domain such as `a event=auth.bypass x` would otherwise forge an `event` field
+// in `target=domain:...`. Space and `=` are the only unescaped ASCII characters
+// with that power: every other logfmt separator is a control character already.
+fn escape_log_domain(domain: &str) -> String {
+    let mut out = String::with_capacity(domain.len());
+    for ch in domain.chars() {
+        match ch {
+            ' ' => out.push_str("\\x20"),
+            '=' => out.push_str("\\x3d"),
+            _ => out.extend(ch.escape_debug()),
+        }
+    }
+    out
 }
 
 fn validate_port(port: u16) -> ProtocolResult<()> {
@@ -234,8 +256,38 @@ mod tests {
     }
 
     #[test]
+    fn log_safe_escapes_logfmt_field_separators() {
+        let target = Target::Domain("a event=auth.bypass x".to_owned(), 443);
+
+        assert_eq!(
+            target.log_safe(),
+            "domain:a\\x20event\\x3dauth.bypass\\x20x:443"
+        );
+    }
+
+    #[test]
     fn rejects_truncated_target() {
         let mut bytes = Bytes::from_static(&[0x01, 0x0b, b'e']);
         assert_eq!(Target::decode(&mut bytes), Err(ProtocolError::Truncated));
+    }
+
+    #[test]
+    fn rejects_huge_declared_host_length() {
+        // `0xffff_ffff` as a minimal varint: large enough to wrap `host_len + 2`
+        // on a 32-bit target, where `usize::try_from` still succeeds.
+        let mut bytes = Bytes::from_static(&[
+            0x01, 0xc0, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, b'a', 0x01, 0xbb,
+        ]);
+        assert_eq!(Target::decode(&mut bytes), Err(ProtocolError::Truncated));
+    }
+
+    #[test]
+    fn rejects_non_minimal_host_length_varint() {
+        // `0x40, 0x04` is a legal QUIC spelling of 4, but not a legal UK one.
+        let mut bytes = Bytes::from_static(&[0x02, 0x40, 0x04, 127, 0, 0, 1, 0x1f, 0x90]);
+        assert_eq!(
+            Target::decode(&mut bytes),
+            Err(ProtocolError::InvalidVarint)
+        );
     }
 }

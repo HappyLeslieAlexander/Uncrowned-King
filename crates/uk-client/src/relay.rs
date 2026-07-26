@@ -149,6 +149,9 @@ struct ClientSessionManager {
     connect_lock: Mutex<()>,
     config_publish_lock: Mutex<()>,
     recent_connect_failure: Mutex<Option<CachedConnectFailure>>,
+    /// Background teardown of sessions pruned from the pool, kept off the
+    /// flow-open path. Drained by [`ClientSessionManager::shutdown`].
+    reapers: Mutex<JoinSet<()>>,
     closed: AtomicBool,
 }
 
@@ -1065,13 +1068,23 @@ impl ClientSessionManager {
             connect_lock: Mutex::new(()),
             config_publish_lock: Mutex::new(()),
             recent_connect_failure: Mutex::new(None),
+            reapers: Mutex::new(JoinSet::new()),
             closed: AtomicBool::new(false),
         }
     }
 
     async fn reload(&self, candidate: ClientConfig) -> Result<u64, AnyError> {
         let result = async {
-            crate::check_config(&candidate)?;
+            // `check_config` reads and parses the CA bundle synchronously, and
+            // this runs on the listener's accept-loop task. A slow or hung
+            // filesystem (an NFS or automount CA path) would otherwise stall
+            // the loop and stop the client accepting SOCKS connections.
+            let validated = candidate.clone();
+            tokio::task::spawn_blocking(move || crate::check_config(&validated))
+                .await
+                .map_err(|err| -> AnyError {
+                    format!("config validation task failed: {err}").into()
+                })??;
             let _publish_guard = self.config_publish_lock.lock().await;
             let current = self.config.snapshot();
             ensure_reload_compatible(&current.config, &candidate)?;
@@ -1361,10 +1374,27 @@ impl ClientSessionManager {
             });
             pool.clone()
         };
+        // Reap off the request path. `close_and_wait` drains the session's
+        // tasks, bounded by `shutdown_timeout_seconds` but still seconds long,
+        // and this runs on every flow open — twice while holding `connect_lock`.
+        // Awaiting it here let one dead carrier stall every new SOCKS
+        // connection. The sessions are already closed, so this is pure cleanup.
         for session in stale {
-            session.close_and_wait().await;
+            self.spawn_reaper(session).await;
         }
         live
+    }
+
+    /// Runs a stale session's teardown in the background, tracked so shutdown
+    /// still waits for it rather than leaving detached tasks behind.
+    async fn spawn_reaper(&self, session: Arc<ClientSession>) {
+        let mut reapers = self.reapers.lock().await;
+        while let Some(result) = reapers.try_join_next() {
+            if let Err(err) = result {
+                debug!(event = "client.session.reaper.join_error", error = %err);
+            }
+        }
+        reapers.spawn(async move { session.close_and_wait().await });
     }
 
     /// Returns the first live pooled session, if any.
@@ -1468,14 +1498,16 @@ impl ClientSessionManager {
         for session in sessions {
             session.close_and_wait().await;
         }
+        let mut reapers = self.reapers.lock().await;
+        while reapers.join_next().await.is_some() {}
     }
 
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
 
-    async fn supports_udp_stream_fallback(&self) -> Result<bool, AnyError> {
-        Ok(self.current_session().await?.supports_udp_stream_fallback)
+    async fn supports_udp_relay(&self) -> Result<bool, AnyError> {
+        Ok(self.current_session().await?.supports_udp_relay())
     }
 
     fn udp_flow_idle_timeout(&self) -> Option<Duration> {
@@ -1671,10 +1703,36 @@ impl ClientSession {
             self.metrics.record_session_closed(was_draining);
             self.pong_notify.notify_waiters();
             self.flows.lock().await.clear();
+            self.shutdown_carrier().await;
+        }
+    }
+
+    /// Closes the carrier write half, best-effort and bounded.
+    ///
+    /// A server that has stopped reading — or a host that blackholes packets
+    /// without sending RST — cannot accept `close_notify`, and this runs on
+    /// paths that must stay responsive: config reload drives it from the
+    /// listener's accept loop, and `remove_flow` from a relay task. Waiting
+    /// indefinitely there stops the client accepting new SOCKS connections.
+    /// A missed `close_notify` only costs the peer a clean shutdown signal;
+    /// dropping the writer still closes the socket.
+    async fn shutdown_carrier(&self) {
+        let close = async {
             let mut writer = self.writer.lock().await;
             if let Err(err) = writer.shutdown().await {
                 debug!(event = "client.session.shutdown.error", error = %err);
             }
+        };
+        let Some(timeout) = self.task_shutdown_timeout else {
+            close.await;
+            return;
+        };
+        if time::timeout(timeout, close).await.is_err() {
+            warn!(
+                event = "client.session.shutdown.timeout",
+                correlation_id = self.correlation_id,
+                timeout_seconds = timeout.as_secs()
+            );
         }
     }
 
@@ -1788,7 +1846,7 @@ impl ClientSession {
         if self.is_closed() {
             return Err("uk session is closed".into());
         }
-        if !self.supports_udp_stream_fallback {
+        if !self.supports_udp_relay() {
             return Ok(OpenOutcome::Rejected(socks5::Reply::CommandNotSupported));
         }
         let Some((flow_id, frames)) = self.reserve_flow(FlowProtocol::Udp).await? else {
@@ -2057,6 +2115,40 @@ impl ClientSession {
         Ok(())
     }
 
+    /// Whether this server offers UDP relay at all.
+    ///
+    /// A server may advertise the QUIC DATAGRAM data path without the reliable
+    /// stream fallback (`uk-proto` treats the two settings independently), and
+    /// flow *creation* always uses a `UDP_OPEN` frame regardless. Gating flows
+    /// on the stream fallback alone conflated "can open a UDP flow" with "can
+    /// carry UDP data on the stream" and refused UDP entirely against such a
+    /// peer, leaving `try_send_udp_datagram` dead code.
+    fn supports_udp_relay(&self) -> bool {
+        self.supports_udp_stream_fallback || self.supports_udp_datagram
+    }
+
+    /// Largest UDP payload this session can carry to `flow_id`.
+    ///
+    /// With no stream fallback the datagram channel is the only data path, so
+    /// its limit is the real one; otherwise a `UDP_DATA` frame can carry the
+    /// rest.
+    fn max_udp_payload_len_for(&self, flow_id: u64) -> usize {
+        if self.supports_udp_stream_fallback {
+            return self.data_frame_size;
+        }
+        let datagram_limit = self
+            .datagrams
+            .as_ref()
+            .and_then(|channel| channel.max_datagram_size())
+            .and_then(|max| {
+                datagram::overhead(flow_id)
+                    .ok()
+                    .and_then(|overhead| max.checked_sub(overhead))
+            })
+            .unwrap_or(0);
+        datagram_limit.min(self.data_frame_size)
+    }
+
     async fn send_udp_data(&self, flow_id: u64, payload: Bytes) -> Result<(), AnyError> {
         let payload_len = payload.len();
         // Prefer the QUIC DATAGRAM path; fall back to a reliable UDP_DATA frame
@@ -2068,6 +2160,13 @@ impl ClientSession {
                 payload_len,
             );
             return Ok(());
+        }
+        if !self.supports_udp_stream_fallback {
+            // Datagram-only peer: a UDP_DATA frame would be a protocol error,
+            // so drop rather than send something the server cannot accept.
+            return Err("uk udp datagram could not be sent and the server has no \
+                        reliable UDP fallback"
+                .into());
         }
         let frame = Frame::new(FrameType::UdpData, 0, flow_id, payload)?;
         self.write_frame(&frame).await?;
@@ -2859,14 +2958,14 @@ async fn relay_udp_association(
         return Ok(());
     }
 
-    let supports_udp_stream_fallback = tokio::select! {
-        result = sessions.supports_udp_stream_fallback() => result,
+    let supports_udp_relay = tokio::select! {
+        result = sessions.supports_udp_relay() => result,
         changed = shutdown_rx.changed() => {
             let _ = changed;
             return Ok(());
         }
     };
-    match supports_udp_stream_fallback {
+    match supports_udp_relay {
         Ok(true) => {}
         Ok(false) => {
             // The server does not offer UDP relay at all, which is exactly what
@@ -3040,7 +3139,22 @@ impl UdpAssociation {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| "failed to send uk udp datagram".into()))
+        // Drop this datagram rather than failing the association. Returning an
+        // error here propagates out of `relay_udp_association` and tears down
+        // the SOCKS control connection along with every other target's flow —
+        // so one unreachable target would take out an application's entire UDP
+        // relay. UDP is best-effort and the failed flow has already been
+        // removed, so the next datagram to this target opens a fresh one. This
+        // matches the reliable path, where a per-flow failure closes only that
+        // flow.
+        warn!(
+            event = "socks5.udp_associate.datagram_dropped",
+            target = %datagram.target.log_safe(),
+            attempts = UDP_SEND_ATTEMPTS,
+            error = %last_error
+                .map_or_else(|| "no send attempt succeeded".to_owned(), |err| err.to_string())
+        );
+        Ok(true)
     }
 
     fn accept_client_endpoint(&mut self, peer: SocketAddr) -> bool {
@@ -3056,10 +3170,13 @@ impl UdpAssociation {
         target: &Target,
         sessions: &ClientSessionManager,
     ) -> Result<usize, AnyError> {
-        match self.flows_by_target.get(target) {
-            Some(flow) => Ok(flow.session.data_frame_size),
-            None => Ok(sessions.current_session().await?.data_frame_size),
+        if let Some(flow) = self.flows_by_target.get(target) {
+            return Ok(flow.session.max_udp_payload_len_for(flow.id));
         }
+        let session = sessions.current_session().await?;
+        // No flow yet, so no flow id: size against the first id this session
+        // would allocate, which bounds the varint overhead.
+        Ok(session.max_udp_payload_len_for(FIRST_CLIENT_FLOW_ID))
     }
 
     async fn flow_for_target(
@@ -3667,6 +3784,9 @@ fn status_frame(frame_type: FrameType, flow_id: u64, code: ErrorCode) -> Result<
 
 fn decode_open_response(frame: Frame) -> Result<OpenResponse, AnyError> {
     match frame.header.frame_type {
+        // Must be zero-length: `docs/spec-v0.1.md` defines the acknowledgement
+        // as an empty TCP_DATA and makes anything else a protocol error, so a
+        // coalesced ack is a non-conforming peer, not an optimisation to accept.
         FrameType::TcpData if frame.payload.is_empty() => Ok(OpenResponse::Accepted),
         FrameType::PolicyDenied => {
             expect_error_payload(frame.payload, ErrorCode::PolicyDenied)?;
@@ -3965,6 +4085,91 @@ mod tests {
             last_pong_nonce: AtomicU64::new(0),
             pong_notify: Notify::new(),
         })
+    }
+
+    /// Stands in for a server that never accepts another byte and never
+    /// completes a shutdown — a peer whose socket buffers are full, or a host
+    /// blackholing packets. `tokio::io::duplex` cannot model this because its
+    /// `poll_shutdown` completes immediately.
+    struct StallingWriter;
+
+    impl AsyncWrite for StallingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// A session whose carrier never finishes closing.
+    fn test_session_with_stalled_carrier(
+        task_shutdown_timeout: Option<Duration>,
+    ) -> Arc<ClientSession> {
+        let session = test_session(4, 4);
+        let mut session = Arc::try_unwrap(session).ok().expect("sole owner");
+        session.writer = Arc::new(Mutex::new(Box::new(StallingWriter)));
+        session.task_shutdown_timeout = task_shutdown_timeout;
+        Arc::new(session)
+    }
+
+    /// Closing must not hang on a server that cannot accept `close_notify`:
+    /// this runs from the listener's accept loop on config reload, and from
+    /// relay tasks when a draining session loses its last flow.
+    #[tokio::test]
+    async fn close_gives_up_on_a_carrier_that_never_finishes_closing() {
+        let session = test_session_with_stalled_carrier(Some(Duration::from_millis(100)));
+
+        tokio::time::timeout(Duration::from_secs(5), session.close())
+            .await
+            .expect("close must not block on an unresponsive carrier");
+
+        assert!(session.is_closed());
+    }
+
+    /// Pruning a dead session must not be awaited on the flow-open path — two
+    /// of those call sites hold `connect_lock`, so one hung carrier would stall
+    /// every new SOCKS connection.
+    #[tokio::test]
+    async fn pruning_a_dead_session_does_not_block_the_flow_open_path() {
+        let manager = test_session_manager(minimal_config());
+        // No task-drain deadline and a task that never finishes, so this
+        // session's teardown would block forever if it were awaited inline.
+        let session = test_session_with_stalled_carrier(None);
+        session
+            .tasks
+            .lock()
+            .await
+            .spawn(ClientSessionTaskKind::CarrierReader, async {
+                std::future::pending::<()>().await;
+            });
+        // Mark it closed directly rather than via `close()`: with no drain
+        // deadline `close()` would itself block on the stalled carrier, which
+        // is the situation under test, not part of the setup.
+        session.shutdown.close();
+        assert!(session.is_closed());
+        manager.pool.lock().await.push(session);
+
+        let live = tokio::time::timeout(Duration::from_secs(5), manager.live_sessions())
+            .await
+            .expect("pruning must not await the stale session's teardown");
+
+        assert!(live.is_empty(), "the closed session should be pruned");
     }
 
     fn boxed_io_error(kind: io::ErrorKind) -> AnyError {

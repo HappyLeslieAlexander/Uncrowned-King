@@ -184,15 +184,46 @@ impl PolicyRule {
 }
 
 /// IP network matcher.
+///
+/// Prefer [`Cidr::new_v4`], [`Cidr::new_v6`] or the [`FromStr`] impl over the
+/// tuple variants: they reject an out-of-range prefix up front. A prefix built
+/// past the address width is still handled safely (see [`ipv4_mask`]), but it
+/// matches a single host rather than the network the caller meant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cidr {
-    /// IPv4 CIDR.
+    /// IPv4 CIDR. The prefix must be `0..=32`.
     V4(Ipv4Addr, u8),
-    /// IPv6 CIDR.
+    /// IPv6 CIDR. The prefix must be `0..=128`.
     V6(Ipv6Addr, u8),
 }
 
 impl Cidr {
+    /// Creates an IPv4 CIDR, rejecting a prefix longer than 32 bits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::InvalidCidr`] when `prefix > 32`.
+    pub fn new_v4(network: Ipv4Addr, prefix: u8) -> PolicyResult<Self> {
+        if prefix <= 32 {
+            Ok(Self::V4(network, prefix))
+        } else {
+            Err(PolicyError::InvalidCidr(format!("{network}/{prefix}")))
+        }
+    }
+
+    /// Creates an IPv6 CIDR, rejecting a prefix longer than 128 bits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::InvalidCidr`] when `prefix > 128`.
+    pub fn new_v6(network: Ipv6Addr, prefix: u8) -> PolicyResult<Self> {
+        if prefix <= 128 {
+            Ok(Self::V6(network, prefix))
+        } else {
+            Err(PolicyError::InvalidCidr(format!("{network}/{prefix}")))
+        }
+    }
+
     /// Returns true when `ip` is inside this CIDR.
     pub fn contains(&self, ip: IpAddr) -> bool {
         match (self, ip) {
@@ -226,10 +257,10 @@ impl FromStr for Cidr {
             .parse()
             .map_err(|_| PolicyError::InvalidCidr(input.to_owned()))?;
         match ip {
-            IpAddr::V4(ip) if prefix <= 32 => Ok(Self::V4(ip, prefix)),
-            IpAddr::V6(ip) if prefix <= 128 => Ok(Self::V6(ip, prefix)),
-            _ => Err(PolicyError::InvalidCidr(input.to_owned())),
+            IpAddr::V4(ip) => Self::new_v4(ip, prefix),
+            IpAddr::V6(ip) => Self::new_v6(ip, prefix),
         }
+        .map_err(|_| PolicyError::InvalidCidr(input.to_owned()))
     }
 }
 
@@ -587,19 +618,33 @@ fn ipv4_from_segments(high: u16, low: u16) -> Ipv4Addr {
     Ipv4Addr::new(high[0], high[1], low[0], low[1])
 }
 
+/// Builds the network mask for an IPv4 prefix length.
+///
+/// `Cidr::new_v4` and `Cidr::from_str` both bound the prefix, but [`Cidr::V4`]
+/// is a public tuple variant, so a library consumer can still hand us
+/// `Cidr::V4(addr, 33)`. A bare `u32::MAX << (32 - prefix)` is the wrong answer
+/// twice over there: it overflows in debug, and in release the shift amount is
+/// masked to `<< 1`, silently producing a *wider* mask than requested — which,
+/// in an allow rule, over-permits. Clamping to a full-width mask instead makes
+/// an out-of-range prefix maximally specific, so misuse can only ever match
+/// fewer addresses than intended, never more.
 fn ipv4_mask(prefix: u8) -> u32 {
-    if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix)
+    match prefix {
+        0 => 0,
+        1..=32 => u32::MAX << (32 - prefix),
+        _ => u32::MAX,
     }
 }
 
+/// Builds the network mask for an IPv6 prefix length.
+///
+/// Clamps an out-of-range prefix to a full-width mask for the same reason as
+/// [`ipv4_mask`].
 fn ipv6_mask(prefix: u8) -> u128 {
-    if prefix == 0 {
-        0
-    } else {
-        u128::MAX << (128 - prefix)
+    match prefix {
+        0 => 0,
+        1..=128 => u128::MAX << (128 - prefix),
+        _ => u128::MAX,
     }
 }
 
@@ -1116,6 +1161,51 @@ mod tests {
         assert!(!cidr.contains(IpAddr::V6("64:ff9b::10.0.0.1".parse().unwrap())));
         assert!(!cidr.contains(IpAddr::V6("2002:0a00:0001::".parse().unwrap())));
         assert!(!cidr.contains(IpAddr::V6("::10.0.0.1".parse().unwrap())));
+    }
+
+    #[test]
+    fn clamps_out_of_range_cidr_prefix_to_a_single_host() {
+        // `Cidr::V4`/`Cidr::V6` are public tuple variants, so an out-of-range
+        // prefix can reach the mask helpers even though `from_str` rejects it.
+        // It must not panic, and above all must not widen the match.
+        assert_eq!(ipv4_mask(33), u32::MAX);
+        assert_eq!(ipv6_mask(129), u128::MAX);
+
+        let v4 = Cidr::V4(Ipv4Addr::new(10, 0, 0, 1), 33);
+        assert!(v4.contains(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(!v4.contains(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
+
+        let v6 = Cidr::V6(Ipv6Addr::LOCALHOST, 129);
+        assert!(v6.contains(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(!v6.contains(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+    }
+
+    #[test]
+    fn rejects_out_of_range_cidr_prefix_at_construction() {
+        assert_eq!(
+            Cidr::new_v4(Ipv4Addr::new(10, 0, 0, 0), 33),
+            Err(PolicyError::InvalidCidr("10.0.0.0/33".to_owned()))
+        );
+        assert_eq!(
+            Cidr::new_v6(Ipv6Addr::LOCALHOST, 129),
+            Err(PolicyError::InvalidCidr("::1/129".to_owned()))
+        );
+        assert_eq!(
+            "10.0.0.0/33".parse::<Cidr>(),
+            Err(PolicyError::InvalidCidr("10.0.0.0/33".to_owned()))
+        );
+        assert_eq!(
+            "::1/129".parse::<Cidr>(),
+            Err(PolicyError::InvalidCidr("::1/129".to_owned()))
+        );
+        assert_eq!(
+            Cidr::new_v4(Ipv4Addr::new(10, 0, 0, 0), 32),
+            Ok(Cidr::V4(Ipv4Addr::new(10, 0, 0, 0), 32))
+        );
+        assert_eq!(
+            Cidr::new_v6(Ipv6Addr::LOCALHOST, 128),
+            Ok(Cidr::V6(Ipv6Addr::LOCALHOST, 128))
+        );
     }
 
     #[test]

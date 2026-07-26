@@ -42,6 +42,8 @@ rustls = "0.23"
 rustls-pki-types = { version = "1.11", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
+socket2 = "0.6"
+subtle = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = "0.26"

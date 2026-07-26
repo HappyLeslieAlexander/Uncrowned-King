@@ -7428,6 +7428,7 @@ fn test_limits() -> LimitConfig {
         target_connect_timeout_seconds: Some(3),
         tcp_half_close_timeout_seconds: Some(3),
         carrier_write_timeout_seconds: None,
+        tcp_keepalive_seconds: None,
         udp_flow_idle_timeout_seconds: None,
         shutdown_timeout_seconds: None,
         replay_cache_window_seconds: None,

@@ -10,10 +10,11 @@ use tokio::sync::Semaphore;
 use uk_auth::{
     AuthError, Credential, CredentialStatus, DEFAULT_REPLAY_CACHE_MAX_ENTRIES,
     DEFAULT_REPLAY_CACHE_WINDOW_SECONDS, MIN_AUTH_RESPONSE_PAYLOAD_SIZE,
+    warn_on_low_secret_diversity,
 };
 use uk_policy::PolicySet;
 use uk_proto::{MAX_FRAME_PAYLOAD_SIZE, MIN_TCP_RELAY_FRAME_SIZE, validate_host_port_endpoint};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Default accepted authentication timestamp skew in seconds.
 pub const DEFAULT_AUTH_SKEW_SECONDS: u64 = 30;
@@ -55,8 +56,13 @@ impl ServerConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let path = path.as_ref();
         validate_sensitive_file_permissions(path, "server config")?;
-        let text = fs::read_to_string(path)
-            .map_err(|err| format!("failed to read server config {}: {err}", path.display()))?;
+        // The file holds every credential secret in cleartext, so the buffer is
+        // scrubbed when it drops rather than being left in freed heap. Only this
+        // buffer is reachable: serde's own intermediate allocations are not.
+        let text =
+            Zeroizing::new(fs::read_to_string(path).map_err(|err| {
+                format!("failed to read server config {}: {err}", path.display())
+            })?);
         let mut config: Self = toml::from_str(&text)
             .map_err(|err| format!("invalid server config {}: {err}", path.display()))?;
         config.resolve_paths(config_base_dir(path));
@@ -322,6 +328,19 @@ impl ServerConfig {
             .unwrap_or(30)
     }
 
+    /// TCP keepalive idle time in seconds for accepted carriers. Zero disables it.
+    ///
+    /// Detects a peer that disappeared without closing (power loss, a NAT that
+    /// dropped the mapping). Such a session is otherwise only reclaimed at
+    /// `idle_timeout_seconds`, which is far longer. QUIC carriers do not need
+    /// this: quinn enforces its own transport idle timeout.
+    pub fn tcp_keepalive_seconds(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.tcp_keepalive_seconds)
+            .unwrap_or(60)
+    }
+
     /// UDP flow idle timeout in seconds. Zero disables it.
     pub fn udp_flow_idle_timeout_seconds(&self) -> u64 {
         self.limits
@@ -442,6 +461,8 @@ pub struct LimitConfig {
     pub tcp_half_close_timeout_seconds: Option<u64>,
     /// Deadline for a single frame write to the client carrier.
     pub carrier_write_timeout_seconds: Option<u64>,
+    /// TCP keepalive idle time in seconds for accepted carriers.
+    pub tcp_keepalive_seconds: Option<u64>,
     /// UDP flow idle timeout in seconds.
     pub udp_flow_idle_timeout_seconds: Option<u64>,
     /// Graceful listener shutdown timeout in seconds.
@@ -511,6 +532,7 @@ impl CredentialConfig {
         {
             return Err(AuthError::InvalidCredentialValidityWindow);
         }
+        warn_on_low_secret_diversity(self.secret.as_bytes());
         let mut credential = Credential::active(self.key_id.as_bytes(), self.secret.as_bytes())?;
         credential.status = status;
         credential.not_before = self.not_before;
@@ -699,6 +721,32 @@ secret = "0123456789abcdef0123456789abcdef"
         let _ = fs::remove_file(&path);
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn config_file_buffer_is_scrubbed_after_parsing() {
+        // `load` reads the file into this wrapper: the parse borrows it and the
+        // wrapper scrubs the cleartext on drop. Freed heap cannot be inspected
+        // from safe Rust, so this pins the mechanism rather than the aftermath.
+        let mut text = Zeroizing::new(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+
+[[credentials]]
+key_id = "client"
+secret = "0123456789abcdef0123456789abcdef"
+"#
+            .to_owned(),
+        );
+
+        let config: ServerConfig = toml::from_str(&text).unwrap();
+        assert_eq!(config.credentials().unwrap().len(), 1);
+
+        text.zeroize();
+
+        assert!(text.is_empty());
     }
 
     #[cfg(unix)]
@@ -2018,6 +2066,44 @@ secret = "too-short"
         .unwrap();
 
         assert_eq!(config.credentials(), Err(AuthError::SecretTooShort));
+    }
+
+    #[test]
+    fn rejects_credential_secret_of_one_repeated_byte() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+
+[[credentials]]
+key_id = "client"
+secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.credentials(), Err(AuthError::SecretNotRandom));
+    }
+
+    #[test]
+    fn accepts_but_warns_about_a_low_diversity_credential_secret() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+
+[[credentials]]
+key_id = "client"
+secret = "abababababababababababababababab"
+"#,
+        )
+        .unwrap();
+
+        // Low diversity is a warning, never an error: rejecting it would be a
+        // breaking config change.
+        assert_eq!(config.credentials().unwrap().len(), 1);
     }
 
     #[test]

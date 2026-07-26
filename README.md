@@ -122,6 +122,7 @@ handshake_timeout_seconds = 10
 target_connect_timeout_seconds = 10
 tcp_half_close_timeout_seconds = 30
 carrier_write_timeout_seconds = 30
+tcp_keepalive_seconds = 60
 udp_flow_idle_timeout_seconds = 120
 shutdown_timeout_seconds = 30
 replay_cache_window_seconds = 300
@@ -138,6 +139,11 @@ otherwise park the writer — and every flow queued behind it — indefinitely,
 holding its session slot. Exceeding the deadline closes that session, since a
 partly written frame leaves the carrier unusable. Set it to `0` to disable the
 deadline (not recommended for internet-facing servers).
+`tcp_keepalive_seconds = 60` enables TCP keepalive on accepted TLS/TCP
+carriers, so a peer that vanished without closing (power loss, a NAT dropping
+the mapping) is detected as a transport error instead of holding its session
+slot until `idle_timeout_seconds`. Set it to `0` to disable. QUIC carriers do
+not need it — quinn enforces its own transport idle timeout.
 Set `udp_flow_idle_timeout_seconds = 0` to disable server-side UDP flow idle cleanup.
 Set `shutdown_timeout_seconds = 0` to wait indefinitely for listener and relay
 session tasks to finish after shutdown; otherwise remaining tasks are aborted
