@@ -187,7 +187,7 @@ impl PolicyRule {
 ///
 /// Prefer [`Cidr::new_v4`], [`Cidr::new_v6`] or the [`FromStr`] impl over the
 /// tuple variants: they reject an out-of-range prefix up front. A prefix built
-/// past the address width is still handled safely (see [`ipv4_mask`]), but it
+/// past the address width is still handled safely, but it
 /// matches a single host rather than the network the caller meant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cidr {

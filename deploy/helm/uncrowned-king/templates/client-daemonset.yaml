@@ -1,0 +1,80 @@
+{{- if and .Values.client.enabled (eq .Values.client.kind "DaemonSet") }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "uncrowned-king.client.fullname" . }}
+  labels:
+    {{- include "uncrowned-king.labels" . | nindent 4 }}
+    app.kubernetes.io/component: client
+spec:
+  selector:
+    matchLabels:
+      {{- include "uncrowned-king.client.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/client-configmap.yaml") . | sha256sum }}
+      labels:
+        {{- include "uncrowned-king.client.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: client
+          image: "{{ .Values.client.image.repository }}:{{ .Values.client.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.client.image.pullPolicy }}
+          command:
+            - "uk-client"
+            - "socks5"
+            - "--config"
+            - "/etc/uncrowned-king/client.toml"
+          ports:
+            - name: socks5
+              containerPort: {{ .Values.client.socks5.port }}
+              hostPort: {{ .Values.client.socks5.hostPort }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.client.metrics.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.client.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/uncrowned-king/client.toml
+              subPath: client.toml
+              readOnly: true
+            - name: secret
+              mountPath: /etc/uncrowned-king/secret
+              readOnly: true
+            {{- if .Values.client.existingCaSecret }}
+            - name: ca
+              mountPath: /etc/uncrowned-king/ca
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "uncrowned-king.client.fullname" . }}-config
+        - name: secret
+          secret:
+            secretName: {{ include "uncrowned-king.client.fullname" . }}-secret
+        {{- if .Values.client.existingCaSecret }}
+        - name: ca
+          secret:
+            secretName: {{ .Values.client.existingCaSecret }}
+        {{- end }}
+{{- end }}

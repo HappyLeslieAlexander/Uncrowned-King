@@ -7,12 +7,15 @@ on:
       - main
 
 jobs:
-  rust:
-    name: Rust (${{ matrix.toolchain }})
-    runs-on: ubuntu-latest
+  test-matrix:
+    name: Test (${{ matrix.os }} - ${{ matrix.toolchain }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
         toolchain:
           - 1.85.0
           - stable
@@ -26,18 +29,31 @@ jobs:
           rustup default ${{ matrix.toolchain }}
           rustup component add rustfmt clippy
 
-      - name: Format
+      - name: Format Check
         run: cargo fmt --all --check
 
-      - name: Check
+      - name: Workspace Check
         run: cargo check --workspace --locked
 
-      - name: Test
+      - name: Run Tests
         run: cargo test --workspace --locked
 
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy Linter
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-      - name: Release build
+      - name: Doc Check
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+
+      - name: Release Build
         if: matrix.toolchain == 'stable'
         run: cargo build --workspace --release --locked
+
+  security-and-license:
+    name: Security & License Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
