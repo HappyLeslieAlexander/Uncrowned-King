@@ -125,9 +125,7 @@ where
 
     match path {
         "/healthz" => write_response(stream, 200, "OK", "text/plain", "ok\n").await,
-        "/readyz" if is_ready() => {
-            write_response(stream, 200, "OK", "text/plain", "ready\n").await
-        }
+        "/readyz" if is_ready() => write_response(stream, 200, "OK", "text/plain", "ready\n").await,
         "/readyz" => {
             write_response(
                 stream,

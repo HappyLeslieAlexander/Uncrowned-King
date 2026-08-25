@@ -1,4 +1,4 @@
-#![allow(unused_imports)]
+#![allow(unused_imports, clippy::wildcard_imports)]
 
 use std::{
     collections::HashMap,
@@ -14,7 +14,12 @@ use std::{
     time::Duration,
 };
 
-use super::*;
+use super::context::*;
+use super::dialer::*;
+use super::session::*;
+use super::tasks::*;
+use super::tcp::*;
+use super::udp::*;
 use crate::observability::*;
 use crate::security::*;
 use bytes::{Bytes, BytesMut};

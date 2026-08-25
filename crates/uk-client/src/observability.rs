@@ -5,11 +5,10 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
 };
 
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpListener,
     sync::{Semaphore, watch},
     task::JoinSet,
@@ -17,8 +16,7 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 use uk_proto::observability::{
-    ACCEPT_RETRY_DELAY, MAX_OBSERVABILITY_CONNECTIONS as MAX_CONNECTIONS, MAX_REQUEST_HEAD_BYTES,
-    parse_request_line, read_request_head, serve_probe_connection,
+    ACCEPT_RETRY_DELAY, MAX_OBSERVABILITY_CONNECTIONS as MAX_CONNECTIONS, serve_probe_connection,
 };
 
 use crate::session::{EndpointAttemptOutcome, EndpointFailurePhase};
@@ -431,6 +429,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn renders_bounded_client_metrics() {

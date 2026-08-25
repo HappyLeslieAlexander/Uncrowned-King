@@ -1,4 +1,4 @@
-#![allow(unused_imports)]
+#![allow(unused_imports, clippy::wildcard_imports)]
 
 use std::{
     collections::HashMap,
@@ -37,7 +37,12 @@ use uk_proto::{
     validate_connection_frame, write_frame,
 };
 
-use super::*;
+use super::context::*;
+use super::dialer::*;
+use super::session::*;
+use super::tasks::*;
+use super::udp::*;
+
 use crate::observability::{
     ActiveFlowGuard, FlowOpenFailure, RelayDirection, RelayProtocol, ServerMetrics,
 };

@@ -1,4 +1,5 @@
 //! Server-side UK TCP and UDP relay.
+#![allow(unused_imports, clippy::wildcard_imports)]
 
 pub(crate) mod context;
 pub(crate) mod dialer;
@@ -10,9 +11,5 @@ pub(crate) mod udp;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use context::*;
-pub(crate) use dialer::*;
-pub(crate) use session::*;
-pub(crate) use tasks::*;
-pub(crate) use tcp::*;
-pub(crate) use udp::*;
+pub(crate) use context::{RelayLimitConfig, RelayLimits, ServerCarrier};
+pub(crate) use session::relay_session;
