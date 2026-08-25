@@ -1103,32 +1103,61 @@ fn classifies_clean_socks_disconnects() {
 }
 
 #[tokio::test]
-async fn carrier_write_exits_when_session_shutdown_notifies() {
-    let (mut writer, _reader) = tokio::io::duplex(1);
+async fn carrier_write_is_refused_once_the_session_is_closing() {
+    let (mut writer, mut reader) = tokio::io::duplex(1024);
+    let shutdown = ClientSessionShutdown::default();
+    shutdown.close();
+    let frame = Frame::new(FrameType::TcpData, 0, 1, Bytes::from_static(b"abc")).unwrap();
+
+    let err = write_frame_or_shutdown(&mut writer, &frame, &shutdown)
+        .await
+        .unwrap_err();
+
+    let io_error = err.downcast_ref::<io::Error>().unwrap();
+    assert_eq!(io_error.kind(), io::ErrorKind::Interrupted);
+
+    // Nothing was emitted, so the peer's framing is untouched.
+    drop(writer);
+    let mut written = Vec::new();
+    reader.read_to_end(&mut written).await.unwrap();
+    assert!(written.is_empty());
+}
+
+/// Shutdown must not truncate a frame that is already going out: dropping
+/// `write_all` mid-frame would leave an unknown-length prefix on the wire
+/// and desynchronise the peer, which is worse than a late clean close.
+#[tokio::test]
+async fn carrier_write_in_flight_is_not_truncated_by_shutdown() {
+    let (mut writer, mut reader) = tokio::io::duplex(1);
     let shutdown = ClientSessionShutdown::default();
     let shutdown_handle = shutdown.clone();
-    let frame = Frame::new(
-        FrameType::TcpData,
-        0,
-        FLOW_ID,
-        Bytes::from(vec![0x42; 1024]),
-    )
-    .unwrap();
+    let payload = vec![0xaa_u8; 1024];
+    let frame = Frame::new(FrameType::TcpData, 0, 1, Bytes::from(payload.clone())).unwrap();
+    let encoded_len = frame.encode().unwrap().len();
 
-    let task =
+    let write_task =
         tokio::spawn(async move { write_frame_or_shutdown(&mut writer, &frame, &shutdown).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(!task.is_finished());
+    assert!(
+        !write_task.is_finished(),
+        "the 1-byte duplex should stall it"
+    );
 
     shutdown_handle.close();
 
-    let err = tokio::time::timeout(Duration::from_secs(1), task)
+    // Drain the peer: the whole frame must still arrive.
+    let mut received = vec![0_u8; encoded_len];
+    tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut received))
+        .await
+        .expect("the in-flight frame must complete")
+        .unwrap();
+    assert_eq!(&received[received.len() - payload.len()..], &payload[..]);
+
+    tokio::time::timeout(Duration::from_secs(5), write_task)
         .await
         .unwrap()
         .unwrap()
-        .unwrap_err();
-    let io_error = err.downcast_ref::<io::Error>().unwrap();
-    assert_eq!(io_error.kind(), io::ErrorKind::Interrupted);
+        .unwrap();
 }
 
 #[tokio::test]

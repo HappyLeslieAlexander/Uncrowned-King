@@ -30,6 +30,9 @@ spec:
             - "socks5"
             - "--config"
             - "/etc/uncrowned-king/client.toml"
+            - "--listen"
+            - "0.0.0.0:{{ .Values.client.socks5.port }}"
+            - "--allow-non-loopback"
           ports:
             - name: socks5
               containerPort: {{ .Values.client.socks5.port }}
@@ -40,7 +43,7 @@ spec:
               protocol: TCP
           livenessProbe:
             httpGet:
-              path: /livez
+              path: /healthz
               port: metrics
             initialDelaySeconds: 5
             periodSeconds: 10
@@ -57,9 +60,6 @@ spec:
               mountPath: /etc/uncrowned-king/client.toml
               subPath: client.toml
               readOnly: true
-            - name: secret
-              mountPath: /etc/uncrowned-king/secret
-              readOnly: true
             {{- if .Values.client.existingCaSecret }}
             - name: ca
               mountPath: /etc/uncrowned-king/ca
@@ -69,9 +69,6 @@ spec:
         - name: config
           configMap:
             name: {{ include "uncrowned-king.client.fullname" . }}-config
-        - name: secret
-          secret:
-            secretName: {{ include "uncrowned-king.client.fullname" . }}-secret
         {{- if .Values.client.existingCaSecret }}
         - name: ca
           secret:

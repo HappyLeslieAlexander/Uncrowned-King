@@ -57,7 +57,7 @@ graph TD
 
 | Crate | 职责与设计原则 |
 | :--- | :--- |
-| **`uk-proto`** | 纯协议层：定义 Frame 格式、常量、零拷贝编码解码器、合并写入 `write_frames`、通用 HTTP 探针 |
+| **`uk-proto`** | 纯协议层：定义 Frame 格式、常量、零拷贝编码解码器、批量帧写入辅助函数与通用 HTTP 探针 |
 | **`uk-auth`** | 鉴权安全层：基于 TLS Keying Material Exporter (RFC 5705) 的双向 HMAC 身份认证，带防重放与密钥零化 (`zeroize`) |
 | **`uk-policy`** | 策略规则引擎：高性能 CIDR 前缀树、通配符域名匹配与 ACL 规则过滤 |
 | **`uk-server`** | 服务端中继核心：支持 TLS 和 QUIC 双载体、防暴力破解速率限制 (`AuthRateLimiter`)、热重载与会话流控 |
@@ -97,7 +97,7 @@ sequenceDiagram
 ### TCP 流生命周期
 1. **打开流**：客户端发送 `TCP_OPEN(FlowID, TargetAddr)`。
 2. **确认流**：服务端异步拨号目标地址，成功后回复 `TCP_OPEN_ACK(FlowID)`，若策略拒绝或目标不可达则返回对应错误码。
-3. **数据传输**：双方使用 `TCP_DATA(FlowID, Payload)` 传输应用层载荷。支持 `write_frames` 批量合并写入。
+3. **数据传输**：双方使用 `TCP_DATA(FlowID, Payload)` 传输应用层载荷。
 4. **半关闭与优雅终止**：一方读关闭时发送 `TCP_CLOSE(FlowID, Normal)`；双方关闭或异常超时后回收 `FlowID`。
 
 ### UDP 流生命周期

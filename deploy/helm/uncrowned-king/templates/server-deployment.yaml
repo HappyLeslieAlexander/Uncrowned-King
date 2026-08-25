@@ -17,7 +17,6 @@ spec:
     metadata:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/server-configmap.yaml") . | sha256sum }}
-        checksum/secret: {{ include (print $.Template.BasePath "/server-secret.yaml") . | sha256sum }}
       labels:
         {{- include "uncrowned-king.server.selectorLabels" . | nindent 8 }}
     spec:
@@ -31,9 +30,11 @@ spec:
           imagePullPolicy: {{ .Values.server.image.pullPolicy }}
           command:
             - "uk-server"
-            - "run"
+            - "serve"
             - "--config"
             - "/etc/uncrowned-king/server.toml"
+            - "--log-format"
+            - "{{ .Values.server.config.log_format }}"
           ports:
             - name: tls
               containerPort: 8443
@@ -46,7 +47,7 @@ spec:
               protocol: TCP
           livenessProbe:
             httpGet:
-              path: /livez
+              path: /healthz
               port: metrics
             initialDelaySeconds: 5
             periodSeconds: 10
@@ -67,10 +68,6 @@ spec:
               mountPath: /etc/uncrowned-king/policy/policy.toml
               subPath: policy.toml
               readOnly: true
-            - name: credentials
-              mountPath: /etc/uncrowned-king/credentials.toml
-              subPath: credentials.toml
-              readOnly: true
             {{- if .Values.server.existingTlsSecret }}
             - name: tls
               mountPath: /etc/uncrowned-king/tls
@@ -83,9 +80,6 @@ spec:
         - name: policy
           configMap:
             name: {{ include "uncrowned-king.server.fullname" . }}-config
-        - name: credentials
-          secret:
-            secretName: {{ include "uncrowned-king.server.fullname" . }}-credentials
         {{- if .Values.server.existingTlsSecret }}
         - name: tls
           secret:

@@ -686,7 +686,7 @@ fn changed_static_config_field(
     }
 }
 
-fn reload_static_limits(config: &ServerConfig) -> [(&'static str, u64); 19] {
+fn reload_static_limits(config: &ServerConfig) -> [(&'static str, u64); 23] {
     [
         ("max_pre_auth_bytes", config.max_pre_auth_bytes()),
         ("max_frame_size", config.max_frame_size()),
@@ -739,6 +739,19 @@ fn reload_static_limits(config: &ServerConfig) -> [(&'static str, u64); 19] {
         (
             "replay_cache_max_entries",
             config.replay_cache_max_entries(),
+        ),
+        ("relay_buffer_size", config.relay_buffer_size() as u64),
+        (
+            "auth_rate_limit_failures",
+            u64::from(config.auth_rate_limit_config().max_failures),
+        ),
+        (
+            "auth_rate_limit_window_seconds",
+            config.auth_rate_limit_config().window_secs,
+        ),
+        (
+            "auth_rate_limit_ban_seconds",
+            config.auth_rate_limit_config().ban_secs,
         ),
     ]
 }
@@ -1562,6 +1575,38 @@ mod tests {
         });
 
         assert!(ensure_reload_compatible(&current, &candidate).is_ok());
+    }
+
+    #[test]
+    fn security_reload_rejects_relay_buffer_size_changes() {
+        let current = minimal_config();
+        let mut candidate = current.clone();
+        candidate.limits = Some(LimitConfig {
+            relay_buffer_size: Some(32 * 1024),
+            ..LimitConfig::default()
+        });
+
+        let error = ensure_reload_compatible(&current, &candidate)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("relay_buffer_size"));
+        assert!(error.contains("requires a restart"));
+    }
+
+    #[test]
+    fn security_reload_rejects_auth_rate_limit_changes() {
+        let current = minimal_config();
+        let mut candidate = current.clone();
+        candidate.limits = Some(LimitConfig {
+            auth_rate_limit_failures: Some(10),
+            ..LimitConfig::default()
+        });
+
+        let error = ensure_reload_compatible(&current, &candidate)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("auth_rate_limit_failures"));
+        assert!(error.contains("requires a restart"));
     }
 
     #[test]

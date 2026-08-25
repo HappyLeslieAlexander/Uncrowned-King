@@ -11,10 +11,16 @@ data:
     {{- if .Values.server.config.observability_listen }}
     observability_listen = "{{ .Values.server.config.observability_listen }}"
     {{- end }}
-    log_format = "{{ .Values.server.config.log_format }}"
     cert_path = "/etc/uncrowned-king/tls/tls.crt"
     key_path = "/etc/uncrowned-king/tls/tls.key"
     policy_path = "/etc/uncrowned-king/policy/policy.toml"
+
+    {{- range .Values.server.credentials }}
+    [[credentials]]
+    id = "{{ .id }}"
+    secret = "{{ .secret }}"
+    policy_group = "{{ .policy_group }}"
+    {{- end }}
 
     [limits]
     max_frame_size = {{ .Values.server.config.limits.max_frame_size }}

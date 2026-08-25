@@ -100,12 +100,13 @@ impl AuthRateLimiter {
 
         // Opportunistic prune if map gets large
         if records.len() > 1024 {
+            let window = Duration::from_secs(self.config.window_secs);
             records.retain(|_, rec| {
                 if let Some(banned_until) = rec.banned_until {
                     now < banned_until
                 } else {
-                    now.duration_since(rec.window_start)
-                        < Duration::from_secs(self.config.window_secs)
+                    now.checked_duration_since(rec.window_start)
+                        .is_some_and(|d| d < window)
                 }
             });
         }
@@ -116,10 +117,16 @@ impl AuthRateLimiter {
             banned_until: None,
         });
 
-        // If window has passed and not banned, reset window
-        if record.banned_until.is_none()
-            && now.duration_since(record.window_start)
-                >= Duration::from_secs(self.config.window_secs)
+        // If currently banned but ban has expired, reset state
+        if let Some(banned_until) = record.banned_until {
+            if now >= banned_until {
+                record.banned_until = None;
+                record.failures = 0;
+                record.window_start = now;
+            }
+        } else if now
+            .checked_duration_since(record.window_start)
+            .is_some_and(|d| d >= Duration::from_secs(self.config.window_secs))
         {
             record.failures = 0;
             record.window_start = now;
@@ -210,5 +217,50 @@ mod tests {
             assert!(!limiter.record_failure(ip));
             assert!(limiter.check(ip));
         }
+    }
+
+    #[test]
+    fn ban_expiration_resets_and_tracks_new_failures() {
+        let limiter = AuthRateLimiter::new(AuthRateLimitConfig {
+            max_failures: 2,
+            window_secs: 60,
+            ban_secs: 0, // 0 sec ban = immediate expiration
+        });
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3));
+
+        assert!(!limiter.record_failure(ip));
+        assert!(limiter.record_failure(ip)); // Banned
+
+        // Since ban_secs is 0, ban is already expired
+        assert!(limiter.check(ip)); // Resets ban & failures
+
+        // 1st failure after expiration should not ban
+        assert!(!limiter.record_failure(ip));
+        assert!(limiter.check(ip));
+
+        // 2nd failure after expiration should ban
+        assert!(limiter.record_failure(ip));
+    }
+
+    #[test]
+    fn record_failure_directly_after_ban_expiration_is_not_wiped_by_check() {
+        let limiter = AuthRateLimiter::new(AuthRateLimitConfig {
+            max_failures: 2,
+            window_secs: 60,
+            ban_secs: 0, // 0 sec ban
+        });
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 4));
+
+        assert!(!limiter.record_failure(ip));
+        assert!(limiter.record_failure(ip)); // Banned
+
+        // Call record_failure directly after ban expiration (without check() first)
+        assert!(!limiter.record_failure(ip)); // resets expired ban and counts 1st failure
+
+        // Next check should still allow
+        assert!(limiter.check(ip));
+
+        // 2nd failure should now ban (proving 1st failure was NOT wiped)
+        assert!(limiter.record_failure(ip));
     }
 }

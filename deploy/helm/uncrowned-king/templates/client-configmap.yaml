@@ -14,7 +14,7 @@ data:
     {{- end }}
     ca_cert_path = "/etc/uncrowned-king/ca/ca.crt"
     key_id = "{{ .Values.client.config.key_id }}"
-    secret = "/etc/uncrowned-king/secret/secret"
+    secret = "{{ .Values.client.config.secret }}"
     {{- if .Values.client.config.relay_buffer_size }}
     relay_buffer_size = {{ .Values.client.config.relay_buffer_size }}
     {{- end }}

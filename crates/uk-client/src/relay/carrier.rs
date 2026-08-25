@@ -586,6 +586,12 @@ pub(crate) async fn write_frame_locked(
     Ok(())
 }
 
+/// Writes one frame, refusing to start if the session is already closing.
+///
+/// The write itself is *not* raced against shutdown. `write_frame` is
+/// `write_all` + `flush` and is not cancellation safe, so dropping it mid-frame
+/// would leave an unknown-length prefix on the wire and desynchronise the peer's
+/// framing.
 pub(crate) async fn write_frame_or_shutdown<W>(
     writer: &mut W,
     frame: &Frame,
@@ -594,10 +600,10 @@ pub(crate) async fn write_frame_or_shutdown<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    tokio::select! {
-        result = write_frame(writer, frame) => result?,
-        () = shutdown.closed() => return Err(session_shutdown_error().into()),
+    if shutdown.is_closed() {
+        return Err(session_shutdown_error().into());
     }
+    write_frame(writer, frame).await?;
     Ok(())
 }
 
