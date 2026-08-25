@@ -16,11 +16,10 @@ use tokio::{
     time,
 };
 use tracing::{debug, info, warn};
-
-const MAX_CONNECTIONS: usize = 32;
-const MAX_REQUEST_HEAD_BYTES: usize = 8 * 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+use uk_proto::observability::{
+    ACCEPT_RETRY_DELAY, MAX_OBSERVABILITY_CONNECTIONS as MAX_CONNECTIONS, MAX_REQUEST_HEAD_BYTES,
+    parse_request_line, read_request_head, serve_probe_connection,
+};
 
 const PROTOCOL_COUNT: usize = 2;
 const OPEN_FAILURE_COUNT: usize = 5;
@@ -512,126 +511,7 @@ async fn serve_connection<S>(stream: &mut S, metrics: &ServerMetrics) -> io::Res
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let request = time::timeout(REQUEST_TIMEOUT, read_request_head(stream))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP request timed out"))??;
-    let Some((method, path, version)) = parse_request_line(&request) else {
-        return write_response(stream, 400, "Bad Request", "text/plain", "bad request\n").await;
-    };
-    if method != "GET" {
-        return write_response(
-            stream,
-            405,
-            "Method Not Allowed",
-            "text/plain",
-            "method not allowed\n",
-        )
-        .await;
-    }
-    if version != "HTTP/1.0" && version != "HTTP/1.1" {
-        return write_response(
-            stream,
-            505,
-            "HTTP Version Not Supported",
-            "text/plain",
-            "HTTP version not supported\n",
-        )
-        .await;
-    }
-
-    match path {
-        "/healthz" => write_response(stream, 200, "OK", "text/plain", "ok\n").await,
-        "/readyz" if metrics.is_ready() => {
-            write_response(stream, 200, "OK", "text/plain", "ready\n").await
-        }
-        "/readyz" => {
-            write_response(
-                stream,
-                503,
-                "Service Unavailable",
-                "text/plain",
-                "not ready\n",
-            )
-            .await
-        }
-        "/metrics" => {
-            let body = metrics.render();
-            write_response(
-                stream,
-                200,
-                "OK",
-                "text/plain; version=0.0.4; charset=utf-8",
-                &body,
-            )
-            .await
-        }
-        _ => write_response(stream, 404, "Not Found", "text/plain", "not found\n").await,
-    }
-}
-
-async fn read_request_head<S>(stream: &mut S) -> io::Result<Vec<u8>>
-where
-    S: AsyncRead + Unpin,
-{
-    let mut request = Vec::with_capacity(512);
-    let mut buffer = [0_u8; 512];
-    loop {
-        let read = stream.read(&mut buffer).await?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "HTTP request closed before headers completed",
-            ));
-        }
-        request.extend_from_slice(&buffer[..read]);
-        if request.len() > MAX_REQUEST_HEAD_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "HTTP request headers exceed limit",
-            ));
-        }
-        if request.windows(4).any(|window| window == b"\r\n\r\n") {
-            return Ok(request);
-        }
-        if request.len() == MAX_REQUEST_HEAD_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "HTTP request headers exceed limit",
-            ));
-        }
-    }
-}
-
-fn parse_request_line(request: &[u8]) -> Option<(&str, &str, &str)> {
-    let line_end = request.windows(2).position(|window| window == b"\r\n")?;
-    let line = std::str::from_utf8(&request[..line_end]).ok()?;
-    let mut parts = line.split(' ');
-    let method = parts.next()?;
-    let path = parts.next()?;
-    let version = parts.next()?;
-    if parts.next().is_some() || method.is_empty() || path.is_empty() || version.is_empty() {
-        return None;
-    }
-    Some((method, path, version))
-}
-
-async fn write_response<S>(
-    stream: &mut S,
-    status: u16,
-    reason: &str,
-    content_type: &str,
-    body: &str,
-) -> io::Result<()>
-where
-    S: AsyncWrite + Unpin,
-{
-    let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(head.as_bytes()).await?;
-    stream.write_all(body.as_bytes()).await?;
-    stream.shutdown().await
+    serve_probe_connection(stream, || metrics.is_ready(), || metrics.render()).await
 }
 
 #[cfg(test)]

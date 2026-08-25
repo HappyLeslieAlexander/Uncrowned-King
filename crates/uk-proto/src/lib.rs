@@ -10,6 +10,7 @@ pub mod error;
 pub mod flow;
 pub mod frame;
 pub mod io;
+pub mod observability;
 pub mod settings;
 pub mod status;
 pub mod target;
