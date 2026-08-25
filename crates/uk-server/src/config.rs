@@ -5,6 +5,7 @@ use std::{collections::HashSet, error::Error, fmt, fs, path::Path};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use crate::rate_limit::AuthRateLimitConfig;
 use serde::Deserialize;
 use tokio::sync::Semaphore;
 use uk_auth::{
@@ -167,6 +168,10 @@ impl ServerConfig {
             MAX_AUTH_SKEW_SECONDS,
         )?;
         self.validate_replay_cache_covers_auth_skew()?;
+        if let Some(buf_size) = self.limits.as_ref().and_then(|l| l.relay_buffer_size) {
+            reject_small_limit("relay_buffer_size", buf_size as u64, 1024)?;
+            reject_large_limit("relay_buffer_size", buf_size as u64, 1024 * 1024)?;
+        }
         Ok(())
     }
 
@@ -373,6 +378,28 @@ impl ServerConfig {
             .unwrap_or(DEFAULT_REPLAY_CACHE_MAX_ENTRIES as u64)
     }
 
+    /// Relay chunk buffer size in bytes. Default: 16 KiB (16384).
+    pub fn relay_buffer_size(&self) -> usize {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.relay_buffer_size)
+            .unwrap_or(16 * 1024)
+    }
+
+    /// Rate limiting configuration for failed authentication attempts.
+    pub fn auth_rate_limit_config(&self) -> AuthRateLimitConfig {
+        let limits = self.limits.as_ref();
+        AuthRateLimitConfig {
+            max_failures: limits.and_then(|l| l.auth_rate_limit_failures).unwrap_or(5),
+            window_secs: limits
+                .and_then(|l| l.auth_rate_limit_window_seconds)
+                .unwrap_or(60),
+            ban_secs: limits
+                .and_then(|l| l.auth_rate_limit_ban_seconds)
+                .unwrap_or(300),
+        }
+    }
+
     fn resolve_paths(&mut self, base_dir: &Path) {
         self.cert_path = resolve_config_relative_path(base_dir, &self.cert_path);
         self.key_path = resolve_config_relative_path(base_dir, &self.key_path);
@@ -471,6 +498,14 @@ pub struct LimitConfig {
     pub replay_cache_window_seconds: Option<u64>,
     /// Maximum accepted nonce pairs retained by the replay cache.
     pub replay_cache_max_entries: Option<u64>,
+    /// Relay chunk buffer size in bytes. Default: 16 KiB (16384).
+    pub relay_buffer_size: Option<usize>,
+    /// Maximum authentication failures from an IP within the window before temporary ban.
+    pub auth_rate_limit_failures: Option<u32>,
+    /// Time window for accumulating authentication failures in seconds.
+    pub auth_rate_limit_window_seconds: Option<u64>,
+    /// Ban duration in seconds when auth_rate_limit_failures is exceeded.
+    pub auth_rate_limit_ban_seconds: Option<u64>,
 }
 
 /// One configured credential.

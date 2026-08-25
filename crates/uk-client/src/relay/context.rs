@@ -702,9 +702,9 @@ pub(crate) fn keepalive_interval(settings: NegotiatedSettings) -> Option<Duratio
     Some(Duration::from_millis(interval_millis.max(1)))
 }
 
-pub(crate) fn tcp_data_frame_size(limits: FrameLimits) -> usize {
-    usize::try_from(limits.max_frame_size)
-        .map_or(RELAY_BUFFER_SIZE, |limit| limit.min(RELAY_BUFFER_SIZE))
+pub(crate) fn tcp_data_frame_size(limits: FrameLimits, relay_buffer_size: Option<usize>) -> usize {
+    let buf_size = relay_buffer_size.unwrap_or(RELAY_BUFFER_SIZE);
+    usize::try_from(limits.max_frame_size).map_or(buf_size, |limit| limit.min(buf_size))
 }
 
 pub(crate) fn reserve_bytes(buffered_bytes: &AtomicUsize, amount: usize, limit: usize) -> bool {

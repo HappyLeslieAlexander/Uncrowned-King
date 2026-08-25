@@ -183,8 +183,8 @@ impl Frame {
         Ok(Self { header, payload })
     }
 
-    /// Encodes the complete frame into a new byte buffer.
-    pub fn encode(&self) -> ProtocolResult<Bytes> {
+    /// Encodes the complete frame into an existing buffer.
+    pub fn encode_into(&self, dst: &mut impl BufMut) -> ProtocolResult<()> {
         let payload_len =
             u64::try_from(self.payload.len()).map_err(|_| ProtocolError::InvalidVarint)?;
         if self.header.length != payload_len {
@@ -192,9 +192,15 @@ impl Frame {
                 "frame header length does not match payload length",
             ));
         }
+        self.header.encode(dst)?;
+        dst.put_slice(&self.payload);
+        Ok(())
+    }
+
+    /// Encodes the complete frame into a new byte buffer.
+    pub fn encode(&self) -> ProtocolResult<Bytes> {
         let mut out = BytesMut::new();
-        self.header.encode(&mut out)?;
-        out.extend_from_slice(&self.payload);
+        self.encode_into(&mut out)?;
         Ok(out.freeze())
     }
 

@@ -108,7 +108,7 @@ fn test_relay_limits(max_streams: u64) -> RelayLimits {
         max_streams,
         max_udp_flows: max_streams,
         max_outbound_dials_per_session: 1,
-        data_frame_size: tcp_data_frame_size(frame),
+        data_frame_size: tcp_data_frame_size(frame, None),
         max_buffered_bytes_per_session: 1024,
         max_buffered_bytes_per_flow: 1024,
         target_connect_timeout: None,
@@ -1515,16 +1515,31 @@ async fn udp_target_connect_binds_matching_ip_family() {
 #[test]
 fn caps_tcp_data_frame_size_to_frame_limit() {
     assert_eq!(
-        tcp_data_frame_size(FrameLimits {
-            max_frame_size: 1024
-        }),
+        tcp_data_frame_size(
+            FrameLimits {
+                max_frame_size: 1024
+            },
+            None
+        ),
         1024
     );
     assert_eq!(
-        tcp_data_frame_size(FrameLimits {
-            max_frame_size: 65_536
-        }),
+        tcp_data_frame_size(
+            FrameLimits {
+                max_frame_size: 65_536
+            },
+            None
+        ),
         RELAY_BUFFER_SIZE
+    );
+    assert_eq!(
+        tcp_data_frame_size(
+            FrameLimits {
+                max_frame_size: 65_536
+            },
+            Some(32 * 1024)
+        ),
+        32 * 1024
     );
 }
 

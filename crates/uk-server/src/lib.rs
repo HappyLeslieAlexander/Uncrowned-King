@@ -1,9 +1,9 @@
 //! Uncrowned King server library.
 
 pub mod config;
-
 mod observability;
 pub mod quic;
+pub mod rate_limit;
 mod relay;
 mod security;
 mod tls;
@@ -156,6 +156,7 @@ struct ServerRuntime {
     config: Arc<ServerConfig>,
     security: SecurityState,
     replay_cache: Arc<Mutex<ReplayCache>>,
+    auth_rate_limiter: Arc<rate_limit::AuthRateLimiter>,
     max_sessions: usize,
     max_handshakes: usize,
 }
@@ -167,6 +168,7 @@ struct ConnectionRuntime {
     session_permits: Arc<Semaphore>,
     config: Arc<ServerConfig>,
     handshake_permits: Arc<Semaphore>,
+    auth_rate_limiter: Arc<rate_limit::AuthRateLimiter>,
     max_sessions: usize,
     max_handshakes: usize,
     metrics: Arc<ServerMetrics>,
@@ -180,6 +182,23 @@ impl ConnectionRuntime {
         peer: SocketAddr,
         shutdown_rx: watch::Receiver<bool>,
     ) {
+        if !self.auth_rate_limiter.check(peer.ip()) {
+            self.metrics.record_rejected_handshake();
+            warn!(
+                event = "server.auth_rate_limit.rejected",
+                peer = %peer,
+                "IP is temporarily banned due to excessive authentication failures"
+            );
+            if let Err(err) = tcp.shutdown().await {
+                debug!(
+                    event = "server.auth_rate_limit.shutdown_error",
+                    peer = %peer,
+                    error = %err
+                );
+            }
+            return;
+        }
+
         self.metrics.record_accepted_connection();
         let Ok(handshake_permit) = Arc::clone(&self.handshake_permits).try_acquire_owned() else {
             self.metrics.record_rejected_handshake();
@@ -224,6 +243,18 @@ impl ConnectionRuntime {
         peer: SocketAddr,
         shutdown_rx: watch::Receiver<bool>,
     ) {
+        if !self.auth_rate_limiter.check(peer.ip()) {
+            self.metrics.record_rejected_handshake();
+            warn!(
+                event = "server.auth_rate_limit.rejected",
+                peer = %peer,
+                carrier = "quic",
+                "IP is temporarily banned due to excessive authentication failures"
+            );
+            incoming.refuse();
+            return;
+        }
+
         self.metrics.record_accepted_connection();
         let Ok(handshake_permit) = Arc::clone(&self.handshake_permits).try_acquire_owned() else {
             self.metrics.record_rejected_handshake();
@@ -317,6 +348,7 @@ where
     run_on_listener_inner(runtime, listener, Some(reload_rx), shutdown).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_on_listener_inner<F>(
     runtime: ServerRuntime,
     listener: TcpListener,
@@ -330,6 +362,7 @@ where
         config,
         security,
         replay_cache,
+        auth_rate_limiter,
         max_sessions,
         max_handshakes,
     } = runtime;
@@ -345,6 +378,7 @@ where
         session_permits: Arc::clone(&session_permits),
         config: Arc::clone(&config),
         handshake_permits,
+        auth_rate_limiter,
         max_sessions,
         max_handshakes,
         metrics: Arc::clone(&metrics),
@@ -553,6 +587,9 @@ fn prepare_server_runtime(mut config: ServerConfig) -> Result<ServerRuntime, Any
             config.replay_cache_max_entries(),
         )?,
     )));
+    let auth_rate_limiter = Arc::new(rate_limit::AuthRateLimiter::new(
+        config.auth_rate_limit_config(),
+    ));
     let max_sessions = usize_limit("max_sessions", config.max_sessions())?;
     let max_handshakes = usize_limit("max_handshakes", config.max_handshakes())?;
 
@@ -560,6 +597,7 @@ fn prepare_server_runtime(mut config: ServerConfig) -> Result<ServerRuntime, Any
         config: Arc::new(config),
         security,
         replay_cache,
+        auth_rate_limiter,
         max_sessions,
         max_handshakes,
     })
@@ -846,11 +884,22 @@ where
         return Ok(());
     };
     let (carrier_reader, carrier_writer, datagrams, identity) = match handshake_result {
-        Ok(handshake) => handshake,
+        Ok(handshake) => {
+            runtime.auth_rate_limiter.record_success(peer.ip());
+            handshake
+        }
         Err(err) => {
-            runtime
-                .metrics
-                .record_failed_handshake(handshake_failure_reason(&err));
+            let reason = handshake_failure_reason(&err);
+            runtime.metrics.record_failed_handshake(reason);
+            if matches!(reason, HandshakeFailureReason::Auth)
+                && runtime.auth_rate_limiter.record_failure(peer.ip())
+            {
+                warn!(
+                    event = "server.auth_rate_limit.banned_after_failure",
+                    peer = %peer,
+                    "IP has been temporarily banned after exceeding auth failure threshold"
+                );
+            }
             return Err(err);
         }
     };
@@ -940,6 +989,7 @@ async fn run_authenticated_session(
             session_task_shutdown_timeout: listener_shutdown_timeout(
                 config.shutdown_timeout_seconds(),
             ),
+            relay_buffer_size: Some(config.relay_buffer_size()),
         }),
         idle_timeout(config.idle_timeout_seconds()),
         shutdown_rx,

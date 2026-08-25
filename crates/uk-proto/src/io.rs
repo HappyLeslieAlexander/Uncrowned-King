@@ -215,6 +215,26 @@ where
     Ok(())
 }
 
+/// Writes multiple frames coalesced into a single contiguous buffer to an async stream.
+///
+/// This reduces write system calls and minimizes packet fragmentation when sending
+/// batches of frames.
+pub async fn write_frames<'a, W, I>(writer: &mut W, frames: I) -> FrameIoResult<()>
+where
+    W: AsyncWrite + Unpin,
+    I: IntoIterator<Item = &'a Frame>,
+{
+    let mut buffer = BytesMut::new();
+    for frame in frames {
+        frame.encode_into(&mut buffer)?;
+    }
+    if !buffer.is_empty() {
+        writer.write_all(&buffer).await?;
+        writer.flush().await?;
+    }
+    Ok(())
+}
+
 async fn read_optional_one<R>(reader: &mut R) -> FrameIoResult<Option<u8>>
 where
     R: AsyncRead + Unpin,
@@ -546,6 +566,44 @@ mod tests {
             ))
         ));
 
+        drop(writer);
+
+        let mut written = Vec::new();
+        reader.read_to_end(&mut written).await.unwrap();
+        assert!(written.is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_frames_coalesces_multiple_frames() {
+        let (mut writer, reader) = tokio::io::duplex(256);
+        let frame1 = Frame::new(FrameType::Ping, 0, 0, Bytes::from_static(b"1234")).unwrap();
+        let frame2 = Frame::new(FrameType::TcpData, 0, 1, Bytes::from_static(b"hello")).unwrap();
+        let frame3 = Frame::new(FrameType::TcpClose, 0, 1, Bytes::from_static(&[0x00])).unwrap();
+
+        write_frames(
+            &mut writer,
+            &[frame1.clone(), frame2.clone(), frame3.clone()],
+        )
+        .await
+        .unwrap();
+        drop(writer);
+
+        let mut read_frames = Vec::new();
+        let mut frame_reader = FrameReader::new(reader, FrameLimits::default());
+        while let Ok(frame) = frame_reader.read_frame().await {
+            read_frames.push(frame);
+        }
+
+        assert_eq!(read_frames.len(), 3);
+        assert_eq!(read_frames[0], frame1);
+        assert_eq!(read_frames[1], frame2);
+        assert_eq!(read_frames[2], frame3);
+    }
+
+    #[tokio::test]
+    async fn write_frames_empty_does_not_write() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        write_frames(&mut writer, &[] as &[Frame]).await.unwrap();
         drop(writer);
 
         let mut written = Vec::new();

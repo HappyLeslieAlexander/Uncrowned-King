@@ -668,7 +668,7 @@ impl ClientSession {
             writer: Arc::new(Mutex::new(carrier_writer)),
             flows: Arc::new(Mutex::new(HashMap::new())),
             limits,
-            data_frame_size: tcp_data_frame_size(limits),
+            data_frame_size: tcp_data_frame_size(limits, Some(config.relay_buffer_size())),
             max_streams: negotiated.max_streams,
             max_udp_flows: negotiated.max_udp_flows,
             admission: FlowAdmissionControl::new(negotiated.max_streams, negotiated.max_udp_flows),

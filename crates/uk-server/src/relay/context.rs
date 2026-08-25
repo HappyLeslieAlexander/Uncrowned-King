@@ -140,6 +140,7 @@ pub(crate) struct RelayLimitConfig {
     pub(crate) carrier_write_timeout: Option<Duration>,
     pub(crate) udp_flow_idle_timeout: Option<Duration>,
     pub(crate) session_task_shutdown_timeout: Option<Duration>,
+    pub(crate) relay_buffer_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -389,7 +390,7 @@ impl RelayLimits {
             max_streams: config.max_streams,
             max_udp_flows: config.max_udp_flows,
             max_outbound_dials_per_session: config.max_outbound_dials_per_session,
-            data_frame_size: tcp_data_frame_size(config.frame),
+            data_frame_size: tcp_data_frame_size(config.frame, config.relay_buffer_size),
             max_buffered_bytes_per_session: config.max_buffered_bytes_per_session,
             max_buffered_bytes_per_flow: config.max_buffered_bytes_per_flow,
             target_connect_timeout: config.target_connect_timeout,
@@ -877,7 +878,7 @@ pub(crate) const fn is_valid_session_transition(
     )
 }
 
-pub(crate) fn tcp_data_frame_size(limits: FrameLimits) -> usize {
-    usize::try_from(limits.max_frame_size)
-        .map_or(RELAY_BUFFER_SIZE, |limit| limit.min(RELAY_BUFFER_SIZE))
+pub(crate) fn tcp_data_frame_size(limits: FrameLimits, relay_buffer_size: Option<usize>) -> usize {
+    let buf_size = relay_buffer_size.unwrap_or(RELAY_BUFFER_SIZE);
+    usize::try_from(limits.max_frame_size).map_or(buf_size, |limit| limit.min(buf_size))
 }

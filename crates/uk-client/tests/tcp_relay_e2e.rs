@@ -314,6 +314,16 @@ async fn reports_auth_failure_during_handshake() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enforces_auth_rate_limiting_on_repeated_auth_failures() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_auth_rate_limiting_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supports_custom_relay_buffer_size() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_custom_relay_buffer_size_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn falls_back_to_secondary_server_addr_during_handshake() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(10), run_handshake_fallback_e2e()).await?
 }
@@ -1063,6 +1073,7 @@ async fn run_udp_associate_server_unavailable_e2e() -> Result<(), TestError> {
         max_buffered_bytes_per_session: None,
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
+        relay_buffer_size: None,
     })
     .await?;
 
@@ -2619,6 +2630,71 @@ async fn run_auth_failure_error_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+async fn run_auth_rate_limiting_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let mut limits = test_limits();
+    limits.auth_rate_limit_failures = Some(2);
+    limits.auth_rate_limit_window_seconds = Some(60);
+    limits.auth_rate_limit_ban_seconds = Some(300);
+
+    let harness = ServerHarness::start(limits).await?;
+
+    // Failure 1
+    let err1 = run_handshake(harness.client_config(WRONG_SECRET))
+        .await
+        .expect_err("1st wrong secret must fail");
+    assert!(err1.to_string().contains("authentication failed"));
+
+    // Failure 2 -> should ban IP
+    let err2 = run_handshake(harness.client_config(WRONG_SECRET))
+        .await
+        .expect_err("2nd wrong secret must fail");
+    assert!(err2.to_string().contains("authentication failed"));
+
+    // Attempt 3 with correct secret should now fail / be rejected due to IP ban
+    let err3 = run_handshake(harness.client_config(SECRET))
+        .await
+        .expect_err("banned IP must be rejected");
+    assert!(
+        err3.to_string().contains("closed")
+            || err3.to_string().contains("handshake")
+            || err3.to_string().contains("reset")
+            || err3.to_string().contains("eof")
+            || err3.to_string().contains("error"),
+        "banned IP error: {err3}"
+    );
+
+    Ok(())
+}
+
+async fn run_custom_relay_buffer_size_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, echo_task) = spawn_echo_target().await?;
+    let mut limits = test_limits();
+    limits.relay_buffer_size = Some(32 * 1024);
+
+    let harness = RelayHarness::start_with_limits(
+        Some(allow_default_group_loopback_policy(target_addr.port())),
+        limits,
+    )
+    .await?;
+
+    let (mut socks, connect_reply) = open_socks_connect(harness.socks_addr, target_addr).await?;
+    assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+
+    socks
+        .write_all(b"Uncrowned King custom relay buffer e2e")
+        .await?;
+    let mut reply = vec![0_u8; b"Uncrowned King custom relay buffer e2e".len()];
+    socks.read_exact(&mut reply).await?;
+    assert_eq!(reply, b"Uncrowned King custom relay buffer e2e");
+
+    echo_task.await??;
+    Ok(())
+}
+
 async fn run_handshake_fallback_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -3532,6 +3608,7 @@ async fn run_server_observability_e2e() -> Result<(), TestError> {
         max_buffered_bytes_per_session: None,
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
+        relay_buffer_size: None,
     })
     .await?;
 
@@ -3631,6 +3708,7 @@ async fn quic_carrier_round_trips_tcp_relay() -> Result<(), TestError> {
         max_buffered_bytes_per_session: None,
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
+        relay_buffer_size: None,
     })
     .await?;
 
@@ -3707,6 +3785,7 @@ async fn quic_carrier_relays_udp_over_datagram() -> Result<(), TestError> {
         max_buffered_bytes_per_session: None,
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
+        relay_buffer_size: None,
     })
     .await?;
 
@@ -3790,6 +3869,7 @@ async fn quic_carrier_falls_back_to_udp_frame_for_large_payload() -> Result<(), 
         max_buffered_bytes_per_session: None,
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
+        relay_buffer_size: None,
     })
     .await?;
 
@@ -4529,6 +4609,7 @@ async fn run_server_active_session_shutdown_e2e() -> Result<(), TestError> {
         max_buffered_bytes_per_session: None,
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
+        relay_buffer_size: None,
     })
     .await?
     .0;
@@ -4574,6 +4655,7 @@ async fn run_socks_listener_shutdown_e2e() -> Result<(), TestError> {
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
+            relay_buffer_size: None,
         },
         async {
             let _ = shutdown_rx.await;
@@ -4628,6 +4710,7 @@ async fn run_socks_listener_shutdown_cancels_pending_open_e2e() -> Result<(), Te
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
+            relay_buffer_size: None,
         },
         async {
             let _ = shutdown_rx.await;
@@ -4695,6 +4778,7 @@ async fn run_socks_listener_shutdown_cancels_pending_udp_open_e2e() -> Result<()
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
+            relay_buffer_size: None,
         },
         async {
             let _ = shutdown_rx.await;
@@ -4781,6 +4865,7 @@ async fn run_socks_listener_shutdown_during_connect_with_request(
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
+            relay_buffer_size: None,
         },
         async {
             let _ = shutdown_rx.await;
@@ -4854,6 +4939,7 @@ async fn run_socks_udp_datagram_shutdown_during_reconnect_e2e() -> Result<(), Te
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
+            relay_buffer_size: None,
         },
         async {
             let _ = shutdown_rx.await;
@@ -4920,6 +5006,7 @@ async fn run_udp_carrier_recovery_e2e() -> Result<(), TestError> {
         max_buffered_bytes_per_session: None,
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
+        relay_buffer_size: None,
     })
     .await?;
 
@@ -5037,6 +5124,7 @@ impl ServerHarness {
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
+            relay_buffer_size: None,
         }
     }
 }
@@ -5172,6 +5260,7 @@ impl MalformedFrameServerHarness {
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
+            relay_buffer_size: None,
         })
         .await?;
 
@@ -5243,6 +5332,7 @@ impl ClientBufferedLimitServerHarness {
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: Some(1),
             max_carrier_sessions: None,
+            relay_buffer_size: None,
         })
         .await?;
 
@@ -5329,6 +5419,7 @@ impl UdpStreamFallbackDisabledServerHarness {
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
+            relay_buffer_size: None,
         })
         .await?;
 
@@ -5413,6 +5504,7 @@ impl AckGatedOpenServerHarness {
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
+            relay_buffer_size: None,
         })
         .await?;
 
@@ -5502,6 +5594,7 @@ impl PendingOpenCancelServerHarness {
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
+            relay_buffer_size: None,
         })
         .await?;
 
@@ -5576,6 +5669,7 @@ impl PendingUdpOpenCancelServerHarness {
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
+            relay_buffer_size: None,
         })
         .await?;
 
@@ -5677,6 +5771,7 @@ impl MissingPongServerHarness {
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
+            relay_buffer_size: None,
         })
         .await?;
 
@@ -6383,6 +6478,7 @@ impl RelayHarness {
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions,
+            relay_buffer_size: None,
         })
         .await?;
 
@@ -6777,6 +6873,7 @@ fn test_client_config(server_addr: SocketAddr, cert_path: &Path, secret: &str) -
         max_buffered_bytes_per_session: None,
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
+        relay_buffer_size: None,
     }
 }
 
@@ -7433,6 +7530,10 @@ fn test_limits() -> LimitConfig {
         shutdown_timeout_seconds: None,
         replay_cache_window_seconds: None,
         replay_cache_max_entries: None,
+        relay_buffer_size: None,
+        auth_rate_limit_failures: None,
+        auth_rate_limit_window_seconds: None,
+        auth_rate_limit_ban_seconds: None,
     }
 }
 

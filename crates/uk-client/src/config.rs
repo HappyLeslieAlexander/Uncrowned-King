@@ -57,6 +57,8 @@ pub struct ClientConfig {
     /// across the pool so a bulk flow's shedding/backpressure on one carrier
     /// does not stall latency-sensitive flows on the others (whitepaper §13).
     pub max_carrier_sessions: Option<u64>,
+    /// Optional relay chunk buffer size in bytes. Default: 16 KiB (16384).
+    pub relay_buffer_size: Option<usize>,
 }
 
 impl Drop for ClientConfig {
@@ -106,6 +108,7 @@ impl fmt::Debug for ClientConfig {
                 &self.max_buffered_bytes_per_flow,
             )
             .field("max_carrier_sessions", &self.max_carrier_sessions)
+            .field("relay_buffer_size", &self.relay_buffer_size)
             .finish()
     }
 }
@@ -274,7 +277,20 @@ impl ClientConfig {
         }
         usize::try_from(max_carrier_sessions)
             .map_err(|_| "max_carrier_sessions is too large for this platform")?;
+        if let Some(buf_size) = self.relay_buffer_size {
+            if buf_size < 1024 {
+                return Err("relay_buffer_size must be at least 1024".into());
+            }
+            if buf_size > 1024 * 1024 {
+                return Err("relay_buffer_size must be at most 1048576".into());
+            }
+        }
         Ok(())
+    }
+
+    /// Relay chunk buffer size in bytes. Default: 16 KiB (16384).
+    pub fn relay_buffer_size(&self) -> usize {
+        self.relay_buffer_size.unwrap_or(16 * 1024)
     }
 
     fn resolve_paths(&mut self, base_dir: &Path) {
@@ -388,6 +404,7 @@ mod tests {
             max_buffered_bytes_per_session: None,
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
+            relay_buffer_size: None,
         }
     }
 

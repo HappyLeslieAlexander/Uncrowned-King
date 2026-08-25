@@ -30,7 +30,7 @@ pub use flow::{
 pub use frame::{
     Frame, FrameHeader, FrameLimits, FrameType, MAX_FRAME_PAYLOAD_SIZE, validate_connection_frame,
 };
-pub use io::{FrameIoError, FrameIoResult, FrameReader, read_frame, write_frame};
+pub use io::{FrameIoError, FrameIoResult, FrameReader, read_frame, write_frame, write_frames};
 pub use settings::{
     DEFAULT_MAX_STREAMS, NegotiatedSettings, PROTOCOL_REVISION_V0_1, SettingKey, Settings,
 };

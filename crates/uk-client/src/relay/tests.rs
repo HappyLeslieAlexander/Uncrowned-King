@@ -73,6 +73,7 @@ fn minimal_config() -> ClientConfig {
         max_buffered_bytes_per_session: None,
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
+        relay_buffer_size: None,
     }
 }
 
@@ -91,7 +92,7 @@ fn test_session(max_streams: u64, max_udp_flows: u64) -> Arc<ClientSession> {
         writer: Arc::new(Mutex::new(Box::new(carrier_writer))),
         flows: Arc::new(Mutex::new(HashMap::new())),
         limits,
-        data_frame_size: tcp_data_frame_size(limits),
+        data_frame_size: tcp_data_frame_size(limits, None),
         max_streams,
         max_udp_flows,
         admission: FlowAdmissionControl::new(max_streams, max_udp_flows),
@@ -1422,16 +1423,31 @@ fn listener_accept_backoff_grows_caps_and_resets() {
 #[test]
 fn caps_tcp_data_frame_size_to_peer_limit() {
     assert_eq!(
-        tcp_data_frame_size(FrameLimits {
-            max_frame_size: 1024
-        }),
+        tcp_data_frame_size(
+            FrameLimits {
+                max_frame_size: 1024
+            },
+            None
+        ),
         1024
     );
     assert_eq!(
-        tcp_data_frame_size(FrameLimits {
-            max_frame_size: 65_536
-        }),
+        tcp_data_frame_size(
+            FrameLimits {
+                max_frame_size: 65_536
+            },
+            None
+        ),
         RELAY_BUFFER_SIZE
+    );
+    assert_eq!(
+        tcp_data_frame_size(
+            FrameLimits {
+                max_frame_size: 65_536
+            },
+            Some(32 * 1024)
+        ),
+        32 * 1024
     );
 }
 
