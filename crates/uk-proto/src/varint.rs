@@ -49,6 +49,15 @@ pub fn decode(src: &mut impl Buf) -> ProtocolResult<u64> {
         8 => src.get_u64() & 0x3fff_ffff_ffff_ffff,
         _ => unreachable!("QUIC varint prefix only permits 1, 2, 4, or 8 bytes"),
     };
+    // QUIC (RFC 9000 §16) allows a value to be encoded in any width whose
+    // prefix can hold it, so `0xc0 00 00 00 00 00 00 01` is a legal spelling of
+    // `1` there. UK's parsers are deliberately stricter (whitepaper §20): one
+    // logical frame must have exactly one wire form, otherwise byte-level
+    // dedup and fingerprinting are defeated and length limits derived from the
+    // minimal encoding (`MIN_TCP_RELAY_FRAME_SIZE`) stop bounding the wire size.
+    if encoded_len(value)? != len {
+        return Err(ProtocolError::InvalidVarint);
+    }
     Ok(value)
 }
 
@@ -106,5 +115,40 @@ mod tests {
     fn rejects_truncated_input() {
         let mut bytes = Bytes::from_static(&[0x40]);
         assert_eq!(decode(&mut bytes), Err(ProtocolError::Truncated));
+    }
+
+    #[test]
+    fn rejects_non_minimal_encodings() {
+        // Every over-wide spelling of a value RFC 9000 would accept.
+        for encoded in [
+            [0x40, 0x01].as_slice(),
+            [0x80, 0x00, 0x00, 0x01].as_slice(),
+            [0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01].as_slice(),
+            [0x80, 0x00, 0x3f, 0xff].as_slice(),
+            [0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xff].as_slice(),
+            [0xc0, 0x00, 0x00, 0x00, 0x3f, 0xff, 0xff, 0xff].as_slice(),
+        ] {
+            let mut bytes = Bytes::from_static(encoded);
+            assert_eq!(decode(&mut bytes), Err(ProtocolError::InvalidVarint));
+        }
+    }
+
+    #[test]
+    fn accepts_minimal_encodings_at_each_width_boundary() {
+        for (value, encoded) in [
+            (0_u64, [0x00].as_slice()),
+            (63, [0x3f].as_slice()),
+            (64, [0x40, 0x40].as_slice()),
+            (16_383, [0x7f, 0xff].as_slice()),
+            (16_384, [0x80, 0x00, 0x40, 0x00].as_slice()),
+            (1_073_741_823, [0xbf, 0xff, 0xff, 0xff].as_slice()),
+            (
+                1_073_741_824,
+                [0xc0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00].as_slice(),
+            ),
+        ] {
+            let mut bytes = Bytes::from_static(encoded);
+            assert_eq!(decode(&mut bytes).unwrap(), value);
+        }
     }
 }

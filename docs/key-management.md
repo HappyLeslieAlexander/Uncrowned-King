@@ -43,7 +43,9 @@ policy_group = "default"   # optional; must be non-empty printable text
 - Files containing secrets (server config, client config) must be readable
   only by the owning user. The process **rejects startup** if a secret- or
   key-bearing file is group/other readable, writable, or executable on Unix.
-  Set `chmod 600`.
+  Set `chmod 600`. The server rejects a secret made of a single repeated byte,
+  and logs a warning when a secret's byte diversity is too low to be plausibly
+  random — neither can fire on material generated as prescribed here.
 - Prefer delivering secrets via a secrets manager / sealed file with `0600`,
   not baked into images or version control.
 - Secrets are zeroized in memory on drop and are never written to logs.

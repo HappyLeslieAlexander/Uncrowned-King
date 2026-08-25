@@ -1,22 +1,76 @@
 //! TLS helpers for the client carrier.
 
-use std::fs;
+use std::{
+    collections::HashMap,
+    fs,
+    sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError},
+};
 
 use rustls::{
     ClientConfig, RootCertStore,
     pki_types::{CertificateDer, ServerName, pem::PemObject},
 };
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, task};
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use uk_auth::EXPORTER_LABEL;
 use uk_proto::ALPN_PROTOCOL;
 
 type TlsError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Client configs already built from a CA bundle, keyed by the configured
+/// `ca_cert_path`.
+///
+/// Building one reads and parses the CA file, which must not happen on a
+/// runtime worker: the client would do it on every pooled reconnect and once
+/// per QUIC endpoint attempt, so a stalled CA path (an automount or an NFS
+/// mount) would block the worker rather than merely fail the dial.
+///
+/// The key is the path because `ca_cert_path` can change across SIGHUP
+/// reloads. [`connector`], which config validation runs on every reload,
+/// always re-reads the file and refreshes the entry, so a CA rotated in place
+/// under an unchanged path is still picked up at reload.
+static CLIENT_CONFIGS: LazyLock<Mutex<HashMap<String, Arc<ClientConfig>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Returns the shared client config for `ca_cert_path`, reading and parsing
+/// the CA bundle on a blocking thread only when it is not cached yet.
+pub async fn shared_client_config(ca_cert_path: &str) -> Result<Arc<ClientConfig>, TlsError> {
+    if let Some(config) = cached_client_config(ca_cert_path) {
+        return Ok(config);
+    }
+
+    let path = ca_cert_path.to_owned();
+    match task::spawn_blocking(move || load_client_config(&path)).await {
+        Ok(result) => result,
+        Err(err) => Err(format!("failed to load CA certificate {ca_cert_path}: {err}").into()),
+    }
+}
+
+/// Builds a TLS 1.3-only client connector, re-reading the CA bundle.
+///
+/// Blocking on purpose: this is the config-validation entry point, which must
+/// observe the CA file as it is on disk. The freshly validated material also
+/// becomes what later connections share.
+pub fn connector(ca_cert_path: &str) -> Result<TlsConnector, TlsError> {
+    Ok(connector_from(load_client_config(ca_cert_path)?))
+}
+
+/// Wraps an already-loaded client config in a connector.
+pub fn connector_from(config: Arc<ClientConfig>) -> TlsConnector {
+    TlsConnector::from(config)
+}
+
+/// Reads the CA bundle, builds the client config, and refreshes the cache.
+fn load_client_config(ca_cert_path: &str) -> Result<Arc<ClientConfig>, TlsError> {
+    let config = Arc::new(build_client_config(ca_cert_path)?);
+    client_configs().insert(ca_cert_path.to_owned(), Arc::clone(&config));
+    Ok(config)
+}
+
 /// Builds a TLS 1.3-only rustls client config with the UK ALPN and 0-RTT
 /// disabled, trusting only the configured CA. Shared by the TLS/TCP and QUIC
 /// client carriers.
-pub fn client_config(ca_cert_path: &str) -> Result<ClientConfig, TlsError> {
+fn build_client_config(ca_cert_path: &str) -> Result<ClientConfig, TlsError> {
     let mut roots = RootCertStore::empty();
     for cert in load_certs(ca_cert_path)? {
         roots.add(cert)?;
@@ -29,11 +83,16 @@ pub fn client_config(ca_cert_path: &str) -> Result<ClientConfig, TlsError> {
     Ok(config)
 }
 
-/// Builds a TLS 1.3-only client connector.
-pub fn connector(ca_cert_path: &str) -> Result<TlsConnector, TlsError> {
-    Ok(TlsConnector::from(std::sync::Arc::new(client_config(
-        ca_cert_path,
-    )?)))
+fn cached_client_config(ca_cert_path: &str) -> Option<Arc<ClientConfig>> {
+    client_configs().get(ca_cert_path).cloned()
+}
+
+/// Locks the config cache, recovering from a poisoned lock: the cached configs
+/// are immutable once built, so a panicking holder cannot leave torn state.
+fn client_configs() -> MutexGuard<'static, HashMap<String, Arc<ClientConfig>>> {
+    CLIENT_CONFIGS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Converts a configured server name into a rustls server name.
@@ -86,6 +145,54 @@ mod tests {
 
     use super::*;
 
+    /// Self-signed `localhost` test certificate, used here only as CA trust
+    /// material to exercise config loading.
+    const CA_PEM: &str = r"-----BEGIN CERTIFICATE-----
+MIIDSTCCAjGgAwIBAgIUEX51v2igsFngMQTuqhBx+gKL2MswDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcwMzEzNTM0MVoXDTM2MDYz
+MDEzNTM0MVowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEAhf3zqFeac7mRJTkyoPMwXUtvgnKcY3ydON4Q3cMrxrd0
+qn2leXJObMP846YgGBtKYu3cDo01qK+cN1rY4l/3iNqa4VOYJ3ckmUTEQhmCG78i
+XIxR9+488rWsxrhJ4GtGj/jd7UaJM9RMs2bb+7KzSj8t6t+Q1MEKsPeqQZ1wBW9S
+wgYLMmrP5eNYFgEgt8KI2r/p+Lf2rbGqu/OdzWkekDbuJq+wqUsEtEnE4x5ELJEE
+axEv+savJVWGSvBUkU6sWU8s0iLNiQKMBjAd/vTbqD+NVGihNrE0S0o0S4oxtHhu
+wwPbfk3bkGV2Z5QwTMI48AhrcoELMuQjO9wZygLHKQIDAQABo4GSMIGPMB0GA1Ud
+DgQWBBT8yAuXKconl4iNVuGmhUJIuVZW5zAfBgNVHSMEGDAWgBT8yAuXKconl4iN
+VuGmhUJIuVZW5zAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwDAYDVR0TAQH/
+BAIwADAOBgNVHQ8BAf8EBAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDQYJKoZI
+hvcNAQELBQADggEBAESMmK/ln9SXy8uevLxfdf0oKE4UC9CyyMj2FPOWSnpvwLJ4
+KI5axpyV3uP4Afd/lH6W47OcvQ9Ah0hSEVY/Xi+sAfLdjPmp3YpTtHP605Bj0y+A
+O2F21JkBh/ZVA2SbI9MCg13XBPfrmqarPxIVlye4kxbD4ZDN5Zp0DLjoIIWWGv2n
+6MuVnlvftL6nyPvc8EyPLM6wxiisxlB/D7jx9tL+GuLHcvXDuxQIkjB7MMWWfERM
+hpwf7QVVYCCnRNdlxk/xa6pr54CMysA75BlDBaVjyqK8Uy74DHL7APCN9opoV5ws
+vX1BONgh2gSRGBFiii6imzEAwefkUtYAvAQy1xw=
+-----END CERTIFICATE-----
+";
+
+    /// A second, unrelated test certificate, used to prove that a changed CA
+    /// path or a CA rotated in place is not served a stale config.
+    const OTHER_CA_PEM: &str = r"-----BEGIN CERTIFICATE-----
+MIIDSTCCAjGgAwIBAgIUbKiGvhPFpGKNHR7j/6IXUhFdHiswDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcxMzA5MTEzMloXDTM2MDcx
+MDA5MTEzMlowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEAkFhamPCkNJ11kWw3cFy+/8mokhXfr21B6uD5uCXYru+2
+RxnV0ALFBzfA42ZcRuesSmlwauQKBnwYD6VfYNJWL0n+UibPI57cNW5yDQg04PY9
+hMoexD9Ls9e2DSpP7Xa2ROx5kbI+1epR1Couu7vFcIVHahz7y8O/QH97xqrMBzmP
+4EEEQKYi61YvUbHRYdFLOJZA2qe2T9CMJVQkwGI2vGHlUpNdP7BYFqj787Y/d+DI
+2nnS/UFm7Hr1S3oBdwkcoqdPC4wqSq4akyYppKuWS9/fpyC+Oo2XCAFQ47YsPguV
+2UjmoBG4hIycdi9ffAKUH9O3lzp7FYT5uIhwG4PwywIDAQABo4GSMIGPMB0GA1Ud
+DgQWBBQgGGr6Btii4e151B3kGUK0enNy9DAfBgNVHSMEGDAWgBQgGGr6Btii4e15
+1B3kGUK0enNy9DAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwDAYDVR0TAQH/
+BAIwADAOBgNVHQ8BAf8EBAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDQYJKoZI
+hvcNAQELBQADggEBABhyQN2prI40OBsUAMkNtwIGP1ApVuTMKHd7KyA/NB+WIW1Q
+W5tBG2g375X5BX8H9+FlVV57Y5lLf0ypUI7Dp6Kwx3Opd77r1IUGT4/SltUxAa04
+0epEQiIKXl/m7dV+XqKMzftn/q92ZXib3/Cy+3SdYoUoD/p4sXcvJ27Dt6pZFHru
+Eyk0ziHhZXvMWYm8k5HUx4/KJrJ14v50Y3ySU7B9FnqwMztL4voIQpA7GeSfsQZY
+a2QH+2MZeMVBaZQ8jAjq24WcpAM1Hx26UOmIy85/NvPFZBbT8ggH2r8CKYjiDqcL
+C2n4SLoR1xpiEaImSSin581IyIJ4vFLJYsUfPJ8=
+-----END CERTIFICATE-----
+";
+
     #[test]
     fn accepts_uk_alpn() {
         assert!(ensure_alpn(Some(ALPN_PROTOCOL)).is_ok());
@@ -117,6 +224,84 @@ mod tests {
         let error = load_certs(&path).unwrap_err().to_string();
 
         assert!(error.contains(&path));
+    }
+
+    #[tokio::test]
+    async fn shares_one_client_config_per_ca_path() {
+        let path = temp_file("shared-ca", CA_PEM.as_bytes());
+
+        let first = shared_client_config(&path).await.unwrap();
+        let second = shared_client_config(&path).await.unwrap();
+
+        // The second call must be served from the cache, not re-read.
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.alpn_protocols, vec![ALPN_PROTOCOL.to_vec()]);
+        assert!(!first.enable_early_data);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn does_not_serve_a_cached_config_for_another_ca_path() {
+        let path = temp_file("first-ca", CA_PEM.as_bytes());
+        let other_path = temp_file("second-ca", OTHER_CA_PEM.as_bytes());
+
+        let first = shared_client_config(&path).await.unwrap();
+        let other = shared_client_config(&other_path).await.unwrap();
+
+        assert!(!Arc::ptr_eq(&first, &other));
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(other_path);
+    }
+
+    #[tokio::test]
+    async fn reload_validation_refreshes_a_ca_rotated_in_place() {
+        let path = temp_file("rotated-ca", CA_PEM.as_bytes());
+
+        let before = shared_client_config(&path).await.unwrap();
+        fs::write(&path, OTHER_CA_PEM.as_bytes()).unwrap();
+        // `connector` is what `check_config` runs on every reload.
+        let _connector = connector(&path).unwrap();
+        let after = shared_client_config(&path).await.unwrap();
+
+        assert!(!Arc::ptr_eq(&before, &after));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn shared_missing_ca_error_includes_path() {
+        let path = temp_missing_file("shared-missing-ca");
+
+        let error = shared_client_config(&path).await.unwrap_err().to_string();
+
+        assert!(error.contains(&path));
+        assert!(cached_client_config(&path).is_none());
+    }
+
+    #[tokio::test]
+    async fn shared_invalid_ca_is_not_cached() {
+        let path = temp_file("shared-invalid-ca", b"not a certificate");
+
+        let error = shared_client_config(&path).await.unwrap_err().to_string();
+
+        assert!(error.contains(&path));
+        assert!(cached_client_config(&path).is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn builds_a_tls13_only_config_with_the_uk_alpn() {
+        let path = temp_file("build-ca", CA_PEM.as_bytes());
+
+        let config = build_client_config(&path).unwrap();
+
+        assert_eq!(config.alpn_protocols, vec![ALPN_PROTOCOL.to_vec()]);
+        assert!(!config.enable_early_data);
+
+        let _ = fs::remove_file(path);
     }
 
     fn temp_file(name: &str, contents: &[u8]) -> String {

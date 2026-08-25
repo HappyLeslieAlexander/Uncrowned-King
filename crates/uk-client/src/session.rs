@@ -4,12 +4,13 @@ use std::{
     error::Error,
     fmt,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
 
 use bytes::BytesMut;
-use rustls::pki_types::ServerName;
+use rustls::{ClientConfig as TlsClientConfig, pki_types::ServerName};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
@@ -266,7 +267,10 @@ async fn connect_authenticated_inner<F>(
 where
     F: FnMut(EndpointAttemptOutcome),
 {
-    let connector = tls::connector(&config.ca_cert_path)?;
+    // Loaded once per connect, off the runtime worker, and reused by every
+    // endpoint attempt below: neither the TLS/TCP nor the QUIC carrier may
+    // re-read the CA bundle while dialling.
+    let tls_config = tls::shared_client_config(&config.ca_cert_path).await?;
     let server_name = tls::server_name(config.server_name.clone())?;
     let mut attempts = Vec::new();
     let mut credential_rejection = false;
@@ -274,7 +278,7 @@ where
     for (index, endpoint) in config.server_endpoints().into_iter().enumerate() {
         match connect_authenticated_endpoint_with_timeout(
             config,
-            &connector,
+            &tls_config,
             server_name.clone(),
             endpoint,
             endpoint_timeout,
@@ -321,7 +325,7 @@ where
 
 async fn connect_authenticated_endpoint_with_timeout(
     config: &ClientConfig,
-    connector: &TlsConnector,
+    tls_config: &Arc<TlsClientConfig>,
     server_name: ServerName<'static>,
     endpoint: &str,
     endpoint_timeout: Option<Duration>,
@@ -329,7 +333,7 @@ async fn connect_authenticated_endpoint_with_timeout(
     if let Some(timeout) = endpoint_timeout {
         match time::timeout(
             timeout,
-            connect_authenticated_endpoint(config, connector, server_name, endpoint),
+            connect_authenticated_endpoint(config, tls_config, server_name, endpoint),
         )
         .await
         {
@@ -341,21 +345,26 @@ async fn connect_authenticated_endpoint_with_timeout(
             )),
         }
     } else {
-        connect_authenticated_endpoint(config, connector, server_name, endpoint).await
+        connect_authenticated_endpoint(config, tls_config, server_name, endpoint).await
     }
 }
 
 async fn connect_authenticated_endpoint(
     config: &ClientConfig,
-    connector: &TlsConnector,
+    tls_config: &Arc<TlsClientConfig>,
     server_name: ServerName<'static>,
     endpoint: &str,
 ) -> Result<(ClientCarrier, Settings), AnyError> {
     let (carrier, addr) = crate::config::parse_endpoint(endpoint)
         .map_err(|err| phase_error("parse endpoint", EndpointFailurePhase::Other, err))?;
     let (reader, writer, exporter, datagrams) = match carrier {
-        CarrierKind::Tls => establish_tls_carrier(connector, server_name, addr).await?,
-        CarrierKind::Quic => establish_quic_carrier(config, addr).await?,
+        CarrierKind::Tls => {
+            // Wrapping the shared config in a connector is a pointer copy, so
+            // each attempt can have its own without re-reading the CA bundle.
+            let connector = tls::connector_from(Arc::clone(tls_config));
+            establish_tls_carrier(&connector, server_name, addr).await?
+        }
+        CarrierKind::Quic => establish_quic_carrier(config, tls_config, addr).await?,
     };
     authenticate_over_carrier(config, reader, writer, exporter, datagrams).await
 }
@@ -393,6 +402,7 @@ async fn establish_tls_carrier(
 
 async fn establish_quic_carrier(
     config: &ClientConfig,
+    tls_config: &Arc<TlsClientConfig>,
     addr: &str,
 ) -> Result<
     (
@@ -403,10 +413,10 @@ async fn establish_quic_carrier(
     ),
     AnyError,
 > {
-    let rustls_config = tls::client_config(&config.ca_cert_path)
-        .map_err(|err| phase_error("quic client config", EndpointFailurePhase::Tls, err))?;
+    // quinn takes the rustls config by value; cloning it is a handful of `Arc`
+    // bumps and, unlike rebuilding it, never touches the filesystem.
     let (reader, writer, exporter, datagrams) =
-        crate::quic::connect(rustls_config, addr, &config.server_name)
+        crate::quic::connect(tls_config.as_ref().clone(), addr, &config.server_name)
             .await
             .map_err(|err| phase_error("quic connect", EndpointFailurePhase::Tls, err))?;
     Ok((reader, writer, exporter, Some(datagrams)))

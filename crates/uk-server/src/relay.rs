@@ -251,11 +251,13 @@ enum FlowIdRejection {
 enum FlowEvent {
     OpenCompleted {
         flow_id: u64,
+        token: FlowToken,
         target: Target,
         result: Result<TcpStream, OpenFailure>,
     },
     UdpOpenCompleted {
         flow_id: u64,
+        token: FlowToken,
         target: Target,
         result: Result<UdpSocket, OpenFailure>,
     },
@@ -398,6 +400,10 @@ enum FlowSlot {
 
 #[derive(Clone)]
 struct OpenFlowCancel {
+    /// Identifies this open attempt. A connect task that finishes after its
+    /// flow id was closed and re-opened must not have its result attached to
+    /// the new flow, so completion events carry this back for comparison.
+    token: FlowToken,
     cancelled: Arc<AtomicBool>,
     notify: Arc<Notify>,
 }
@@ -692,11 +698,13 @@ async fn handle_flow_event(
     match event {
         Some(FlowEvent::OpenCompleted {
             flow_id,
+            token,
             target,
             result,
         }) => {
             handle_tcp_open_completed(
                 flow_id,
+                token,
                 target,
                 result,
                 context,
@@ -707,11 +715,13 @@ async fn handle_flow_event(
         }
         Some(FlowEvent::UdpOpenCompleted {
             flow_id,
+            token,
             target,
             result,
         }) => {
             handle_udp_open_completed(
                 flow_id,
+                token,
                 target,
                 result,
                 context,
@@ -1443,7 +1453,7 @@ async fn handle_tcp_open_frame(
             flow_id,
             security_generation = policy.generation
         );
-        let cancel = OpenFlowCancel::default();
+        let cancel = OpenFlowCancel::new(context.flow_tokens.next());
         target_writers.insert(flow_id, FlowSlot::OpeningTcp(cancel.clone()));
         spawn_target_open(
             session_tasks,
@@ -1561,7 +1571,7 @@ async fn handle_udp_open_frame(
             flow_id,
             security_generation = policy.generation
         );
-        let cancel = OpenFlowCancel::default();
+        let cancel = OpenFlowCancel::new(context.flow_tokens.next());
         target_writers.insert(flow_id, FlowSlot::OpeningUdp(cancel.clone()));
         spawn_udp_open(
             session_tasks,
@@ -1850,6 +1860,7 @@ fn spawn_target_open(session_tasks: &mut SessionTasks, task: TargetOpenTask) {
                 &task.event_tx,
                 FlowEvent::OpenCompleted {
                     flow_id: task.flow_id,
+                    token: task.cancel.token,
                     target: task.target,
                     result,
                 },
@@ -1882,6 +1893,7 @@ fn spawn_udp_open(session_tasks: &mut SessionTasks, task: UdpOpenTask) {
                 &task.event_tx,
                 FlowEvent::UdpOpenCompleted {
                     flow_id: task.flow_id,
+                    token: task.cancel.token,
                     target: task.target,
                     result,
                 },
@@ -1909,13 +1921,22 @@ where
 
 async fn handle_tcp_open_completed(
     flow_id: u64,
+    token: FlowToken,
     target: Target,
     result: Result<TcpStream, OpenFailure>,
     context: &RelaySessionContext<'_>,
     target_writers: &mut FlowTable,
     session_tasks: &mut SessionTasks,
 ) -> Result<(), AnyError> {
-    if !matches!(target_writers.get(&flow_id), Some(FlowSlot::OpeningTcp(_))) {
+    // The token must match *this* open attempt, not merely "some open is
+    // pending": the producer's cancellation check is not atomic with the send,
+    // so a close plus re-open can slip in between and would otherwise get the
+    // previous attempt's stream wired in, under a target the client never
+    // requested for that flow.
+    if !matches!(
+        target_writers.get(&flow_id),
+        Some(FlowSlot::OpeningTcp(cancel)) if cancel.token == token
+    ) {
         return Ok(());
     }
 
@@ -1935,13 +1956,17 @@ async fn handle_tcp_open_completed(
 
 async fn handle_udp_open_completed(
     flow_id: u64,
+    token: FlowToken,
     target: Target,
     result: Result<UdpSocket, OpenFailure>,
     context: &RelaySessionContext<'_>,
     target_writers: &mut FlowTable,
     session_tasks: &mut SessionTasks,
 ) -> Result<(), AnyError> {
-    if !matches!(target_writers.get(&flow_id), Some(FlowSlot::OpeningUdp(_))) {
+    if !matches!(
+        target_writers.get(&flow_id),
+        Some(FlowSlot::OpeningUdp(cancel)) if cancel.token == token
+    ) {
         return Ok(());
     }
 
@@ -2365,11 +2390,13 @@ async fn relay_client_to_target(
                 }
 
                 let payload_len = buffered_data.payload().len();
-                let write_result = tokio::select! {
-                    result = target_writer.write_all(buffered_data.payload()) => result,
-                    () = shutdown.closed() => return Ok(()),
-                    () = flow_control.aborted() => return Ok(()),
-                };
+                // Not raced against shutdown/abort: `write_all` is not
+                // cancellation safe, so losing that race would leave a partial
+                // payload in the target's byte stream and still report success
+                // — turning "abort this flow" into "corrupt the target's
+                // stream". The payload is bounded by `max_frame_size`, and the
+                // target is a socket we dialled, so finishing it is cheap.
+                let write_result = target_writer.write_all(buffered_data.payload()).await;
                 write_result?;
                 metrics.record_relay_bytes(
                     RelayProtocol::Tcp,
@@ -2491,9 +2518,10 @@ impl fmt::Debug for OpenDialPermit {
     }
 }
 
-impl Default for OpenFlowCancel {
-    fn default() -> Self {
+impl OpenFlowCancel {
+    fn new(token: FlowToken) -> Self {
         Self {
+            token,
             cancelled: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
         }
@@ -3522,6 +3550,14 @@ fn carrier_write_timeout_error(timeout: Duration) -> io::Error {
     )
 }
 
+/// Writes one frame, refusing to start if the session is already closing.
+///
+/// The write itself is *not* raced against shutdown. `write_frame` is
+/// `write_all` + `flush` and is not cancellation safe, so dropping it mid-frame
+/// would leave an unknown-length prefix on the wire and desynchronise the peer's
+/// framing — trading a clean close for a corrupt one. Callers bound the write
+/// with the carrier write deadline instead, which is what stops a peer that has
+/// stopped reading from parking it forever.
 async fn write_frame_or_shutdown<W>(
     writer: &mut W,
     frame: &Frame,
@@ -3530,10 +3566,10 @@ async fn write_frame_or_shutdown<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    tokio::select! {
-        result = write_frame(writer, frame) => result?,
-        () = shutdown.closed() => return Err(session_shutdown_error().into()),
+    if shutdown.is_closed() {
+        return Err(session_shutdown_error().into());
     }
+    write_frame(writer, frame).await?;
     Ok(())
 }
 
@@ -3618,11 +3654,11 @@ mod tests {
     }
 
     fn test_opening_flow_slot() -> FlowSlot {
-        FlowSlot::OpeningTcp(OpenFlowCancel::default())
+        FlowSlot::OpeningTcp(OpenFlowCancel::new(TEST_FLOW_TOKEN))
     }
 
     fn test_opening_udp_flow_slot() -> FlowSlot {
-        FlowSlot::OpeningUdp(OpenFlowCancel::default())
+        FlowSlot::OpeningUdp(OpenFlowCancel::new(TEST_FLOW_TOKEN))
     }
 
     async fn test_udp_flow() -> UdpTargetFlow {
@@ -3773,6 +3809,42 @@ mod tests {
         let target = open_target_flow_mut(&mut target_writers, 1).expect("flow should remain open");
         assert!(target.target_to_client_open);
         assert!(target.client_to_target_open);
+    }
+
+    /// A connect task that finishes after its flow id was closed and re-opened
+    /// must not have its result wired into the new flow. The slot's token
+    /// distinguishes the two open attempts; matching on "some open is pending"
+    /// alone would attach the wrong target.
+    #[test]
+    fn stale_open_completion_is_rejected_for_a_reused_flow_id() {
+        let mut target_writers = FlowTable::new();
+        target_writers.insert(1, test_opening_flow_slot());
+
+        let slot = target_writers.get(&1);
+        let matches_stale = matches!(
+            slot,
+            Some(FlowSlot::OpeningTcp(cancel)) if cancel.token == STALE_FLOW_TOKEN
+        );
+        let matches_current = matches!(
+            slot,
+            Some(FlowSlot::OpeningTcp(cancel)) if cancel.token == TEST_FLOW_TOKEN
+        );
+
+        assert!(!matches_stale, "a superseded open attempt must not match");
+        assert!(matches_current, "the current open attempt must still match");
+    }
+
+    #[test]
+    fn open_flow_cancel_tokens_are_unique_per_attempt() {
+        let tokens = FlowTokenAllocator::default();
+        let first = OpenFlowCancel::new(tokens.next());
+        let second = OpenFlowCancel::new(tokens.next());
+
+        assert_ne!(first.token, second.token);
+        // Cancelling the superseded attempt must not affect the new one.
+        first.cancel();
+        assert!(first.is_cancelled());
+        assert!(!second.is_cancelled());
     }
 
     #[tokio::test]
@@ -3974,7 +4046,7 @@ mod tests {
     #[tokio::test]
     async fn open_task_wait_returns_completed_result() {
         let shutdown = SessionShutdown::default();
-        let cancel = OpenFlowCancel::default();
+        let cancel = OpenFlowCancel::new(TEST_FLOW_TOKEN);
 
         let result = wait_for_open_task(async { 7_u8 }, &shutdown, &cancel).await;
 
@@ -3985,7 +4057,7 @@ mod tests {
     async fn open_task_wait_exits_on_session_shutdown() {
         let shutdown = SessionShutdown::default();
         let shutdown_handle = shutdown.clone();
-        let cancel = OpenFlowCancel::default();
+        let cancel = OpenFlowCancel::new(TEST_FLOW_TOKEN);
         let task = tokio::spawn(async move {
             wait_for_open_task(std::future::pending::<u8>(), &shutdown, &cancel).await
         });
@@ -4002,7 +4074,7 @@ mod tests {
     #[tokio::test]
     async fn open_task_wait_exits_on_pending_open_cancel() {
         let shutdown = SessionShutdown::default();
-        let cancel = OpenFlowCancel::default();
+        let cancel = OpenFlowCancel::new(TEST_FLOW_TOKEN);
         let cancel_handle = cancel.clone();
         let task = tokio::spawn(async move {
             wait_for_open_task(std::future::pending::<u8>(), &shutdown, &cancel).await
@@ -4018,28 +4090,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn carrier_write_exits_when_session_shutdown_notifies() {
-        let (mut writer, _reader) = tokio::io::duplex(1);
+    async fn carrier_write_is_refused_once_the_session_is_closing() {
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        let shutdown = SessionShutdown::default();
+        shutdown.close();
+        let frame = Frame::new(FrameType::TcpData, 0, 1, Bytes::from_static(b"abc")).unwrap();
+
+        let err = write_frame_or_shutdown(&mut writer, &frame, &shutdown)
+            .await
+            .unwrap_err();
+
+        let io_error = err.downcast_ref::<io::Error>().unwrap();
+        assert_eq!(io_error.kind(), io::ErrorKind::Interrupted);
+
+        // Nothing was emitted, so the peer's framing is untouched.
+        drop(writer);
+        let mut written = Vec::new();
+        reader.read_to_end(&mut written).await.unwrap();
+        assert!(written.is_empty());
+    }
+
+    /// Shutdown must not truncate a frame that is already going out: dropping
+    /// `write_all` mid-frame would leave an unknown-length prefix on the wire
+    /// and desynchronise the peer, which is worse than a late clean close.
+    #[tokio::test]
+    async fn carrier_write_in_flight_is_not_truncated_by_shutdown() {
+        let (mut writer, mut reader) = tokio::io::duplex(1);
         let shutdown = SessionShutdown::default();
         let shutdown_handle = shutdown.clone();
-        let frame = Frame::new(FrameType::TcpData, 0, 1, Bytes::from(vec![0xaa; 1024])).unwrap();
+        let payload = vec![0xaa_u8; 1024];
+        let frame = Frame::new(FrameType::TcpData, 0, 1, Bytes::from(payload.clone())).unwrap();
+        let encoded_len = frame.encode().unwrap().len();
 
         let write_task =
             tokio::spawn(
                 async move { write_frame_or_shutdown(&mut writer, &frame, &shutdown).await },
             );
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!write_task.is_finished());
+        assert!(
+            !write_task.is_finished(),
+            "the 1-byte duplex should stall it"
+        );
 
         shutdown_handle.close();
 
-        let err = tokio::time::timeout(Duration::from_secs(1), write_task)
+        // Drain the peer: the whole frame must still arrive.
+        let mut received = vec![0_u8; encoded_len];
+        tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut received))
+            .await
+            .expect("the in-flight frame must complete")
+            .unwrap();
+        assert_eq!(&received[received.len() - payload.len()..], &payload[..]);
+
+        tokio::time::timeout(Duration::from_secs(5), write_task)
             .await
             .unwrap()
             .unwrap()
-            .unwrap_err();
-        let io_error = err.downcast_ref::<io::Error>().unwrap();
-        assert_eq!(io_error.kind(), io::ErrorKind::Interrupted);
+            .unwrap();
     }
 
     /// A peer that stops reading must not be able to park a carrier write for
@@ -4419,7 +4526,7 @@ mod tests {
 
     #[test]
     fn client_flow_status_cancels_pending_open() {
-        let cancel = OpenFlowCancel::default();
+        let cancel = OpenFlowCancel::new(TEST_FLOW_TOKEN);
         let mut target_writers = FlowTable::new();
         target_writers.insert(1, FlowSlot::OpeningTcp(cancel.clone()));
 
@@ -4431,7 +4538,7 @@ mod tests {
 
     #[test]
     fn client_flow_status_cancels_pending_udp_open() {
-        let cancel = OpenFlowCancel::default();
+        let cancel = OpenFlowCancel::new(TEST_FLOW_TOKEN);
         let mut target_writers = FlowTable::new();
         target_writers.insert(1, FlowSlot::OpeningUdp(cancel.clone()));
 
@@ -4657,7 +4764,10 @@ mod tests {
     async fn classifies_udp_data_for_flow_kinds() {
         let mut target_writers = FlowTable::new();
         target_writers.insert(1, FlowSlot::Udp(test_udp_flow().await));
-        target_writers.insert(3, FlowSlot::OpeningUdp(OpenFlowCancel::default()));
+        target_writers.insert(
+            3,
+            FlowSlot::OpeningUdp(OpenFlowCancel::new(TEST_FLOW_TOKEN)),
+        );
         target_writers.insert(5, test_open_flow_slot());
         target_writers.insert(7, test_opening_flow_slot());
 
@@ -4707,7 +4817,7 @@ mod tests {
 
     #[test]
     fn removing_pending_open_slot_cancels_connect_task() {
-        let cancel = OpenFlowCancel::default();
+        let cancel = OpenFlowCancel::new(TEST_FLOW_TOKEN);
         let mut target_writers = FlowTable::new();
         target_writers.insert(1, FlowSlot::OpeningTcp(cancel.clone()));
 
@@ -4719,7 +4829,7 @@ mod tests {
 
     #[test]
     fn removing_pending_udp_open_slot_cancels_connect_task() {
-        let cancel = OpenFlowCancel::default();
+        let cancel = OpenFlowCancel::new(TEST_FLOW_TOKEN);
         let mut target_writers = FlowTable::new();
         target_writers.insert(1, FlowSlot::OpeningUdp(cancel.clone()));
 
@@ -4731,7 +4841,7 @@ mod tests {
 
     #[test]
     fn closing_session_cancels_pending_open_slots() {
-        let cancel = OpenFlowCancel::default();
+        let cancel = OpenFlowCancel::new(TEST_FLOW_TOKEN);
         let mut target_writers = FlowTable::new();
         target_writers.insert(1, FlowSlot::OpeningTcp(cancel.clone()));
         target_writers.insert(3, test_open_flow_slot());
@@ -4744,7 +4854,7 @@ mod tests {
 
     #[tokio::test]
     async fn closing_session_aborts_udp_flows_and_cancels_pending_udp_opens() {
-        let cancel = OpenFlowCancel::default();
+        let cancel = OpenFlowCancel::new(TEST_FLOW_TOKEN);
         let udp_flow = test_udp_flow().await;
         let control = udp_flow.control.clone();
         let mut target_writers = FlowTable::new();
