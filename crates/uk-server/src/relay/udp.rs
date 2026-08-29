@@ -223,12 +223,15 @@ pub(crate) async fn forward_udp_data_frame(
         return Ok(());
     };
     target.record_activity();
-    match target.socket.send(&payload).await {
+    match target.socket.try_send(&payload) {
         Ok(written) => context.metrics.record_relay_bytes(
             RelayProtocol::Udp,
             RelayDirection::ClientToTarget,
             written,
         ),
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+            debug!(event = "udp.target.send_buffer_full", flow_id);
+        }
         Err(err) => {
             warn!(event = "udp.target.write.error", flow_id, error = %err);
             send_error(
@@ -249,9 +252,9 @@ pub(crate) async fn forward_udp_data_frame(
 /// Unlike the reliable `UDP_DATA` frame path, datagrams are unreliable and
 /// unordered: a datagram for an unknown/closed flow or a failed target send is
 /// dropped silently rather than erroring the session.
-pub(crate) async fn forward_udp_datagram(
+pub(crate) fn forward_udp_datagram(
     flow_id: u64,
-    payload: Bytes,
+    payload: &Bytes,
     context: &RelaySessionContext<'_>,
     target_writers: &mut FlowTable,
 ) {
@@ -260,7 +263,7 @@ pub(crate) async fn forward_udp_datagram(
         return;
     };
     target.record_activity();
-    match target.socket.send(&payload).await {
+    match target.socket.try_send(payload) {
         Ok(written) => context.metrics.record_relay_bytes(
             RelayProtocol::Udp,
             RelayDirection::ClientToTarget,

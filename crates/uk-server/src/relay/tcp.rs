@@ -601,6 +601,7 @@ pub(crate) async fn accept_open_target(
             carrier_writer: context.carrier_writer.clone(),
             event_tx: context.event_tx.clone(),
             shutdown: context.shutdown.clone(),
+            write_timeout: context.limits.carrier_write_timeout,
         },
     );
     info!(event = "tcp.open", flow_id, target = %target.log_safe());

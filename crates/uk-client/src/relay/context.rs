@@ -185,6 +185,7 @@ impl PendingClientSession {
 
     /// Tears the session down on a path that can await, avoiding the spawned
     /// fallback in [`Drop`].
+    #[allow(dead_code)]
     pub(crate) async fn close_and_wait(mut self) {
         if let Some(session) = self.session.take() {
             session.close_and_wait().await;

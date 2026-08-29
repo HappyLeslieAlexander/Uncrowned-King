@@ -762,6 +762,7 @@ async fn target_writer_exits_when_session_shutdown_notifies() {
             &event_tx,
             &shutdown,
             &metrics,
+            None,
         )
         .await
     });
@@ -803,6 +804,7 @@ async fn target_writer_reports_activity_after_payload_write() {
         &event_tx,
         &shutdown,
         &metrics,
+        None,
     );
     let reader = async {
         let mut received = vec![0_u8; payload.len()];
@@ -814,6 +816,42 @@ async fn target_writer_reports_activity_after_payload_write() {
     writer_result.unwrap();
     assert_eq!(reader_result.unwrap(), payload);
     assert!(matches!(event_rx.recv().await, Some(FlowEvent::Activity)));
+}
+
+#[tokio::test]
+async fn target_writer_times_out_when_target_stalled() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let target_stream = TcpStream::connect(addr).await.unwrap();
+    let (_target_peer, _) = listener.accept().await.unwrap();
+    let (_target_reader, target_writer) = target_stream.into_split();
+    let (commands_tx, commands_rx) = mpsc::channel(1);
+    let (event_tx, _event_rx) = mpsc::channel(1);
+    let flow_control = TargetFlowControl::default();
+    let shutdown = SessionShutdown::default();
+    let metrics = ServerMetrics::default();
+    let payload = vec![0xcc_u8; 10 * 1024 * 1024]; // 10MB to fill OS buffer
+    let buffered_payload =
+        BufferedTargetData::new(Bytes::from(payload), flow_control.clone(), 20 * 1024 * 1024, 20 * 1024 * 1024).unwrap();
+
+    commands_tx
+        .send(TargetCommand::Data(buffered_payload))
+        .await
+        .unwrap();
+
+    let writer = relay_client_to_target(
+        target_writer,
+        commands_rx,
+        flow_control,
+        &event_tx,
+        &shutdown,
+        &metrics,
+        Some(Duration::from_millis(50)),
+    );
+
+    let err = writer.await.unwrap_err();
+    let io_err = err.downcast_ref::<io::Error>().unwrap();
+    assert_eq!(io_err.kind(), io::ErrorKind::TimedOut);
 }
 
 #[test]

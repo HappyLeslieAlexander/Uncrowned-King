@@ -171,6 +171,7 @@ pub(crate) struct TargetWriterTask {
     pub(crate) carrier_writer: CarrierWriter,
     pub(crate) event_tx: FlowEventSender,
     pub(crate) shutdown: SessionShutdown,
+    pub(crate) write_timeout: Option<Duration>,
 }
 
 pub(crate) fn spawn_target_open(session_tasks: &mut SessionTasks, task: TargetOpenTask) {
@@ -390,6 +391,7 @@ pub(crate) fn spawn_target_writer(session_tasks: &mut SessionTasks, task: Target
             &task.event_tx,
             &task.shutdown,
             &task.carrier_writer.metrics,
+            task.write_timeout,
         )
         .await
         {
@@ -448,6 +450,7 @@ pub(crate) async fn relay_client_to_target(
     event_tx: &FlowEventSender,
     shutdown: &SessionShutdown,
     metrics: &ServerMetrics,
+    write_timeout: Option<Duration>,
 ) -> Result<(), AnyError> {
     loop {
         let command = tokio::select! {
@@ -465,13 +468,26 @@ pub(crate) async fn relay_client_to_target(
                 }
 
                 let payload_len = buffered_data.payload().len();
-                // Not raced against shutdown/abort: `write_all` is not
-                // cancellation safe, so losing that race would leave a partial
-                // payload in the target's byte stream and still report success
-                // — turning "abort this flow" into "corrupt the target's
-                // stream". The payload is bounded by `max_frame_size`, and the
-                // target is a socket we dialled, so finishing it is cheap.
-                let write_result = target_writer.write_all(buffered_data.payload()).await;
+                let write_fut = target_writer.write_all(buffered_data.payload());
+                let write_result: Result<(), AnyError> = match write_timeout {
+                    Some(timeout) => {
+                        tokio::select! {
+                            res = write_fut => res.map_err(|e| -> AnyError { e.into() }),
+                            () = shutdown.closed() => return Ok(()),
+                            () = flow_control.aborted() => return Ok(()),
+                            () = tokio::time::sleep(timeout) => {
+                                Err(io::Error::new(io::ErrorKind::TimedOut, "target write timed out").into())
+                            }
+                        }
+                    }
+                    None => {
+                        tokio::select! {
+                            res = write_fut => res.map_err(|e| -> AnyError { e.into() }),
+                            () = shutdown.closed() => return Ok(()),
+                            () = flow_control.aborted() => return Ok(()),
+                        }
+                    }
+                };
                 write_result?;
                 metrics.record_relay_bytes(
                     RelayProtocol::Tcp,

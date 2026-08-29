@@ -425,20 +425,22 @@ impl ClientSessionManager {
         let publish_guard = self.config_publish_lock.lock().await;
         if self.config.generation() != snapshot.generation {
             drop(publish_guard);
-            pending.close_and_wait().await;
+            // Let the PendingClientSession's Drop impl clean up in the
+            // background rather than blocking here while holding connect_lock.
+            drop(pending);
             return Ok(None);
         }
         self.clear_connect_failure().await;
         if self.is_closed() {
             drop(publish_guard);
-            pending.close_and_wait().await;
+            drop(pending);
             return Err("client session manager is shutting down".into());
         }
         let mut pool = self.pool.lock().await;
         if self.is_closed() {
             drop(pool);
             drop(publish_guard);
-            pending.close_and_wait().await;
+            drop(pending);
             return Err("client session manager is shutting down".into());
         }
         // Take ownership only once publishing is certain: there is no `.await`
@@ -584,7 +586,9 @@ impl ClientSessionManager {
             pool.len() != before
         };
         if removed {
-            session.close_and_wait().await;
+            // Tear down in the background so the SOCKS request path is not
+            // blocked by `close_and_wait` (up to `shutdown_timeout_seconds`).
+            self.spawn_reaper(Arc::clone(session)).await;
         } else {
             session.close().await;
         }
@@ -1413,7 +1417,9 @@ impl ClientSession {
     }
 
     pub(crate) async fn write_frame(&self, frame: &Frame) -> Result<(), AnyError> {
-        let result = write_frame_locked(&self.writer, frame, &self.shutdown).await;
+        let result =
+            write_frame_locked(&self.writer, frame, &self.shutdown, self.task_shutdown_timeout)
+                .await;
         if result.is_err() {
             self.close().await;
         }

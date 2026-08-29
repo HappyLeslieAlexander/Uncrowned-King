@@ -31,7 +31,7 @@ pub enum FrameIoError {
 /// `max_frame_size`. Reserving the whole declared payload up front would let a
 /// peer commit that much memory per session without sending any of it, so
 /// capacity grows in bounded steps as the payload actually arrives.
-const READ_RESERVE_CHUNK: usize = 16 * 1024;
+const READ_RESERVE_CHUNK: usize = 256 * 1024;
 
 /// Smallest amount of spare capacity offered to a single read.
 const MIN_READ_RESERVE: usize = 64;
@@ -67,8 +67,17 @@ where
     debug_assert_eq!(header.length, length);
 
     let payload_len = usize::try_from(header.length).map_err(|_| ProtocolError::InvalidVarint)?;
-    let mut payload = BytesMut::zeroed(payload_len);
-    read_exact_or_truncated(reader, &mut payload).await?;
+    let mut payload = BytesMut::new();
+    let mut remaining = payload_len;
+    while remaining > 0 {
+        let chunk_size = remaining.min(READ_RESERVE_CHUNK);
+        payload.reserve(chunk_size);
+        let mut buf = [0_u8; 8192];
+        let to_read = remaining.min(buf.len());
+        read_exact_or_truncated(reader, &mut buf[..to_read]).await?;
+        payload.extend_from_slice(&buf[..to_read]);
+        remaining -= to_read;
+    }
 
     Ok(Frame {
         header,
@@ -257,9 +266,9 @@ where
     let len = 1_usize << (first >> 6);
     if len > 1 {
         let remaining = len - 1;
-        let mut rest = vec![0_u8; remaining];
-        read_exact_or_truncated(reader, &mut rest).await?;
-        header_bytes.extend_from_slice(&rest);
+        let mut rest = [0_u8; 7];
+        read_exact_or_truncated(reader, &mut rest[..remaining]).await?;
+        header_bytes.extend_from_slice(&rest[..remaining]);
     }
 
     let start = header_bytes.len() - len;

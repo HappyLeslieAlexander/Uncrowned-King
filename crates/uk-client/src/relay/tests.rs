@@ -1109,7 +1109,7 @@ async fn carrier_write_is_refused_once_the_session_is_closing() {
     shutdown.close();
     let frame = Frame::new(FrameType::TcpData, 0, 1, Bytes::from_static(b"abc")).unwrap();
 
-    let err = write_frame_or_shutdown(&mut writer, &frame, &shutdown)
+    let err = write_frame_or_shutdown(&mut writer, &frame, &shutdown, None)
         .await
         .unwrap_err();
 
@@ -1136,7 +1136,7 @@ async fn carrier_write_in_flight_is_not_truncated_by_shutdown() {
     let encoded_len = frame.encode().unwrap().len();
 
     let write_task =
-        tokio::spawn(async move { write_frame_or_shutdown(&mut writer, &frame, &shutdown).await });
+        tokio::spawn(async move { write_frame_or_shutdown(&mut writer, &frame, &shutdown, None).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
         !write_task.is_finished(),
@@ -1158,6 +1158,26 @@ async fn carrier_write_in_flight_is_not_truncated_by_shutdown() {
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn carrier_write_times_out_when_stalled() {
+    let (mut writer, _reader) = tokio::io::duplex(1);
+    let shutdown = ClientSessionShutdown::default();
+    let payload = vec![0xbb_u8; 1024];
+    let frame = Frame::new(FrameType::TcpData, 0, 1, Bytes::from(payload)).unwrap();
+
+    let err = write_frame_or_shutdown(
+        &mut writer,
+        &frame,
+        &shutdown,
+        Some(Duration::from_millis(50)),
+    )
+    .await
+    .unwrap_err();
+
+    let io_error = err.downcast_ref::<io::Error>().unwrap();
+    assert_eq!(io_error.kind(), io::ErrorKind::TimedOut);
 }
 
 #[tokio::test]

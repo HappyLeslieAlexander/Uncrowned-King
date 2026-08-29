@@ -34,6 +34,14 @@ const fn default_ban_secs() -> u64 {
     300
 }
 
+/// Minimum interval between O(N) prune scans to prevent CPU exhaustion
+/// when an attacker floods from many distinct IPs.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Hard cap on the number of tracked IPs. When reached, new IPs are not
+/// tracked rather than allowing unbounded growth.
+const MAX_ENTRIES: usize = 65_536;
+
 impl Default for AuthRateLimitConfig {
     fn default() -> Self {
         Self {
@@ -51,11 +59,17 @@ struct IpFailureRecord {
     banned_until: Option<Instant>,
 }
 
+#[derive(Debug)]
+struct RateLimitState {
+    entries: HashMap<IpAddr, IpFailureRecord>,
+    last_prune: Instant,
+}
+
 /// Thread-safe IP rate limiter protecting against authentication brute-force attacks.
 #[derive(Debug)]
 pub struct AuthRateLimiter {
     config: AuthRateLimitConfig,
-    records: Mutex<HashMap<IpAddr, IpFailureRecord>>,
+    records: Mutex<RateLimitState>,
 }
 
 impl AuthRateLimiter {
@@ -63,7 +77,10 @@ impl AuthRateLimiter {
     pub fn new(config: AuthRateLimitConfig) -> Self {
         Self {
             config,
-            records: Mutex::new(HashMap::new()),
+            records: Mutex::new(RateLimitState {
+                entries: HashMap::new(),
+                last_prune: Instant::now(),
+            }),
         }
     }
 
@@ -74,8 +91,8 @@ impl AuthRateLimiter {
             return true;
         }
         let now = Instant::now();
-        let mut records = self.records.lock().unwrap();
-        if let Some(record) = records.get_mut(&ip) {
+        let mut state = self.records.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(record) = state.entries.get_mut(&ip) {
             if let Some(banned_until) = record.banned_until {
                 if now < banned_until {
                     return false;
@@ -96,12 +113,18 @@ impl AuthRateLimiter {
             return false;
         }
         let now = Instant::now();
-        let mut records = self.records.lock().unwrap();
+        let mut state = self.records.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Opportunistic prune if map gets large
-        if records.len() > 1024 {
+        // Opportunistic prune if map gets large, but throttled to at most once
+        // per PRUNE_INTERVAL. Without this throttle, an attacker producing
+        // failures from >1024 distinct IPs would trigger an O(N) scan on every
+        // single failure, exhausting CPU while holding the mutex.
+        if state.entries.len() > 1024
+            && now.saturating_duration_since(state.last_prune) >= PRUNE_INTERVAL
+        {
+            state.last_prune = now;
             let window = Duration::from_secs(self.config.window_secs);
-            records.retain(|_, rec| {
+            state.entries.retain(|_, rec| {
                 if let Some(banned_until) = rec.banned_until {
                     now < banned_until
                 } else {
@@ -111,7 +134,14 @@ impl AuthRateLimiter {
             });
         }
 
-        let record = records.entry(ip).or_insert_with(|| IpFailureRecord {
+        // Hard cap: stop tracking new IPs rather than growing unboundedly.
+        // The worst case is a new attacker IP escapes rate-limiting, but they
+        // still must authenticate — the real defense.
+        if !state.entries.contains_key(&ip) && state.entries.len() >= MAX_ENTRIES {
+            return false;
+        }
+
+        let record = state.entries.entry(ip).or_insert_with(|| IpFailureRecord {
             failures: 0,
             window_start: now,
             banned_until: None,
@@ -144,8 +174,8 @@ impl AuthRateLimiter {
 
     /// Clears any recorded failures for `ip` upon successful authentication.
     pub fn record_success(&self, ip: IpAddr) {
-        let mut records = self.records.lock().unwrap();
-        records.remove(&ip);
+        let mut state = self.records.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.entries.remove(&ip);
     }
 }
 

@@ -8,7 +8,7 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite},
     net::TcpListener,
     sync::{Semaphore, watch},
     task::JoinSet,
@@ -481,7 +481,9 @@ pub(super) async fn serve(
                 };
                 let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
                     debug!(event = "server.observability.connection_limit", peer = %peer);
-                    let _ = stream.shutdown().await;
+                    // Drop instead of awaiting shutdown — a slow peer would
+                    // stall the accept loop.
+                    drop(stream);
                     continue;
                 };
                 let metrics = Arc::clone(&metrics);
@@ -515,7 +517,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use uk_proto::observability::{MAX_REQUEST_HEAD_BYTES, parse_request_line, read_request_head};
 
     async fn request(metrics: Arc<ServerMetrics>, request: &[u8]) -> String {

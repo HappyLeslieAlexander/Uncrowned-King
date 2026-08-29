@@ -289,7 +289,7 @@ pub(crate) async fn handle_flow_event(
             }
         }
         Some(FlowEvent::InboundDatagram { flow_id, payload }) => {
-            forward_udp_datagram(flow_id, payload, context, target_writers).await;
+            forward_udp_datagram(flow_id, &payload, context, target_writers);
         }
         Some(FlowEvent::HalfCloseDrainExpired {
             flow_id,

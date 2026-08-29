@@ -27,9 +27,9 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 use uk_auth::{AuthenticatedIdentity, unix_now};
 use uk_proto::{
     BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, DatagramSendOutcome, ErrorCode,
-    ErrorPayload, FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, Frame, FrameIoError, FrameLimits, FrameType,
-    NegotiatedSettings, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose,
-    TcpOpen, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose, UdpOpen, datagram,
+    ErrorPayload, FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, Frame, FrameIoError, FrameLimits, FrameReader,
+    FrameType, NegotiatedSettings, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target,
+    TcpClose, TcpOpen, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose, UdpOpen, datagram,
     is_client_initiated_flow_id, read_frame, validate_connection_frame, varint::MAX_VARINT,
     write_frame,
 };
@@ -113,15 +113,16 @@ pub(crate) fn record_matching_pong(
 }
 
 pub(crate) async fn spawn_carrier_reader(
-    mut carrier_reader: BoxedCarrierReader,
+    carrier_reader: BoxedCarrierReader,
     session: Arc<ClientSession>,
 ) {
     let correlation_id = session.correlation_id;
     let task_session = Arc::clone(&session);
+    let mut frame_reader = FrameReader::new(carrier_reader, task_session.limits);
     let task = async move {
         loop {
             let frame = tokio::select! {
-                frame = read_frame(&mut carrier_reader, task_session.limits) => frame,
+                frame = frame_reader.read_frame() => frame,
                 () = task_session.shutdown.closed() => return,
             };
             match frame {
@@ -574,6 +575,7 @@ pub(crate) async fn write_frame_locked(
     writer: &CarrierWriter,
     frame: &Frame,
     shutdown: &ClientSessionShutdown,
+    write_timeout: Option<Duration>,
 ) -> Result<(), AnyError> {
     let mut writer = tokio::select! {
         writer = writer.lock() => writer,
@@ -582,20 +584,24 @@ pub(crate) async fn write_frame_locked(
     if shutdown.is_closed() {
         return Err(session_shutdown_error().into());
     }
-    write_frame_or_shutdown(&mut *writer, frame, shutdown).await?;
+    write_frame_or_shutdown(&mut *writer, frame, shutdown, write_timeout).await?;
     Ok(())
 }
 
-/// Writes one frame, refusing to start if the session is already closing.
+/// Writes one frame with an optional timeout, refusing to start if the session
+/// is already closing.
 ///
-/// The write itself is *not* raced against shutdown. `write_frame` is
-/// `write_all` + `flush` and is not cancellation safe, so dropping it mid-frame
-/// would leave an unknown-length prefix on the wire and desynchronise the peer's
-/// framing.
+/// The write is bounded by `write_timeout` but is *not* raced against shutdown
+/// via `select!`: `write_frame` uses `write_all` + `flush` and is not
+/// cancellation safe, so dropping it mid-frame would leave a partial frame on
+/// the wire. Instead, a timeout on the whole write ensures that a stalled
+/// carrier does not block the writer forever; the caller tears down the session
+/// when the timeout fires, so the partial write is harmless.
 pub(crate) async fn write_frame_or_shutdown<W>(
     writer: &mut W,
     frame: &Frame,
     shutdown: &ClientSessionShutdown,
+    write_timeout: Option<Duration>,
 ) -> Result<(), AnyError>
 where
     W: AsyncWrite + Unpin,
@@ -603,7 +609,18 @@ where
     if shutdown.is_closed() {
         return Err(session_shutdown_error().into());
     }
-    write_frame(writer, frame).await?;
+    match write_timeout {
+        Some(timeout) => {
+            time::timeout(timeout, write_frame(writer, frame))
+                .await
+                .map_err(|_| -> AnyError {
+                    io::Error::new(io::ErrorKind::TimedOut, "carrier write timed out").into()
+                })??;
+        }
+        None => {
+            write_frame(writer, frame).await?;
+        }
+    }
     Ok(())
 }
 

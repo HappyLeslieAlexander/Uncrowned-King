@@ -73,6 +73,7 @@ impl Target {
         let addr_type = src.get_u8();
         let host_len =
             usize::try_from(varint::decode(src)?).map_err(|_| ProtocolError::InvalidVarint)?;
+
         // `host_len` is attacker-controlled and only bounded by `usize`: on a
         // 32-bit target `usize::try_from` accepts values up to `u32::MAX`, where
         // a plain `+ 2` would wrap to a tiny number, pass this check and panic
@@ -80,15 +81,31 @@ impl Target {
         if src.remaining() < host_len.saturating_add(2) {
             return Err(ProtocolError::Truncated);
         }
+
+        // Validate `host_len` against `addr_type` BEFORE allocating memory.
+        // Without this, an attacker can send packets with large `host_len`
+        // (up to `max_frame_size`) and an invalid address type, forcing the
+        // server to repeatedly allocate and discard large buffers.
+        match addr_type {
+            ADDR_DOMAIN if host_len == 0 || host_len > 255 => {
+                return Err(ProtocolError::InvalidTarget("invalid domain length"));
+            }
+            ADDR_IPV4 if host_len != 4 => {
+                return Err(ProtocolError::InvalidTarget("invalid ipv4 length"));
+            }
+            ADDR_IPV6 if host_len != 16 => {
+                return Err(ProtocolError::InvalidTarget("invalid ipv6 length"));
+            }
+            ADDR_DOMAIN | ADDR_IPV4 | ADDR_IPV6 => {}
+            _ => return Err(ProtocolError::InvalidTarget("unknown address type")),
+        }
+
         let host = src.copy_to_bytes(host_len);
         let port = src.get_u16();
         validate_port(port)?;
 
         match addr_type {
             ADDR_DOMAIN => {
-                if host.is_empty() || host.len() > 255 {
-                    return Err(ProtocolError::InvalidTarget("invalid domain length"));
-                }
                 let domain = std::str::from_utf8(&host)
                     .map_err(|_| ProtocolError::InvalidTarget("domain is not utf-8"))?;
                 validate_domain(domain)?;
@@ -108,6 +125,7 @@ impl Target {
                     .map_err(|_| ProtocolError::InvalidTarget("invalid ipv6 length"))?;
                 Ok(Self::Ipv6(Ipv6Addr::from(octets), port))
             }
+            // SAFETY: unreachable — the match above rejects unknown types.
             _ => Err(ProtocolError::InvalidTarget("unknown address type")),
         }
     }

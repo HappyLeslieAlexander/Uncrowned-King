@@ -175,10 +175,10 @@ struct ConnectionRuntime {
 }
 
 impl ConnectionRuntime {
-    async fn spawn_accepted(
+    fn spawn_accepted(
         &self,
         connections: &mut JoinSet<()>,
-        mut tcp: TcpStream,
+        tcp: TcpStream,
         peer: SocketAddr,
         shutdown_rx: watch::Receiver<bool>,
     ) {
@@ -189,13 +189,10 @@ impl ConnectionRuntime {
                 peer = %peer,
                 "IP is temporarily banned due to excessive authentication failures"
             );
-            if let Err(err) = tcp.shutdown().await {
-                debug!(
-                    event = "server.auth_rate_limit.shutdown_error",
-                    peer = %peer,
-                    error = %err
-                );
-            }
+            // Drop the stream immediately (sending RST) instead of awaiting a
+            // graceful shutdown. A malicious peer that holds the TCP half-close
+            // open would otherwise block the entire accept loop.
+            drop(tcp);
             return;
         }
 
@@ -207,20 +204,15 @@ impl ConnectionRuntime {
                 peer = %peer,
                 max_handshakes = self.max_handshakes
             );
-            if let Err(err) = tcp.shutdown().await {
-                debug!(
-                    event = "server.handshake.limit_shutdown_error",
-                    peer = %peer,
-                    error = %err
-                );
-            }
+            // Drop instead of shutdown — see the rate-limit rejection above.
+            drop(tcp);
             return;
         };
         let runtime = self.clone();
         let connection_id = next_connection_correlation_id();
         let connection = async move {
             if let Err(err) =
-                handle_connection(runtime, tcp, handshake_permit, peer, shutdown_rx).await
+                Box::pin(handle_connection(runtime, tcp, handshake_permit, peer, shutdown_rx)).await
             {
                 if is_clean_tls_handshake_disconnect(&err) {
                     debug!(event = "tls.handshake.closed", peer = %peer);
@@ -271,7 +263,7 @@ impl ConnectionRuntime {
         let connection_id = next_connection_correlation_id();
         let connection = async move {
             if let Err(err) =
-                handle_quic_connection(runtime, incoming, handshake_permit, peer, shutdown_rx).await
+                Box::pin(handle_quic_connection(runtime, incoming, handshake_permit, peer, shutdown_rx)).await
             {
                 warn!(event = "protocol.error", peer = %peer, carrier = "quic", error = %err);
             }
@@ -436,8 +428,7 @@ where
                     }
                 };
                 connection_runtime
-                    .spawn_accepted(&mut connections, tcp, peer, shutdown_tx.subscribe())
-                    .await;
+                    .spawn_accepted(&mut connections, tcp, peer, shutdown_tx.subscribe());
             }
             incoming = accept_quic(quic_endpoint.as_ref()) => {
                 if let Some(incoming) = incoming {
@@ -808,7 +799,7 @@ async fn handle_connection(
     let config = Arc::clone(&runtime.config);
     let handshake =
         async move { complete_handshake(tcp, authentication, replay_cache, &config).await };
-    serve_authenticated_carrier(runtime, handshake_permit, peer, shutdown_rx, handshake).await
+    Box::pin(serve_authenticated_carrier(runtime, handshake_permit, peer, shutdown_rx, handshake)).await
 }
 
 async fn handle_quic_connection(
@@ -842,7 +833,7 @@ async fn handle_quic_connection(
         )
         .await
     };
-    serve_authenticated_carrier(runtime, handshake_permit, peer, shutdown_rx, handshake).await
+    Box::pin(serve_authenticated_carrier(runtime, handshake_permit, peer, shutdown_rx, handshake)).await
 }
 
 /// Applies the handshake timeout, races the handshake against shutdown, and

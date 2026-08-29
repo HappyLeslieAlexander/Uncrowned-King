@@ -686,15 +686,38 @@ fn verify_auth_response_credential<'a>(
 /// Every configured credential is inspected and every key id is compared in
 /// constant time, so neither a shared key id prefix nor the position of the
 /// match changes how long the lookup takes.
+///
+/// Both key ids are padded to a fixed-length buffer before comparison so that
+/// `ct_eq` always operates on equal-length inputs and never short-circuits on
+/// a length mismatch.
 fn find_credential<'a>(credentials: &'a [Credential], key_id: &[u8]) -> Option<&'a Credential> {
     let mut matched = None;
+    let input_padded = pad_key_id_for_ct(key_id);
     for credential in credentials {
-        let is_match = bool::from(credential.key_id.ct_eq(key_id));
+        let cred_padded = pad_key_id_for_ct(&credential.key_id);
+        let input_ref: &[u8] = &input_padded;
+        let cred_ref: &[u8] = &cred_padded;
+        let is_match = bool::from(input_ref.ct_eq(cred_ref));
         if is_match && matched.is_none() {
             matched = Some(credential);
         }
     }
     matched
+}
+
+/// Pads a key id to a fixed-length buffer for constant-time comparison.
+///
+/// The buffer stores the key bytes in the first [`MAX_KEY_ID_LEN`] positions
+/// and the original length as a little-endian u64 in the last eight bytes.
+/// This ensures that (a) two key ids of different lengths never collide and
+/// (b) `ct_eq` always runs over equal-length buffers, preventing the
+/// length-dependent early return in `subtle::ConstantTimeEq` for slices.
+fn pad_key_id_for_ct(key_id: &[u8]) -> [u8; MAX_KEY_ID_LEN + 8] {
+    let mut buf = [0u8; MAX_KEY_ID_LEN + 8];
+    let len = key_id.len().min(MAX_KEY_ID_LEN);
+    buf[..len].copy_from_slice(&key_id[..len]);
+    buf[MAX_KEY_ID_LEN..].copy_from_slice(&(key_id.len() as u64).to_le_bytes());
+    buf
 }
 
 /// Returns the process-local secret used to keep unknown key ids expensive.
