@@ -6,10 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.1.2] - 2026-08-25
+## [0.1.2] - 2026-09-03
+
+### Added
+
+- **Production Helm Chart**: Fully configurable Kubernetes deployment chart (`deploy/helm/uncrowned-king`) with secure defaults, secret validation, and health/readiness probe configurations.
+- **Architecture and Performance Tuning Guides**: Production deployment and operational tuning documentation (`docs/tuning.md`, `docs/architecture.md`).
+- **Coalesced Frame Writing**: Batched carrier writes to reduce syscall overhead and maximize throughput under concurrent flow pressure.
+- **Authentication IP Rate Limiting**: Sliding window rate limiting on connection attempts and authentication failures to protect against brute force, with max capacity eviction.
+- **Configurable Relay Buffers**: Per-session and per-flow configurable buffer limits to control memory footprint under diverse network topologies.
+- **Automated CI Matrix**: Cross-platform testing matrix, cargo-deny license and advisory scanning, and automated releases.
 
 ### Changed
 
+- **Relay Engine Modularization**: Refactored monolithic client and server relay engines into focused, cohesive submodules (`carrier_writer`, `session_tasks`, `task_spawner`, `flow_control`, `target_writer`, `target_connect`, `udp_relay`).
+- **Deduplicated HTTP Observability Probes**: Unified HTTP health check, readiness probe, and Prometheus metrics formatting in `uk-proto`.
 - **`varint::decode` now rejects non-minimal encodings.** RFC 9000 permits a
   value to be encoded in any width at least as wide as the minimum; UK's parsers
   are deliberately strict (whitepaper §20), so one logical frame has exactly one
@@ -21,6 +32,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **Authentication & Rate Limiting Hardening**:
+  - Evict unbanned entries when rate limit capacity is reached to ensure active attacker tracking cannot be bypassed.
+  - Offloaded dynamic security reload parsing to blocking tasks (`spawn_blocking`) to avoid Tokio event loop stalls.
+  - Explicitly reject `UNREADABLE_CLOCK` sentinels in timestamp validation and credential activity checks.
+  - Mitigated `key_id` timing oracle through constant-time dummy credential lookups and fixed-delay padding.
+  - Fail closed on insecure or placeholder secrets in Helm charts.
+- **Relay & Protocol Hardening**:
+  - Protected against target decoding allocate-before-validate and `read_frame` memory preallocation OOM vulnerabilities.
+  - Prevented server accept loop blocking on rejected handshakes and session invalidation blocking request paths.
+  - Applied TCP keepalive to outgoing target connections on the server to prevent lingering half-open sockets.
+  - Gracefully handle transient UDP socket receive errors and use non-blocking `try_send` to avoid head-of-line blocking under packet bursts.
 - **Authentication no longer leaks key ids or the server clock through timing.**
   Credential lookup compared `key_id` with a short-circuiting `==` and returned
   before any HMAC, and the timestamp-skew check ran *before* tag verification —
