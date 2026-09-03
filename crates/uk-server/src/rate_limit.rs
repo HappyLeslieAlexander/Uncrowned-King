@@ -38,9 +38,13 @@ const fn default_ban_secs() -> u64 {
 /// when an attacker floods from many distinct IPs.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Hard cap on the number of tracked IPs. When reached, new IPs are not
-/// tracked rather than allowing unbounded growth.
+/// Hard cap on the number of tracked IPs. When reached, older unbanned entries
+/// are evicted in batches so new IPs are always tracked and cannot bypass rate limiting.
 const MAX_ENTRIES: usize = 65_536;
+
+/// Number of entries to evict at once when `MAX_ENTRIES` is reached, avoiding
+/// repeated evictions on consecutive inserts.
+const EVICTION_BATCH_SIZE: usize = 128;
 
 impl Default for AuthRateLimitConfig {
     fn default() -> Self {
@@ -125,8 +129,9 @@ impl AuthRateLimiter {
         // per PRUNE_INTERVAL. Without this throttle, an attacker producing
         // failures from >1024 distinct IPs would trigger an O(N) scan on every
         // single failure, exhausting CPU while holding the mutex.
-        if state.entries.len() > 1024
-            && now.saturating_duration_since(state.last_prune) >= PRUNE_INTERVAL
+        if (state.entries.len() > 1024
+            && now.saturating_duration_since(state.last_prune) >= PRUNE_INTERVAL)
+            || state.entries.len() >= MAX_ENTRIES
         {
             state.last_prune = now;
             let window = Duration::from_secs(self.config.window_secs);
@@ -140,11 +145,26 @@ impl AuthRateLimiter {
             });
         }
 
-        // Hard cap: stop tracking new IPs rather than growing unboundedly.
-        // The worst case is a new attacker IP escapes rate-limiting, but they
-        // still must authenticate — the real defense.
+        // When at capacity, evict unbanned entries in batches so new failing IPs
+        // are always tracked and cannot bypass rate limiting by filling the map.
         if !state.entries.contains_key(&ip) && state.entries.len() >= MAX_ENTRIES {
-            return false;
+            let mut victims = Vec::with_capacity(EVICTION_BATCH_SIZE);
+            for (&entry_ip, rec) in &state.entries {
+                if rec.banned_until.is_none() {
+                    victims.push(entry_ip);
+                    if victims.len() >= EVICTION_BATCH_SIZE {
+                        break;
+                    }
+                }
+            }
+            if victims.is_empty() {
+                for &entry_ip in state.entries.keys().take(EVICTION_BATCH_SIZE) {
+                    victims.push(entry_ip);
+                }
+            }
+            for victim in victims {
+                state.entries.remove(&victim);
+            }
         }
 
         let record = state.entries.entry(ip).or_insert_with(|| IpFailureRecord {
@@ -301,5 +321,40 @@ mod tests {
 
         // 2nd failure should now ban (proving 1st failure was NOT wiped)
         assert!(limiter.record_failure(ip));
+    }
+
+    #[test]
+    fn tracks_and_bans_new_ips_at_max_capacity() {
+        let limiter = AuthRateLimiter::new(AuthRateLimitConfig {
+            max_failures: 2,
+            window_secs: 60,
+            ban_secs: 300,
+        });
+        {
+            let mut state = limiter.records.lock().unwrap();
+            for i in 0..MAX_ENTRIES as u32 {
+                let octet2 = (i >> 16) as u8;
+                let octet3 = (i >> 8) as u8;
+                let octet4 = i as u8;
+                let dummy_ip = IpAddr::V4(Ipv4Addr::new(10, octet2, octet3, octet4));
+                state.entries.insert(
+                    dummy_ip,
+                    IpFailureRecord {
+                        failures: 1,
+                        window_start: Instant::now(),
+                        banned_until: None,
+                    },
+                );
+            }
+            assert_eq!(state.entries.len(), MAX_ENTRIES);
+        }
+
+        let new_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 100, 1));
+        assert!(limiter.check(new_ip));
+        // 1st failure should be recorded despite capacity
+        assert!(!limiter.record_failure(new_ip));
+        // 2nd failure should ban new_ip
+        assert!(limiter.record_failure(new_ip));
+        assert!(!limiter.check(new_ip));
     }
 }

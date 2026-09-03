@@ -416,7 +416,8 @@ where
                         quic_endpoint.as_ref(),
                         &metrics,
                         request,
-                    );
+                    )
+                    .await;
                 } else {
                     reload_rx = None;
                     debug!(event = "server.config.reload_channel_closed");
@@ -499,14 +500,25 @@ async fn accept_quic(endpoint: Option<&quinn::Endpoint>) -> Option<quinn::Incomi
     }
 }
 
-fn handle_reload_request(
+async fn handle_reload_request(
     config: &ServerConfig,
     security: &SecurityState,
     quic_endpoint: Option<&quinn::Endpoint>,
     metrics: &ServerMetrics,
     request: ServerReloadRequest,
 ) {
-    match apply_security_reload(config, security, quic_endpoint, request.config) {
+    let current = config.clone();
+    let security = security.clone();
+    let quic_endpoint = quic_endpoint.cloned();
+    let candidate = request.config;
+
+    let result = tokio::task::spawn_blocking(move || {
+        apply_security_reload(&current, &security, quic_endpoint.as_ref(), candidate)
+    })
+    .await
+    .unwrap_or_else(|err| Err(Box::new(err)));
+
+    match result {
         Ok(generation) => {
             metrics.record_config_reload_success(generation);
             info!(

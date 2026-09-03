@@ -68,13 +68,17 @@ server:
       auth_rate_limit_window_seconds: 60
       auth_rate_limit_ban_seconds: 300
 
-  # Credentials for authenticating clients
+  # Credentials for authenticating clients.
+  # WARNING: You MUST replace the placeholder secret with a secure 64-character hex secret!
+  # Helm deployment will fail closed if a placeholder secret is detected.
   credentials:
     - id: "client-default"
       secret: "replace-with-a-64-character-hex-secret-in-production-00000000000000"
       policy_group: "default"
 
   # Access policies
+  # WARNING: Configure allowed destination CIDRs, domains, and ports according to your
+  # environment. The default rule below allows all destinations for the 'default' policy group.
   policy:
     default_action: "deny"
     rules:

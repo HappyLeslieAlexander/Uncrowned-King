@@ -1,4 +1,9 @@
 {{- if .Values.server.enabled }}
+{{- range .Values.server.credentials }}
+{{- if hasPrefix "replace-with" .secret }}
+{{- fail "Security error: placeholder credential secret found in server.credentials. You must configure a secure 64-character hex secret before deployment." }}
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

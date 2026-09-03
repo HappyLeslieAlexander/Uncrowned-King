@@ -69,10 +69,10 @@ where
     let payload_len = usize::try_from(header.length).map_err(|_| ProtocolError::InvalidVarint)?;
     let mut payload = BytesMut::new();
     let mut remaining = payload_len;
+    let mut buf = [0_u8; 8192];
     while remaining > 0 {
         let chunk_size = remaining.min(READ_RESERVE_CHUNK);
         payload.reserve(chunk_size);
-        let mut buf = [0_u8; 8192];
         let to_read = remaining.min(buf.len());
         read_exact_or_truncated(reader, &mut buf[..to_read]).await?;
         payload.extend_from_slice(&buf[..to_read]);

@@ -198,6 +198,9 @@ impl Credential {
 
     /// Returns whether the credential may authenticate at the supplied Unix time.
     pub fn is_active_at(&self, now: u64) -> bool {
+        if now == UNREADABLE_CLOCK {
+            return false;
+        }
         if self.status != CredentialStatus::Active {
             return false;
         }
@@ -758,6 +761,9 @@ fn auth_mac(
 }
 
 fn timestamp_within_skew(timestamp: u64, now: u64, allowed_skew: Duration) -> bool {
+    if timestamp == UNREADABLE_CLOCK || now == UNREADABLE_CLOCK {
+        return false;
+    }
     now.abs_diff(timestamp) <= allowed_skew.as_secs()
 }
 
@@ -1659,6 +1665,14 @@ mod tests {
     #[test]
     fn unreadable_clock_sentinel_fails_every_timestamp_check() {
         let (mut credential, exporter, challenge, response) = fixture();
+        let (unexpired_cred, _, _, _) = fixture();
+        assert!(!unexpired_cred.is_active_at(UNREADABLE_CLOCK));
+        assert!(!timestamp_within_skew(
+            UNREADABLE_CLOCK,
+            UNREADABLE_CLOCK,
+            Duration::from_secs(30)
+        ));
+
         credential.not_after = Some(1_700_000_100);
         let mut replay_cache = ReplayCache::default();
 

@@ -196,7 +196,14 @@ pub(crate) fn udp_target_connector() -> TargetConnector<UdpSocket> {
 
 pub(crate) async fn connect_socket_addr(addr: SocketAddr) -> (SocketAddr, io::Result<TcpStream>) {
     let result = match TcpStream::connect(addr).await {
-        Ok(stream) => stream.set_nodelay(true).map(|()| stream),
+        Ok(stream) => {
+            let _ = stream.set_nodelay(true);
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(Duration::from_secs(60))
+                .with_interval(Duration::from_secs(60));
+            let _ = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive);
+            Ok(stream)
+        }
         Err(err) => Err(err),
     };
     (addr, result)

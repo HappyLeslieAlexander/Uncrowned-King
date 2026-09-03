@@ -200,19 +200,25 @@ pub(crate) async fn relay_udp_association(
                 debug!(event = "socks5.udp_associate.control_data_ignored");
             }
             received = association.socket.recv_from(udp_buf.as_mut()) => {
-                let (read, peer) = received?;
-                if !association
-                    .handle_local_udp_datagram(
-                        peer,
-                        &udp_buf[..read],
-                        &mut local,
-                        &mut tcp_buf,
-                        &sessions,
-                        &mut shutdown_rx,
-                    )
-                    .await?
-                {
-                    break;
+                match received {
+                    Ok((read, peer)) => {
+                        if !association
+                            .handle_local_udp_datagram(
+                                peer,
+                                &udp_buf[..read],
+                                &mut local,
+                                &mut tcp_buf,
+                                &sessions,
+                                &mut shutdown_rx,
+                            )
+                            .await?
+                        {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        debug!(event = "socks5.udp.recv_error", error = %err);
+                    }
                 }
             }
             joined = association.flow_tasks.join_next(), if !association.flow_tasks.is_empty() => {
