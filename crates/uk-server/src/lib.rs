@@ -211,8 +211,14 @@ impl ConnectionRuntime {
         let runtime = self.clone();
         let connection_id = next_connection_correlation_id();
         let connection = async move {
-            if let Err(err) =
-                Box::pin(handle_connection(runtime, tcp, handshake_permit, peer, shutdown_rx)).await
+            if let Err(err) = Box::pin(handle_connection(
+                runtime,
+                tcp,
+                handshake_permit,
+                peer,
+                shutdown_rx,
+            ))
+            .await
             {
                 if is_clean_tls_handshake_disconnect(&err) {
                     debug!(event = "tls.handshake.closed", peer = %peer);
@@ -262,8 +268,14 @@ impl ConnectionRuntime {
         let runtime = self.clone();
         let connection_id = next_connection_correlation_id();
         let connection = async move {
-            if let Err(err) =
-                Box::pin(handle_quic_connection(runtime, incoming, handshake_permit, peer, shutdown_rx)).await
+            if let Err(err) = Box::pin(handle_quic_connection(
+                runtime,
+                incoming,
+                handshake_permit,
+                peer,
+                shutdown_rx,
+            ))
+            .await
             {
                 warn!(event = "protocol.error", peer = %peer, carrier = "quic", error = %err);
             }
@@ -799,7 +811,14 @@ async fn handle_connection(
     let config = Arc::clone(&runtime.config);
     let handshake =
         async move { complete_handshake(tcp, authentication, replay_cache, &config).await };
-    Box::pin(serve_authenticated_carrier(runtime, handshake_permit, peer, shutdown_rx, handshake)).await
+    Box::pin(serve_authenticated_carrier(
+        runtime,
+        handshake_permit,
+        peer,
+        shutdown_rx,
+        handshake,
+    ))
+    .await
 }
 
 async fn handle_quic_connection(
@@ -833,7 +852,14 @@ async fn handle_quic_connection(
         )
         .await
     };
-    Box::pin(serve_authenticated_carrier(runtime, handshake_permit, peer, shutdown_rx, handshake)).await
+    Box::pin(serve_authenticated_carrier(
+        runtime,
+        handshake_permit,
+        peer,
+        shutdown_rx,
+        handshake,
+    ))
+    .await
 }
 
 /// Applies the handshake timeout, races the handshake against shutdown, and

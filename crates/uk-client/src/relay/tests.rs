@@ -1136,7 +1136,9 @@ async fn carrier_write_in_flight_is_not_truncated_by_shutdown() {
     let encoded_len = frame.encode().unwrap().len();
 
     let write_task =
-        tokio::spawn(async move { write_frame_or_shutdown(&mut writer, &frame, &shutdown, None).await });
+        tokio::spawn(
+            async move { write_frame_or_shutdown(&mut writer, &frame, &shutdown, None).await },
+        );
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
         !write_task.is_finished(),

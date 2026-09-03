@@ -831,8 +831,13 @@ async fn target_writer_times_out_when_target_stalled() {
     let shutdown = SessionShutdown::default();
     let metrics = ServerMetrics::default();
     let payload = vec![0xcc_u8; 10 * 1024 * 1024]; // 10MB to fill OS buffer
-    let buffered_payload =
-        BufferedTargetData::new(Bytes::from(payload), flow_control.clone(), 20 * 1024 * 1024, 20 * 1024 * 1024).unwrap();
+    let buffered_payload = BufferedTargetData::new(
+        Bytes::from(payload),
+        flow_control.clone(),
+        20 * 1024 * 1024,
+        20 * 1024 * 1024,
+    )
+    .unwrap();
 
     commands_tx
         .send(TargetCommand::Data(buffered_payload))

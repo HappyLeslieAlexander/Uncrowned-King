@@ -1417,9 +1417,13 @@ impl ClientSession {
     }
 
     pub(crate) async fn write_frame(&self, frame: &Frame) -> Result<(), AnyError> {
-        let result =
-            write_frame_locked(&self.writer, frame, &self.shutdown, self.task_shutdown_timeout)
-                .await;
+        let result = write_frame_locked(
+            &self.writer,
+            frame,
+            &self.shutdown,
+            self.task_shutdown_timeout,
+        )
+        .await;
         if result.is_err() {
             self.close().await;
         }

@@ -91,7 +91,10 @@ impl AuthRateLimiter {
             return true;
         }
         let now = Instant::now();
-        let mut state = self.records.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(record) = state.entries.get_mut(&ip) {
             if let Some(banned_until) = record.banned_until {
                 if now < banned_until {
@@ -113,7 +116,10 @@ impl AuthRateLimiter {
             return false;
         }
         let now = Instant::now();
-        let mut state = self.records.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Opportunistic prune if map gets large, but throttled to at most once
         // per PRUNE_INTERVAL. Without this throttle, an attacker producing
@@ -174,7 +180,10 @@ impl AuthRateLimiter {
 
     /// Clears any recorded failures for `ip` upon successful authentication.
     pub fn record_success(&self, ip: IpAddr) {
-        let mut state = self.records.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.entries.remove(&ip);
     }
 }
