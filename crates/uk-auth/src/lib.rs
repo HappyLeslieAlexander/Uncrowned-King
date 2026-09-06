@@ -630,14 +630,17 @@ pub fn verify_auth_response_identity(
     .map(AuthenticatedIdentity::from)
 }
 
-fn verify_auth_response_credential<'a>(
+/// Verifies an authentication response statelessly without modifying the replay cache.
+///
+/// Performs constant-time credential lookup, computes HMAC-SHA256, verifies tag and timestamps.
+/// The caller records nonces into the replay cache separately if successful.
+pub fn verify_auth_response_stateless<'a>(
     credentials: &'a [Credential],
     exporter_32: &[u8; 32],
     challenge: &AuthChallenge,
     response: &AuthResponse,
     now: u64,
     allowed_skew: Duration,
-    replay_cache: &mut ReplayCache,
 ) -> AuthResult<&'a Credential> {
     let matched = find_credential(credentials, &response.key_id);
 
@@ -680,6 +683,46 @@ fn verify_auth_response_credential<'a>(
         return Err(AuthError::ClockSkew);
     }
 
+    Ok(credential)
+}
+
+/// Verifies an authentication response statelessly and returns identity data.
+pub fn verify_auth_response_identity_stateless(
+    credentials: &[Credential],
+    exporter_32: &[u8; 32],
+    challenge: &AuthChallenge,
+    response: &AuthResponse,
+    now: u64,
+    allowed_skew: Duration,
+) -> AuthResult<AuthenticatedIdentity> {
+    verify_auth_response_stateless(
+        credentials,
+        exporter_32,
+        challenge,
+        response,
+        now,
+        allowed_skew,
+    )
+    .map(AuthenticatedIdentity::from)
+}
+
+fn verify_auth_response_credential<'a>(
+    credentials: &'a [Credential],
+    exporter_32: &[u8; 32],
+    challenge: &AuthChallenge,
+    response: &AuthResponse,
+    now: u64,
+    allowed_skew: Duration,
+    replay_cache: &mut ReplayCache,
+) -> AuthResult<&'a Credential> {
+    let credential = verify_auth_response_stateless(
+        credentials,
+        exporter_32,
+        challenge,
+        response,
+        now,
+        allowed_skew,
+    )?;
     replay_cache.check_and_insert(now, challenge.server_nonce, response.client_nonce)?;
     Ok(credential)
 }

@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashMap,
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -56,6 +56,30 @@ impl Default for AuthRateLimitConfig {
     }
 }
 
+/// Key used to aggregate failures by IPv4 address or IPv6 /64 network prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RateLimitKey {
+    V4(Ipv4Addr),
+    V6Prefix([u8; 8]),
+}
+
+impl RateLimitKey {
+    fn from_ip(ip: IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(v4) => Self::V4(v4),
+            IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    Self::V4(v4)
+                } else {
+                    let mut prefix = [0u8; 8];
+                    prefix.copy_from_slice(&v6.octets()[..8]);
+                    Self::V6Prefix(prefix)
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct IpFailureRecord {
     failures: u32,
@@ -65,7 +89,7 @@ struct IpFailureRecord {
 
 #[derive(Debug)]
 struct RateLimitState {
-    entries: HashMap<IpAddr, IpFailureRecord>,
+    entries: HashMap<RateLimitKey, IpFailureRecord>,
     last_prune: Instant,
 }
 
@@ -94,12 +118,13 @@ impl AuthRateLimiter {
         if self.config.max_failures == 0 {
             return true;
         }
+        let key = RateLimitKey::from_ip(ip);
         let now = Instant::now();
         let mut state = self
             .records
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(record) = state.entries.get_mut(&ip) {
+        if let Some(record) = state.entries.get_mut(&key) {
             if let Some(banned_until) = record.banned_until {
                 if now < banned_until {
                     return false;
@@ -119,19 +144,18 @@ impl AuthRateLimiter {
         if self.config.max_failures == 0 {
             return false;
         }
+        let key = RateLimitKey::from_ip(ip);
         let now = Instant::now();
         let mut state = self
             .records
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Opportunistic prune if map gets large, but throttled to at most once
-        // per PRUNE_INTERVAL. Without this throttle, an attacker producing
-        // failures from >1024 distinct IPs would trigger an O(N) scan on every
-        // single failure, exhausting CPU while holding the mutex.
-        if (state.entries.len() > 1024
-            && now.saturating_duration_since(state.last_prune) >= PRUNE_INTERVAL)
-            || state.entries.len() >= MAX_ENTRIES
+        // Opportunistic prune if map gets large, but strictly throttled to at most once
+        // per PRUNE_INTERVAL. This prevents CPU exhaustion under lock when an attacker
+        // floods with failures from many distinct IPs.
+        if (state.entries.len() > 1024 || state.entries.len() >= MAX_ENTRIES)
+            && now.saturating_duration_since(state.last_prune) >= PRUNE_INTERVAL
         {
             state.last_prune = now;
             let window = Duration::from_secs(self.config.window_secs);
@@ -147,19 +171,15 @@ impl AuthRateLimiter {
 
         // When at capacity, evict unbanned entries in batches so new failing IPs
         // are always tracked and cannot bypass rate limiting by filling the map.
-        if !state.entries.contains_key(&ip) && state.entries.len() >= MAX_ENTRIES {
+        // Active bans are NEVER evicted so an attacker cannot wash away legitimate bans.
+        if !state.entries.contains_key(&key) && state.entries.len() >= MAX_ENTRIES {
             let mut victims = Vec::with_capacity(EVICTION_BATCH_SIZE);
-            for (&entry_ip, rec) in &state.entries {
+            for (&entry_key, rec) in &state.entries {
                 if rec.banned_until.is_none() {
-                    victims.push(entry_ip);
+                    victims.push(entry_key);
                     if victims.len() >= EVICTION_BATCH_SIZE {
                         break;
                     }
-                }
-            }
-            if victims.is_empty() {
-                for &entry_ip in state.entries.keys().take(EVICTION_BATCH_SIZE) {
-                    victims.push(entry_ip);
                 }
             }
             for victim in victims {
@@ -167,7 +187,12 @@ impl AuthRateLimiter {
             }
         }
 
-        let record = state.entries.entry(ip).or_insert_with(|| IpFailureRecord {
+        if !state.entries.contains_key(&key) && state.entries.len() >= MAX_ENTRIES {
+            // Saturated with active bans; avoid unbounded memory growth.
+            return false;
+        }
+
+        let record = state.entries.entry(key).or_insert_with(|| IpFailureRecord {
             failures: 0,
             window_start: now,
             banned_until: None,
@@ -200,11 +225,12 @@ impl AuthRateLimiter {
 
     /// Clears any recorded failures for `ip` upon successful authentication.
     pub fn record_success(&self, ip: IpAddr) {
+        let key = RateLimitKey::from_ip(ip);
         let mut state = self
             .records
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.entries.remove(&ip);
+        state.entries.remove(&key);
     }
 }
 
@@ -338,7 +364,7 @@ mod tests {
                 let octet4 = i as u8;
                 let dummy_ip = IpAddr::V4(Ipv4Addr::new(10, octet2, octet3, octet4));
                 state.entries.insert(
-                    dummy_ip,
+                    RateLimitKey::from_ip(dummy_ip),
                     IpFailureRecord {
                         failures: 1,
                         window_start: Instant::now(),
@@ -356,5 +382,75 @@ mod tests {
         // 2nd failure should ban new_ip
         assert!(limiter.record_failure(new_ip));
         assert!(!limiter.check(new_ip));
+    }
+
+    #[test]
+    fn aggregates_ipv6_by_64_prefix() {
+        let limiter = AuthRateLimiter::new(AuthRateLimitConfig {
+            max_failures: 3,
+            window_secs: 60,
+            ban_secs: 300,
+        });
+
+        // Three different addresses in the same 2001:db8:abcd:0012::/64 subnet
+        let ip1: IpAddr = "2001:db8:abcd:12::1".parse().unwrap();
+        let ip2: IpAddr = "2001:db8:abcd:12::2".parse().unwrap();
+        let ip3: IpAddr = "2001:db8:abcd:12::dead:beef".parse().unwrap();
+        // A different subnet
+        let ip_other: IpAddr = "2001:db8:abcd:13::1".parse().unwrap();
+
+        assert!(limiter.check(ip1));
+        assert!(!limiter.record_failure(ip1)); // 1st failure
+        assert!(limiter.check(ip2));
+        assert!(!limiter.record_failure(ip2)); // 2nd failure (from different host in same /64)
+        assert!(limiter.check(ip3));
+        assert!(limiter.record_failure(ip3)); // 3rd failure bans the /64 prefix!
+
+        // All IPs in the /64 are now banned
+        assert!(!limiter.check(ip1));
+        assert!(!limiter.check(ip2));
+        assert!(!limiter.check(ip3));
+
+        // The other subnet is unaffected
+        assert!(limiter.check(ip_other));
+    }
+
+    #[test]
+    fn does_not_evict_active_bans_when_full() {
+        let limiter = AuthRateLimiter::new(AuthRateLimitConfig {
+            max_failures: 2,
+            window_secs: 60,
+            ban_secs: 300,
+        });
+        let banned_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        assert!(!limiter.record_failure(banned_ip));
+        assert!(limiter.record_failure(banned_ip)); // Banned
+        assert!(!limiter.check(banned_ip));
+
+        // Fill table with unbanned records
+        {
+            let mut state = limiter.records.lock().unwrap();
+            for i in 1..MAX_ENTRIES as u32 {
+                let octet2 = (i >> 16) as u8;
+                let octet3 = (i >> 8) as u8;
+                let octet4 = i as u8;
+                let ip = IpAddr::V4(Ipv4Addr::new(10, octet2, octet3, octet4));
+                state.entries.insert(
+                    RateLimitKey::from_ip(ip),
+                    IpFailureRecord {
+                        failures: 1,
+                        window_start: Instant::now(),
+                        banned_until: None,
+                    },
+                );
+            }
+        }
+
+        // Add another failing IP to trigger batch eviction
+        let attacker = IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1));
+        limiter.record_failure(attacker);
+
+        // Active ban for banned_ip must still be enforced!
+        assert!(!limiter.check(banned_ip));
     }
 }

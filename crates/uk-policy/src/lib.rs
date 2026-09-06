@@ -97,6 +97,24 @@ impl PolicySet {
 
         PolicyDecision::Deny
     }
+
+    /// Checks if the policy set contains any `Allow` rule that can match private
+    /// or loopback destinations without being preceded by a blanket
+    /// `action = "deny", private = true` rule, and without an explicit `private` constraint.
+    pub fn has_unrestricted_private_allow(&self) -> bool {
+        let mut has_blanket_private_deny = false;
+        for rule in &self.rules {
+            if rule.is_blanket_private_deny() {
+                has_blanket_private_deny = true;
+            } else if rule.action == PolicyDecision::Allow
+                && !has_blanket_private_deny
+                && rule.private.is_none()
+            {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// One ordered policy rule.
@@ -133,6 +151,18 @@ impl PolicyRule {
             ports: None,
             private: None,
         }
+    }
+
+    /// Returns whether this rule acts as an unconditional private IP denial.
+    pub fn is_blanket_private_deny(&self) -> bool {
+        self.action == PolicyDecision::Deny
+            && self.private == Some(true)
+            && self.key_id.is_none()
+            && self.policy_group.is_none()
+            && self.domain.is_none()
+            && self.domain_suffix.is_none()
+            && self.ports.is_none()
+            && self.cidr.is_none()
     }
 
     fn matches(&self, context: &PolicyContext<'_>) -> bool {
@@ -790,6 +820,24 @@ mod tests {
             policy.evaluate(&context(&target, Some("default"), &[])),
             PolicyDecision::Deny
         );
+    }
+
+    #[test]
+    fn detects_unrestricted_private_allow_rules() {
+        let mut allow_rule = PolicyRule::new(PolicyDecision::Allow);
+        allow_rule.domain_suffix = Some(".example.com".to_owned());
+        let insecure_policy = PolicySet::new(vec![allow_rule.clone()]);
+        assert!(insecure_policy.has_unrestricted_private_allow());
+
+        let mut deny_private = PolicyRule::new(PolicyDecision::Deny);
+        deny_private.private = Some(true);
+        let secure_policy = PolicySet::new(vec![deny_private, allow_rule.clone()]);
+        assert!(!secure_policy.has_unrestricted_private_allow());
+
+        let mut allow_public_only = allow_rule;
+        allow_public_only.private = Some(false);
+        let public_policy = PolicySet::new(vec![allow_public_only]);
+        assert!(!public_policy.has_unrestricted_private_allow());
     }
 
     #[test]

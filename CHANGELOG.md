@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-06
+
+### Security
+
+- **IPv6 Authentication Rate Limiting & Prefix Aggregation**:
+  - Aggregated authentication failure rate limiting by IPv6 `/64` network prefix (`RateLimitKey`), preventing rate limiter bypass across rotating IPv6 interface identifiers.
+  - Preserved active bans during capacity eviction when reaching `MAX_ENTRIES`, preventing attackers from wiping legitimate bans through failure flooding.
+  - Enforced `PRUNE_INTERVAL` throttling even under full capacity to prevent O(N) map scans and mutex contention under high failure rates.
+- **Decoupled Stateless Auth Verification from ReplayCache Lock**:
+  - Separated CPU-intensive credential lookups, HMAC-SHA256 calculations, and constant-time tag comparisons into stateless verification functions.
+  - Eliminated server-wide handshake serialization by reducing the global `ReplayCache` mutex hold time strictly to nonce test-and-set insertion.
+- **Sensitive File Permission Symlink Traversal Protection**:
+  - Replaced `fs::metadata` with `fs::symlink_metadata` in `validate_sensitive_file_permissions` across client and server configurations.
+  - Explicitly rejected symlinks on TLS private keys, client credentials, and CA certificates to prevent local file permission bypasses.
+- **SSRF & Private IP Target Policy Safeguards**:
+  - Added `has_unrestricted_private_allow` detection in `uk-policy` to identify allow rules matching private or loopback IP ranges without prior private denial rules.
+  - Emitted actionable `policy.unrestricted_private` warnings during server config validation and startup to alert operators to potential SSRF / DNS rebinding exposures.
+- **SOCKS Handshake Timeout Protection**:
+  - Enforced `socks_handshake_timeout_seconds > 0` in client resource limit validation, preventing idle client connections from permanently holding semaphore connection slots.
+
+### Changed
+
+- **QUIC Client Endpoint Driver Cleanup**:
+  - Removed unused runtime handle binding in `keep_endpoint_alive` and clarified background endpoint driver lifecycle.
+
 ## [0.1.2] - 2026-09-03
 
 ### Added
@@ -342,7 +367,8 @@ policy-enforced SOCKS5 → UK → target relay over TLS/TCP and QUIC.
   saturating bulk flow); and a soak/chaos harness showing flat memory across
   sustained load. See `docs/performance.md`.
 
-[Unreleased]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/HappyLeslieAlexander/Uncrowned-King/releases/tag/v0.1.0

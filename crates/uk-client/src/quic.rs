@@ -9,9 +9,7 @@
 use std::{future::Future, io, net::SocketAddr, pin::Pin, sync::Arc};
 
 use bytes::Bytes;
-use quinn::{
-    ClientConfig as QuinnClientConfig, Endpoint, crypto::rustls::QuicClientConfig, default_runtime,
-};
+use quinn::{ClientConfig as QuinnClientConfig, Endpoint, crypto::rustls::QuicClientConfig};
 use rustls::ClientConfig as RustlsClientConfig;
 use tokio::net::lookup_host;
 use uk_auth::EXPORTER_LABEL;
@@ -142,9 +140,9 @@ fn exporter(connection: &quinn::Connection) -> Result<[u8; 32], QuicError> {
 
 /// Keeps the client endpoint alive for the connection's lifetime. quinn drives
 /// I/O from the endpoint; dropping it would close the connection. The stream
-/// halves hold the connection state, so we only need to retain the endpoint.
+/// halves hold the connection state, so we retain the endpoint driver until
+/// all connections on it have completed and gone idle.
 fn keep_endpoint_alive(endpoint: Endpoint) {
-    let _runtime = default_runtime();
     tokio::spawn(async move {
         endpoint.wait_idle().await;
     });

@@ -33,7 +33,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{Instrument, debug, info, info_span, warn};
 use uk_auth::{
     AuthChallenge, AuthResponse, AuthenticatedIdentity, ReplayCache, try_unix_now,
-    verify_auth_response_identity,
+    verify_auth_response_identity_stateless,
 };
 use uk_proto::{
     BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, ErrorCode, ErrorPayload, Frame,
@@ -1177,19 +1177,14 @@ async fn authenticate_carrier(
             ));
         }
     };
-    let verification = {
-        let mut replay_cache = replay_cache.lock().await;
-        verify_auth_response_identity(
-            &authentication.credentials,
-            &exporter,
-            &challenge,
-            &response,
-            now,
-            authentication.auth_skew,
-            &mut replay_cache,
-        )
-    };
-    let identity = match verification {
+    let identity = match verify_auth_response_identity_stateless(
+        &authentication.credentials,
+        &exporter,
+        &challenge,
+        &response,
+        now,
+        authentication.auth_skew,
+    ) {
         Ok(identity) => identity,
         Err(err) => {
             let _ = write_connection_error(&mut writer, ErrorCode::AuthFailed).await;
@@ -1200,6 +1195,19 @@ async fn authenticate_carrier(
             ));
         }
     };
+
+    let replay_result = {
+        let mut replay_cache = replay_cache.lock().await;
+        replay_cache.check_and_insert(now, challenge.server_nonce, response.client_nonce)
+    };
+    if let Err(err) = replay_result {
+        let _ = write_connection_error(&mut writer, ErrorCode::AuthFailed).await;
+        return Err(phase_error(
+            "verify auth response replay",
+            HandshakeFailureReason::Auth,
+            err,
+        ));
+    }
 
     info!(
         event = "auth.success",

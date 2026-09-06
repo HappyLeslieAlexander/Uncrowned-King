@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use crate::rate_limit::AuthRateLimitConfig;
 use serde::Deserialize;
 use tokio::sync::Semaphore;
+use tracing::warn;
 use uk_auth::{
     AuthError, Credential, CredentialStatus, DEFAULT_REPLAY_CACHE_MAX_ENTRIES,
     DEFAULT_REPLAY_CACHE_WINDOW_SECONDS, MIN_AUTH_RESPONSE_PAYLOAD_SIZE,
@@ -95,8 +96,16 @@ impl ServerConfig {
         validate_owner_only_writable_file(Path::new(path), "policy file")?;
         let text = fs::read_to_string(path)
             .map_err(|err| format!("failed to read policy file {path}: {err}"))?;
-        PolicySet::from_toml(&text)
-            .map_err(|err| format!("invalid policy file {path}: {err}").into())
+        let policy_set = PolicySet::from_toml(&text)
+            .map_err(|err| format!("invalid policy file {path}: {err}"))?;
+        if policy_set.has_unrestricted_private_allow() {
+            warn!(
+                event = "policy.unrestricted_private",
+                path = %path,
+                "policy file contains allow rules that can match private/loopback IP addresses without a preceding 'deny private = true' rule; consider adding '[[rules]] action = \"deny\", private = true' to prevent SSRF"
+            );
+        }
+        Ok(policy_set)
     }
 
     /// Validates configured resource limits.
@@ -592,10 +601,14 @@ fn validate_sensitive_file_permissions(
     path: &Path,
     label: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let metadata = fs::metadata(path)
+    let metadata = fs::symlink_metadata(path)
         .map_err(|err| format!("failed to read {label} metadata {}: {err}", path.display()))?;
     if !metadata.is_file() {
-        return Err(format!("{label} {} must be a regular file", path.display()).into());
+        return Err(format!(
+            "{label} {} must be a regular file, not a symlink or directory",
+            path.display()
+        )
+        .into());
     }
     let mode = metadata.permissions().mode();
     if mode & 0o077 != 0 {
@@ -1992,6 +2005,25 @@ replay_cache_window_seconds = 120
         assert!(error.contains("policy file"));
         assert!(error.contains(&link_text));
         assert!(error.contains("regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_sensitive_paths_rejects_symlinked_key_path() {
+        let target = write_temp_file("key-target", "pem", "private-key-content", 0o600);
+        let link = temp_path("key-link", "pem");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let link_text = link.to_string_lossy().into_owned();
+        let mut config = minimal_config();
+        config.key_path = link_text.clone();
+
+        let error = config.validate_sensitive_paths().unwrap_err().to_string();
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_file(&target);
+
+        assert!(error.contains("private key"));
+        assert!(error.contains(&link_text));
+        assert!(error.contains("regular file, not a symlink"));
     }
 
     #[test]

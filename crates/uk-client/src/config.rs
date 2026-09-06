@@ -285,6 +285,11 @@ impl ClientConfig {
                 return Err("relay_buffer_size must be at most 1048576".into());
             }
         }
+        if let Some(timeout) = self.socks_handshake_timeout_seconds {
+            if timeout == 0 {
+                return Err("socks_handshake_timeout_seconds must be greater than zero".into());
+            }
+        }
         Ok(())
     }
 
@@ -341,10 +346,14 @@ fn validate_sensitive_file_permissions(
     path: &Path,
     label: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let metadata = fs::metadata(path)
+    let metadata = fs::symlink_metadata(path)
         .map_err(|err| format!("failed to read {label} metadata {}: {err}", path.display()))?;
     if !metadata.is_file() {
-        return Err(format!("{label} {} must be a regular file", path.display()).into());
+        return Err(format!(
+            "{label} {} must be a regular file, not a symlink or directory",
+            path.display()
+        )
+        .into());
     }
     let mode = metadata.permissions().mode();
     if mode & 0o077 != 0 {
@@ -511,6 +520,23 @@ secret = "0123456789abcdef0123456789abcdef"
         assert!(error.contains("client config"));
         assert!(error.contains(&path_text));
         assert!(error.contains("group or other"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_symlinked_config_file() {
+        let target = write_temp_client_config(0o600);
+        let link = temp_path("config-link", "toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let link_text = link.to_string_lossy().into_owned();
+
+        let error = ClientConfig::load(&link).unwrap_err().to_string();
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_file(&target);
+
+        assert!(error.contains("client config"));
+        assert!(error.contains(&link_text));
+        assert!(error.contains("regular file, not a symlink"));
     }
 
     #[test]
@@ -815,6 +841,14 @@ max_buffered_bytes_per_flow = 4096
         config.max_buffered_bytes_per_flow = Some(MAX_FRAME_PAYLOAD_SIZE + 1);
 
         assert!(config.validate_resource_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_socks_handshake_timeout() {
+        let mut config = minimal_config();
+        config.socks_handshake_timeout_seconds = Some(0);
+        let error = config.validate_resource_limits().unwrap_err().to_string();
+        assert!(error.contains("socks_handshake_timeout_seconds"));
     }
 
     #[test]
