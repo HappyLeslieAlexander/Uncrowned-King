@@ -3953,7 +3953,7 @@ async fn run_client_observability_e2e() -> Result<(), TestError> {
     let health = http_get(observability_addr, "/healthz").await?;
     let ready = http_get(observability_addr, "/readyz").await?;
     assert!(health.starts_with("HTTP/1.1 200 OK\r\n"));
-    assert!(ready.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(ready.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
 
     let (udp_target_addr, udp_target_task) = spawn_udp_echo_target().await?;
     let (udp_control, udp_relay_addr) = open_socks_udp_associate(socks_addr).await?;
@@ -3961,6 +3961,9 @@ async fn run_client_observability_e2e() -> Result<(), TestError> {
     let udp_payload = b"client observability udp payload";
     assert_socks_udp_roundtrip(&udp_client, udp_relay_addr, udp_target_addr, udp_payload).await?;
     udp_target_task.await??;
+
+    let ready_after = http_get(observability_addr, "/readyz").await?;
+    assert!(ready_after.starts_with("HTTP/1.1 200 OK\r\n"));
 
     let mut incompatible = initial_config.clone();
     incompatible.observability_listen = Some(unused_loopback_addr().await?.to_string());

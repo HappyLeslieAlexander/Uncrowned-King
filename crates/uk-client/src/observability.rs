@@ -103,7 +103,7 @@ impl ClientMetrics {
     }
 
     fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+        self.ready.load(Ordering::Acquire) && self.active_sessions.load(Ordering::Relaxed) > 0
     }
 
     pub(crate) fn set_config_generation(&self, generation: u64) {
@@ -506,11 +506,23 @@ mod tests {
                 .contains("503 Service Unavailable")
         );
         metrics.set_ready(true);
+        assert!(
+            request(&metrics, "/readyz")
+                .await
+                .contains("503 Service Unavailable")
+        );
+        metrics.record_session_established();
         assert!(request(&metrics, "/readyz").await.contains("200 OK"));
         assert!(
             request(&metrics, "/metrics")
                 .await
                 .contains("uncrowned_king_client_ready 1\n")
+        );
+        metrics.record_session_closed(false);
+        assert!(
+            request(&metrics, "/readyz")
+                .await
+                .contains("503 Service Unavailable")
         );
     }
 

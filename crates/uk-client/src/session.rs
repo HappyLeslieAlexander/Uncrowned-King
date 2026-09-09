@@ -1,12 +1,13 @@
 //! Client-side UK session setup.
 
 use std::{
+    collections::HashMap,
     error::Error,
     fmt,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, LazyLock, Mutex as StdMutex},
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::BytesMut;
@@ -259,6 +260,38 @@ where
     .await
 }
 
+static DEGRADED_ENDPOINTS: LazyLock<StdMutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+const DEGRADED_COOLDOWN: Duration = Duration::from_secs(180);
+
+fn is_endpoint_degraded(endpoint: &str) -> bool {
+    let Ok(mut map) = DEGRADED_ENDPOINTS.lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    map.retain(|_, until| *until > now);
+    map.contains_key(endpoint)
+}
+
+fn mark_endpoint_degraded(endpoint: &str) {
+    if let Ok(mut map) = DEGRADED_ENDPOINTS.lock() {
+        map.insert(endpoint.to_owned(), Instant::now() + DEGRADED_COOLDOWN);
+    }
+}
+
+fn clear_endpoint_degraded(endpoint: &str) {
+    if let Ok(mut map) = DEGRADED_ENDPOINTS.lock() {
+        map.remove(endpoint);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn clear_all_degraded_endpoints() {
+    if let Ok(mut map) = DEGRADED_ENDPOINTS.lock() {
+        map.clear();
+    }
+}
+
 async fn connect_authenticated_inner<F>(
     config: &ClientConfig,
     endpoint_timeout: Option<Duration>,
@@ -275,7 +308,24 @@ where
     let mut attempts = Vec::new();
     let mut credential_rejection = false;
 
-    for (index, endpoint) in config.server_endpoints().into_iter().enumerate() {
+    let raw_endpoints = config.server_endpoints();
+    let mut healthy = Vec::new();
+    let mut degraded = Vec::new();
+    for ep in raw_endpoints {
+        if is_endpoint_degraded(ep) {
+            degraded.push(ep);
+        } else {
+            healthy.push(ep);
+        }
+    }
+    let ordered_endpoints = if healthy.is_empty() {
+        degraded
+    } else {
+        healthy.extend(degraded);
+        healthy
+    };
+
+    for (index, endpoint) in ordered_endpoints.into_iter().enumerate() {
         match connect_authenticated_endpoint_with_timeout(
             config,
             &tls_config,
@@ -286,11 +336,15 @@ where
         .await
         {
             Ok(session) => {
+                clear_endpoint_degraded(endpoint);
                 observe(EndpointAttemptOutcome::Succeeded);
                 return Ok(session);
             }
             Err(err) => {
                 let failure_phase = endpoint_failure_phase(&err);
+                if failure_phase == EndpointFailurePhase::Timeout {
+                    mark_endpoint_degraded(endpoint);
+                }
                 credential_rejection = is_credential_rejection(&err);
                 observe(EndpointAttemptOutcome::Failed(failure_phase));
                 warn!(
@@ -894,5 +948,19 @@ mod tests {
         settings.set(SettingKey::SupportsUdpStreamFallback, 2);
 
         assert!(settings.negotiated_v0_1().is_err());
+    }
+
+    #[test]
+    fn tracks_and_clears_degraded_endpoints() {
+        clear_all_degraded_endpoints();
+        let ep = "quic://127.0.0.1:9443";
+        assert!(!is_endpoint_degraded(ep));
+        mark_endpoint_degraded(ep);
+        assert!(is_endpoint_degraded(ep));
+        clear_endpoint_degraded(ep);
+        assert!(!is_endpoint_degraded(ep));
+        mark_endpoint_degraded(ep);
+        clear_all_degraded_endpoints();
+        assert!(!is_endpoint_degraded(ep));
     }
 }

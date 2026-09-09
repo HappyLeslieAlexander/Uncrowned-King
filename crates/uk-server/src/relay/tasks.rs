@@ -337,6 +337,10 @@ pub(crate) fn spawn_datagram_reader(
             };
             match datagram::decode(datagram) {
                 Ok((flow_id, payload)) => {
+                    if !is_client_initiated_flow_id(flow_id) {
+                        debug!(event = "udp.datagram.invalid_flow_id", flow_id);
+                        continue;
+                    }
                     send_flow_event_or_shutdown(
                         &event_tx,
                         FlowEvent::InboundDatagram { flow_id, payload },

@@ -183,7 +183,7 @@ impl ConnectionRuntime {
         shutdown_rx: watch::Receiver<bool>,
     ) {
         if !self.auth_rate_limiter.check(peer.ip()) {
-            self.metrics.record_rejected_handshake();
+            self.metrics.record_rate_limited_connection();
             warn!(
                 event = "server.auth_rate_limit.rejected",
                 peer = %peer,
@@ -252,7 +252,7 @@ impl ConnectionRuntime {
         shutdown_rx: watch::Receiver<bool>,
     ) {
         if !self.auth_rate_limiter.check(peer.ip()) {
-            self.metrics.record_rejected_handshake();
+            self.metrics.record_rate_limited_connection();
             warn!(
                 event = "server.auth_rate_limit.rejected",
                 peer = %peer,
@@ -661,15 +661,12 @@ fn apply_security_reload(
     // Build both carrier crypto configs before touching any live state so an
     // invalid certificate or key fails the reload atomically, leaving the
     // running TLS and QUIC identities in place.
-    let tls_acceptor = TlsAcceptor::from(Arc::new(tls::server_config(
-        &candidate.cert_path,
-        &candidate.key_path,
-    )?));
+    let (certs, key) = tls::load_identity(&candidate.cert_path, &candidate.key_path)?;
+    let tls_server_config = tls::server_config_from_memory(certs.clone(), key.clone_key())?;
+    let tls_acceptor = TlsAcceptor::from(Arc::new(tls_server_config));
     let quic_config = if quic_endpoint.is_some() {
-        Some(quic::server_config(tls::server_config(
-            &candidate.cert_path,
-            &candidate.key_path,
-        )?)?)
+        let quic_tls_config = tls::server_config_from_memory(certs, key)?;
+        Some(quic::server_config(quic_tls_config)?)
     } else {
         None
     };

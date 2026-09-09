@@ -85,6 +85,24 @@ where
     stream.shutdown().await
 }
 
+/// Writes an HTTP response head without body (for HEAD requests) and shuts down.
+pub async fn write_response_head_only<S>(
+    stream: &mut S,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    content_length: usize,
+) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {content_length}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.shutdown().await
+}
+
 /// Dispatches a single HTTP probe connection.
 pub async fn serve_probe_connection<S, FReady, FRender>(
     stream: &mut S,
@@ -99,10 +117,10 @@ where
     let request = tokio::time::timeout(REQUEST_TIMEOUT, read_request_head(stream))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP request timed out"))??;
-    let Some((method, path, version)) = parse_request_line(&request) else {
+    let Some((method, raw_path, version)) = parse_request_line(&request) else {
         return write_response(stream, 400, "Bad Request", "text/plain", "bad request\n").await;
     };
-    if method != "GET" {
+    if method != "GET" && method != "HEAD" {
         return write_response(
             stream,
             405,
@@ -123,31 +141,35 @@ where
         .await;
     }
 
-    match path {
-        "/healthz" => write_response(stream, 200, "OK", "text/plain", "ok\n").await,
-        "/readyz" if is_ready() => write_response(stream, 200, "OK", "text/plain", "ready\n").await,
-        "/readyz" => {
-            write_response(
-                stream,
-                503,
-                "Service Unavailable",
-                "text/plain",
-                "not ready\n",
-            )
-            .await
-        }
-        "/metrics" => {
-            let body = render_metrics();
-            write_response(
-                stream,
-                200,
-                "OK",
-                "text/plain; version=0.0.4; charset=utf-8",
-                &body,
-            )
-            .await
-        }
-        _ => write_response(stream, 404, "Not Found", "text/plain", "not found\n").await,
+    let path = raw_path.split('?').next().unwrap_or(raw_path);
+    let is_head = method == "HEAD";
+
+    let (status, reason, content_type, body) = match path {
+        "/healthz" => (200, "OK", "text/plain", "ok\n".to_string()),
+        "/readyz" if is_ready() => (200, "OK", "text/plain", "ready\n".to_string()),
+        "/readyz" => (
+            503,
+            "Service Unavailable",
+            "text/plain",
+            "not ready\n".to_string(),
+        ),
+        "/metrics" => (
+            200,
+            "OK",
+            "text/plain; version=0.0.4; charset=utf-8",
+            if is_head {
+                String::new()
+            } else {
+                render_metrics()
+            },
+        ),
+        _ => (404, "Not Found", "text/plain", "not found\n".to_string()),
+    };
+
+    if is_head {
+        write_response_head_only(stream, status, reason, content_type, body.len()).await
+    } else {
+        write_response(stream, status, reason, content_type, &body).await
     }
 }
 
@@ -162,8 +184,33 @@ mod tests {
             Some(("GET", "/healthz", "HTTP/1.1"))
         );
         assert_eq!(
+            parse_request_line(b"HEAD /healthz?verbose=1 HTTP/1.1\r\n"),
+            Some(("HEAD", "/healthz?verbose=1", "HTTP/1.1"))
+        );
+        assert_eq!(
             parse_request_line(b"GET /metrics HTTP/1.0\r\n"),
             Some(("GET", "/metrics", "HTTP/1.0"))
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_head_request_and_query_params() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let task = tokio::spawn(async move {
+            serve_probe_connection(&mut server, || true, || "test_metric 1\n".to_string()).await
+        });
+        client
+            .write_all(b"HEAD /healthz?probe=1 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        task.await.unwrap().unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Length: 3\r\n"));
+        assert!(
+            response.ends_with("\r\n\r\n"),
+            "HEAD request should have no body content"
         );
     }
 

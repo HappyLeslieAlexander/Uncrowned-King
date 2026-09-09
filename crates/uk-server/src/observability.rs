@@ -162,6 +162,7 @@ pub(super) struct ServerMetrics {
     config_reload_successes_total: AtomicU64,
     config_reload_failures_total: AtomicU64,
     accepted_connections_total: AtomicU64,
+    rate_limited_connections_total: AtomicU64,
     rejected_handshakes_total: AtomicU64,
     failed_handshakes_total: AtomicU64,
     handshake_failures_total: [AtomicU64; HANDSHAKE_FAILURE_COUNT],
@@ -207,6 +208,11 @@ impl ServerMetrics {
 
     pub(super) fn record_accepted_connection(&self) {
         self.accepted_connections_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_rate_limited_connection(&self) {
+        self.rate_limited_connections_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -291,6 +297,9 @@ impl ServerMetrics {
                 "# HELP uncrowned_king_server_accepted_connections_total Accepted TCP carrier connections.\n",
                 "# TYPE uncrowned_king_server_accepted_connections_total counter\n",
                 "uncrowned_king_server_accepted_connections_total {accepted_connections_total}\n",
+                "# HELP uncrowned_king_server_rate_limited_connections_total Carrier connections rejected by authentication rate limiting.\n",
+                "# TYPE uncrowned_king_server_rate_limited_connections_total counter\n",
+                "uncrowned_king_server_rate_limited_connections_total {rate_limited_connections_total}\n",
                 "# HELP uncrowned_king_server_rejected_handshakes_total Carrier connections rejected by the handshake concurrency limit.\n",
                 "# TYPE uncrowned_king_server_rejected_handshakes_total counter\n",
                 "uncrowned_king_server_rejected_handshakes_total {rejected_handshakes_total}\n",
@@ -319,6 +328,8 @@ impl ServerMetrics {
             config_reload_failures_total =
                 self.config_reload_failures_total.load(Ordering::Relaxed),
             accepted_connections_total = self.accepted_connections_total.load(Ordering::Relaxed),
+            rate_limited_connections_total =
+                self.rate_limited_connections_total.load(Ordering::Relaxed),
             rejected_handshakes_total = self.rejected_handshakes_total.load(Ordering::Relaxed),
             failed_handshakes_total = self.failed_handshakes_total.load(Ordering::Relaxed),
             active_handshakes = self.active_handshakes.load(Ordering::Relaxed),
@@ -707,8 +718,10 @@ mod tests {
         metrics.record_flow_open_failure(RelayProtocol::Tcp, FlowOpenFailure::TargetUnavailable);
         metrics.record_relay_bytes(RelayProtocol::Tcp, RelayDirection::ClientToTarget, 100);
         metrics.record_failed_handshake(HandshakeFailureReason::Auth);
+        metrics.record_rate_limited_connection();
 
         let rendered = metrics.render();
         assert_prometheus_spec_conformance(&rendered);
+        assert!(rendered.contains("uncrowned_king_server_rate_limited_connections_total 1\n"));
     }
 }

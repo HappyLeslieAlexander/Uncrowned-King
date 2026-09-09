@@ -15,8 +15,25 @@ type TlsError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Builds a TLS 1.3-only server config.
 pub fn server_config(cert_path: &str, key_path: &str) -> Result<ServerConfig, TlsError> {
+    let (certs, key) = load_identity(cert_path, key_path)?;
+    server_config_from_memory(certs, key)
+}
+
+/// Loads certificates and private key from disk once into memory.
+pub fn load_identity(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsError> {
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
+    Ok((certs, key))
+}
+
+/// Builds a TLS 1.3-only server config from in-memory DER certificates and private key.
+pub fn server_config_from_memory(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<ServerConfig, TlsError> {
     let mut config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_no_client_auth()
         .with_single_cert(certs, key)?;

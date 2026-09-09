@@ -666,6 +666,9 @@ pub(crate) async fn relay_udp_flow_to_client(
         flow_event_tx,
     )
     .await;
+    if outcome.is_err() {
+        let _ = session.send_udp_close(flow_id, UDP_CLOSE_NORMAL).await;
+    }
     session.remove_flow(flow_id).await;
     UdpFlowTaskResult {
         flow_id,
