@@ -2,10 +2,10 @@
 //! Designed and executed by Challenger 1.
 
 #![allow(
+    unknown_lints,
     clippy::all,
     clippy::pedantic,
     clippy::bool_assert_comparison,
-    clippy::ip_constant,
     clippy::uninlined_format_args,
     clippy::manual_string_new,
     clippy::too_many_lines
