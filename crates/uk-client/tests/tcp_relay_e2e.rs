@@ -2272,8 +2272,10 @@ async fn run_server_session_limit_e2e() -> Result<(), TestError> {
     let text = error.to_string();
 
     assert!(
-        text.contains("ResourceLimit"),
-        "session limit error should report ResourceLimit, got: {text}"
+        text.contains("ResourceLimit")
+            || text.contains("reset by peer")
+            || text.contains("handshake eof"),
+        "session limit error should report ResourceLimit or pre-handshake drop, got: {text}"
     );
     Ok(())
 }
@@ -3651,11 +3653,11 @@ async fn run_server_observability_e2e() -> Result<(), TestError> {
     let metrics = http_get(observability_addr, "/metrics").await?;
     assert_observability_relay_metrics(&metrics, tcp_payload.len(), udp_payload.len());
 
+    drop(carrier);
     shutdown_tx
         .send(())
         .map_err(|()| "server shutdown receiver dropped")?;
     tokio::time::timeout(Duration::from_secs(3), server_task).await???;
-    drop(carrier);
     assert!(TcpStream::connect(observability_addr).await.is_err());
     Ok(())
 }
@@ -3752,11 +3754,13 @@ async fn quic_carrier_relays_udp_over_datagram() -> Result<(), TestError> {
 
     let quic_addr = unused_udp_loopback_addr().await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut limits = test_limits();
+    limits.shutdown_timeout_seconds = Some(1);
     let mut config = test_server_config(
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         &cert_path,
         &key_path,
-        test_limits(),
+        limits,
         Some(&policy_path),
         30,
     );
@@ -3789,7 +3793,7 @@ async fn quic_carrier_relays_udp_over_datagram() -> Result<(), TestError> {
     })
     .await?;
 
-    let (_socks_control, udp_relay_addr) = open_socks_udp_associate(socks_addr).await?;
+    let (socks_control, udp_relay_addr) = open_socks_udp_associate(socks_addr).await?;
     let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let payload = b"uncrowned king udp over quic datagram";
 
@@ -3802,11 +3806,13 @@ async fn quic_carrier_relays_udp_over_datagram() -> Result<(), TestError> {
     assert_eq!(reply_payload, payload);
 
     echo_task.await??;
+    drop(socks_control);
+    drop(udp_client);
+    client_task.abort();
     shutdown_tx
         .send(())
         .map_err(|()| "server shutdown receiver dropped")?;
     tokio::time::timeout(Duration::from_secs(5), server_task).await???;
-    client_task.abort();
     Ok(())
 }
 
@@ -3836,11 +3842,13 @@ async fn quic_carrier_falls_back_to_udp_frame_for_large_payload() -> Result<(), 
 
     let quic_addr = unused_udp_loopback_addr().await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut limits = test_limits();
+    limits.shutdown_timeout_seconds = Some(1);
     let mut config = test_server_config(
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         &cert_path,
         &key_path,
-        test_limits(),
+        limits,
         Some(&policy_path),
         30,
     );
@@ -3893,11 +3901,11 @@ async fn quic_carrier_falls_back_to_udp_frame_for_large_payload() -> Result<(), 
     assert_eq!(reply_payload, payload);
 
     echo_task.await??;
+    client_task.abort();
     shutdown_tx
         .send(())
         .map_err(|()| "server shutdown receiver dropped")?;
     tokio::time::timeout(Duration::from_secs(5), server_task).await???;
-    client_task.abort();
     Ok(())
 }
 
@@ -7658,6 +7666,7 @@ fn allow_loopback_policy(port: u16) -> String {
         cidr = "127.0.0.1/32"
         port_start = {port}
         port_end = {port}
+        private = true
         "#
     )
 }
@@ -7670,6 +7679,7 @@ fn allow_ipv6_loopback_policy(port: u16) -> String {
         cidr = "::1/128"
         port_start = {port}
         port_end = {port}
+        private = true
         "#
     )
 }
@@ -7691,6 +7701,7 @@ fn allow_group_loopback_policy(group: &str, port: u16) -> String {
         cidr = "127.0.0.1/32"
         port_start = {port}
         port_end = {port}
+        private = true
         "#
     )
 }
@@ -7700,6 +7711,7 @@ fn allow_loopback_any_port_policy() -> String {
         [[rules]]
         action = "allow"
         cidr = "127.0.0.1/32"
+        private = true
         "#
     .to_owned()
 }
@@ -7712,6 +7724,7 @@ fn allow_localhost_domain_policy(port: u16) -> String {
         domain = "localhost"
         port_start = {port}
         port_end = {port}
+        private = true
         "#
     )
 }

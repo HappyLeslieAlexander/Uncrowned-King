@@ -1,6 +1,6 @@
 //! Strict target address encoding.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use bytes::{Buf, BufMut};
 
@@ -166,6 +166,34 @@ fn validate_domain(domain: &str) -> ProtocolResult<()> {
             "domain contains ascii control character",
         ));
     }
+    if domain.parse::<IpAddr>().is_ok() {
+        return Err(ProtocolError::InvalidTarget(
+            "domain must not be an IP literal",
+        ));
+    }
+    if domain.starts_with('.') || domain.ends_with('.') || domain.contains("..") {
+        return Err(ProtocolError::InvalidTarget(
+            "malformed domain dot structure",
+        ));
+    }
+    if !domain
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return Err(ProtocolError::InvalidTarget(
+            "domain contains invalid characters",
+        ));
+    }
+    for label in domain.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(ProtocolError::InvalidTarget("invalid domain label length"));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(ProtocolError::InvalidTarget(
+                "domain label cannot start or end with hyphen",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -307,5 +335,105 @@ mod tests {
             Target::decode(&mut bytes),
             Err(ProtocolError::InvalidVarint)
         );
+    }
+
+    #[test]
+    fn rejects_ip_literals_as_domain() {
+        let ipv4 = Target::Domain("127.0.0.1".to_owned(), 80);
+        let mut out = Vec::new();
+        assert_eq!(
+            ipv4.encode(&mut out),
+            Err(ProtocolError::InvalidTarget(
+                "domain must not be an IP literal"
+            ))
+        );
+
+        let ipv6 = Target::Domain("::1".to_owned(), 80);
+        assert_eq!(
+            ipv6.encode(&mut out),
+            Err(ProtocolError::InvalidTarget(
+                "domain must not be an IP literal"
+            ))
+        );
+
+        let mut bytes = Bytes::from_static(&[
+            0x01, 0x09, b'1', b'2', b'7', b'.', b'0', b'.', b'0', b'.', b'1', 0x00, 0x50,
+        ]);
+        assert_eq!(
+            Target::decode(&mut bytes),
+            Err(ProtocolError::InvalidTarget(
+                "domain must not be an IP literal"
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_domain_dot_structures() {
+        let mut out = Vec::new();
+        let bad_dots = [".example.com", "example.com.", "example..com"];
+        for domain in bad_dots {
+            let target = Target::Domain(domain.to_owned(), 80);
+            assert_eq!(
+                target.encode(&mut out),
+                Err(ProtocolError::InvalidTarget(
+                    "malformed domain dot structure"
+                )),
+                "failed on {domain}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_domain_characters() {
+        let mut out = Vec::new();
+        let bad_chars = [
+            "example.com/admin",
+            "example.com:80",
+            "example.com@bad",
+            "foo_bar.com",
+            "a b.com",
+        ];
+        for domain in bad_chars {
+            let target = Target::Domain(domain.to_owned(), 80);
+            assert_eq!(
+                target.encode(&mut out),
+                Err(ProtocolError::InvalidTarget(
+                    "domain contains invalid characters"
+                )),
+                "failed on {domain}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_domain_label_boundaries() {
+        let mut out = Vec::new();
+        let bad_labels = ["-example.com", "example-.com", "sub.-bad.org"];
+        for domain in bad_labels {
+            let target = Target::Domain(domain.to_owned(), 80);
+            assert_eq!(
+                target.encode(&mut out),
+                Err(ProtocolError::InvalidTarget(
+                    "domain label cannot start or end with hyphen"
+                )),
+                "failed on {domain}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_valid_rfc1123_domains() {
+        let mut out = Vec::new();
+        let valid_domains = [
+            "example.com",
+            "api.v2.service.corp",
+            "host-1.example.org",
+            "com",
+        ];
+        for domain in valid_domains {
+            out.clear();
+            let target = Target::Domain(domain.to_owned(), 443);
+            assert!(target.encode(&mut out).is_ok());
+        }
     }
 }

@@ -147,6 +147,7 @@ pub(crate) struct RelayLimitConfig {
 pub(crate) enum ServerSessionState {
     Authenticated,
     Relaying,
+    Draining,
     Closing,
     Closed,
 }
@@ -232,6 +233,7 @@ pub(crate) enum SessionEvent {
     UdpIdleMaintenance,
     PeerClosed,
     Shutdown,
+    DrainTimeout,
     /// The carrier was declared unusable by a writer (see `write_frame_locked`).
     CarrierFailed,
 }
@@ -873,6 +875,9 @@ pub(crate) const fn is_valid_session_transition(
             ServerSessionState::Relaying
         ) | (
             ServerSessionState::Relaying,
+            ServerSessionState::Draining | ServerSessionState::Closing | ServerSessionState::Closed
+        ) | (
+            ServerSessionState::Draining,
             ServerSessionState::Closing | ServerSessionState::Closed
         ) | (ServerSessionState::Closing, ServerSessionState::Closed)
     )

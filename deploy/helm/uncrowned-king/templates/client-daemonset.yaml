@@ -14,6 +14,9 @@ spec:
     metadata:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/client-configmap.yaml") . | sha256sum }}
+        {{- if not .Values.client.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/client-secret.yaml") . | sha256sum }}
+        {{- end }}
       labels:
         {{- include "uncrowned-king.client.selectorLabels" . | nindent 8 }}
     spec:
@@ -21,6 +24,37 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      initContainers:
+        - name: stage-config
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /etc/uncrowned-king
+              cat /staging/config/client.toml /staging/credentials/credentials.toml > /etc/uncrowned-king/client.toml
+              chmod 0600 /etc/uncrowned-king/client.toml
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "32Mi"
+          volumeMounts:
+            - name: config-source
+              mountPath: /staging/config
+              readOnly: true
+            - name: credentials-source
+              mountPath: /staging/credentials
+              readOnly: true
+            - name: runtime-config
+              mountPath: /etc/uncrowned-king
       containers:
         - name: client
           image: "{{ .Values.client.image.repository }}:{{ .Values.client.image.tag | default .Chart.AppVersion }}"
@@ -56,9 +90,8 @@ spec:
           resources:
             {{- toYaml .Values.client.resources | nindent 12 }}
           volumeMounts:
-            - name: config
-              mountPath: /etc/uncrowned-king/client.toml
-              subPath: client.toml
+            - name: runtime-config
+              mountPath: /etc/uncrowned-king
               readOnly: true
             {{- if .Values.client.existingCaSecret }}
             - name: ca
@@ -66,9 +99,17 @@ spec:
               readOnly: true
             {{- end }}
       volumes:
-        - name: config
+        - name: config-source
           configMap:
             name: {{ include "uncrowned-king.client.fullname" . }}-config
+        - name: credentials-source
+          secret:
+            secretName: {{ .Values.client.existingSecret | default (printf "%s-credentials" (include "uncrowned-king.client.fullname" .)) }}
+            defaultMode: 0400
+        - name: runtime-config
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
         {{- if .Values.client.existingCaSecret }}
         - name: ca
           secret:

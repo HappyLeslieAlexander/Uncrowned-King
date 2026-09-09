@@ -27,10 +27,12 @@ server:
         port: 443
         targetPort: 8443
         protocol: UDP
-      metrics:
-        port: 9090
-        targetPort: 9090
-        protocol: TCP
+
+  metricsService:
+    enabled: true
+    port: 9090
+    targetPort: 9090
+    annotations: {}
 
   resources:
     limits:
@@ -91,6 +93,9 @@ server:
   # Existing TLS secret name containing tls.crt and tls.key (e.g. from cert-manager)
   existingTlsSecret: ""
 
+  # Existing credentials secret name containing credentials.toml
+  existingSecret: ""
+
 # Client DaemonSet / Deployment component configuration
 client:
   enabled: false # Set true to deploy client as cluster-wide sidecar / DaemonSet
@@ -125,6 +130,9 @@ client:
     relay_buffer_size: 16384
 
   existingCaSecret: ""
+
+  # Existing credentials secret name containing credentials.toml
+  existingSecret: ""
 
 # Prometheus Operator ServiceMonitor
 serviceMonitor:

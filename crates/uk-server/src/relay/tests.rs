@@ -1444,6 +1444,62 @@ async fn target_connect_uses_later_candidate_while_first_is_pending() {
 }
 
 #[tokio::test]
+async fn dropping_connect_tasks_aborts_inflight_tasks() {
+    struct DropGuard(Arc<AtomicBool>);
+    impl Drop for DropGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], 10_001));
+    let limiter = OpenDialLimiter::new(1);
+    let permit = limiter.try_acquire().unwrap();
+
+    let started = Arc::new(AtomicBool::new(false));
+    let started_clone = Arc::clone(&started);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_clone = Arc::clone(&cancelled);
+
+    let connector: TargetConnector<SocketAddr> =
+        Arc::new(move |addr| -> BoxedConnectFuture<SocketAddr> {
+            let started = Arc::clone(&started_clone);
+            let cancelled = Arc::clone(&cancelled_clone);
+            Box::pin(async move {
+                let _guard = DropGuard(cancelled);
+                started.store(true, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                (addr, Ok(addr))
+            })
+        });
+
+    let mut tasks = ConnectTasks::new();
+    tasks.spawn(addr, &connector, permit);
+
+    for _ in 0..100 {
+        if started.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(started.load(Ordering::SeqCst));
+    assert!(!cancelled.load(Ordering::SeqCst));
+
+    drop(tasks);
+
+    for _ in 0..100 {
+        if cancelled.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        cancelled.load(Ordering::SeqCst),
+        "in-flight connect task was not aborted upon drop"
+    );
+}
+
+#[tokio::test]
 async fn target_connect_rejects_when_dial_limiter_is_exhausted() {
     let addr = SocketAddr::from(([127, 0, 0, 1], 10_001));
     let addrs = [addr];
@@ -1599,8 +1655,11 @@ fn accepts_server_session_transition_to_relaying() {
             ServerSessionState::Authenticated,
             ServerSessionState::Relaying,
         ),
+        (ServerSessionState::Relaying, ServerSessionState::Draining),
         (ServerSessionState::Relaying, ServerSessionState::Closing),
         (ServerSessionState::Relaying, ServerSessionState::Closed),
+        (ServerSessionState::Draining, ServerSessionState::Closing),
+        (ServerSessionState::Draining, ServerSessionState::Closed),
         (ServerSessionState::Closing, ServerSessionState::Closed),
     ];
 
@@ -1619,6 +1678,246 @@ fn rejects_server_session_state_regression() {
         ServerSessionState::Closed,
         ServerSessionState::Relaying
     ));
+    assert!(!is_valid_session_transition(
+        ServerSessionState::Draining,
+        ServerSessionState::Relaying
+    ));
+    assert!(!is_valid_session_transition(
+        ServerSessionState::Closing,
+        ServerSessionState::Draining
+    ));
+    assert!(!is_valid_session_transition(
+        ServerSessionState::Closed,
+        ServerSessionState::Draining
+    ));
+}
+
+#[tokio::test]
+async fn server_session_graceful_drain_completes_active_flows_and_rejects_new() {
+    let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target_listener.local_addr().unwrap();
+
+    let (client_transport, server_transport) = tokio::io::duplex(65536);
+    let (server_reader, server_writer) = tokio::io::split(server_transport);
+    let carrier = ServerCarrier::new(Box::new(server_reader), Box::new(server_writer), None);
+
+    let cred = uk_auth::Credential::active(
+        b"user".to_vec(),
+        b"0123456789abcdef0123456789abcdef".to_vec(),
+    )
+    .unwrap();
+    let identity = AuthenticatedIdentity::from(&cred);
+    let mut policy = uk_policy::PolicyRule::new(uk_policy::PolicyDecision::Allow);
+    policy.ports = Some(1..=65535);
+    policy.private = Some(true);
+    let security = SecurityState::new(
+        crate::security::test_tls_acceptor(),
+        vec![cred],
+        uk_policy::PolicySet::new(vec![policy]),
+        Duration::from_secs(30),
+    );
+    let mut limits = test_relay_limits(10);
+    limits.session_task_shutdown_timeout = Some(Duration::from_secs(5));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let metrics = Arc::new(ServerMetrics::default());
+
+    let session_handle = tokio::spawn(async move {
+        relay_session(
+            carrier,
+            identity,
+            security,
+            limits,
+            None,
+            shutdown_rx,
+            metrics,
+        )
+        .await
+    });
+
+    let (client_reader, mut client_writer) = tokio::io::split(client_transport);
+    let mut client_frame_reader = FrameReader::new(Box::pin(client_reader), FrameLimits::default());
+
+    // 1. Open Flow 1 before shutdown
+    let target = Target::Ipv4(Ipv4Addr::LOCALHOST, target_addr.port());
+    let mut payload = BytesMut::new();
+    TcpOpen::new(target, TCP_OPEN_FLAGS_NONE)
+        .encode(&mut payload)
+        .unwrap();
+    let frame = Frame::new(FrameType::TcpOpen, 0, 1, payload.freeze()).unwrap();
+    write_frame(&mut client_writer, &frame).await.unwrap();
+
+    let (mut target_stream, _) = target_listener.accept().await.unwrap();
+    let open_ack = client_frame_reader.read_frame().await.unwrap();
+    assert_eq!(open_ack.header.frame_type, FrameType::TcpData);
+    assert_eq!(open_ack.header.id, 1);
+
+    // 2. Trigger graceful shutdown signal
+    shutdown_tx.send(true).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 3. Client attempts to open new Flow 2 during Draining -> must be rejected with ResourceLimit
+    let target2 = Target::Ipv4(Ipv4Addr::LOCALHOST, target_addr.port());
+    let mut payload2 = BytesMut::new();
+    TcpOpen::new(target2, TCP_OPEN_FLAGS_NONE)
+        .encode(&mut payload2)
+        .unwrap();
+    let frame2 = Frame::new(FrameType::TcpOpen, 0, 3, payload2.freeze()).unwrap();
+    write_frame(&mut client_writer, &frame2).await.unwrap();
+
+    let reject_frame = client_frame_reader.read_frame().await.unwrap();
+    assert_eq!(reject_frame.header.frame_type, FrameType::ResourceLimit);
+    assert_eq!(reject_frame.header.id, 3);
+
+    let close_frame = client_frame_reader.read_frame().await.unwrap();
+    assert_eq!(close_frame.header.frame_type, FrameType::TcpClose);
+    assert_eq!(close_frame.header.id, 3);
+
+    // 4. Existing Flow 1 continues duplex data transfer during Draining
+    let data_frame =
+        Frame::new(FrameType::TcpData, 0, 1, Bytes::from_static(b"ping data")).unwrap();
+    write_frame(&mut client_writer, &data_frame).await.unwrap();
+
+    let mut buf = [0u8; 9];
+    target_stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"ping data");
+
+    target_stream.write_all(b"pong reply").await.unwrap();
+    target_stream.shutdown().await.unwrap();
+
+    let reply_frame = client_frame_reader.read_frame().await.unwrap();
+    assert_eq!(reply_frame.header.frame_type, FrameType::TcpData);
+    assert_eq!(reply_frame.header.id, 1);
+    assert_eq!(&reply_frame.payload[..], b"pong reply");
+
+    // 5. Client finishes Flow 1
+    let mut close_payload = BytesMut::new();
+    TcpClose::new(TCP_CLOSE_NORMAL)
+        .encode(&mut close_payload)
+        .unwrap();
+    let close_1 = Frame::new(FrameType::TcpClose, 0, 1, close_payload.freeze()).unwrap();
+    write_frame(&mut client_writer, &close_1).await.unwrap();
+
+    // 6. Session cleanly finishes drain phase
+    let session_res = tokio::time::timeout(Duration::from_secs(2), session_handle)
+        .await
+        .expect("session should finish draining promptly")
+        .expect("task join");
+    assert!(session_res.is_ok());
+}
+
+#[tokio::test]
+async fn server_session_drain_timeout_aborts_hung_flows() {
+    let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target_listener.local_addr().unwrap();
+
+    let (client_transport, server_transport) = tokio::io::duplex(65536);
+    let (server_reader, server_writer) = tokio::io::split(server_transport);
+    let carrier = ServerCarrier::new(Box::new(server_reader), Box::new(server_writer), None);
+
+    let cred = uk_auth::Credential::active(
+        b"user".to_vec(),
+        b"0123456789abcdef0123456789abcdef".to_vec(),
+    )
+    .unwrap();
+    let identity = AuthenticatedIdentity::from(&cred);
+    let mut policy = uk_policy::PolicyRule::new(uk_policy::PolicyDecision::Allow);
+    policy.ports = Some(1..=65535);
+    policy.private = Some(true);
+    let security = SecurityState::new(
+        crate::security::test_tls_acceptor(),
+        vec![cred],
+        uk_policy::PolicySet::new(vec![policy]),
+        Duration::from_secs(30),
+    );
+    let mut limits = test_relay_limits(10);
+    // Configure a very short drain timeout (50ms)
+    limits.session_task_shutdown_timeout = Some(Duration::from_millis(50));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let metrics = Arc::new(ServerMetrics::default());
+
+    let session_handle = tokio::spawn(async move {
+        relay_session(
+            carrier,
+            identity,
+            security,
+            limits,
+            None,
+            shutdown_rx,
+            metrics,
+        )
+        .await
+    });
+
+    let (client_reader, mut client_writer) = tokio::io::split(client_transport);
+    let mut client_frame_reader = FrameReader::new(Box::pin(client_reader), FrameLimits::default());
+
+    // Open Flow 1
+    let target = Target::Ipv4(Ipv4Addr::LOCALHOST, target_addr.port());
+    let mut payload = BytesMut::new();
+    TcpOpen::new(target, TCP_OPEN_FLAGS_NONE)
+        .encode(&mut payload)
+        .unwrap();
+    let frame = Frame::new(FrameType::TcpOpen, 0, 1, payload.freeze()).unwrap();
+    write_frame(&mut client_writer, &frame).await.unwrap();
+
+    let (_target_stream, _) = target_listener.accept().await.unwrap();
+    let open_ack = client_frame_reader.read_frame().await.unwrap();
+    assert_eq!(open_ack.header.frame_type, FrameType::TcpData);
+
+    // Trigger shutdown — flow remains open and never closes
+    shutdown_tx.send(true).unwrap();
+
+    // The session should hit DrainTimeout after ~50ms and forcefully exit
+    let session_res = tokio::time::timeout(Duration::from_secs(2), session_handle)
+        .await
+        .expect("session should time out and exit")
+        .expect("task join");
+    assert!(session_res.is_ok());
+}
+
+#[tokio::test]
+async fn server_session_zero_flows_instant_shutdown() {
+    let (_client_transport, server_transport) = tokio::io::duplex(65536);
+    let (server_reader, server_writer) = tokio::io::split(server_transport);
+    let carrier = ServerCarrier::new(Box::new(server_reader), Box::new(server_writer), None);
+
+    let cred = uk_auth::Credential::active(
+        b"user".to_vec(),
+        b"0123456789abcdef0123456789abcdef".to_vec(),
+    )
+    .unwrap();
+    let identity = AuthenticatedIdentity::from(&cred);
+    let security = SecurityState::new(
+        crate::security::test_tls_acceptor(),
+        vec![cred],
+        uk_policy::PolicySet::default(),
+        Duration::from_secs(30),
+    );
+    let limits = test_relay_limits(10);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let metrics = Arc::new(ServerMetrics::default());
+
+    let session_handle = tokio::spawn(async move {
+        relay_session(
+            carrier,
+            identity,
+            security,
+            limits,
+            None,
+            shutdown_rx,
+            metrics,
+        )
+        .await
+    });
+
+    // Trigger shutdown immediately with 0 active flows
+    shutdown_tx.send(true).unwrap();
+
+    let session_res = tokio::time::timeout(Duration::from_millis(500), session_handle)
+        .await
+        .expect("zero-flow session should exit instantaneously")
+        .expect("task join");
+    assert!(session_res.is_ok());
 }
 
 #[test]

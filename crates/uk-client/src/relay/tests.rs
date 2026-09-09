@@ -1411,6 +1411,109 @@ async fn previous_generation_connect_failure_cache_is_cleared() {
 }
 
 #[test]
+fn exponential_backoff_calculation_scales_and_caps() {
+    let base = 250_u64;
+    let max_backoff = SERVER_CONNECT_RETRY_MAX_MILLIS; // 30_000
+
+    assert_eq!(calculate_reconnect_backoff_ms(base, 0, max_backoff), 250);
+    assert_eq!(calculate_reconnect_backoff_ms(base, 1, max_backoff), 500);
+    assert_eq!(calculate_reconnect_backoff_ms(base, 2, max_backoff), 1000);
+    assert_eq!(calculate_reconnect_backoff_ms(base, 3, max_backoff), 2000);
+    assert_eq!(calculate_reconnect_backoff_ms(base, 4, max_backoff), 4000);
+    assert_eq!(calculate_reconnect_backoff_ms(base, 5, max_backoff), 8000);
+    assert_eq!(calculate_reconnect_backoff_ms(base, 6, max_backoff), 16000);
+    // 250 * 2^7 = 32000 > 30000 -> capped at 30000
+    assert_eq!(calculate_reconnect_backoff_ms(base, 7, max_backoff), 30000);
+    assert_eq!(calculate_reconnect_backoff_ms(base, 10, max_backoff), 30000);
+    // Beyond shift 10, shift remains capped at 10 and no overflow occurs
+    assert_eq!(calculate_reconnect_backoff_ms(base, 11, max_backoff), 30000);
+    assert_eq!(
+        calculate_reconnect_backoff_ms(base, 100, max_backoff),
+        30000
+    );
+    assert_eq!(
+        calculate_reconnect_backoff_ms(base, u32::MAX, max_backoff),
+        30000
+    );
+}
+
+#[test]
+fn reconnect_jitter_range_bounds_valid() {
+    let (min, max) = calculate_reconnect_jitter_range(250);
+    assert_eq!(min, 125);
+    assert_eq!(max, 375);
+
+    let (min_1, max_1) = calculate_reconnect_jitter_range(1);
+    assert_eq!(min_1, 1);
+    assert_eq!(max_1, 1);
+
+    let (min_30k, max_30k) = calculate_reconnect_jitter_range(30_000);
+    assert_eq!(min_30k, 15_000);
+    assert_eq!(max_30k, 45_000);
+
+    for backoff in [1, 2, 10, 100, 250, 1000, 30_000] {
+        let (min, max) = calculate_reconnect_jitter_range(backoff);
+        assert!(
+            min <= max,
+            "min {min} should be <= max {max} for backoff {backoff}"
+        );
+        assert!(min >= 1);
+    }
+}
+
+#[tokio::test]
+async fn session_manager_tracks_consecutive_failures_with_jitter_and_resets() {
+    let mut config = minimal_config();
+    config.server_connect_retry_delay_millis = Some(250);
+    let manager = test_session_manager(config);
+    let snapshot = manager.config.snapshot();
+    let test_err: AnyError = "test connect failure".into();
+
+    assert_eq!(
+        manager.consecutive_connect_failures.load(Ordering::Relaxed),
+        0
+    );
+
+    // First failure: consecutive_failures transitions from 0 to 1
+    assert!(manager.remember_connect_failure(&snapshot, &test_err).await);
+    assert_eq!(
+        manager.consecutive_connect_failures.load(Ordering::Relaxed),
+        1
+    );
+    let first_recent = manager.recent_connect_failure.lock().await.clone().unwrap();
+    let first_expiry = first_recent.expires_at.unwrap();
+
+    // Verify expiry is in [now + 125ms, now + 375ms + delta]
+    let now = time::Instant::now();
+    assert!(first_expiry >= now - Duration::from_millis(50));
+    assert!(first_expiry <= now + Duration::from_millis(450));
+
+    // Simulate 4 more failures
+    for i in 2..=5 {
+        assert!(manager.remember_connect_failure(&snapshot, &test_err).await);
+        assert_eq!(
+            manager.consecutive_connect_failures.load(Ordering::Relaxed),
+            i
+        );
+    }
+
+    // Success / clear clears failure and resets counter to 0
+    manager.clear_connect_failure().await;
+    assert_eq!(
+        manager.consecutive_connect_failures.load(Ordering::Relaxed),
+        0
+    );
+    assert!(manager.recent_connect_failure.lock().await.is_none());
+
+    // Next failure starts at consecutive_failures = 0 again
+    assert!(manager.remember_connect_failure(&snapshot, &test_err).await);
+    assert_eq!(
+        manager.consecutive_connect_failures.load(Ordering::Relaxed),
+        1
+    );
+}
+
+#[test]
 fn client_reload_rejects_static_listener_changes() {
     let current = minimal_config();
     let mut candidate = current.clone();

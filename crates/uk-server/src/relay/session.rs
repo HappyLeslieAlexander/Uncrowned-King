@@ -43,10 +43,12 @@ use super::tasks::*;
 use super::tcp::*;
 use super::udp::*;
 
+pub(crate) use super::context::{ServerSessionState, SessionEvent};
 use crate::observability::{
     ActiveFlowGuard, FlowOpenFailure, RelayDirection, RelayProtocol, ServerMetrics,
 };
 use crate::security::SecurityState;
+
 pub(crate) async fn relay_session(
     carrier: ServerCarrier,
     identity: AuthenticatedIdentity,
@@ -94,6 +96,7 @@ pub(crate) async fn relay_session(
     };
     let mut idle_deadline = next_idle_deadline(idle_timeout);
     let mut udp_idle_interval = udp_idle_interval(limits.udp_flow_idle_timeout);
+    let mut drain_deadline: Option<time::Instant> = None;
 
     let result = loop {
         let event = match next_session_event(
@@ -104,13 +107,22 @@ pub(crate) async fn relay_session(
             &mut udp_idle_interval,
             &mut shutdown_rx,
             &shutdown,
+            drain_deadline,
         )
         .await
         {
             Ok(event) => event,
             Err(err) => break Err(err),
         };
-        match handle_session_event(event, &context, &mut target_writers, &mut session_tasks).await {
+        match handle_session_event(
+            event,
+            &context,
+            &mut target_writers,
+            &mut session_tasks,
+            &mut state,
+        )
+        .await
+        {
             SessionStep::Continue {
                 counts_as_activity: true,
             } => idle_deadline = next_idle_deadline(idle_timeout),
@@ -118,6 +130,23 @@ pub(crate) async fn relay_session(
                 counts_as_activity: false,
             } => {}
             SessionStep::Stop(result) => break result,
+        }
+
+        if state == ServerSessionState::Draining {
+            if target_writers.is_empty() {
+                info!(event = "server.session.drain_complete");
+                break Ok(());
+            }
+            if drain_deadline.is_none() {
+                let timeout = limits
+                    .session_task_shutdown_timeout
+                    .unwrap_or(Duration::from_secs(30));
+                drain_deadline = Some(
+                    time::Instant::now()
+                        .checked_add(timeout)
+                        .unwrap_or_else(time::Instant::now),
+                );
+            }
         }
     };
 
@@ -153,6 +182,7 @@ pub(crate) async fn handle_session_event(
     context: &RelaySessionContext<'_>,
     target_writers: &mut FlowTable,
     session_tasks: &mut SessionTasks,
+    state: &mut ServerSessionState,
 ) -> SessionStep {
     let counts_as_activity = match event {
         SessionEvent::Flow(event) => {
@@ -166,7 +196,7 @@ pub(crate) async fn handle_session_event(
         }
         SessionEvent::Frame(frame) => {
             if let Err(err) =
-                handle_session_frame(frame, context, target_writers, session_tasks).await
+                handle_session_frame(frame, context, target_writers, session_tasks, *state).await
             {
                 return SessionStep::Stop(Err(err));
             }
@@ -193,6 +223,19 @@ pub(crate) async fn handle_session_event(
         }
         SessionEvent::Shutdown => {
             info!(event = "server.session.shutdown");
+            if *state == ServerSessionState::Relaying {
+                transition(state, ServerSessionState::Draining);
+            }
+            if target_writers.is_empty() {
+                return SessionStep::Stop(Ok(()));
+            }
+            false
+        }
+        SessionEvent::DrainTimeout => {
+            warn!(
+                event = "server.session.drain_timeout",
+                remaining_flows = target_writers.len()
+            );
             return SessionStep::Stop(Ok(()));
         }
         SessionEvent::CarrierFailed => {
@@ -313,6 +356,7 @@ pub(crate) async fn handle_flow_event(
 /// finishes after its id was closed and re-opened would otherwise tear down the
 /// new association, leaving the client sending into a flow the server no longer
 /// knows about.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn next_session_event(
     carrier_reader: &mut FrameReader<BoxedCarrierReader>,
     event_rx: &mut FlowEventReceiver,
@@ -321,8 +365,10 @@ pub(crate) async fn next_session_event(
     udp_idle_interval: &mut Option<time::Interval>,
     shutdown_rx: &mut watch::Receiver<bool>,
     session_shutdown: &SessionShutdown,
+    drain_deadline: Option<time::Instant>,
 ) -> Result<SessionEvent, AnyError> {
-    if *shutdown_rx.borrow() {
+    let is_draining = drain_deadline.is_some();
+    if !is_draining && *shutdown_rx.borrow() {
         return Ok(SessionEvent::Shutdown);
     }
 
@@ -333,9 +379,12 @@ pub(crate) async fn next_session_event(
             () = session_tasks.join_next(), if !session_tasks.is_empty() => {
                 Ok(SessionEvent::SessionTaskCompleted)
             }
-            changed = shutdown_rx.changed() => {
+            changed = shutdown_rx.changed(), if !is_draining => {
                 let _ = changed;
                 Ok(SessionEvent::Shutdown)
+            }
+            () = wait_drain_deadline(drain_deadline), if is_draining => {
+                Ok(SessionEvent::DrainTimeout)
             }
             () = time::sleep_until(idle_deadline) => Ok(SessionEvent::IdleTimeout),
             () = session_shutdown.closed() => Ok(SessionEvent::CarrierFailed),
@@ -350,15 +399,25 @@ pub(crate) async fn next_session_event(
             () = session_tasks.join_next(), if !session_tasks.is_empty() => {
                 Ok(SessionEvent::SessionTaskCompleted)
             }
-            changed = shutdown_rx.changed() => {
+            changed = shutdown_rx.changed(), if !is_draining => {
                 let _ = changed;
                 Ok(SessionEvent::Shutdown)
+            }
+            () = wait_drain_deadline(drain_deadline), if is_draining => {
+                Ok(SessionEvent::DrainTimeout)
             }
             () = tick_udp_idle_interval(udp_idle_interval), if udp_idle_interval.is_some() => {
                 Ok(SessionEvent::UdpIdleMaintenance)
             }
             () = session_shutdown.closed() => Ok(SessionEvent::CarrierFailed),
         }
+    }
+}
+
+async fn wait_drain_deadline(deadline: Option<time::Instant>) {
+    match deadline {
+        Some(deadline) => time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -473,7 +532,38 @@ pub(crate) async fn handle_session_frame(
     context: &RelaySessionContext<'_>,
     target_writers: &mut FlowTable,
     session_tasks: &mut SessionTasks,
+    state: ServerSessionState,
 ) -> Result<(), AnyError> {
+    if state == ServerSessionState::Draining {
+        match frame.header.frame_type {
+            FrameType::TcpOpen => {
+                warn!(
+                    event = "server.session.drain.reject_tcp_open",
+                    flow_id = frame.header.id
+                );
+                context
+                    .metrics
+                    .record_flow_open_failure(RelayProtocol::Tcp, FlowOpenFailure::ResourceLimit);
+                send_resource_limit(context.carrier_writer, frame.header.id).await?;
+                send_tcp_close(context.carrier_writer, frame.header.id, TCP_CLOSE_ERROR).await?;
+                return Ok(());
+            }
+            FrameType::UdpOpen => {
+                warn!(
+                    event = "server.session.drain.reject_udp_open",
+                    flow_id = frame.header.id
+                );
+                context
+                    .metrics
+                    .record_flow_open_failure(RelayProtocol::Udp, FlowOpenFailure::ResourceLimit);
+                send_resource_limit(context.carrier_writer, frame.header.id).await?;
+                send_udp_close(context.carrier_writer, frame.header.id, UDP_CLOSE_ERROR).await?;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     match frame.header.frame_type {
         FrameType::TcpOpen => {
             handle_tcp_open_frame(context, frame, target_writers, session_tasks).await

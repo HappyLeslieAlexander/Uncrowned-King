@@ -197,6 +197,16 @@ impl ConnectionRuntime {
         }
 
         self.metrics.record_accepted_connection();
+        if self.session_permits.available_permits() == 0 {
+            self.metrics.record_rejected_session();
+            warn!(
+                event = "server.session.limit",
+                peer = %peer,
+                max_sessions = self.max_sessions
+            );
+            drop(tcp);
+            return;
+        }
         let Ok(handshake_permit) = Arc::clone(&self.handshake_permits).try_acquire_owned() else {
             self.metrics.record_rejected_handshake();
             warn!(
@@ -254,6 +264,17 @@ impl ConnectionRuntime {
         }
 
         self.metrics.record_accepted_connection();
+        if self.session_permits.available_permits() == 0 {
+            self.metrics.record_rejected_session();
+            warn!(
+                event = "server.session.limit",
+                peer = %peer,
+                carrier = "quic",
+                max_sessions = self.max_sessions
+            );
+            incoming.refuse();
+            return;
+        }
         let Ok(handshake_permit) = Arc::clone(&self.handshake_permits).try_acquire_owned() else {
             self.metrics.record_rejected_handshake();
             warn!(
@@ -460,10 +481,10 @@ where
         }
     }
 
+    drain_connection_tasks(&mut connections, shutdown_timeout).await;
     if let Some(endpoint) = &quic_endpoint {
         endpoint.close(0_u32.into(), b"server shutdown");
     }
-    drain_connection_tasks(&mut connections, shutdown_timeout).await;
     stop_observability(observability_shutdown_tx, observability_task).await;
 
     Ok(())
@@ -1088,11 +1109,35 @@ async fn complete_handshake(
     .await
 }
 
+async fn send_auth_challenge(
+    writer: &mut BoxedCarrierWriter,
+    now: u64,
+) -> Result<AuthChallenge, AnyError> {
+    let challenge = AuthChallenge::generate(now);
+    let mut payload = BytesMut::new();
+    challenge
+        .encode(&mut payload)
+        .map_err(|err| phase_error("encode auth challenge", HandshakeFailureReason::Auth, err))?;
+    let challenge_frame =
+        Frame::new(FrameType::AuthChallenge, 0, 0, payload.freeze()).map_err(|err| {
+            phase_error(
+                "build auth challenge frame",
+                HandshakeFailureReason::Auth,
+                err,
+            )
+        })?;
+    write_frame(writer, &challenge_frame).await.map_err(|err| {
+        let reason = frame_io_failure_reason(&err);
+        phase_error("write auth challenge", reason, err)
+    })?;
+    Ok(challenge)
+}
+
 /// Runs the UK challenge-response authentication over an established,
 /// ALPN-verified carrier. This is carrier-neutral: the TLS/TCP and QUIC
 /// acceptors both establish their transport, derive the exporter binding, and
 /// then delegate the identical frame exchange to this function.
-async fn authenticate_carrier(
+pub(crate) async fn authenticate_carrier(
     mut reader: BoxedCarrierReader,
     mut writer: BoxedCarrierWriter,
     exporter: [u8; 32],
@@ -1119,26 +1164,7 @@ async fn authenticate_carrier(
             "system clock is before the Unix epoch",
         )
     })?;
-    let challenge = AuthChallenge::generate(now);
-
-    let mut payload = BytesMut::new();
-    challenge
-        .encode(&mut payload)
-        .map_err(|err| phase_error("encode auth challenge", HandshakeFailureReason::Auth, err))?;
-    let challenge_frame =
-        Frame::new(FrameType::AuthChallenge, 0, 0, payload.freeze()).map_err(|err| {
-            phase_error(
-                "build auth challenge frame",
-                HandshakeFailureReason::Auth,
-                err,
-            )
-        })?;
-    write_frame(&mut writer, &challenge_frame)
-        .await
-        .map_err(|err| {
-            let reason = frame_io_failure_reason(&err);
-            phase_error("write auth challenge", reason, err)
-        })?;
+    let challenge = send_auth_challenge(&mut writer, now).await?;
 
     let response_frame = match read_frame(
         &mut reader,
@@ -1177,12 +1203,19 @@ async fn authenticate_carrier(
             ));
         }
     };
+    let verify_now = try_unix_now().ok_or_else(|| {
+        phase_error(
+            "read system clock",
+            HandshakeFailureReason::Auth,
+            "system clock error",
+        )
+    })?;
     let identity = match verify_auth_response_identity_stateless(
         &authentication.credentials,
         &exporter,
         &challenge,
         &response,
-        now,
+        verify_now,
         authentication.auth_skew,
     ) {
         Ok(identity) => identity,
@@ -1198,7 +1231,7 @@ async fn authenticate_carrier(
 
     let replay_result = {
         let mut replay_cache = replay_cache.lock().await;
-        replay_cache.check_and_insert(now, challenge.server_nonce, response.client_nonce)
+        replay_cache.check_and_insert(verify_now, challenge.server_nonce, response.client_nonce)
     };
     if let Err(err) = replay_result {
         let _ = write_connection_error(&mut writer, ErrorCode::AuthFailed).await;
@@ -1777,5 +1810,209 @@ mod tests {
         drain_connection_tasks(&mut connections, Some(Duration::from_secs(1))).await;
 
         assert!(connections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn connection_rejected_before_handshake_when_session_permits_exhausted() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server_sock, peer) = listener.accept().await.unwrap();
+
+        let config = Arc::new(minimal_config());
+        let metrics = Arc::new(ServerMetrics::default());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let session_permits = Arc::new(Semaphore::new(0));
+        let handshake_permits = Arc::new(Semaphore::new(10));
+        let auth_rate_limiter = Arc::new(rate_limit::AuthRateLimiter::new(
+            rate_limit::AuthRateLimitConfig::default(),
+        ));
+        let replay_cache = Arc::new(Mutex::new(ReplayCache::new(Duration::from_secs(60))));
+
+        let security = SecurityState::new(
+            crate::security::test_tls_acceptor(),
+            vec![],
+            uk_policy::PolicySet::default(),
+            Duration::from_secs(30),
+        );
+
+        let runtime = ConnectionRuntime {
+            security,
+            replay_cache,
+            session_permits,
+            config,
+            handshake_permits: Arc::clone(&handshake_permits),
+            auth_rate_limiter,
+            max_sessions: 0,
+            max_handshakes: 10,
+            metrics: Arc::clone(&metrics),
+        };
+
+        let mut connections = JoinSet::new();
+        runtime.spawn_accepted(&mut connections, server_sock, peer, shutdown_rx);
+
+        assert!(
+            connections.is_empty(),
+            "task should not be spawned when session permits are exhausted"
+        );
+        assert_eq!(
+            handshake_permits.available_permits(),
+            10,
+            "handshake permit should not be acquired"
+        );
+        let mut client_sock = client_sock;
+        let mut buf = [0u8; 16];
+        let n = client_sock.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "connection should be closed immediately");
+    }
+
+    #[tokio::test]
+    async fn handshake_timestamp_freshness_accepts_legitimate_latency() {
+        use uk_proto::FrameReader;
+
+        let (client_transport, server_transport) = tokio::io::duplex(65536);
+        let (server_reader, server_writer) = tokio::io::split(server_transport);
+        let (client_reader, mut client_writer) = tokio::io::split(client_transport);
+
+        let exporter = [7u8; 32];
+        let cred = uk_auth::Credential::active(
+            b"client".to_vec(),
+            b"0123456789abcdef0123456789abcdef".to_vec(),
+        )
+        .unwrap();
+
+        let authentication = AuthenticationSnapshot {
+            generation: 1,
+            tls_acceptor: test_tls_acceptor(),
+            credentials: Arc::new(vec![cred.clone()]),
+            auth_skew: Duration::from_secs(5),
+        };
+        let replay_cache = Arc::new(Mutex::new(ReplayCache::new(Duration::from_secs(60))));
+        let config = minimal_config();
+
+        let server_task = tokio::spawn(async move {
+            authenticate_carrier(
+                Box::new(server_reader),
+                Box::new(server_writer),
+                exporter,
+                None,
+                authentication,
+                replay_cache,
+                &config,
+            )
+            .await
+        });
+
+        let mut client_frame_reader =
+            FrameReader::new(Box::pin(client_reader), FrameLimits::default());
+        let challenge_frame = client_frame_reader.read_frame().await.unwrap();
+        assert_eq!(challenge_frame.header.frame_type, FrameType::AuthChallenge);
+
+        let mut payload = challenge_frame.payload;
+        let challenge = AuthChallenge::decode(&mut payload).unwrap();
+
+        let client_now = uk_auth::unix_now();
+        let response = AuthResponse::for_challenge(
+            b"client".to_vec(),
+            b"0123456789abcdef0123456789abcdef",
+            &exporter,
+            &challenge,
+            client_now,
+            vec![],
+        )
+        .unwrap();
+
+        let mut resp_payload = BytesMut::new();
+        response.encode(&mut resp_payload).unwrap();
+        let resp_frame = Frame::new(FrameType::AuthResponse, 0, 0, resp_payload.freeze()).unwrap();
+        write_frame(&mut client_writer, &resp_frame).await.unwrap();
+
+        let server_result = server_task.await.unwrap();
+        assert!(
+            server_result.is_ok(),
+            "authentication within auth_skew should succeed"
+        );
+        let (_, _, _, identity) = server_result.unwrap();
+        assert_eq!(identity.key_id, b"client");
+    }
+
+    #[tokio::test]
+    async fn handshake_timestamp_freshness_rejects_expired_challenge() {
+        use uk_proto::FrameReader;
+
+        let (client_transport, server_transport) = tokio::io::duplex(65536);
+        let (server_reader, server_writer) = tokio::io::split(server_transport);
+        let (client_reader, mut client_writer) = tokio::io::split(client_transport);
+
+        let exporter = [7u8; 32];
+        let cred = uk_auth::Credential::active(
+            b"client".to_vec(),
+            b"0123456789abcdef0123456789abcdef".to_vec(),
+        )
+        .unwrap();
+
+        let authentication = AuthenticationSnapshot {
+            generation: 1,
+            tls_acceptor: test_tls_acceptor(),
+            credentials: Arc::new(vec![cred.clone()]),
+            auth_skew: Duration::from_secs(1),
+        };
+        let replay_cache = Arc::new(Mutex::new(ReplayCache::new(Duration::from_secs(60))));
+        let config = minimal_config();
+
+        let server_task = tokio::spawn(async move {
+            authenticate_carrier(
+                Box::new(server_reader),
+                Box::new(server_writer),
+                exporter,
+                None,
+                authentication,
+                replay_cache,
+                &config,
+            )
+            .await
+        });
+
+        let mut client_frame_reader =
+            FrameReader::new(Box::pin(client_reader), FrameLimits::default());
+        let challenge_frame = client_frame_reader.read_frame().await.unwrap();
+        assert_eq!(challenge_frame.header.frame_type, FrameType::AuthChallenge);
+
+        let mut payload = challenge_frame.payload;
+        let challenge = AuthChallenge::decode(&mut payload).unwrap();
+
+        // Sleep 2100ms so challenge expires relative to server arrival time (> 1s skew)
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+
+        let client_now = uk_auth::unix_now();
+        let response = AuthResponse::for_challenge(
+            b"client".to_vec(),
+            b"0123456789abcdef0123456789abcdef",
+            &exporter,
+            &challenge,
+            client_now,
+            vec![],
+        )
+        .unwrap();
+
+        let mut resp_payload = BytesMut::new();
+        response.encode(&mut resp_payload).unwrap();
+        let resp_frame = Frame::new(FrameType::AuthResponse, 0, 0, resp_payload.freeze()).unwrap();
+        write_frame(&mut client_writer, &resp_frame).await.unwrap();
+
+        let server_result = server_task.await.unwrap();
+        match server_result {
+            Err(error) => {
+                assert_eq!(
+                    handshake_failure_reason(&error),
+                    HandshakeFailureReason::Auth,
+                    "expired challenge failure reason must be Auth"
+                );
+            }
+            Ok(_) => panic!("challenge expired relative to real arrival time must be rejected"),
+        }
     }
 }

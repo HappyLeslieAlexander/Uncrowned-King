@@ -21,10 +21,29 @@ spec:
       targetPort: {{ .Values.server.service.ports.quic.targetPort }}
       protocol: {{ .Values.server.service.ports.quic.protocol }}
       name: quic
-    - port: {{ .Values.server.service.ports.metrics.port }}
-      targetPort: {{ .Values.server.service.ports.metrics.targetPort }}
-      protocol: {{ .Values.server.service.ports.metrics.protocol }}
+  selector:
+    {{- include "uncrowned-king.server.selectorLabels" . | nindent 4 }}
+---
+{{- if .Values.server.metricsService.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "uncrowned-king.server.fullname" . }}-metrics
+  labels:
+    {{- include "uncrowned-king.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+  {{- with .Values.server.metricsService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.server.metricsService.port }}
+      targetPort: {{ .Values.server.metricsService.targetPort | default 9090 }}
+      protocol: TCP
       name: metrics
   selector:
     {{- include "uncrowned-king.server.selectorLabels" . | nindent 4 }}
+{{- end }}
 {{- end }}

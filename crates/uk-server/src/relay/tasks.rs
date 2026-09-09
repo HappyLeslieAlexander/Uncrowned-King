@@ -47,9 +47,15 @@ use crate::observability::{
     ActiveFlowGuard, FlowOpenFailure, RelayDirection, RelayProtocol, ServerMetrics,
 };
 use crate::security::SecurityState;
-pub(crate) struct ConnectTasks<T> {
+pub(crate) struct ConnectTasks<T: 'static> {
     pub(crate) tasks: JoinSet<(SocketAddr, io::Result<T>)>,
     pub(crate) permits: HashMap<Id, OpenDialPermit>,
+}
+
+impl<T: 'static> Drop for ConnectTasks<T> {
+    fn drop(&mut self) {
+        self.tasks.abort_all();
+    }
 }
 
 pub(crate) struct SessionTasks {

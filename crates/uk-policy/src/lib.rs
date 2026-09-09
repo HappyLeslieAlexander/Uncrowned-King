@@ -91,6 +91,12 @@ impl PolicySet {
 
         for rule in &self.rules {
             if rule.matches(context) {
+                if rule.action == PolicyDecision::Allow
+                    && rule.private != Some(true)
+                    && target_or_resolution_is_private(context.target, context.resolved_ips)
+                {
+                    return PolicyDecision::Deny;
+                }
                 return rule.action;
             }
         }
@@ -141,6 +147,10 @@ pub struct PolicyRule {
 impl PolicyRule {
     /// Creates a rule with an action and no predicates.
     pub fn new(action: PolicyDecision) -> Self {
+        let private = match action {
+            PolicyDecision::Allow => Some(false),
+            PolicyDecision::Deny => None,
+        };
         Self {
             action,
             key_id: None,
@@ -149,7 +159,7 @@ impl PolicyRule {
             domain_suffix: None,
             cidr: None,
             ports: None,
-            private: None,
+            private,
         }
     }
 
@@ -342,6 +352,10 @@ impl TryFrom<RawPolicyRule> for PolicyRule {
             (None, None) => None,
             _ => return Err(PolicyError::InvalidPortRange),
         };
+        let private = match (action, raw.private) {
+            (PolicyDecision::Allow, None) => Some(false),
+            (_, other) => other,
+        };
         Ok(Self {
             action,
             key_id: raw.key_id.map(validate_key_id_match).transpose()?,
@@ -356,7 +370,7 @@ impl TryFrom<RawPolicyRule> for PolicyRule {
                 .transpose()?,
             cidr: raw.cidr.as_deref().map(Cidr::from_str).transpose()?,
             ports,
-            private: raw.private,
+            private,
         })
     }
 }
@@ -488,10 +502,26 @@ fn target_or_resolution_contains_metadata_service_ip(
         .any(is_metadata_service_ip)
 }
 
+fn target_or_resolution_is_private(target: &Target, resolved_ips: &[IpAddr]) -> bool {
+    match target {
+        Target::Ipv4(ip, _) => is_restricted_ipv4(*ip),
+        Target::Ipv6(ip, _) => is_private(IpAddr::V6(*ip)),
+        Target::Domain(_, _) => {
+            if resolved_ips.is_empty() {
+                true
+            } else {
+                resolved_ips.iter().copied().any(is_private)
+            }
+        }
+    }
+}
+
 fn is_metadata_service_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
-            ip == Ipv4Addr::new(169, 254, 169, 254) || ip == Ipv4Addr::new(100, 100, 100, 200)
+            ip == Ipv4Addr::new(169, 254, 169, 254)
+                || ip == Ipv4Addr::new(100, 100, 100, 200)
+                || ip == Ipv4Addr::new(168, 63, 129, 16)
         }
         IpAddr::V6(ip) => {
             embedded_ipv4(ip).is_some_and(|ip| is_metadata_service_ip(IpAddr::V4(ip)))
@@ -703,8 +733,9 @@ mod tests {
         rule.ports = Some(443..=443);
         let policy = PolicySet::new(vec![rule]);
         let target = Target::Domain("api.example.com".to_owned(), 443);
+        let resolved = [IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))];
         assert_eq!(
-            policy.evaluate(&context(&target, Some("default"), &[])),
+            policy.evaluate(&context(&target, Some("default"), &resolved)),
             PolicyDecision::Allow
         );
     }
@@ -718,17 +749,18 @@ mod tests {
         let exact = Target::Domain("example.com".to_owned(), 443);
         let subdomain = Target::Domain("api.example.com".to_owned(), 443);
         let false_suffix = Target::Domain("badexample.com".to_owned(), 443);
+        let resolved = [IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))];
 
         assert_eq!(
-            policy.evaluate(&context(&exact, Some("default"), &[])),
+            policy.evaluate(&context(&exact, Some("default"), &resolved)),
             PolicyDecision::Allow
         );
         assert_eq!(
-            policy.evaluate(&context(&subdomain, Some("default"), &[])),
+            policy.evaluate(&context(&subdomain, Some("default"), &resolved)),
             PolicyDecision::Allow
         );
         assert_eq!(
-            policy.evaluate(&context(&false_suffix, Some("default"), &[])),
+            policy.evaluate(&context(&false_suffix, Some("default"), &resolved)),
             PolicyDecision::Deny
         );
     }
@@ -740,13 +772,14 @@ mod tests {
         let policy = PolicySet::new(vec![rule]);
         let exact = Target::Domain("example.com".to_owned(), 443);
         let subdomain = Target::Domain("api.example.com".to_owned(), 443);
+        let resolved = [IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))];
 
         assert_eq!(
-            policy.evaluate(&context(&exact, Some("default"), &[])),
+            policy.evaluate(&context(&exact, Some("default"), &resolved)),
             PolicyDecision::Deny
         );
         assert_eq!(
-            policy.evaluate(&context(&subdomain, Some("default"), &[])),
+            policy.evaluate(&context(&subdomain, Some("default"), &resolved)),
             PolicyDecision::Allow
         );
     }
@@ -759,13 +792,14 @@ mod tests {
         let policy = PolicySet::new(vec![rule]);
         let exact = Target::Domain("example.com".to_owned(), 443);
         let subdomain = Target::Domain("api.example.com".to_owned(), 443);
+        let resolved = [IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))];
 
         assert_eq!(
-            policy.evaluate(&context(&exact, Some("default"), &[])),
+            policy.evaluate(&context(&exact, Some("default"), &resolved)),
             PolicyDecision::Allow
         );
         assert_eq!(
-            policy.evaluate(&context(&subdomain, Some("default"), &[])),
+            policy.evaluate(&context(&subdomain, Some("default"), &resolved)),
             PolicyDecision::Deny
         );
     }
@@ -777,9 +811,10 @@ mod tests {
         rule.ports = Some(443..=443);
         let policy = PolicySet::new(vec![rule]);
         let target = Target::Domain("example.com".to_owned(), 443);
+        let resolved = [IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))];
 
         assert_eq!(
-            policy.evaluate(&context(&target, Some("default"), &[])),
+            policy.evaluate(&context(&target, Some("default"), &resolved)),
             PolicyDecision::Allow
         );
     }
@@ -825,6 +860,7 @@ mod tests {
     #[test]
     fn detects_unrestricted_private_allow_rules() {
         let mut allow_rule = PolicyRule::new(PolicyDecision::Allow);
+        allow_rule.private = None;
         allow_rule.domain_suffix = Some(".example.com".to_owned());
         let insecure_policy = PolicySet::new(vec![allow_rule.clone()]);
         assert!(insecure_policy.has_unrestricted_private_allow());
@@ -1293,6 +1329,7 @@ mod tests {
             r#"
             [[rules]]
             action = "allow"
+            private = true
             policy_group = "ops"
             domain = "bastion.example.com"
             cidr = "10.20.0.0/16"
@@ -1548,5 +1585,150 @@ mod tests {
         .unwrap();
 
         assert_eq!(policy.rules.len(), 3);
+    }
+
+    #[test]
+    fn allow_rule_defaults_to_private_false_in_toml() {
+        let policy = PolicySet::from_toml(
+            r#"
+            [[rules]]
+            action = "allow"
+            domain_suffix = ".example.com"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(policy.rules[0].private, Some(false));
+    }
+
+    #[test]
+    fn default_allow_rule_rejects_private_and_loopback_ips() {
+        let policy = PolicySet::from_toml(
+            r#"
+            [[rules]]
+            action = "allow"
+            port_start = 1
+            port_end = 65535
+            "#,
+        )
+        .unwrap();
+        let private_targets = [
+            Target::Ipv4(Ipv4Addr::LOCALHOST, 80),
+            Target::Ipv4(Ipv4Addr::new(10, 0, 0, 1), 80),
+            Target::Ipv4(Ipv4Addr::new(172, 16, 0, 1), 80),
+            Target::Ipv4(Ipv4Addr::new(192, 168, 1, 1), 80),
+            Target::Ipv6(Ipv6Addr::LOCALHOST, 80),
+        ];
+        for target in private_targets {
+            assert_eq!(
+                policy.evaluate(&context(&target, Some("default"), &[])),
+                PolicyDecision::Deny
+            );
+        }
+    }
+
+    #[test]
+    fn default_allow_rule_rejects_domain_resolving_to_private_ip() {
+        let policy = PolicySet::from_toml(
+            r#"
+            [[rules]]
+            action = "allow"
+            domain_suffix = ".rebind.example"
+            "#,
+        )
+        .unwrap();
+        let target = Target::Domain("rebind.example".to_owned(), 80);
+        let resolved = [IpAddr::V4(Ipv4Addr::LOCALHOST)];
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &resolved)),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn default_allow_rule_rejects_unresolved_domain_fallback() {
+        let policy = PolicySet::from_toml(
+            r#"
+            [[rules]]
+            action = "allow"
+            domain_suffix = ".example.com"
+            "#,
+        )
+        .unwrap();
+        let target = Target::Domain("api.example.com".to_owned(), 443);
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &[])),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn explicit_private_true_permits_private_ip_but_denies_metadata() {
+        let policy = PolicySet::from_toml(
+            r#"
+            [[rules]]
+            action = "allow"
+            private = true
+            port_start = 1
+            port_end = 65535
+            "#,
+        )
+        .unwrap();
+        let private_target = Target::Ipv4(Ipv4Addr::new(10, 0, 0, 1), 80);
+        assert_eq!(
+            policy.evaluate(&context(&private_target, Some("default"), &[])),
+            PolicyDecision::Allow
+        );
+        let metadata_target = Target::Ipv4(Ipv4Addr::new(169, 254, 169, 254), 80);
+        assert_eq!(
+            policy.evaluate(&context(&metadata_target, Some("default"), &[])),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn denies_azure_wireserver_ip_even_when_allow_rule_matches() {
+        let mut rule = PolicyRule::new(PolicyDecision::Allow);
+        rule.ports = Some(1..=65535);
+        rule.private = Some(true); // Even with explicit private opt-in!
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Ipv4(Ipv4Addr::new(168, 63, 129, 16), 80);
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &[])),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn denies_domain_resolving_to_azure_wireserver_ip() {
+        let mut rule = PolicyRule::new(PolicyDecision::Allow);
+        rule.ports = Some(1..=65535);
+        rule.private = Some(true);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Domain("metadata.azure.internal".to_owned(), 80);
+        let resolved = [IpAddr::V4(Ipv4Addr::new(168, 63, 129, 16))];
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &resolved)),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn denies_embedded_ipv4_azure_wireserver_targets() {
+        let rule = PolicyRule::new(PolicyDecision::Allow);
+        let policy = PolicySet::new(vec![rule]);
+        let embedded = [
+            "::ffff:168.63.129.16",
+            "64:ff9b::168.63.129.16",
+            "::168.63.129.16",
+            "2002:a83f:8110::",
+        ];
+        for ip in embedded {
+            let target = Target::Ipv6(ip.parse().unwrap(), 80);
+            assert_eq!(
+                policy.evaluate(&context(&target, Some("default"), &[])),
+                PolicyDecision::Deny,
+                "failed to deny {ip}"
+            );
+        }
     }
 }

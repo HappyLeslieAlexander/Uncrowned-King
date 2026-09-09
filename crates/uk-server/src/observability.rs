@@ -351,25 +351,24 @@ impl ServerMetrics {
     fn render_flow_metrics(&self, output: &mut String) {
         output.push_str(
             "# HELP uncrowned_king_server_flow_open_requests_total UK flow open requests received.\n\
-# TYPE uncrowned_king_server_flow_open_requests_total counter\n\
-# HELP uncrowned_king_server_flow_open_failures_total UK flow opens rejected or failed.\n\
-# TYPE uncrowned_king_server_flow_open_failures_total counter\n\
-# HELP uncrowned_king_server_opened_flows_total UK flows opened successfully.\n\
-# TYPE uncrowned_king_server_opened_flows_total counter\n\
-# HELP uncrowned_king_server_active_flows UK flows currently active.\n\
-# TYPE uncrowned_king_server_active_flows gauge\n\
-# HELP uncrowned_king_server_relay_bytes_total Payload bytes relayed after a successful socket or carrier write.\n\
-# TYPE uncrowned_king_server_relay_bytes_total counter\n",
+# TYPE uncrowned_king_server_flow_open_requests_total counter\n",
         );
         for protocol in RelayProtocol::ALL {
-            let protocol_index = protocol.index();
             writeln!(
                 output,
                 "uncrowned_king_server_flow_open_requests_total{{protocol=\"{}\"}} {}",
                 protocol.label(),
-                self.flow_open_requests_total[protocol_index].load(Ordering::Relaxed)
+                self.flow_open_requests_total[protocol.index()].load(Ordering::Relaxed)
             )
             .expect("writing metrics to a String cannot fail");
+        }
+
+        output.push_str(
+            "# HELP uncrowned_king_server_flow_open_failures_total UK flow opens rejected or failed.\n\
+# TYPE uncrowned_king_server_flow_open_failures_total counter\n",
+        );
+        for protocol in RelayProtocol::ALL {
+            let protocol_index = protocol.index();
             for failure in FlowOpenFailure::ALL {
                 writeln!(
                     output,
@@ -381,20 +380,42 @@ impl ServerMetrics {
                 )
                 .expect("writing metrics to a String cannot fail");
             }
+        }
+
+        output.push_str(
+            "# HELP uncrowned_king_server_opened_flows_total UK flows opened successfully.\n\
+# TYPE uncrowned_king_server_opened_flows_total counter\n",
+        );
+        for protocol in RelayProtocol::ALL {
             writeln!(
                 output,
                 "uncrowned_king_server_opened_flows_total{{protocol=\"{}\"}} {}",
                 protocol.label(),
-                self.opened_flows_total[protocol_index].load(Ordering::Relaxed)
+                self.opened_flows_total[protocol.index()].load(Ordering::Relaxed)
             )
             .expect("writing metrics to a String cannot fail");
+        }
+
+        output.push_str(
+            "# HELP uncrowned_king_server_active_flows UK flows currently active.\n\
+# TYPE uncrowned_king_server_active_flows gauge\n",
+        );
+        for protocol in RelayProtocol::ALL {
             writeln!(
                 output,
                 "uncrowned_king_server_active_flows{{protocol=\"{}\"}} {}",
                 protocol.label(),
-                self.active_flows[protocol_index].load(Ordering::Relaxed)
+                self.active_flows[protocol.index()].load(Ordering::Relaxed)
             )
             .expect("writing metrics to a String cannot fail");
+        }
+
+        output.push_str(
+            "# HELP uncrowned_king_server_relay_bytes_total Payload bytes relayed after a successful socket or carrier write.\n\
+# TYPE uncrowned_king_server_relay_bytes_total counter\n",
+        );
+        for protocol in RelayProtocol::ALL {
+            let protocol_index = protocol.index();
             for direction in RelayDirection::ALL {
                 writeln!(
                     output,
@@ -644,5 +665,50 @@ mod tests {
         let error = read_request_head(&mut server).await.unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    fn assert_prometheus_spec_conformance(rendered: &str) {
+        let mut seen_families = std::collections::HashSet::new();
+        let mut current_family: Option<String> = None;
+
+        for line in rendered.lines() {
+            if let Some(rest) = line.strip_prefix("# HELP ") {
+                let family = rest.split_whitespace().next().unwrap();
+                assert!(
+                    seen_families.insert(family.to_string()),
+                    "Metric family {family} declared more than once (interleaved metric family violation)!"
+                );
+                current_family = Some(family.to_string());
+            } else if let Some(rest) = line.strip_prefix("# TYPE ") {
+                let family = rest.split_whitespace().next().unwrap();
+                assert_eq!(
+                    current_family.as_deref(),
+                    Some(family),
+                    "# TYPE line for {family} does not match active family"
+                );
+            } else if !line.is_empty() {
+                let sample_name = line.split(&['{', ' '][..]).next().unwrap();
+                assert_eq!(
+                    current_family.as_deref(),
+                    Some(sample_name),
+                    "Sample {sample_name} does not belong to active metric family {current_family:?}"
+                );
+            }
+        }
+        assert!(!seen_families.is_empty(), "No metric families rendered!");
+    }
+
+    #[test]
+    fn prometheus_metric_families_are_contiguous_and_spec_conformant() {
+        let metrics = ServerMetrics::default();
+        metrics.set_ready(true);
+        metrics.record_flow_open_request(RelayProtocol::Tcp);
+        metrics.record_flow_open_request(RelayProtocol::Udp);
+        metrics.record_flow_open_failure(RelayProtocol::Tcp, FlowOpenFailure::TargetUnavailable);
+        metrics.record_relay_bytes(RelayProtocol::Tcp, RelayDirection::ClientToTarget, 100);
+        metrics.record_failed_handshake(HandshakeFailureReason::Auth);
+
+        let rendered = metrics.render();
+        assert_prometheus_spec_conformance(&rendered);
     }
 }

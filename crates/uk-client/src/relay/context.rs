@@ -68,6 +68,7 @@ pub(crate) const RELAY_BUFFER_SIZE: usize = 16 * 1024;
 pub(crate) const UDP_ASSOCIATION_BUFFER_SIZE: usize = 65_536;
 pub(crate) const ACCEPT_RETRY_BASE_MILLIS: u64 = 10;
 pub(crate) const ACCEPT_RETRY_MAX_MILLIS: u64 = 1_000;
+pub(crate) const SERVER_CONNECT_RETRY_MAX_MILLIS: u64 = 30_000;
 pub(crate) static NEXT_SOCKS_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 pub(crate) static NEXT_CLIENT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 

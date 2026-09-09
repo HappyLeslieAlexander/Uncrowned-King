@@ -270,49 +270,14 @@ impl ClientMetrics {
             draining_sessions = self.draining_sessions.load(Ordering::Relaxed),
         );
         self.render_endpoint_metrics(&mut output);
-        output.push_str("# HELP uncrowned_king_client_flow_open_requests_total UK flow open requests.\n# TYPE uncrowned_king_client_flow_open_requests_total counter\n");
-        output.push_str("# HELP uncrowned_king_client_opened_flows_total UK flows opened successfully.\n# TYPE uncrowned_king_client_opened_flows_total counter\n");
-        output.push_str("# HELP uncrowned_king_client_active_flows Active UK flows.\n# TYPE uncrowned_king_client_active_flows gauge\n");
-        output.push_str("# HELP uncrowned_king_client_relay_bytes_total Payload bytes relayed after a successful write.\n# TYPE uncrowned_king_client_relay_bytes_total counter\n");
-        for protocol in RelayProtocol::ALL {
-            let index = protocol.index();
-            let _ = writeln!(
-                output,
-                "uncrowned_king_client_flow_open_requests_total{{protocol=\"{}\"}} {}",
-                protocol.label(),
-                self.flow_open_requests_total[index].load(Ordering::Relaxed)
-            );
-            let _ = writeln!(
-                output,
-                "uncrowned_king_client_opened_flows_total{{protocol=\"{}\"}} {}",
-                protocol.label(),
-                self.opened_flows_total[index].load(Ordering::Relaxed)
-            );
-            let _ = writeln!(
-                output,
-                "uncrowned_king_client_active_flows{{protocol=\"{}\"}} {}",
-                protocol.label(),
-                self.active_flows[index].load(Ordering::Relaxed)
-            );
-            for direction in RelayDirection::ALL {
-                let _ = writeln!(
-                    output,
-                    "uncrowned_king_client_relay_bytes_total{{protocol=\"{}\",direction=\"{}\"}} {}",
-                    protocol.label(),
-                    direction.label(),
-                    self.relay_bytes_total[index][direction.index()].load(Ordering::Relaxed)
-                );
-            }
-        }
+        self.render_flow_metrics(&mut output);
         output
     }
 
     fn render_endpoint_metrics(&self, output: &mut String) {
         output.push_str(
             "# HELP uncrowned_king_client_endpoint_attempts_total UK server endpoint connection attempts.\n\
-# TYPE uncrowned_king_client_endpoint_attempts_total counter\n\
-# HELP uncrowned_king_client_endpoint_failures_total Failed UK server endpoint attempts by bounded phase.\n\
-# TYPE uncrowned_king_client_endpoint_failures_total counter\n",
+# TYPE uncrowned_king_client_endpoint_attempts_total counter\n",
         );
         writeln!(
             output,
@@ -327,6 +292,11 @@ impl ClientMetrics {
             self.endpoint_attempt_failures_total.load(Ordering::Relaxed)
         )
         .expect("writing metrics to a String cannot fail");
+
+        output.push_str(
+            "# HELP uncrowned_king_client_endpoint_failures_total Failed UK server endpoint attempts by bounded phase.\n\
+# TYPE uncrowned_king_client_endpoint_failures_total counter\n",
+        );
         for phase in EndpointFailurePhase::ALL {
             writeln!(
                 output,
@@ -335,6 +305,64 @@ impl ClientMetrics {
                 self.endpoint_failures_total[phase.index()].load(Ordering::Relaxed)
             )
             .expect("writing metrics to a String cannot fail");
+        }
+    }
+
+    fn render_flow_metrics(&self, output: &mut String) {
+        output.push_str(
+            "# HELP uncrowned_king_client_flow_open_requests_total UK flow open requests.\n\
+# TYPE uncrowned_king_client_flow_open_requests_total counter\n",
+        );
+        for protocol in RelayProtocol::ALL {
+            let _ = writeln!(
+                output,
+                "uncrowned_king_client_flow_open_requests_total{{protocol=\"{}\"}} {}",
+                protocol.label(),
+                self.flow_open_requests_total[protocol.index()].load(Ordering::Relaxed)
+            );
+        }
+
+        output.push_str(
+            "# HELP uncrowned_king_client_opened_flows_total UK flows opened successfully.\n\
+# TYPE uncrowned_king_client_opened_flows_total counter\n",
+        );
+        for protocol in RelayProtocol::ALL {
+            let _ = writeln!(
+                output,
+                "uncrowned_king_client_opened_flows_total{{protocol=\"{}\"}} {}",
+                protocol.label(),
+                self.opened_flows_total[protocol.index()].load(Ordering::Relaxed)
+            );
+        }
+
+        output.push_str(
+            "# HELP uncrowned_king_client_active_flows Active UK flows.\n\
+# TYPE uncrowned_king_client_active_flows gauge\n",
+        );
+        for protocol in RelayProtocol::ALL {
+            let _ = writeln!(
+                output,
+                "uncrowned_king_client_active_flows{{protocol=\"{}\"}} {}",
+                protocol.label(),
+                self.active_flows[protocol.index()].load(Ordering::Relaxed)
+            );
+        }
+
+        output.push_str(
+            "# HELP uncrowned_king_client_relay_bytes_total Payload bytes relayed after a successful write.\n\
+# TYPE uncrowned_king_client_relay_bytes_total counter\n",
+        );
+        for protocol in RelayProtocol::ALL {
+            let index = protocol.index();
+            for direction in RelayDirection::ALL {
+                let _ = writeln!(
+                    output,
+                    "uncrowned_king_client_relay_bytes_total{{protocol=\"{}\",direction=\"{}\"}} {}",
+                    protocol.label(),
+                    direction.label(),
+                    self.relay_bytes_total[index][direction.index()].load(Ordering::Relaxed)
+                );
+            }
         }
     }
 }
@@ -498,5 +526,52 @@ mod tests {
         client.read_to_string(&mut response).await.unwrap();
         task.await.unwrap().unwrap();
         response
+    }
+
+    fn assert_prometheus_spec_conformance(rendered: &str) {
+        let mut seen_families = std::collections::HashSet::new();
+        let mut current_family: Option<String> = None;
+
+        for line in rendered.lines() {
+            if let Some(rest) = line.strip_prefix("# HELP ") {
+                let family = rest.split_whitespace().next().unwrap();
+                assert!(
+                    seen_families.insert(family.to_string()),
+                    "Metric family {family} declared more than once (interleaved metric family violation)!"
+                );
+                current_family = Some(family.to_string());
+            } else if let Some(rest) = line.strip_prefix("# TYPE ") {
+                let family = rest.split_whitespace().next().unwrap();
+                assert_eq!(
+                    current_family.as_deref(),
+                    Some(family),
+                    "# TYPE line for {family} does not match active family"
+                );
+            } else if !line.is_empty() {
+                let sample_name = line.split(&['{', ' '][..]).next().unwrap();
+                assert_eq!(
+                    current_family.as_deref(),
+                    Some(sample_name),
+                    "Sample {sample_name} does not belong to active metric family {current_family:?}"
+                );
+            }
+        }
+        assert!(!seen_families.is_empty(), "No metric families rendered!");
+    }
+
+    #[test]
+    fn prometheus_metric_families_are_contiguous_and_spec_conformant() {
+        let metrics = ClientMetrics::default();
+        metrics.set_ready(true);
+        metrics.record_reload_success(1);
+        metrics.record_session_connect_attempt();
+        metrics.record_endpoint_attempt(EndpointAttemptOutcome::Succeeded);
+        metrics.record_endpoint_attempt(EndpointAttemptOutcome::Failed(EndpointFailurePhase::Tls));
+        metrics.record_flow_open_request(RelayProtocol::Tcp);
+        metrics.record_flow_open_request(RelayProtocol::Udp);
+        metrics.record_relay_bytes(RelayProtocol::Tcp, RelayDirection::LocalToServer, 42);
+
+        let rendered = metrics.render();
+        assert_prometheus_spec_conformance(&rendered);
     }
 }

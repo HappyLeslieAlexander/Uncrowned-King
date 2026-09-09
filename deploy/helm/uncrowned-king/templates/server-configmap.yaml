@@ -1,9 +1,4 @@
 {{- if .Values.server.enabled }}
-{{- range .Values.server.credentials }}
-{{- if hasPrefix "replace-with" .secret }}
-{{- fail "Security error: placeholder credential secret found in server.credentials. You must configure a secure 64-character hex secret before deployment." }}
-{{- end }}
-{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -19,13 +14,6 @@ data:
     cert_path = "/etc/uncrowned-king/tls/tls.crt"
     key_path = "/etc/uncrowned-king/tls/tls.key"
     policy_path = "/etc/uncrowned-king/policy/policy.toml"
-
-    {{- range .Values.server.credentials }}
-    [[credentials]]
-    id = "{{ .id }}"
-    secret = "{{ .secret }}"
-    policy_group = "{{ .policy_group }}"
-    {{- end }}
 
     [limits]
     max_frame_size = {{ .Values.server.config.limits.max_frame_size }}

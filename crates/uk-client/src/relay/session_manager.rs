@@ -10,10 +10,12 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
+
+use rand::Rng;
 
 use bytes::{Bytes, BytesMut};
 use tokio::{
@@ -89,6 +91,7 @@ pub(crate) struct ClientSessionManager {
     pub(crate) connect_lock: Mutex<()>,
     pub(crate) config_publish_lock: Mutex<()>,
     pub(crate) recent_connect_failure: Mutex<Option<CachedConnectFailure>>,
+    pub(crate) consecutive_connect_failures: AtomicU32,
     /// Background teardown of sessions pruned from the pool, kept off the
     /// flow-open path. Drained by [`ClientSessionManager::shutdown`].
     pub(crate) reapers: Mutex<JoinSet<()>>,
@@ -166,6 +169,7 @@ impl ClientSessionManager {
             connect_lock: Mutex::new(()),
             config_publish_lock: Mutex::new(()),
             recent_connect_failure: Mutex::new(None),
+            consecutive_connect_failures: AtomicU32::new(0),
             reapers: Mutex::new(JoinSet::new()),
             closed: AtomicBool::new(false),
         }
@@ -562,9 +566,20 @@ impl ClientSessionManager {
         if self.config.generation() != snapshot.generation {
             return false;
         }
-        let Some(delay) = retry_delay(snapshot.config.server_connect_retry_delay_millis()) else {
+        let base_delay_ms = snapshot.config.server_connect_retry_delay_millis();
+        if retry_delay(base_delay_ms).is_none() {
             return true;
-        };
+        }
+        let consecutive_failures = self
+            .consecutive_connect_failures
+            .fetch_add(1, Ordering::Relaxed);
+        let max_backoff_ms = SERVER_CONNECT_RETRY_MAX_MILLIS;
+        let backoff_ms =
+            calculate_reconnect_backoff_ms(base_delay_ms, consecutive_failures, max_backoff_ms);
+        let (min_ms, max_ms) = calculate_reconnect_jitter_range(backoff_ms);
+        let delay_ms = rand::thread_rng().gen_range(min_ms..=max_ms);
+        let delay = Duration::from_millis(delay_ms);
+
         let mut recent = self.recent_connect_failure.lock().await;
         *recent = Some(CachedConnectFailure {
             generation: snapshot.generation,
@@ -575,6 +590,8 @@ impl ClientSessionManager {
     }
 
     pub(crate) async fn clear_connect_failure(&self) {
+        self.consecutive_connect_failures
+            .store(0, Ordering::Relaxed);
         *self.recent_connect_failure.lock().await = None;
     }
 
@@ -620,6 +637,23 @@ impl ClientSessionManager {
                 .udp_flow_idle_timeout_seconds(),
         )
     }
+}
+
+pub(crate) fn calculate_reconnect_backoff_ms(
+    base_delay_ms: u64,
+    consecutive_failures: u32,
+    max_backoff_ms: u64,
+) -> u64 {
+    std::cmp::min(
+        max_backoff_ms,
+        base_delay_ms.saturating_mul(1_u64 << std::cmp::min(consecutive_failures, 10)),
+    )
+}
+
+pub(crate) fn calculate_reconnect_jitter_range(backoff_ms: u64) -> (u64, u64) {
+    let min_ms = (backoff_ms / 2).max(1);
+    let max_ms = (backoff_ms.saturating_mul(3) / 2).max(min_ms);
+    (min_ms, max_ms)
 }
 
 pub(crate) fn ensure_reload_compatible(
