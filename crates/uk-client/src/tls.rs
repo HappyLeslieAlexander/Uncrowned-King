@@ -26,9 +26,10 @@ type TlsError = Box<dyn std::error::Error + Send + Sync>;
 /// mount) would block the worker rather than merely fail the dial.
 ///
 /// The key is the path because `ca_cert_path` can change across SIGHUP
-/// reloads. [`connector`], which config validation runs on every reload,
-/// always re-reads the file and refreshes the entry, so a CA rotated in place
-/// under an unchanged path is still picked up at reload.
+/// reloads. SIGHUP reload validation uses [`validate_ca_bundle`] or [`connector`],
+/// which validate the CA file without mutating the cache. When a reload passes
+/// compatibility checks, [`refresh_client_config`] atomically refreshes the entry,
+/// so a CA rotated in place under an unchanged path is picked up only upon successful reload.
 static CLIENT_CONFIGS: LazyLock<Mutex<HashMap<String, Arc<ClientConfig>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -40,19 +41,23 @@ pub async fn shared_client_config(ca_cert_path: &str) -> Result<Arc<ClientConfig
     }
 
     let path = ca_cert_path.to_owned();
-    match task::spawn_blocking(move || load_client_config(&path)).await {
+    match task::spawn_blocking(move || refresh_client_config(&path)).await {
         Ok(result) => result,
         Err(err) => Err(format!("failed to load CA certificate {ca_cert_path}: {err}").into()),
     }
 }
 
-/// Builds a TLS 1.3-only client connector, re-reading the CA bundle.
+/// Validates the CA bundle and builds an isolated TLS 1.3 client config without mutating the global cache.
+pub fn validate_ca_bundle(ca_cert_path: &str) -> Result<Arc<ClientConfig>, TlsError> {
+    Ok(Arc::new(build_client_config(ca_cert_path)?))
+}
+
+/// Builds a TLS 1.3-only client connector without mutating the global cache.
 ///
 /// Blocking on purpose: this is the config-validation entry point, which must
-/// observe the CA file as it is on disk. The freshly validated material also
-/// becomes what later connections share.
+/// observe the CA file as it is on disk without polluting the active CA cache.
 pub fn connector(ca_cert_path: &str) -> Result<TlsConnector, TlsError> {
-    Ok(connector_from(load_client_config(ca_cert_path)?))
+    Ok(connector_from(validate_ca_bundle(ca_cert_path)?))
 }
 
 /// Wraps an already-loaded client config in a connector.
@@ -60,8 +65,8 @@ pub fn connector_from(config: Arc<ClientConfig>) -> TlsConnector {
     TlsConnector::from(config)
 }
 
-/// Reads the CA bundle, builds the client config, and refreshes the cache.
-fn load_client_config(ca_cert_path: &str) -> Result<Arc<ClientConfig>, TlsError> {
+/// Reads the CA bundle, builds the client config, and atomically refreshes the cache entry for `ca_cert_path`.
+pub fn refresh_client_config(ca_cert_path: &str) -> Result<Arc<ClientConfig>, TlsError> {
     let config = Arc::new(build_client_config(ca_cert_path)?);
     client_configs().insert(ca_cert_path.to_owned(), Arc::clone(&config));
     Ok(config)
@@ -261,11 +266,25 @@ C2n4SLoR1xpiEaImSSin581IyIJ4vFLJYsUfPJ8=
 
         let before = shared_client_config(&path).await.unwrap();
         fs::write(&path, OTHER_CA_PEM.as_bytes()).unwrap();
-        // `connector` is what `check_config` runs on every reload.
-        let _connector = connector(&path).unwrap();
+        let _refreshed = refresh_client_config(&path).unwrap();
         let after = shared_client_config(&path).await.unwrap();
 
         assert!(!Arc::ptr_eq(&before, &after));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn config_validation_does_not_pollute_active_ca_cache() {
+        let path = temp_file("unpolluted-ca", CA_PEM.as_bytes());
+
+        let before = shared_client_config(&path).await.unwrap();
+        fs::write(&path, OTHER_CA_PEM.as_bytes()).unwrap();
+        // Validation must read the new CA without mutating the shared cache.
+        let _connector = connector(&path).unwrap();
+        let active = shared_client_config(&path).await.unwrap();
+
+        assert!(Arc::ptr_eq(&before, &active));
 
         let _ = fs::remove_file(path);
     }

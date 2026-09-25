@@ -13,7 +13,7 @@ server:
   image:
     repository: ghcr.io/happylesliealexander/uncrowned-king-server
     pullPolicy: IfNotPresent
-    tag: "0.1.2"
+    tag: "v0.1.3"
 
   service:
     type: LoadBalancer
@@ -55,6 +55,7 @@ server:
 
   config:
     listen: "0.0.0.0:8443"
+    quic_listen: "0.0.0.0:8443"
     observability_listen: "0.0.0.0:9090"
     log_format: "json"
     limits:
@@ -63,7 +64,7 @@ server:
       max_handshakes: 1000
       max_streams: 1024
       max_udp_flows: 512
-      max_buffered_bytes_per_session: 67108864 # 64MB
+      max_buffered_bytes_per_session: 16777216 # 16MB
       max_buffered_bytes_per_flow: 4194304     # 4MB
       relay_buffer_size: 16384                 # 16KB
       auth_rate_limit_failures: 5
@@ -82,7 +83,6 @@ server:
   # WARNING: Configure allowed destination CIDRs, domains, and ports according to your
   # environment. The default rule below allows all destinations for the 'default' policy group.
   policy:
-    default_action: "deny"
     rules:
       - action: "allow"
         policy_group: "default"
@@ -104,11 +104,11 @@ client:
   image:
     repository: ghcr.io/happylesliealexander/uncrowned-king-client
     pullPolicy: IfNotPresent
-    tag: "0.1.2"
+    tag: "v0.1.3"
 
   socks5:
     port: 1080
-    hostPort: 1080
+    hostPort: null # Disabled by default to prevent exposing unauthenticated SOCKS5 to cluster nodes
 
   metrics:
     port: 9091

@@ -68,7 +68,7 @@ pub(crate) fn handle_target_read_closed(
         info!(event = "tcp.target_read_closed", flow_id);
         if target.client_to_target_open {
             if let Some(timeout) = tcp_half_close_timeout {
-                spawn_half_close_timer(
+                let timer = spawn_half_close_timer(
                     session_tasks,
                     flow_id,
                     token,
@@ -77,9 +77,11 @@ pub(crate) fn handle_target_read_closed(
                     event_tx.clone(),
                     shutdown.clone(),
                 );
+                target.set_half_close_timer(timer);
             }
         }
-        if target.is_fully_closed() {
+        if target.is_removable() {
+            target.cancel_half_close_timer();
             remove_flow_slot(target_writers, flow_id);
             info!(event = "tcp.closed", flow_id);
         }
@@ -135,8 +137,9 @@ pub(crate) fn expire_half_close_drain(
         _ => false,
     };
     if should_close_peer {
+        target.cancel_half_close_timer();
         HalfCloseDrainDecision::ClosePeer {
-            remove: target.is_fully_closed(),
+            remove: target.is_removable(),
         }
     } else {
         HalfCloseDrainDecision::Ignored
@@ -158,8 +161,9 @@ pub(crate) fn handle_target_write_closed(
         if target.token != token {
             return;
         }
-        target.mark_client_to_target_closed();
-        if target.is_fully_closed() {
+        target.mark_target_write_closed();
+        if target.is_removable() {
+            target.cancel_half_close_timer();
             remove_flow_slot(target_writers, flow_id);
             info!(event = "tcp.closed", flow_id);
         }
@@ -231,7 +235,7 @@ pub(crate) async fn forward_tcp_data_frame(
         Ok(()) => {}
         Err(EnqueueError::Closed) => {
             target.mark_client_to_target_closed();
-            should_remove = target.is_fully_closed();
+            should_remove = target.is_removable();
         }
         Err(EnqueueError::ResourceLimit) => {
             target.abort();
@@ -284,7 +288,7 @@ pub(crate) async fn handle_tcp_close_frame(
                 target.close_client_to_target();
                 if should_start_drain_timer {
                     if let Some(timeout) = context.limits.tcp_half_close_timeout {
-                        spawn_half_close_timer(
+                        let timer = spawn_half_close_timer(
                             session_tasks,
                             flow_id,
                             token,
@@ -293,12 +297,14 @@ pub(crate) async fn handle_tcp_close_frame(
                             context.event_tx.clone(),
                             context.shutdown.clone(),
                         );
+                        target.set_half_close_timer(timer);
                     }
                 }
+                false
             } else {
                 target.abort();
+                true
             }
-            target.is_fully_closed()
         }
         Some(FlowSlot::OpeningUdp(_) | FlowSlot::Udp(_)) => {
             should_report_protocol_error = true;
@@ -576,7 +582,7 @@ pub(crate) async fn accept_open_target(
     let flow_control = TargetFlowControl::new(context.session_buffer.clone());
     let token = context.flow_tokens.next();
     let identity = TargetFlowIdentity { flow_id, token };
-    send_tcp_data(context.carrier_writer, flow_id, Bytes::new()).await?;
+    send_tcp_data(context.carrier_writer, flow_id, Bytes::new(), &flow_control).await?;
     let target_flow = TargetFlow::new(token, target_writer_tx, flow_control.clone())
         .track_metrics(context.metrics.begin_flow(RelayProtocol::Tcp));
     spawn_target_reader(
@@ -665,9 +671,10 @@ pub(crate) async fn send_tcp_data(
     writer: &CarrierWriter,
     flow_id: u64,
     payload: Bytes,
+    flow_control: &TargetFlowControl,
 ) -> Result<(), AnyError> {
     let frame = Frame::new(FrameType::TcpData, 0, flow_id, payload)?;
-    write_frame_locked(writer, &frame).await
+    write_flow_frame_locked(writer, &frame, flow_control).await
 }
 
 pub(crate) async fn send_tcp_close(

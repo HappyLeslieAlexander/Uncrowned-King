@@ -24,6 +24,13 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       initContainers:
         - name: stage-config
           image: busybox:1.36
@@ -37,6 +44,9 @@ spec:
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
             capabilities:
               drop: ["ALL"]
           resources:
@@ -67,10 +77,20 @@ spec:
             - "--listen"
             - "0.0.0.0:{{ .Values.client.socks5.port }}"
             - "--allow-non-loopback"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            capabilities:
+              drop: ["ALL"]
           ports:
             - name: socks5
               containerPort: {{ .Values.client.socks5.port }}
+              {{- if .Values.client.socks5.hostPort }}
               hostPort: {{ .Values.client.socks5.hostPort }}
+              {{- end }}
               protocol: TCP
             - name: metrics
               containerPort: {{ .Values.client.metrics.port }}

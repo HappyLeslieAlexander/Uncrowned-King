@@ -75,12 +75,22 @@ bg_pids+=("$!")
 wait_for_tcp 127.0.0.1 "${target_port}"
 
 # --- TLS/QUIC identity + policy + credentials ----------------------------------
+ca_cert="${workdir}/ca-cert.pem"
+ca_key="${workdir}/ca-key.pem"
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "${ca_key}" -out "${ca_cert}" \
+    -days 1 -subj "/CN=UK-Test-CA" \
+    -addext "basicConstraints=critical,CA:TRUE" >/dev/null 2>&1
+
 cert="${workdir}/server-cert.pem"
 key="${workdir}/server-key.pem"
-openssl req -x509 -newkey rsa:2048 -nodes -keyout "${key}" -out "${cert}" \
-    -days 1 -subj "/CN=localhost" \
-    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1
-chmod 600 "${key}"
+csr="${workdir}/server.csr"
+openssl req -new -newkey rsa:2048 -nodes -keyout "${key}" -out "${csr}" \
+    -subj "/CN=localhost" >/dev/null 2>&1
+
+openssl x509 -req -in "${csr}" -CA "${ca_cert}" -CAkey "${ca_key}" -CAcreateserial \
+    -out "${cert}" -days 1 \
+    -extfile <(printf "subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\n") >/dev/null 2>&1
+chmod 600 "${key}" "${ca_key}"
 
 secret="$(head -c 32 /dev/urandom | base64)"
 
@@ -90,6 +100,7 @@ action = "allow"
 cidr = "127.0.0.1/32"
 port_start = ${target_port}
 port_end = ${target_port}
+private = true
 EOF
 
 server_tcp="$(free_port)"
@@ -111,7 +122,7 @@ EOF
 chmod 600 "${workdir}/server.toml"
 
 echo "==> Starting uk-server (TLS 127.0.0.1:${server_tcp}, QUIC 127.0.0.1:${server_quic})"
-"${server_bin}" --config "${workdir}/server.toml" serve >/dev/null 2>&1 &
+"${server_bin}" --config "${workdir}/server.toml" serve > "${workdir}/server.log" 2>&1 &
 bg_pids+=("$!")
 wait_for_tcp 127.0.0.1 "${server_tcp}"
 
@@ -124,23 +135,29 @@ run_carrier() {
     cat > "${client_conf}" <<EOF
 server_addr = "${server_addr}"
 server_name = "localhost"
-ca_cert_path = "${cert}"
+ca_cert_path = "${ca_cert}"
 key_id = "interop"
 secret = "${secret}"
 EOF
     chmod 600 "${client_conf}"
 
     "${client_bin}" --config "${client_conf}" socks5 --listen "127.0.0.1:${socks_port}" \
-        >/dev/null 2>&1 &
+        > "${workdir}/client-${name}.log" 2>&1 &
     local client_pid="$!"
     bg_pids+=("${client_pid}")
     wait_for_tcp 127.0.0.1 "${socks_port}"
 
     local got_sha
-    got_sha="$(curl -fsS --max-time 15 \
+    if ! got_sha="$(curl -fsS --max-time 15 \
         --socks5-hostname "127.0.0.1:${socks_port}" \
         "http://127.0.0.1:${target_port}/payload.txt" \
-        | shasum -a 256 | awk '{print $1}')"
+        | shasum -a 256 | awk '{print $1}')"; then
+        echo "=== SERVER LOG ==="
+        cat "${workdir}/server.log" || true
+        echo "=== CLIENT LOG ==="
+        cat "${workdir}/client-${name}.log" || true
+        exit 1
+    fi
 
     kill "${client_pid}" 2>/dev/null || true
 

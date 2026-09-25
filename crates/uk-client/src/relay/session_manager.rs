@@ -190,6 +190,12 @@ impl ClientSessionManager {
             let _publish_guard = self.config_publish_lock.lock().await;
             let current = self.config.snapshot();
             ensure_reload_compatible(&current.config, &candidate)?;
+            let ca_path = candidate.ca_cert_path.clone();
+            tokio::task::spawn_blocking(move || crate::tls::refresh_client_config(&ca_path))
+                .await
+                .map_err(|err| -> AnyError {
+                    format!("failed to refresh TLS CA cache: {err}").into()
+                })??;
             let generation = self.config.replace(candidate);
             self.clear_connect_failure().await;
             let previous: Vec<Arc<ClientSession>> = self.pool.lock().await.drain(..).collect();

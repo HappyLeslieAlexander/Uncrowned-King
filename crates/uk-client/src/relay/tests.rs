@@ -81,13 +81,15 @@ fn test_session_manager(config: ClientConfig) -> ClientSessionManager {
     ClientSessionManager::new(config, Arc::new(ClientMetrics::default()))
 }
 
+static NEXT_TEST_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Builds a session that is structurally complete but carries no live
 /// carrier tasks, for exercising admission and teardown without a server.
 fn test_session(max_streams: u64, max_udp_flows: u64) -> Arc<ClientSession> {
     let limits = FrameLimits::default();
     let (carrier_writer, _carrier_reader) = tokio::io::duplex(64);
     Arc::new(ClientSession {
-        correlation_id: 1,
+        correlation_id: NEXT_TEST_SESSION_ID.fetch_add(1, Ordering::Relaxed),
         config_generation: 1,
         writer: Arc::new(Mutex::new(Box::new(carrier_writer))),
         flows: Arc::new(Mutex::new(HashMap::new())),
@@ -1239,11 +1241,16 @@ async fn udp_association_activity_events_are_lossy_when_queue_is_full() {
     let first_target = Target::Domain("first.example".to_owned(), 53);
     let second_target = Target::Domain("second.example".to_owned(), 53);
 
-    try_record_udp_association_activity(&event_tx, 1, &first_target);
-    try_record_udp_association_activity(&event_tx, 3, &second_target);
+    try_record_udp_association_activity(&event_tx, 100, 1, &first_target);
+    try_record_udp_association_activity(&event_tx, 100, 3, &second_target);
 
     match event_rx.recv().await {
-        Some(UdpAssociationFlowEvent::Activity { flow_id, target }) => {
+        Some(UdpAssociationFlowEvent::Activity {
+            session_id,
+            flow_id,
+            target,
+        }) => {
+            assert_eq!(session_id, 100);
             assert_eq!(flow_id, 1);
             assert_eq!(target, first_target);
         }
@@ -2112,4 +2119,171 @@ async fn shutdown_flush_is_a_no_op_without_buffered_frames() {
     let mut received = Vec::new();
     reader.read_to_end(&mut received).await.unwrap();
     assert!(received.is_empty());
+}
+
+#[tokio::test]
+async fn audit_udp_control_reset_leaves_orphan_route() {
+    let session = test_session(8, 8);
+    let mut raw = Arc::try_unwrap(session).ok().unwrap();
+    let (writer, mut mock_peer) = tokio::io::duplex(65536);
+    raw.writer = Arc::new(Mutex::new(Box::new(writer)));
+    let session = Arc::new(raw);
+    let manager = Arc::new(test_session_manager(minimal_config()));
+    manager.pool.lock().await.push(session.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut control = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (accepted, _) = listener.accept().await.unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let relay = tokio::spawn(relay_udp_association(
+        accepted,
+        manager.clone(),
+        socks5::SocksEndpoint::Ipv4(Ipv4Addr::UNSPECIFIED, 0),
+        shutdown_rx,
+    ));
+    let mut reply = [0; 10];
+    control.read_exact(&mut reply).await.unwrap();
+    let relay_addr = SocketAddr::from((
+        Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7]),
+        u16::from_be_bytes([reply[8], reply[9]]),
+    ));
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target = Target::Ipv4(Ipv4Addr::LOCALHOST, 12345);
+    udp.send_to(
+        &socks5::encode_udp_datagram(&target, b"ping").unwrap(),
+        relay_addr,
+    )
+    .await
+    .unwrap();
+    let open = time::timeout(
+        Duration::from_secs(1),
+        read_frame(&mut mock_peer, FrameLimits::default()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(open.header.frame_type, FrameType::UdpOpen);
+    handle_carrier_frame(
+        &session,
+        Frame::new(FrameType::UdpData, 0, open.header.id, Bytes::new()).unwrap(),
+    )
+    .await
+    .unwrap();
+    let data = time::timeout(
+        Duration::from_secs(1),
+        read_frame(&mut mock_peer, FrameLimits::default()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(data.header.frame_type, FrameType::UdpData);
+    socket2::SockRef::from(&control)
+        .set_linger(Some(Duration::ZERO))
+        .unwrap();
+    drop(control);
+    let result = time::timeout(Duration::from_secs(2), relay)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.is_err(), "RST must be an error to reproduce");
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
+    let retained = session.flows.lock().await.len();
+    eprintln!(
+        "audit control RST: routes retained={retained}, available_udp_permits={}",
+        session.admission.available_udp_flows()
+    );
+    assert_eq!(retained, 0, "association error must remove its routes");
+    drop(shutdown_tx);
+}
+
+#[tokio::test]
+async fn audit_udp_old_session_completion_must_not_remove_new_session_flow() {
+    let old_session = test_session(8, 8);
+    let new_session = test_session(8, 8);
+    let target = Target::Ipv4(Ipv4Addr::LOCALHOST, 12345);
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let (event_tx, _event_rx) = mpsc::channel(8);
+    let mut association = UdpAssociation::new(
+        socket,
+        None,
+        event_tx,
+        socks5::SocksEndpoint::Ipv4(Ipv4Addr::UNSPECIFIED, 0),
+        CONTROL_PEER_IP,
+    );
+    let old_id = old_session
+        .reserve_flow(FlowProtocol::Udp)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    let new_id = new_session
+        .reserve_flow(FlowProtocol::Udp)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(old_id, new_id, "ids restart per carrier");
+    association.flows_by_target.insert(
+        target.clone(),
+        UdpAssociationFlow {
+            id: new_id,
+            session: new_session.clone(),
+            last_activity: time::Instant::now(),
+        },
+    );
+    association.handle_flow_task_result(Some(Ok(UdpFlowTaskResult {
+        session_id: old_session.correlation_id,
+        flow_id: old_id,
+        target: target.clone(),
+        outcome: Ok(()),
+    })));
+    assert!(
+        association.flows_by_target.contains_key(&target),
+        "old carrier completion removed new carrier flow with the same id"
+    );
+}
+
+#[tokio::test]
+async fn audit_rejected_reload_must_preserve_active_ca_cache() {
+    let path = std::env::temp_dir().join(format!(
+        "audit-ca-rejected-reload-{}.pem",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        include_str!("../../../../docs/audits/2026-09-09/evidence/client/audit-ca-one.pem"),
+    )
+    .unwrap();
+    let mut config = minimal_config();
+    config.ca_cert_path = path.to_string_lossy().into_owned();
+    crate::check_config(&config).unwrap();
+    let old_tls = crate::tls::shared_client_config(&config.ca_cert_path)
+        .await
+        .unwrap();
+    let manager = test_session_manager(config.clone());
+    std::fs::write(
+        &path,
+        include_str!("../../../../docs/audits/2026-09-09/evidence/client/audit-ca-two.pem"),
+    )
+    .unwrap();
+    config.max_socks_connections = Some(config.max_socks_connections() + 1);
+    let error = manager.reload(config.clone()).await.unwrap_err();
+    assert!(error.to_string().contains("requires a restart"));
+    assert_eq!(manager.config.generation(), 1);
+    let active_tls = crate::tls::shared_client_config(&config.ca_cert_path)
+        .await
+        .unwrap();
+    eprintln!(
+        "audit rejected reload: error={error}, generation={}, CA cache same={}",
+        manager.config.generation(),
+        Arc::ptr_eq(&old_tls, &active_tls)
+    );
+    std::fs::remove_file(path).unwrap();
+    assert!(
+        Arc::ptr_eq(&old_tls, &active_tls),
+        "rejected reload replaced active cached TLS trust"
+    );
 }

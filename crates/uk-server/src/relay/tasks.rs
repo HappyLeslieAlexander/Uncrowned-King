@@ -23,7 +23,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
-    task::{Id, JoinError, JoinSet},
+    task::{AbortHandle, Id, JoinError, JoinSet},
     time,
 };
 use tracing::{Instrument, Span, debug, info, warn};
@@ -61,6 +61,13 @@ impl<T: 'static> Drop for ConnectTasks<T> {
 pub(crate) struct SessionTasks {
     pub(crate) tasks: JoinSet<SessionTaskKind>,
     pub(crate) kinds: HashMap<Id, SessionTaskKind>,
+    pub(crate) cancelled: HashMap<Id, Arc<AtomicBool>>,
+}
+
+impl Drop for SessionTasks {
+    fn drop(&mut self) {
+        self.abort_all();
+    }
 }
 
 impl Default for SessionTasks {
@@ -68,32 +75,65 @@ impl Default for SessionTasks {
         Self {
             tasks: JoinSet::new(),
             kinds: HashMap::new(),
+            cancelled: HashMap::new(),
         }
     }
 }
 
 impl SessionTasks {
-    pub(crate) fn spawn<F>(&mut self, kind: SessionTaskKind, task: F)
+    pub(crate) fn spawn<F>(&mut self, kind: SessionTaskKind, task: F) -> SessionTaskHandle
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.reap_completed();
         let span = Span::current();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_for_task = Arc::clone(&cancelled);
         let handle = self.tasks.spawn(
             async move {
                 task.await;
+                cancelled_for_task.store(true, Ordering::Release);
                 kind
             }
             .instrument(span),
         );
+        let task_handle = SessionTaskHandle::new(handle.clone(), Arc::clone(&cancelled));
         self.kinds.insert(handle.id(), kind);
+        self.cancelled.insert(handle.id(), cancelled);
+        task_handle
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.tasks.is_empty()
+    pub(crate) fn reap_completed(&mut self) {
+        while let Some(result) = self.tasks.try_join_next_with_id() {
+            match result {
+                Ok((id, kind)) => {
+                    self.kinds.remove(&id);
+                    self.cancelled.remove(&id);
+                    debug!(event = "server.session.task.done", kind = ?kind);
+                }
+                Err(err) => {
+                    let kind = self.kinds.remove(&err.id());
+                    self.cancelled.remove(&err.id());
+                    log_session_task_error(kind, &err);
+                }
+            }
+        }
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.tasks.len()
+    pub(crate) fn is_empty(&mut self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn len(&mut self) -> usize {
+        self.reap_completed();
+        self.kinds
+            .keys()
+            .filter(|id| {
+                self.cancelled
+                    .get(id)
+                    .is_some_and(|c| !c.load(Ordering::Acquire))
+            })
+            .count()
     }
 
     pub(crate) async fn join_next(&mut self) {
@@ -103,22 +143,27 @@ impl SessionTasks {
         match result {
             Ok((id, kind)) => {
                 self.kinds.remove(&id);
+                self.cancelled.remove(&id);
                 debug!(event = "server.session.task.done", kind = ?kind);
             }
             Err(err) => {
                 let kind = self.kinds.remove(&err.id());
+                self.cancelled.remove(&err.id());
                 log_session_task_error(kind, &err);
             }
         }
     }
 
     pub(crate) async fn join_all(&mut self) {
-        while !self.is_empty() {
+        while !self.tasks.is_empty() {
             self.join_next().await;
         }
     }
 
     pub(crate) fn abort_all(&mut self) {
+        for cancelled in self.cancelled.values() {
+            cancelled.store(true, Ordering::Release);
+        }
         self.tasks.abort_all();
     }
 }
@@ -433,7 +478,7 @@ pub(crate) fn spawn_half_close_timer(
     timeout: Duration,
     event_tx: FlowEventSender,
     shutdown: SessionShutdown,
-) {
+) -> SessionTaskHandle {
     session_tasks.spawn(SessionTaskKind::HalfCloseTimer, async move {
         tokio::select! {
             () = tokio::time::sleep(timeout) => {
@@ -450,7 +495,56 @@ pub(crate) fn spawn_half_close_timer(
             }
             () = shutdown.closed() => {}
         }
-    });
+    })
+}
+
+async fn write_target_command(
+    command: TargetCommand,
+    target_writer: &mut OwnedWriteHalf,
+    flow_control: &TargetFlowControl,
+    event_tx: &FlowEventSender,
+    metrics: &ServerMetrics,
+    write_timeout: Option<Duration>,
+) -> Result<bool, AnyError> {
+    match command {
+        TargetCommand::Data(buffered_data) => {
+            if flow_control.is_aborted() {
+                return Ok(true);
+            }
+            let payload_len = buffered_data.payload().len();
+            let write_fut = target_writer.write_all(buffered_data.payload());
+            let write_result: Result<(), AnyError> = match write_timeout {
+                Some(timeout) => {
+                    tokio::select! {
+                        res = write_fut => res.map_err(|e| -> AnyError { e.into() }),
+                        () = flow_control.aborted() => return Ok(true),
+                        () = tokio::time::sleep(timeout) => {
+                            Err(io::Error::new(io::ErrorKind::TimedOut, "target write timed out").into())
+                        }
+                    }
+                }
+                None => {
+                    tokio::select! {
+                        res = write_fut => res.map_err(|e| -> AnyError { e.into() }),
+                        () = flow_control.aborted() => return Ok(true),
+                    }
+                }
+            };
+            write_result?;
+            metrics.record_relay_bytes(
+                RelayProtocol::Tcp,
+                RelayDirection::ClientToTarget,
+                payload_len,
+            );
+            try_record_flow_activity(event_tx, FlowEvent::Activity);
+            Ok(false)
+        }
+        TargetCommand::Close => {
+            flow_control.close();
+            target_writer.shutdown().await?;
+            Ok(true)
+        }
+    }
 }
 
 pub(crate) async fn relay_client_to_target(
@@ -463,57 +557,51 @@ pub(crate) async fn relay_client_to_target(
     write_timeout: Option<Duration>,
 ) -> Result<(), AnyError> {
     loop {
+        if flow_control.is_aborted() {
+            return Ok(());
+        }
         let command = tokio::select! {
-            command = commands.recv() => command,
-            () = shutdown.closed() => return Ok(()),
+            biased;
             () = flow_control.aborted() => return Ok(()),
+            command = commands.recv() => command,
+            () = shutdown.closed() => {
+                while let Ok(command) = commands.try_recv() {
+                    if write_target_command(
+                        command,
+                        &mut target_writer,
+                        &flow_control,
+                        event_tx,
+                        metrics,
+                        write_timeout,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                }
+                if flow_control.is_closed() && !flow_control.is_aborted() {
+                    target_writer.shutdown().await?;
+                }
+                return Ok(());
+            }
         };
         let Some(command) = command else {
             break;
         };
-        match command {
-            TargetCommand::Data(buffered_data) => {
-                if flow_control.is_aborted() || shutdown.is_closed() {
-                    return Ok(());
-                }
-
-                let payload_len = buffered_data.payload().len();
-                let write_fut = target_writer.write_all(buffered_data.payload());
-                let write_result: Result<(), AnyError> = match write_timeout {
-                    Some(timeout) => {
-                        tokio::select! {
-                            res = write_fut => res.map_err(|e| -> AnyError { e.into() }),
-                            () = shutdown.closed() => return Ok(()),
-                            () = flow_control.aborted() => return Ok(()),
-                            () = tokio::time::sleep(timeout) => {
-                                Err(io::Error::new(io::ErrorKind::TimedOut, "target write timed out").into())
-                            }
-                        }
-                    }
-                    None => {
-                        tokio::select! {
-                            res = write_fut => res.map_err(|e| -> AnyError { e.into() }),
-                            () = shutdown.closed() => return Ok(()),
-                            () = flow_control.aborted() => return Ok(()),
-                        }
-                    }
-                };
-                write_result?;
-                metrics.record_relay_bytes(
-                    RelayProtocol::Tcp,
-                    RelayDirection::ClientToTarget,
-                    payload_len,
-                );
-                try_record_flow_activity(event_tx, FlowEvent::Activity);
-            }
-            TargetCommand::Close => {
-                flow_control.close();
-                target_writer.shutdown().await?;
-                return Ok(());
-            }
+        if write_target_command(
+            command,
+            &mut target_writer,
+            &flow_control,
+            event_tx,
+            metrics,
+            write_timeout,
+        )
+        .await?
+        {
+            return Ok(());
         }
     }
-    if flow_control.is_closed() && !flow_control.is_aborted() && !shutdown.is_closed() {
+    if flow_control.is_closed() && !flow_control.is_aborted() {
         target_writer.shutdown().await?;
     }
     Ok(())
@@ -549,6 +637,7 @@ pub(crate) async fn relay_target_to_client(
             carrier_writer,
             flow_id,
             Bytes::copy_from_slice(&target_buf[..read]),
+            &flow_control,
         )
         .await?;
         carrier_writer.metrics.record_relay_bytes(

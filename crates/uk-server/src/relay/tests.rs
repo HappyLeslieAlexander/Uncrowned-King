@@ -401,12 +401,30 @@ fn matching_half_close_timer_closes_original_flow() {
             HalfCloseSide::TargetToClient,
             &mut target_writers
         ),
-        HalfCloseDrainDecision::ClosePeer { remove: true }
+        HalfCloseDrainDecision::ClosePeer { remove: false }
     );
 
     let target = open_target_flow_mut(&mut target_writers, 1).expect("removal is caller-owned");
     assert!(!target.client_to_target_open);
     assert!(target.control.is_closed());
+}
+
+#[test]
+fn matching_half_close_client_to_target_timer_aborts_and_removes() {
+    let mut target_writers = FlowTable::new();
+    let mut flow = test_target_flow_with_token(TEST_FLOW_TOKEN);
+    flow.mark_client_to_target_closed();
+    target_writers.insert(1, FlowSlot::Tcp(flow));
+
+    assert_eq!(
+        expire_half_close_drain(
+            1,
+            TEST_FLOW_TOKEN,
+            HalfCloseSide::ClientToTarget,
+            &mut target_writers
+        ),
+        HalfCloseDrainDecision::ClosePeer { remove: true }
+    );
 }
 
 #[test]
@@ -1142,6 +1160,28 @@ async fn session_tasks_reap_completed_tasks() {
 }
 
 #[tokio::test]
+async fn session_tasks_is_empty_and_len_are_consistent() {
+    let mut tasks = SessionTasks::default();
+    assert!(tasks.is_empty());
+    assert_eq!(tasks.len(), 0);
+
+    let handle = tasks.spawn(
+        SessionTaskKind::HalfCloseTimer,
+        std::future::pending::<()>(),
+    );
+    assert!(!tasks.is_empty());
+    assert_eq!(tasks.len(), 1);
+
+    handle.abort();
+    assert_eq!(tasks.len(), 0);
+    assert!(tasks.is_empty());
+
+    tasks.join_all().await;
+    assert!(tasks.is_empty());
+    assert_eq!(tasks.len(), 0);
+}
+
+#[tokio::test]
 async fn session_task_drain_aborts_pending_tasks_after_timeout() {
     let mut tasks = SessionTasks::default();
 
@@ -1152,6 +1192,50 @@ async fn session_task_drain_aborts_pending_tasks_after_timeout() {
 
     assert!(tasks.is_empty());
     assert!(tasks.kinds.is_empty());
+}
+
+#[tokio::test]
+async fn dropping_session_tasks_aborts_inflight_tasks() {
+    struct DropGuard(Arc<AtomicBool>);
+    impl Drop for DropGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let started = Arc::new(AtomicBool::new(false));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let started_clone = Arc::clone(&started);
+    let cancelled_clone = Arc::clone(&cancelled);
+
+    let mut tasks = SessionTasks::default();
+    tasks.spawn(SessionTaskKind::TargetReader, async move {
+        let _guard = DropGuard(cancelled_clone);
+        started_clone.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+
+    for _ in 0..100 {
+        if started.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(started.load(Ordering::SeqCst));
+    assert!(!cancelled.load(Ordering::SeqCst));
+
+    drop(tasks);
+
+    for _ in 0..100 {
+        if cancelled.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        cancelled.load(Ordering::SeqCst),
+        "in-flight session task was not aborted upon drop"
+    );
 }
 
 #[test]
@@ -1930,5 +2014,447 @@ fn target_write_queue_capacity_tracks_byte_limit() {
     assert_eq!(
         target_write_queue_capacity(64 * 1024 * 1024),
         TARGET_WRITE_QUEUE_MAX_CAPACITY
+    );
+}
+
+#[tokio::test]
+async fn review_drain_drops_data_after_both_half_closes() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_socket = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (mut target, _) = listener.accept().await.unwrap();
+    let (_, target_writer) = relay_socket.into_split();
+    let (tx, rx) = mpsc::channel(10);
+    let flow_control = TargetFlowControl::default();
+    let mut flow = TargetFlow::new(TEST_FLOW_TOKEN, tx, flow_control.clone());
+    flow.mark_target_to_client_closed();
+    flow.enqueue_data(Bytes::from_static(b"last request bytes"), 1000, 1000)
+        .unwrap();
+    flow.close_client_to_target();
+    assert!(flow.is_fully_closed());
+    drop(flow); // Same remove_flow_slot path after client TCP_CLOSE.
+    let (event_tx, _event_rx) = mpsc::channel(10);
+    let shutdown = SessionShutdown::default();
+    let writer = CarrierWriter::new(
+        Box::new(tokio::io::sink()),
+        shutdown.clone(),
+        Arc::new(ServerMetrics::default()),
+        Some(Duration::from_secs(1)),
+    );
+    let mut tasks = SessionTasks::default();
+    spawn_target_writer(
+        &mut tasks,
+        TargetWriterTask {
+            identity: TargetFlowIdentity {
+                flow_id: 1,
+                token: TEST_FLOW_TOKEN,
+            },
+            target_writer,
+            commands: rx,
+            flow_control,
+            carrier_writer: writer.clone(),
+            event_tx,
+            shutdown: shutdown.clone(),
+            write_timeout: Some(Duration::from_secs(1)),
+        },
+    );
+    let mut state = ServerSessionState::Draining;
+    let mut table = FlowTable::new();
+    // Draining loop sees empty table and invokes this while writer has queued bytes.
+    close_session(
+        &mut state,
+        &shutdown,
+        &mut table,
+        &mut tasks,
+        &writer,
+        Some(Duration::from_secs(1)),
+    )
+    .await;
+    let mut received = Vec::new();
+    target.read_to_end(&mut received).await.unwrap();
+    assert_eq!(
+        received, b"last request bytes",
+        "drain acknowledged both closes but discarded queued target data"
+    );
+}
+
+#[tokio::test]
+async fn review_closed_flows_leave_half_close_timers() {
+    let mut tasks = SessionTasks::default();
+    let mut table = FlowTable::new();
+    let (event_tx, _event_rx) = mpsc::channel(1000);
+    let shutdown = SessionShutdown::default();
+    for id in (1..=199).step_by(2) {
+        assert!(check_open_slot(id, &table, 1).is_ok());
+        table.insert(id, test_open_flow_slot());
+        handle_target_read_closed(
+            id,
+            TEST_FLOW_TOKEN,
+            Some(Duration::from_secs(30)),
+            &event_tx,
+            &shutdown,
+            &mut table,
+            &mut tasks,
+        );
+        handle_target_write_closed(id, TEST_FLOW_TOKEN, &mut table);
+        assert!(table.is_empty());
+    }
+    tokio::task::yield_now().await;
+    assert!(
+        tasks.len() <= 1,
+        "max_streams=1 but {} timers remain after 100 fully closed flows",
+        tasks.len()
+    );
+}
+
+#[tokio::test]
+async fn stress_rapid_flow_churn_and_timer_counts() {
+    let mut tasks = SessionTasks::default();
+    let mut table = FlowTable::new();
+    let (event_tx, _event_rx) = mpsc::channel(10000);
+    let shutdown = SessionShutdown::default();
+
+    // Pattern 1: Target read closed first, then target write closed (1000 flows)
+    for id in 1..=1000 {
+        assert!(check_open_slot(id, &table, 1).is_ok());
+        table.insert(id, test_open_flow_slot());
+        handle_target_read_closed(
+            id,
+            TEST_FLOW_TOKEN,
+            Some(Duration::from_secs(30)),
+            &event_tx,
+            &shutdown,
+            &mut table,
+            &mut tasks,
+        );
+        assert_eq!(
+            tasks.len(),
+            1,
+            "Active timer count should be 1 during half-close"
+        );
+        handle_target_write_closed(id, TEST_FLOW_TOKEN, &mut table);
+        assert!(table.is_empty());
+        assert_eq!(
+            tasks.len(),
+            0,
+            "Timer must be immediately cancelled and reaped upon flow close"
+        );
+    }
+
+    // Pattern 2: Client TCP_CLOSE first, then target read closed, then target write closed (1000 flows)
+    for id in 1001..=2000 {
+        assert!(check_open_slot(id, &table, 1).is_ok());
+        table.insert(id, test_open_flow_slot());
+        if let Some(FlowSlot::Tcp(flow)) = table.get_mut(&id) {
+            flow.close_client_to_target();
+            let timer = spawn_half_close_timer(
+                &mut tasks,
+                id,
+                TEST_FLOW_TOKEN,
+                HalfCloseSide::ClientToTarget,
+                Duration::from_secs(30),
+                event_tx.clone(),
+                shutdown.clone(),
+            );
+            flow.set_half_close_timer(timer);
+        }
+        assert_eq!(
+            tasks.len(),
+            1,
+            "Active timer count should be 1 during client half-close"
+        );
+        handle_target_read_closed(
+            id,
+            TEST_FLOW_TOKEN,
+            Some(Duration::from_secs(30)),
+            &event_tx,
+            &shutdown,
+            &mut table,
+            &mut tasks,
+        );
+        handle_target_write_closed(id, TEST_FLOW_TOKEN, &mut table);
+        assert!(table.is_empty());
+        assert_eq!(
+            tasks.len(),
+            0,
+            "Timer must be cancelled when write completes"
+        );
+    }
+
+    // Pattern 3: Flow aborted midway during half-close (1000 flows)
+    for id in 2001..=3000 {
+        assert!(check_open_slot(id, &table, 1).is_ok());
+        table.insert(id, test_open_flow_slot());
+        handle_target_read_closed(
+            id,
+            TEST_FLOW_TOKEN,
+            Some(Duration::from_secs(30)),
+            &event_tx,
+            &shutdown,
+            &mut table,
+            &mut tasks,
+        );
+        assert_eq!(tasks.len(), 1);
+        if let Some(FlowSlot::Tcp(flow)) = table.get_mut(&id) {
+            flow.abort();
+        }
+        table.remove(&id);
+        assert_eq!(tasks.len(), 0, "Timer must be cancelled upon abort");
+    }
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(tasks.len(), 0);
+    assert_eq!(
+        tasks.kinds.len(),
+        0,
+        "tasks.kinds leaked! length is {}",
+        tasks.kinds.len()
+    );
+    assert_eq!(
+        tasks.cancelled.len(),
+        0,
+        "tasks.cancelled leaked! length is {}",
+        tasks.cancelled.len()
+    );
+}
+
+#[tokio::test]
+async fn review_aborted_flow_still_sends_queued_data() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_socket = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (mut target, _) = listener.accept().await.unwrap();
+    let (reader, _) = relay_socket.into_split();
+    let shutdown = SessionShutdown::default();
+    let control = TargetFlowControl::default();
+    let (carrier_output, mut carrier_input) = tokio::io::duplex(1000);
+    let writer = CarrierWriter::new(
+        Box::new(carrier_output),
+        shutdown.clone(),
+        Arc::new(ServerMetrics::default()),
+        Some(Duration::from_secs(1)),
+    );
+    let guard = writer.inner.lock().await;
+    let (event_tx, _event_rx) = mpsc::channel(10);
+    let task_control = control.clone();
+    let task_writer = writer.clone();
+    let task_shutdown = shutdown.clone();
+    target.write_all(b"stale target bytes").await.unwrap();
+    let task = tokio::spawn(async move {
+        relay_target_to_client(
+            1,
+            reader,
+            task_control,
+            &task_writer,
+            &event_tx,
+            &task_shutdown,
+            100,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    control.abort(); // Client closes ID 1 while old reader waits for carrier lock.
+    drop(guard);
+    task.await.unwrap().unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(30),
+            read_frame(&mut carrier_input, FrameLimits::default())
+        )
+        .await
+        .is_err(),
+        "old flow emitted data after abort instead of discarding queued frame"
+    );
+}
+
+#[tokio::test]
+async fn review_aborted_flow_contended_locks_drops_only_aborted_data() {
+    let shutdown = SessionShutdown::default();
+    let (carrier_output, mut carrier_input) = tokio::io::duplex(4096);
+    let writer = CarrierWriter::new(
+        Box::new(carrier_output),
+        shutdown.clone(),
+        Arc::new(ServerMetrics::default()),
+        Some(Duration::from_secs(1)),
+    );
+
+    // Flow 1: holds lock
+    let guard = writer.inner.lock().await;
+
+    // Flow 2: will be aborted while waiting
+    let control2 = TargetFlowControl::default();
+    let writer2 = writer.clone();
+    let control2_clone = control2.clone();
+    let task2 = tokio::spawn(async move {
+        let frame =
+            Frame::new(FrameType::TcpData, 0, 2, Bytes::from_static(b"flow 2 data")).unwrap();
+        write_flow_frame_locked(&writer2, &frame, &control2_clone).await
+    });
+
+    // Flow 3: will be aborted while waiting
+    let control3 = TargetFlowControl::default();
+    let writer3 = writer.clone();
+    let control3_clone = control3.clone();
+    let task3 = tokio::spawn(async move {
+        let frame =
+            Frame::new(FrameType::TcpData, 0, 3, Bytes::from_static(b"flow 3 data")).unwrap();
+        write_flow_frame_locked(&writer3, &frame, &control3_clone).await
+    });
+
+    // Flow 4: will NOT be aborted
+    let control4 = TargetFlowControl::default();
+    let writer4 = writer.clone();
+    let control4_clone = control4.clone();
+    let task4 = tokio::spawn(async move {
+        let frame =
+            Frame::new(FrameType::TcpData, 0, 4, Bytes::from_static(b"flow 4 data")).unwrap();
+        write_flow_frame_locked(&writer4, &frame, &control4_clone).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    // Abort flows 2 and 3
+    control2.abort();
+    control3.abort();
+
+    // Release carrier lock
+    drop(guard);
+
+    task2.await.unwrap().unwrap();
+    task3.await.unwrap().unwrap();
+    task4.await.unwrap().unwrap();
+
+    // Flow 4 must be received on carrier
+    let received = tokio::time::timeout(
+        Duration::from_millis(100),
+        read_frame(&mut carrier_input, FrameLimits::default()),
+    )
+    .await
+    .expect("must not time out reading valid flow 4 frame")
+    .expect("frame read must succeed");
+
+    assert_eq!(received.header.id, 4);
+    assert_eq!(received.payload.as_ref(), b"flow 4 data");
+
+    // No further frames should be available (flows 2 and 3 were dropped)
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(30),
+            read_frame(&mut carrier_input, FrameLimits::default()),
+        )
+        .await
+        .is_err(),
+        "aborted flows 2 and 3 must not have sent any frames"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn review_real_relay_drain_loses_tail_of_upload() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (client, server) = tokio::io::duplex(4 * 1024 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server);
+    let carrier = ServerCarrier::new(Box::new(server_reader), Box::new(server_writer), None);
+    let cred = uk_auth::Credential::active(
+        b"user".to_vec(),
+        b"0123456789abcdef0123456789abcdef".to_vec(),
+    )
+    .unwrap();
+    let identity = AuthenticatedIdentity::from(&cred);
+    let mut rule = uk_policy::PolicyRule::new(uk_policy::PolicyDecision::Allow);
+    rule.private = Some(true);
+    let security = SecurityState::new(
+        crate::security::test_tls_acceptor(),
+        vec![cred],
+        PolicySet::new(vec![rule]),
+        Duration::from_secs(30),
+    );
+    let mut limits = test_relay_limits(1);
+    limits.max_buffered_bytes_per_flow = 2 * 1024 * 1024;
+    limits.max_buffered_bytes_per_session = 16 * 1024 * 1024;
+    limits.carrier_write_timeout = Some(Duration::from_secs(30));
+    limits.tcp_half_close_timeout = Some(Duration::from_secs(30));
+    limits.session_task_shutdown_timeout = Some(Duration::from_secs(30));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let metrics = Arc::new(ServerMetrics::default());
+    let session = tokio::spawn(relay_session(
+        carrier,
+        identity,
+        security,
+        limits,
+        None,
+        shutdown_rx,
+        metrics,
+    ));
+    let (client_reader, mut client_writer) = tokio::io::split(client);
+    let mut frames = FrameReader::new(client_reader, FrameLimits::default());
+    let mut open = BytesMut::new();
+    TcpOpen::new(
+        Target::Ipv4(Ipv4Addr::LOCALHOST, address.port()),
+        TCP_OPEN_FLAGS_NONE,
+    )
+    .encode(&mut open)
+    .unwrap();
+    write_frame(
+        &mut client_writer,
+        &Frame::new(FrameType::TcpOpen, 0, 1, open.freeze()).unwrap(),
+    )
+    .await
+    .unwrap();
+    let (mut target, _) = listener.accept().await.unwrap();
+    socket2::SockRef::from(&target)
+        .set_recv_buffer_size(1024)
+        .unwrap();
+    let ack = frames.read_frame().await.unwrap();
+    assert_eq!(ack.header.frame_type, FrameType::TcpData);
+    target.shutdown().await.unwrap(); // Target sends FIN but can still receive an upload.
+    let close = frames.read_frame().await.unwrap();
+    assert_eq!(close.header.frame_type, FrameType::TcpClose);
+    shutdown_tx.send(true).unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let payload = Bytes::from(vec![0x6d; 1024 * 1024]);
+    for start in (0..payload.len()).step_by(65536) {
+        write_frame(
+            &mut client_writer,
+            &Frame::new(
+                FrameType::TcpData,
+                0,
+                1,
+                payload.slice(start..start + 65536),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    let mut closing = BytesMut::new();
+    TcpClose::new(TCP_CLOSE_NORMAL)
+        .encode(&mut closing)
+        .unwrap();
+    write_frame(
+        &mut client_writer,
+        &Frame::new(FrameType::TcpClose, 0, 1, closing.freeze()).unwrap(),
+    )
+    .await
+    .unwrap();
+    // Delay consumption briefly to keep upload writes queued within the 30s drain budget.
+    time::sleep(Duration::from_millis(50)).await;
+    let _ = socket2::SockRef::from(&target).set_recv_buffer_size(128 * 1024);
+    let mut received = Vec::new();
+    let _ = time::timeout(Duration::from_secs(5), target.read_to_end(&mut received))
+        .await
+        .unwrap();
+    let session_result = time::timeout(Duration::from_secs(2), session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(session_result.is_ok(), "session failed: {session_result:?}");
+    assert_eq!(
+        received.len(),
+        payload.len(),
+        "graceful shutdown reported success while truncating upload"
     );
 }

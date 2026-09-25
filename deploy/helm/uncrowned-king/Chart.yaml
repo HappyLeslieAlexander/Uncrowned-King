@@ -2,8 +2,8 @@ apiVersion: v2
 name: uncrowned-king
 description: A Helm chart for Uncrowned King high-performance multiplexed secure proxy (Server & Client DaemonSet)
 type: application
-version: 0.1.2
-appVersion: "0.1.2"
+version: 0.1.3
+appVersion: "v0.1.3"
 keywords:
   - proxy
   - secure-tunnel

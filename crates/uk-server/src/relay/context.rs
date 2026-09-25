@@ -23,7 +23,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
-    task::{Id, JoinError, JoinSet},
+    task::{AbortHandle, Id, JoinError, JoinSet},
     time,
 };
 use tracing::{Instrument, Span, debug, info, warn};
@@ -341,6 +341,26 @@ pub(crate) struct OpenFlowCancel {
     pub(crate) notify: Arc<Notify>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SessionTaskHandle {
+    pub(crate) abort_handle: AbortHandle,
+    pub(crate) cancelled: Arc<AtomicBool>,
+}
+
+impl SessionTaskHandle {
+    pub(crate) fn new(abort_handle: AbortHandle, cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            abort_handle,
+            cancelled,
+        }
+    }
+
+    pub(crate) fn abort(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.abort_handle.abort();
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct TargetFlow {
     pub(crate) token: FlowToken,
@@ -348,6 +368,8 @@ pub(crate) struct TargetFlow {
     pub(crate) control: TargetFlowControl,
     pub(crate) target_to_client_open: bool,
     pub(crate) client_to_target_open: bool,
+    pub(crate) target_write_open: bool,
+    pub(crate) half_close_timer: Option<SessionTaskHandle>,
     pub(crate) metrics_guard: Option<ActiveFlowGuard>,
 }
 
@@ -693,6 +715,8 @@ impl TargetFlow {
             control,
             target_to_client_open: true,
             client_to_target_open: true,
+            target_write_open: true,
+            half_close_timer: None,
             metrics_guard: None,
         }
     }
@@ -700,6 +724,18 @@ impl TargetFlow {
     pub(crate) fn track_metrics(mut self, guard: ActiveFlowGuard) -> Self {
         self.metrics_guard = Some(guard);
         self
+    }
+
+    pub(crate) fn set_half_close_timer(&mut self, handle: SessionTaskHandle) {
+        if let Some(old) = self.half_close_timer.replace(handle) {
+            old.abort();
+        }
+    }
+
+    pub(crate) fn cancel_half_close_timer(&mut self) {
+        if let Some(handle) = self.half_close_timer.take() {
+            handle.abort();
+        }
     }
 
     pub(crate) fn enqueue_data(
@@ -760,8 +796,10 @@ impl TargetFlow {
     }
 
     pub(crate) fn abort(&mut self) {
+        self.cancel_half_close_timer();
         self.target_to_client_open = false;
         self.client_to_target_open = false;
+        self.target_write_open = false;
         self.control.abort();
         self.close_client_to_target_queue();
     }
@@ -775,6 +813,17 @@ impl TargetFlow {
         self.control.close();
     }
 
+    pub(crate) fn mark_target_write_closed(&mut self) {
+        self.client_to_target_open = false;
+        self.target_write_open = false;
+        self.control.close();
+    }
+
+    pub(crate) const fn is_removable(&self) -> bool {
+        !self.target_to_client_open && !self.client_to_target_open && !self.target_write_open
+    }
+
+    #[allow(dead_code)]
     pub(crate) const fn is_fully_closed(&self) -> bool {
         !self.target_to_client_open && !self.client_to_target_open
     }
@@ -782,9 +831,11 @@ impl TargetFlow {
 
 impl Drop for TargetFlow {
     fn drop(&mut self) {
+        self.cancel_half_close_timer();
         if !self.is_fully_closed() {
             self.target_to_client_open = false;
             self.client_to_target_open = false;
+            self.target_write_open = false;
             self.control.abort();
             self.commands = None;
         }

@@ -1015,8 +1015,47 @@ async fn run_authenticated_session(
     // a datagram channel (QUIC) and the peer enabled the datagram extension.
     let datagrams = datagrams.filter(|channel| channel.max_datagram_size().is_some());
     let supports_udp_datagram = datagrams.is_some();
+    let settings_timeout = carrier_write_timeout(config.carrier_write_timeout_seconds());
+    {
+        let mut shutdown_watch = shutdown_rx.clone();
+        let wait_shutdown = async {
+            if *shutdown_watch.borrow() {
+                return;
+            }
+            while let Ok(()) = shutdown_watch.changed().await {
+                if *shutdown_watch.borrow() {
+                    return;
+                }
+            }
+        };
+        let write_settings =
+            write_server_settings(&mut carrier_writer, config, supports_udp_datagram);
+        tokio::pin!(write_settings);
+        tokio::pin!(wait_shutdown);
 
-    write_server_settings(&mut carrier_writer, config, supports_udp_datagram).await?;
+        let write_result: Result<(), AnyError> = match settings_timeout {
+            Some(timeout) => {
+                tokio::select! {
+                    res = &mut write_settings => res,
+                    () = &mut wait_shutdown => {
+                        Err("session cancelled by server shutdown while writing SETTINGS".into())
+                    }
+                    () = tokio::time::sleep(timeout) => {
+                        Err(io::Error::new(io::ErrorKind::TimedOut, "timed out writing server settings").into())
+                    }
+                }
+            }
+            None => {
+                tokio::select! {
+                    res = &mut write_settings => res,
+                    () = &mut wait_shutdown => {
+                        Err("session cancelled by server shutdown while writing SETTINGS".into())
+                    }
+                }
+            }
+        };
+        write_result?;
+    }
 
     let carrier = relay::ServerCarrier::new(carrier_reader, carrier_writer, datagrams);
 
@@ -2011,5 +2050,196 @@ mod tests {
             }
             Ok(_) => panic!("challenge expired relative to real arrival time must be rejected"),
         }
+    }
+}
+
+#[cfg(test)]
+mod review_settings_tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct Stall;
+
+    impl tokio::io::AsyncWrite for Stall {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn review_settings_write_holds_session_after_shutdown() {
+        let config: ServerConfig =
+            toml::from_str(include_str!("../../../examples/server.toml")).unwrap();
+        let cred = uk_auth::Credential::active(
+            b"client".to_vec(),
+            b"0123456789abcdef0123456789abcdef".to_vec(),
+        )
+        .unwrap();
+        let identity = AuthenticatedIdentity::from(&cred);
+        let security = SecurityState::new(
+            crate::security::test_tls_acceptor(),
+            vec![cred],
+            uk_policy::PolicySet::default(),
+            Duration::from_secs(30),
+        );
+        let permits = Arc::new(Semaphore::new(1));
+        let task_permits = permits.clone();
+        let (tx, rx) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            run_authenticated_session(
+                Box::new(tokio::io::empty()),
+                Box::new(Stall),
+                None,
+                identity,
+                security,
+                &config,
+                task_permits,
+                1,
+                "127.0.0.1:1000".parse().unwrap(),
+                rx,
+                Arc::new(ServerMetrics::default()),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(permits.available_permits(), 0);
+        tx.send(true).unwrap();
+        let result = time::timeout(Duration::from_millis(100), handle).await;
+        assert!(
+            result.is_ok(),
+            "SETTINGS write ignores shutdown and has no write deadline; slot remains held"
+        );
+        let session_res = result.unwrap().unwrap();
+        assert!(
+            session_res.is_err(),
+            "session should exit with cancellation error"
+        );
+        assert_eq!(
+            permits.available_permits(),
+            1,
+            "session permit must be reclaimed after shutdown cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_settings_write_timeout_reclaims_permit() {
+        let mut config: ServerConfig =
+            toml::from_str(include_str!("../../../examples/server.toml")).unwrap();
+        // Configure carrier write timeout to 1 second for fast empirical verification
+        config
+            .limits
+            .get_or_insert_with(Default::default)
+            .carrier_write_timeout_seconds = Some(1);
+        let cred = uk_auth::Credential::active(
+            b"client".to_vec(),
+            b"0123456789abcdef0123456789abcdef".to_vec(),
+        )
+        .unwrap();
+        let identity = AuthenticatedIdentity::from(&cred);
+        let security = SecurityState::new(
+            crate::security::test_tls_acceptor(),
+            vec![cred],
+            uk_policy::PolicySet::default(),
+            Duration::from_secs(30),
+        );
+        let permits = Arc::new(Semaphore::new(1));
+        let task_permits = permits.clone();
+        let (_tx, rx) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            run_authenticated_session(
+                Box::new(tokio::io::empty()),
+                Box::new(Stall),
+                None,
+                identity,
+                security,
+                &config,
+                task_permits,
+                1,
+                "127.0.0.1:1000".parse().unwrap(),
+                rx,
+                Arc::new(ServerMetrics::default()),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(permits.available_permits(), 0);
+        // Do NOT send shutdown; wait for 1-second timeout to fire
+        let result = time::timeout(Duration::from_millis(1500), handle).await;
+        assert!(
+            result.is_ok(),
+            "SETTINGS write did not time out as expected"
+        );
+        let session_res = result.unwrap().unwrap();
+        assert!(session_res.is_err(), "session should fail on timeout");
+        let err = session_res.unwrap_err();
+        assert!(
+            err.to_string().contains("timed out")
+                || err
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|e| e.kind() == io::ErrorKind::TimedOut),
+            "expected timed out error, got: {err}"
+        );
+        assert_eq!(
+            permits.available_permits(),
+            1,
+            "session permit must be reclaimed after write timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_settings_write_pre_shutdown_cancels_immediately_and_reclaims_permit() {
+        let config: ServerConfig =
+            toml::from_str(include_str!("../../../examples/server.toml")).unwrap();
+        let cred = uk_auth::Credential::active(
+            b"client".to_vec(),
+            b"0123456789abcdef0123456789abcdef".to_vec(),
+        )
+        .unwrap();
+        let identity = AuthenticatedIdentity::from(&cred);
+        let security = SecurityState::new(
+            crate::security::test_tls_acceptor(),
+            vec![cred],
+            uk_policy::PolicySet::default(),
+            Duration::from_secs(30),
+        );
+        let permits = Arc::new(Semaphore::new(1));
+        let task_permits = permits.clone();
+        let (_tx, rx) = watch::channel(true); // Already shut down!
+        let result = run_authenticated_session(
+            Box::new(tokio::io::empty()),
+            Box::new(Stall),
+            None,
+            identity,
+            security,
+            &config,
+            task_permits,
+            1,
+            "127.0.0.1:1000".parse().unwrap(),
+            rx,
+            Arc::new(ServerMetrics::default()),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "session should fail immediately when server is already shut down"
+        );
+        assert_eq!(
+            permits.available_permits(),
+            1,
+            "permit must be reclaimed immediately when server is already shut down"
+        );
     }
 }

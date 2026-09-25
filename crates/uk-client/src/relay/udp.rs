@@ -78,6 +78,7 @@ pub(crate) struct UdpAssociationFlow {
 }
 
 pub(crate) struct UdpFlowTaskResult {
+    pub(crate) session_id: u64,
     pub(crate) flow_id: u64,
     pub(crate) target: Target,
     pub(crate) outcome: Result<(), AnyError>,
@@ -135,6 +136,7 @@ pub(crate) fn route_inbound_datagram(
     route.sender.try_send(buffered_frame).is_ok()
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn relay_udp_association(
     mut local: TcpStream,
     sessions: Arc<ClientSessionManager>,
@@ -186,6 +188,7 @@ pub(crate) async fn relay_udp_association(
     let mut idle_interval = udp_idle_interval(association.idle_timeout);
     let mut udp_buf = vec![0_u8; UDP_ASSOCIATION_BUFFER_SIZE].into_boxed_slice();
     let mut tcp_buf = [0_u8; 1];
+    let mut termination_error = None;
 
     loop {
         tokio::select! {
@@ -194,15 +197,22 @@ pub(crate) async fn relay_udp_association(
                 break;
             }
             read = local.read(&mut tcp_buf) => {
-                if read? == 0 {
-                    break;
+                match read {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        debug!(event = "socks5.udp_associate.control_data_ignored");
+                    }
+                    Err(err) => {
+                        debug!(event = "socks5.udp_associate.control_read_error", error = %err);
+                        termination_error = Some(err.into());
+                        break;
+                    }
                 }
-                debug!(event = "socks5.udp_associate.control_data_ignored");
             }
             received = association.socket.recv_from(udp_buf.as_mut()) => {
                 match received {
                     Ok((read, peer)) => {
-                        if !association
+                        match association
                             .handle_local_udp_datagram(
                                 peer,
                                 &udp_buf[..read],
@@ -211,9 +221,14 @@ pub(crate) async fn relay_udp_association(
                                 &sessions,
                                 &mut shutdown_rx,
                             )
-                            .await?
+                            .await
                         {
-                            break;
+                            Ok(true) => {}
+                            Ok(false) => break,
+                            Err(err) => {
+                                termination_error = Some(err);
+                                break;
+                            }
                         }
                     }
                     Err(err) => {
@@ -234,7 +249,11 @@ pub(crate) async fn relay_udp_association(
     }
 
     association.close().await;
-    Ok(())
+    if let Some(err) = termination_error {
+        Err(err)
+    } else {
+        Ok(())
+    }
 }
 
 impl UdpAssociation {
@@ -325,7 +344,11 @@ impl UdpAssociation {
                         attempt,
                         error = %err
                     );
-                    self.remove_flow_if_matches(&datagram.target, flow.id);
+                    self.remove_flow_if_matches(
+                        &datagram.target,
+                        flow.session.correlation_id,
+                        flow.id,
+                    );
                     flow.session.remove_flow(flow.id).await;
                     last_error = Some(err);
                 }
@@ -425,7 +448,7 @@ impl UdpAssociation {
                 flow_id = flow.id,
                 target = %target.log_safe()
             );
-            self.spawn_udp_flow_cleanup(flow, target);
+            self.spawn_udp_flow_cleanup(&flow, target);
             return;
         };
         self.flow_tasks.spawn(async move {
@@ -441,10 +464,11 @@ impl UdpAssociation {
         });
     }
 
-    pub(crate) fn spawn_udp_flow_cleanup(&mut self, flow: ClientFlow, target: Target) {
+    pub(crate) fn spawn_udp_flow_cleanup(&mut self, flow: &ClientFlow, target: Target) {
+        let session_id = flow.session.correlation_id;
+        let flow_id = flow.id;
+        let session = Arc::clone(&flow.session);
         self.flow_tasks.spawn(async move {
-            let flow_id = flow.id;
-            let session = Arc::clone(&flow.session);
             let outcome = async {
                 session.send_udp_close(flow_id, UDP_CLOSE_ERROR).await?;
                 session.remove_flow(flow_id).await;
@@ -452,6 +476,7 @@ impl UdpAssociation {
             }
             .await;
             UdpFlowTaskResult {
+                session_id,
                 flow_id,
                 target,
                 outcome,
@@ -468,10 +493,11 @@ impl UdpAssociation {
         };
         match joined {
             Ok(result) => {
-                self.remove_flow_if_matches(&result.target, result.flow_id);
+                self.remove_flow_if_matches(&result.target, result.session_id, result.flow_id);
                 if let Err(err) = result.outcome {
                     warn!(
                         event = "client.udp_flow.task_error",
+                        session_id = result.session_id,
                         flow_id = result.flow_id,
                         target = %result.target.log_safe(),
                         error = %err
@@ -484,24 +510,34 @@ impl UdpAssociation {
         }
     }
 
-    pub(crate) fn remove_flow_if_matches(&mut self, target: &Target, flow_id: u64) -> bool {
-        let current_flow_id = self.flows_by_target.get(target).map(|flow| flow.id);
-        if udp_flow_id_matches(current_flow_id, flow_id) {
-            self.flows_by_target.remove(target);
-            true
-        } else {
-            false
+    pub(crate) fn remove_flow_if_matches(
+        &mut self,
+        target: &Target,
+        session_id: u64,
+        flow_id: u64,
+    ) -> bool {
+        if let Some(flow) = self.flows_by_target.get(target) {
+            if flow.session.correlation_id == session_id && flow.id == flow_id {
+                self.flows_by_target.remove(target);
+                return true;
+            }
         }
+        false
     }
 
     pub(crate) fn handle_flow_event(&mut self, event: Option<UdpAssociationFlowEvent>) {
-        let Some(UdpAssociationFlowEvent::Activity { flow_id, target }) = event else {
+        let Some(UdpAssociationFlowEvent::Activity {
+            session_id,
+            flow_id,
+            target,
+        }) = event
+        else {
             return;
         };
         let Some(flow) = self.flows_by_target.get_mut(&target) else {
             return;
         };
-        if flow.id == flow_id {
+        if flow.session.correlation_id == session_id && flow.id == flow_id {
             flow.record_activity();
         }
     }
@@ -542,6 +578,7 @@ impl UdpAssociation {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn udp_flow_id_matches(current_flow_id: Option<u64>, candidate_flow_id: u64) -> bool {
     current_flow_id == Some(candidate_flow_id)
 }
@@ -655,6 +692,7 @@ pub(crate) async fn relay_udp_flow_to_client(
     shutdown_rx: watch::Receiver<bool>,
     flow_event_tx: mpsc::Sender<UdpAssociationFlowEvent>,
 ) -> UdpFlowTaskResult {
+    let session_id = flow.session.correlation_id;
     let flow_id = flow.id;
     let session = Arc::clone(&flow.session);
     let outcome = relay_udp_flow_to_client_inner(
@@ -671,6 +709,7 @@ pub(crate) async fn relay_udp_flow_to_client(
     }
     session.remove_flow(flow_id).await;
     UdpFlowTaskResult {
+        session_id,
         flow_id,
         target,
         outcome,
@@ -707,7 +746,12 @@ pub(crate) async fn relay_udp_flow_to_client_inner(
                             RelayDirection::ServerToLocal,
                             payload_len,
                         );
-                        try_record_udp_association_activity(&flow_event_tx, flow_id, &target);
+                        try_record_udp_association_activity(
+                            &flow_event_tx,
+                            flow.session.correlation_id,
+                            flow_id,
+                            &target,
+                        );
                     }
                     FrameType::UdpClose => {
                         let mut payload = frame.payload;
@@ -734,10 +778,12 @@ pub(crate) fn udp_association_bind_addr(tcp_local_addr: SocketAddr) -> SocketAdd
 
 pub(crate) fn try_record_udp_association_activity(
     flow_event_tx: &mpsc::Sender<UdpAssociationFlowEvent>,
+    session_id: u64,
     flow_id: u64,
     target: &Target,
 ) {
     let _ = flow_event_tx.try_send(UdpAssociationFlowEvent::Activity {
+        session_id,
         flow_id,
         target: target.clone(),
     });

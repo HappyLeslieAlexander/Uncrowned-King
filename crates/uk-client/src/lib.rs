@@ -81,7 +81,7 @@ pub fn client_reload_channel() -> (ClientReloadHandle, ClientReloadReceiver) {
     (ClientReloadHandle { tx }, ClientReloadReceiver { rx })
 }
 
-/// Validates client config and TLS trust material without connecting.
+/// Validates client config and TLS trust material without connecting or mutating shared state.
 pub fn check_config(config: &ClientConfig) -> Result<(), AnyError> {
     config.validate_network_endpoints()?;
     config.validate_resource_limits()?;

@@ -397,7 +397,11 @@ pub(crate) fn semaphore_permits(limit: u64) -> usize {
 }
 
 pub(crate) enum UdpAssociationFlowEvent {
-    Activity { flow_id: u64, target: Target },
+    Activity {
+        session_id: u64,
+        flow_id: u64,
+        target: Target,
+    },
 }
 
 pub(crate) enum UdpAssociationFlowLookup {

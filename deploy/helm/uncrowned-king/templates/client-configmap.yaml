@@ -14,6 +14,6 @@ data:
     {{- end }}
     ca_cert_path = "/etc/uncrowned-king/ca/ca.crt"
     {{- if .Values.client.config.relay_buffer_size }}
-    relay_buffer_size = {{ .Values.client.config.relay_buffer_size }}
+    relay_buffer_size = {{ int64 .Values.client.config.relay_buffer_size }}
     {{- end }}
 {{- end }}

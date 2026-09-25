@@ -2014,6 +2014,7 @@ fn soak_limits() -> LimitConfig {
     // Enough concurrent streams for the persistent flows plus injected chaos.
     LimitConfig {
         max_streams: Some(64),
+        max_outbound_dials_per_session: Some(64),
         ..test_limits()
     }
 }

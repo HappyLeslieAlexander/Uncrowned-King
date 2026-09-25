@@ -813,6 +813,42 @@ pub(crate) async fn write_frame_locked(
     Ok(())
 }
 
+/// Writes a frame for a target flow to the carrier writer under lock, verifying
+/// that the flow has not been aborted both while waiting for the lock and after
+/// acquiring it. If the flow has been aborted, the frame is discarded.
+pub(crate) async fn write_flow_frame_locked(
+    writer: &CarrierWriter,
+    frame: &Frame,
+    flow_control: &TargetFlowControl,
+) -> Result<(), AnyError> {
+    if writer.shutdown.is_closed() || flow_control.is_aborted() {
+        return Ok(());
+    }
+    let mut guard = tokio::select! {
+        guard = writer.inner.lock() => guard,
+        () = writer.shutdown.closed() => return Err(session_shutdown_error().into()),
+        () = flow_control.aborted() => return Ok(()),
+    };
+    if writer.shutdown.is_closed() || flow_control.is_aborted() {
+        return Ok(());
+    }
+    let write = write_frame_or_shutdown(&mut *guard, frame, &writer.shutdown);
+    let Some(timeout) = writer.write_timeout else {
+        write.await?;
+        return Ok(());
+    };
+    let Ok(result) = time::timeout(timeout, write).await else {
+        writer.shutdown.close();
+        warn!(
+            event = "server.carrier.write_timeout",
+            timeout_seconds = timeout.as_secs()
+        );
+        return Err(carrier_write_timeout_error(timeout).into());
+    };
+    result?;
+    Ok(())
+}
+
 pub(crate) fn carrier_unusable_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::BrokenPipe,

@@ -1,0 +1,254 @@
+---
+# Source: uncrowned-king/templates/server-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: audit-uncrowned-king-server-config
+  labels:
+    helm.sh/chart: uncrowned-king-0.1.2
+    app.kubernetes.io/name: uncrowned-king
+    app.kubernetes.io/instance: audit
+    app.kubernetes.io/version: "0.1.2"
+    app.kubernetes.io/managed-by: Helm
+data:
+  server.toml: |
+    listen = "0.0.0.0:8443"
+    observability_listen = "0.0.0.0:9090"
+    cert_path = "/etc/uncrowned-king/tls/tls.crt"
+    key_path = "/etc/uncrowned-king/tls/tls.key"
+    policy_path = "/etc/uncrowned-king/policy/policy.toml"
+
+    [limits]
+    max_frame_size = 65536
+    max_sessions = 10000
+    max_handshakes = 1000
+    max_streams = 1024
+    max_udp_flows = 512
+    max_buffered_bytes_per_session = 6.7108864e+07
+    max_buffered_bytes_per_flow = 4.194304e+06
+    relay_buffer_size = 16384
+    auth_rate_limit_failures = 5
+    auth_rate_limit_window_seconds = 60
+    auth_rate_limit_ban_seconds = 300
+
+  policy.toml: |
+    default_action = "deny"
+    [[rules]]
+    action = "allow"
+    policy_group = "default"
+    cidr = "0.0.0.0/0"
+    port_start = 1
+    port_end = 65535
+---
+# Source: uncrowned-king/templates/server-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: audit-uncrowned-king-server
+  labels:
+    helm.sh/chart: uncrowned-king-0.1.2
+    app.kubernetes.io/name: uncrowned-king
+    app.kubernetes.io/instance: audit
+    app.kubernetes.io/version: "0.1.2"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: server
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 443
+      targetPort: 8443
+      protocol: TCP
+      name: tls
+    - port: 443
+      targetPort: 8443
+      protocol: UDP
+      name: quic
+  selector:
+    app.kubernetes.io/name: uncrowned-king
+    app.kubernetes.io/instance: audit
+    app.kubernetes.io/component: server
+---
+# Source: uncrowned-king/templates/server-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: audit-uncrowned-king-server-metrics
+  labels:
+    helm.sh/chart: uncrowned-king-0.1.2
+    app.kubernetes.io/name: uncrowned-king
+    app.kubernetes.io/instance: audit
+    app.kubernetes.io/version: "0.1.2"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: server
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9090
+      targetPort: 9090
+      protocol: TCP
+      name: metrics
+  selector:
+    app.kubernetes.io/name: uncrowned-king
+    app.kubernetes.io/instance: audit
+    app.kubernetes.io/component: server
+---
+# Source: uncrowned-king/templates/server-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: audit-uncrowned-king-server
+  labels:
+    helm.sh/chart: uncrowned-king-0.1.2
+    app.kubernetes.io/name: uncrowned-king
+    app.kubernetes.io/instance: audit
+    app.kubernetes.io/version: "0.1.2"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: server
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: uncrowned-king
+      app.kubernetes.io/instance: audit
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      annotations:
+        checksum/config: 5e95c524dc8ba8c10966c611de374b11dfcd2f5920c7000a6e9ea79a76dcd35d
+      labels:
+        app.kubernetes.io/name: uncrowned-king
+        app.kubernetes.io/instance: audit
+        app.kubernetes.io/component: server
+    spec:
+      initContainers:
+        - name: stage-config
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /etc/uncrowned-king/policy
+              cat /staging/config/server.toml /staging/credentials/credentials.toml > /etc/uncrowned-king/server.toml
+              cp /staging/config/policy.toml /etc/uncrowned-king/policy/policy.toml
+              if [ -d /staging/tls ]; then
+                mkdir -p /etc/uncrowned-king/tls
+                cp /staging/tls/* /etc/uncrowned-king/tls/
+                chmod 0600 /etc/uncrowned-king/tls/*
+              fi
+              chmod 0600 /etc/uncrowned-king/server.toml /etc/uncrowned-king/policy/policy.toml
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "32Mi"
+          volumeMounts:
+            - name: config-source
+              mountPath: /staging/config
+              readOnly: true
+            - name: credentials-source
+              mountPath: /staging/credentials
+              readOnly: true
+            - name: tls-source
+              mountPath: /staging/tls
+              readOnly: true
+            - name: runtime-config
+              mountPath: /etc/uncrowned-king
+      containers:
+        - name: server
+          image: "ghcr.io/happylesliealexander/uncrowned-king-server:0.1.2"
+          imagePullPolicy: IfNotPresent
+          command:
+            - "uk-server"
+            - "serve"
+            - "--config"
+            - "/etc/uncrowned-king/server.toml"
+            - "--log-format"
+            - "json"
+          ports:
+            - name: tls
+              containerPort: 8443
+              protocol: TCP
+            - name: quic
+              containerPort: 8443
+              protocol: UDP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            limits:
+              cpu: "2"
+              memory: 2Gi
+            requests:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: runtime-config
+              mountPath: /etc/uncrowned-king
+              readOnly: true
+      volumes:
+        - name: config-source
+          configMap:
+            name: audit-uncrowned-king-server-config
+        - name: credentials-source
+          secret:
+            secretName: audit-creds
+            defaultMode: 0400
+        - name: runtime-config
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: tls-source
+          secret:
+            secretName: audit-tls
+            defaultMode: 0400
+---
+# Source: uncrowned-king/templates/hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: audit-uncrowned-king-server
+  labels:
+    helm.sh/chart: uncrowned-king-0.1.2
+    app.kubernetes.io/name: uncrowned-king
+    app.kubernetes.io/instance: audit
+    app.kubernetes.io/version: "0.1.2"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: server
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: audit-uncrowned-king-server
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
