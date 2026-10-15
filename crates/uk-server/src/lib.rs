@@ -175,25 +175,28 @@ struct ConnectionRuntime {
 }
 
 impl ConnectionRuntime {
-    fn spawn_accepted(
+    /// Runs the admission checks shared by the TCP and QUIC accept paths:
+    /// the handshake-DoS rate limiter, then session permits, then handshake
+    /// permits. Metrics are recorded and rejections logged here; the caller
+    /// only has to refuse the pending connection in its carrier-specific
+    /// way (`drop` the TCP stream to send RST, `refuse()` the QUIC
+    /// incoming).
+    ///
+    /// Returns the acquired handshake permit when admitted.
+    fn admit_connection(
         &self,
-        connections: &mut JoinSet<()>,
-        tcp: TcpStream,
         peer: SocketAddr,
-        shutdown_rx: watch::Receiver<bool>,
-    ) {
+        carrier: &'static str,
+    ) -> Option<OwnedSemaphorePermit> {
         if !self.auth_rate_limiter.check(peer.ip()) {
             self.metrics.record_rate_limited_connection();
             warn!(
                 event = "server.auth_rate_limit.rejected",
                 peer = %peer,
+                carrier = carrier,
                 "IP is temporarily banned due to excessive authentication failures"
             );
-            // Drop the stream immediately (sending RST) instead of awaiting a
-            // graceful shutdown. A malicious peer that holds the TCP half-close
-            // open would otherwise block the entire accept loop.
-            drop(tcp);
-            return;
+            return None;
         }
 
         self.metrics.record_accepted_connection();
@@ -202,19 +205,35 @@ impl ConnectionRuntime {
             warn!(
                 event = "server.session.limit",
                 peer = %peer,
+                carrier = carrier,
                 max_sessions = self.max_sessions
             );
-            drop(tcp);
-            return;
+            return None;
         }
         let Ok(handshake_permit) = Arc::clone(&self.handshake_permits).try_acquire_owned() else {
             self.metrics.record_rejected_handshake();
             warn!(
                 event = "server.handshake.limit",
                 peer = %peer,
+                carrier = carrier,
                 max_handshakes = self.max_handshakes
             );
-            // Drop instead of shutdown — see the rate-limit rejection above.
+            return None;
+        };
+        Some(handshake_permit)
+    }
+
+    fn spawn_accepted(
+        &self,
+        connections: &mut JoinSet<()>,
+        tcp: TcpStream,
+        peer: SocketAddr,
+        shutdown_rx: watch::Receiver<bool>,
+    ) {
+        let Some(handshake_permit) = self.admit_connection(peer, "tcp") else {
+            // Drop the stream immediately (sending RST) instead of awaiting a
+            // graceful shutdown. A malicious peer that holds the TCP half-close
+            // open would otherwise block the entire accept loop.
             drop(tcp);
             return;
         };
@@ -251,38 +270,7 @@ impl ConnectionRuntime {
         peer: SocketAddr,
         shutdown_rx: watch::Receiver<bool>,
     ) {
-        if !self.auth_rate_limiter.check(peer.ip()) {
-            self.metrics.record_rate_limited_connection();
-            warn!(
-                event = "server.auth_rate_limit.rejected",
-                peer = %peer,
-                carrier = "quic",
-                "IP is temporarily banned due to excessive authentication failures"
-            );
-            incoming.refuse();
-            return;
-        }
-
-        self.metrics.record_accepted_connection();
-        if self.session_permits.available_permits() == 0 {
-            self.metrics.record_rejected_session();
-            warn!(
-                event = "server.session.limit",
-                peer = %peer,
-                carrier = "quic",
-                max_sessions = self.max_sessions
-            );
-            incoming.refuse();
-            return;
-        }
-        let Ok(handshake_permit) = Arc::clone(&self.handshake_permits).try_acquire_owned() else {
-            self.metrics.record_rejected_handshake();
-            warn!(
-                event = "server.handshake.limit",
-                peer = %peer,
-                carrier = "quic",
-                max_handshakes = self.max_handshakes
-            );
+        let Some(handshake_permit) = self.admit_connection(peer, "quic") else {
             incoming.refuse();
             return;
         };
@@ -481,13 +469,24 @@ where
         }
     }
 
-    drain_connection_tasks(&mut connections, shutdown_timeout).await;
+    drain_connection_tasks(&mut connections, shutdown_deadline(shutdown_timeout)).await;
     if let Some(endpoint) = &quic_endpoint {
         endpoint.close(0_u32.into(), b"server shutdown");
     }
     stop_observability(observability_shutdown_tx, observability_task).await;
 
     Ok(())
+}
+
+/// Converts the configured shutdown timeout into the single deadline shared
+/// by the whole shutdown sequence.
+///
+/// Connection tasks drain their sessions against `session_task_shutdown_timeout`
+/// internally, so the listener-level rejoin below must wait on the *same*
+/// deadline rather than granting another full timeout on top — otherwise
+/// worst-case shutdown would be ~2x the configured value.
+fn shutdown_deadline(shutdown_timeout: Option<Duration>) -> Option<time::Instant> {
+    shutdown_timeout.map(|timeout| time::Instant::now() + timeout)
 }
 
 /// Builds the QUIC endpoint (when configured) and logs its listen address.
@@ -799,16 +798,19 @@ fn log_connection_task_result(result: Option<Result<(), tokio::task::JoinError>>
     }
 }
 
-async fn drain_connection_tasks(connections: &mut JoinSet<()>, shutdown_timeout: Option<Duration>) {
-    if let Some(timeout) = shutdown_timeout {
-        if time::timeout(timeout, join_connection_tasks(connections))
+async fn drain_connection_tasks(
+    connections: &mut JoinSet<()>,
+    shutdown_deadline: Option<time::Instant>,
+) {
+    if let Some(deadline) = shutdown_deadline {
+        if time::timeout_at(deadline, join_connection_tasks(connections))
             .await
             .is_err()
         {
             warn!(
                 event = "server.shutdown.timeout",
                 remaining_connections = connections.len(),
-                timeout_seconds = timeout.as_secs()
+                "shutdown deadline exceeded; aborting remaining connection tasks"
             );
             connections.abort_all();
             join_connection_tasks(connections).await;
@@ -1267,7 +1269,7 @@ pub(crate) async fn authenticate_carrier(
 
     let replay_result = {
         let mut replay_cache = replay_cache.lock().await;
-        replay_cache.check_and_insert(verify_now, challenge.server_nonce, response.client_nonce)
+        replay_cache.check_and_insert(challenge.server_nonce, response.client_nonce)
     };
     if let Err(err) = replay_result {
         let _ = write_connection_error(&mut writer, ErrorCode::AuthFailed).await;
@@ -1472,7 +1474,7 @@ fn is_clean_tls_handshake_disconnect(error: &AnyError) -> bool {
                 | io::ErrorKind::BrokenPipe
                 | io::ErrorKind::NotConnected
         ) || is_tls_handshake_eof(error)
-    }) || error.to_string() == "tls handshake eof"
+    }) || error.to_string() == TLS_HANDSHAKE_EOF_MESSAGE
 }
 
 fn find_io_error<'a>(error: &'a (dyn Error + 'static)) -> Option<&'a io::Error> {
@@ -1486,8 +1488,20 @@ fn find_io_error<'a>(error: &'a (dyn Error + 'static)) -> Option<&'a io::Error> 
     None
 }
 
+/// Message of the `io::Error` produced when a client disconnects mid-TLS-handshake.
+///
+/// This string is produced by the TLS stack (tokio-rustls maps a peer EOF
+/// during the handshake to `io::ErrorKind::UnexpectedEof` with this message;
+/// see `tokio_rustls::common`), not by this crate, so it cannot be matched by
+/// type alone — and it can also arrive re-wrapped as a plain string through
+/// error conversions. It is centralized here so the dependency on the exact
+/// wording lives in exactly one place; if a tokio-rustls upgrade changes the
+/// wording, only this constant needs updating (the
+/// `classifies_clean_tls_handshake_disconnects` test pins it).
+const TLS_HANDSHAKE_EOF_MESSAGE: &str = "tls handshake eof";
+
 fn is_tls_handshake_eof(error: &io::Error) -> bool {
-    error.to_string() == "tls handshake eof"
+    error.to_string() == TLS_HANDSHAKE_EOF_MESSAGE
 }
 
 fn usize_limit(name: &str, value: u64) -> Result<usize, AnyError> {
@@ -1767,6 +1781,10 @@ mod tests {
 
     #[test]
     fn classifies_clean_tls_handshake_disconnects() {
+        // Pin the exact rustls wording: if a dependency upgrade changes it,
+        // this test fails loudly instead of the classifier silently
+        // misclassifying handshake EOFs as handshake failures.
+        assert_eq!(TLS_HANDSHAKE_EOF_MESSAGE, "tls handshake eof");
         let unexpected_eof: AnyError =
             io::Error::new(io::ErrorKind::UnexpectedEof, "client closed").into();
         let connection_reset: AnyError =
@@ -1776,7 +1794,11 @@ mod tests {
         let not_connected: AnyError =
             io::Error::new(io::ErrorKind::NotConnected, "client gone").into();
         let rustls_eof: AnyError =
-            io::Error::new(io::ErrorKind::InvalidData, "tls handshake eof").into();
+            io::Error::new(io::ErrorKind::UnexpectedEof, TLS_HANDSHAKE_EOF_MESSAGE).into();
+        // The same message re-wrapped as a plain string (e.g. through error
+        // conversions that lose the io::Error): only the string comparison
+        // catches this one.
+        let rewrapped_eof: AnyError = io::Error::other(TLS_HANDSHAKE_EOF_MESSAGE).into();
         let protocol_error: AnyError =
             io::Error::new(io::ErrorKind::InvalidData, "invalid certificate").into();
 
@@ -1785,6 +1807,7 @@ mod tests {
         assert!(is_clean_tls_handshake_disconnect(&broken_pipe));
         assert!(is_clean_tls_handshake_disconnect(&not_connected));
         assert!(is_clean_tls_handshake_disconnect(&rustls_eof));
+        assert!(is_clean_tls_handshake_disconnect(&rewrapped_eof));
         assert!(!is_clean_tls_handshake_disconnect(&protocol_error));
     }
 
@@ -1830,7 +1853,10 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            drain_connection_tasks(&mut connections, Some(Duration::from_millis(10))),
+            drain_connection_tasks(
+                &mut connections,
+                shutdown_deadline(Some(Duration::from_millis(10))),
+            ),
         )
         .await
         .unwrap();
@@ -1843,7 +1869,30 @@ mod tests {
         let mut connections = JoinSet::new();
         connections.spawn(async {});
 
-        drain_connection_tasks(&mut connections, Some(Duration::from_secs(1))).await;
+        drain_connection_tasks(
+            &mut connections,
+            shutdown_deadline(Some(Duration::from_secs(1))),
+        )
+        .await;
+
+        assert!(connections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn server_shutdown_deadline_in_past_aborts_without_waiting() {
+        let mut connections = JoinSet::new();
+        connections.spawn(std::future::pending::<()>());
+
+        // The shared deadline may already be exhausted when the listener
+        // reaches the rejoin (sessions drained against it internally); the
+        // rejoin must abort immediately rather than granting more time.
+        let past = time::Instant::now() - Duration::from_secs(1);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_connection_tasks(&mut connections, Some(past)),
+        )
+        .await
+        .unwrap();
 
         assert!(connections.is_empty());
     }
@@ -2054,7 +2103,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod review_settings_tests {
+mod settings_write_tests {
     use super::*;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -2080,7 +2129,7 @@ mod review_settings_tests {
     }
 
     #[tokio::test]
-    async fn review_settings_write_holds_session_after_shutdown() {
+    async fn settings_write_exits_on_shutdown_and_reclaims_permit() {
         let config: ServerConfig =
             toml::from_str(include_str!("../../../examples/server.toml")).unwrap();
         let cred = uk_auth::Credential::active(
@@ -2120,7 +2169,7 @@ mod review_settings_tests {
         let result = time::timeout(Duration::from_millis(100), handle).await;
         assert!(
             result.is_ok(),
-            "SETTINGS write ignores shutdown and has no write deadline; slot remains held"
+            "session did not exit within 100ms after shutdown; the SETTINGS write must observe shutdown and the slot must be released"
         );
         let session_res = result.unwrap().unwrap();
         assert!(
@@ -2135,7 +2184,7 @@ mod review_settings_tests {
     }
 
     #[tokio::test]
-    async fn review_settings_write_timeout_reclaims_permit() {
+    async fn settings_write_timeout_reclaims_permit() {
         let mut config: ServerConfig =
             toml::from_str(include_str!("../../../examples/server.toml")).unwrap();
         // Configure carrier write timeout to 1 second for fast empirical verification
@@ -2200,7 +2249,7 @@ mod review_settings_tests {
     }
 
     #[tokio::test]
-    async fn review_settings_write_pre_shutdown_cancels_immediately_and_reclaims_permit() {
+    async fn settings_write_pre_shutdown_cancels_immediately_and_reclaims_permit() {
         let config: ServerConfig =
             toml::from_str(include_str!("../../../examples/server.toml")).unwrap();
         let cred = uk_auth::Credential::active(

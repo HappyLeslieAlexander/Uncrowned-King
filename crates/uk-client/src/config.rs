@@ -7,8 +7,11 @@ use std::os::unix::fs::PermissionsExt;
 
 use serde::Deserialize;
 use tokio::sync::Semaphore;
+use tracing::warn;
 use uk_auth::{AuthError, validate_key_id, validate_shared_secret, warn_on_low_secret_diversity};
-use uk_proto::{MAX_FRAME_PAYLOAD_SIZE, validate_host_port_endpoint};
+use uk_proto::{
+    BindExposure, MAX_FRAME_PAYLOAD_SIZE, validate_host_port_endpoint, validate_observability_bind,
+};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Default number of concurrent carrier sessions in the client connection pool.
@@ -201,8 +204,21 @@ impl ClientConfig {
         validate_endpoint("server_addr", &self.server_addr)
             .map_err(|err| format!("server_addr: {err}"))?;
         if let Some(listen) = &self.observability_listen {
-            validate_endpoint("observability_listen", listen)
-                .map_err(|err| format!("observability_listen: {err}"))?;
+            // The probe endpoint is unauthenticated: wildcard binds are
+            // rejected outright, and any other non-loopback bind gets a
+            // loud warning so the operator consciously keeps it internal.
+            match validate_observability_bind("observability_listen", listen)
+                .map_err(|err| format!("observability_listen: {err}"))?
+            {
+                BindExposure::Loopback => {}
+                BindExposure::NonLoopback => warn!(
+                    event = "client.config.observability_non_loopback",
+                    listen = listen.as_str(),
+                    "observability_listen is bound to a non-loopback address; \
+                     the /metrics and probe endpoints are unauthenticated, \
+                     keep this listener on an internal network"
+                ),
+            }
         }
         let mut seen = HashSet::from([self.server_addr.as_str()]);
         for (index, endpoint) in self.server_addrs().iter().enumerate() {
@@ -558,7 +574,7 @@ secret = "0123456789abcdef0123456789abcdef"
 
         zeroize_client_secret(&mut secret);
 
-        assert!(secret.is_empty());
+        assert!(secret.is_empty(), "zeroize must clear the secret");
     }
 
     #[test]
@@ -1023,6 +1039,21 @@ secret = "secret"
         let error = config.validate_network_endpoints().unwrap_err().to_string();
 
         assert!(error.contains("observability_listen"));
+    }
+
+    #[test]
+    fn rejects_wildcard_observability_listener() {
+        for wildcard in ["0.0.0.0:9091", "[::]:9091"] {
+            let mut config = minimal_config();
+            config.observability_listen = Some(wildcard.to_owned());
+
+            let error = config.validate_network_endpoints().unwrap_err().to_string();
+
+            assert!(
+                error.contains("observability_listen") && error.contains("wildcard"),
+                "unexpected error for {wildcard}: {error}"
+            );
+        }
     }
 
     #[test]

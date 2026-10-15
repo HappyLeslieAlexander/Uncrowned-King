@@ -58,6 +58,13 @@ pub(crate) const SESSION_EVENT_QUEUE_BASE_CAPACITY: usize = 64;
 pub(crate) const SESSION_EVENT_QUEUE_PER_FLOW_CAPACITY: usize = 4;
 pub(crate) const SESSION_EVENT_QUEUE_MAX_CAPACITY: usize = 4096;
 pub(crate) const UDP_TARGET_BUFFER_SIZE: usize = 65_536;
+/// TCP keepalive idle time and probe interval, in seconds, for outbound
+/// target sockets dialed by the relay.
+///
+/// Deliberately fixed rather than following `tcp_keepalive_seconds`: that
+/// config knob governs *accepted* carrier connections, while these are
+/// short-lived per-flow relay legs.
+pub(crate) const TARGET_TCP_KEEPALIVE_SECONDS: u64 = 60;
 
 pub(crate) type AnyError = Box<dyn Error + Send + Sync>;
 pub(crate) type FlowTable = HashMap<u64, FlowSlot>;

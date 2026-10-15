@@ -97,9 +97,10 @@ fn validate_open_flags(open_flags: u16) -> ProtocolResult<()> {
 }
 
 fn validate_close_code(close_code: u16) -> ProtocolResult<()> {
-    match close_code {
-        TCP_CLOSE_NORMAL | TCP_CLOSE_ERROR => Ok(()),
-        _ => Err(ProtocolError::InvalidTcpPayload("unknown tcp close code")),
+    if crate::is_valid_close_code(close_code) {
+        Ok(())
+    } else {
+        Err(ProtocolError::InvalidTcpPayload("unknown tcp close code"))
     }
 }
 

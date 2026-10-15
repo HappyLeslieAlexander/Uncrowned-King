@@ -1,6 +1,10 @@
 //! Shared host:port endpoint validation.
 
-use std::{error::Error, fmt, net::SocketAddr};
+use std::{
+    error::Error,
+    fmt,
+    net::{IpAddr, SocketAddr},
+};
 
 /// Error returned when a configured endpoint is malformed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,6 +19,7 @@ enum EndpointErrorKind {
     InvalidHost,
     InvalidPort,
     ZeroPort,
+    WildcardBind,
 }
 
 impl EndpointError {
@@ -36,6 +41,13 @@ impl fmt::Display for EndpointError {
             EndpointErrorKind::ZeroPort => {
                 write!(f, "{} port must be 1..=65535", self.name)
             }
+            EndpointErrorKind::WildcardBind => write!(
+                f,
+                "{} must not bind a wildcard address (0.0.0.0 or [::]); \
+                 the observability endpoint is unauthenticated, so bind \
+                 127.0.0.1, [::1], or a specific internal interface address",
+                self.name
+            ),
         }
     }
 }
@@ -80,6 +92,57 @@ fn validate_port(name: &'static str, port: u16) -> Result<(), EndpointError> {
     } else {
         Ok(())
     }
+}
+
+/// How exposed an observability/metrics bind address is.
+///
+/// The probe endpoint served on `observability_listen` is unauthenticated,
+/// so binding it anywhere reachable off-host is a deployment decision the
+/// operator must make consciously.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindExposure {
+    /// Loopback address (`127.0.0.1`, `[::1]`): safe, no warning.
+    Loopback,
+    /// A specific non-loopback IP, or a hostname that cannot be classified
+    /// without resolving DNS: reachable off-host, the operator must ensure
+    /// it stays on an internal network.
+    NonLoopback,
+}
+
+/// Validates an `observability_listen`-style bind address.
+///
+/// The address must first be a well-formed `host:port` endpoint
+/// ([`validate_host_port_endpoint`]). Wildcard binds (`0.0.0.0`, `[::]`)
+/// are rejected outright: on a host with a public address they would expose
+/// the unauthenticated metrics endpoint to the internet, and a wildcard
+/// never expresses the intent "internal only". Bind `127.0.0.1`, `[::1]`,
+/// or a specific internal interface address (for example a Kubernetes pod
+/// IP supplied via the downward API) instead.
+///
+/// Returns [`BindExposure::NonLoopback`] for specific non-loopback
+/// addresses and hostnames so the caller can log a warning; loopback
+/// binds are silent.
+pub fn validate_observability_bind(
+    name: &'static str,
+    value: &str,
+) -> Result<BindExposure, EndpointError> {
+    validate_host_port_endpoint(name, value)?;
+    let host = endpoint_host(value)
+        .ok_or_else(|| EndpointError::new(name, EndpointErrorKind::InvalidHost))?;
+    let exposure = match host.parse::<IpAddr>() {
+        Ok(ip) if ip.is_unspecified() => {
+            return Err(EndpointError::new(name, EndpointErrorKind::WildcardBind));
+        }
+        Ok(ip) if ip.is_loopback() => BindExposure::Loopback,
+        _ => BindExposure::NonLoopback,
+    };
+    Ok(exposure)
+}
+
+/// Extracts the host part of a `host:port` endpoint previously accepted by
+/// [`validate_host_port_endpoint`].
+fn endpoint_host(value: &str) -> Option<&str> {
+    split_host_port(value).map(|(host, _)| host)
 }
 
 #[cfg(test)]
@@ -149,6 +212,50 @@ mod tests {
         assert_eq!(
             validate_host_port_endpoint("listen", "127.0.0.1:0"),
             Err(EndpointError::new("listen", EndpointErrorKind::ZeroPort))
+        );
+    }
+
+    #[test]
+    fn observability_bind_accepts_loopback() {
+        assert_eq!(
+            validate_observability_bind("observability_listen", "127.0.0.1:9090"),
+            Ok(BindExposure::Loopback)
+        );
+        assert_eq!(
+            validate_observability_bind("observability_listen", "[::1]:9090"),
+            Ok(BindExposure::Loopback)
+        );
+    }
+
+    #[test]
+    fn observability_bind_rejects_wildcard() {
+        assert_eq!(
+            validate_observability_bind("observability_listen", "0.0.0.0:9090"),
+            Err(EndpointError::new(
+                "observability_listen",
+                EndpointErrorKind::WildcardBind
+            ))
+        );
+        assert_eq!(
+            validate_observability_bind("observability_listen", "[::]:9090"),
+            Err(EndpointError::new(
+                "observability_listen",
+                EndpointErrorKind::WildcardBind
+            ))
+        );
+    }
+
+    #[test]
+    fn observability_bind_flags_non_loopback() {
+        assert_eq!(
+            validate_observability_bind("observability_listen", "10.0.0.5:9090"),
+            Ok(BindExposure::NonLoopback)
+        );
+        // Hostnames cannot be classified without DNS; treat as non-loopback
+        // so the caller warns.
+        assert_eq!(
+            validate_observability_bind("observability_listen", "metrics.internal:9090"),
+            Ok(BindExposure::NonLoopback)
         );
     }
 }

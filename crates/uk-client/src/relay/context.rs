@@ -735,9 +735,23 @@ pub(crate) fn reserve_bytes(buffered_bytes: &AtomicUsize, amount: usize, limit: 
 }
 
 pub(crate) fn release_bytes(buffered_bytes: &AtomicUsize, amount: usize) {
-    let _ = buffered_bytes.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-        Some(current.saturating_sub(amount))
-    });
+    // Written as an explicit compare-exchange loop rather than
+    // `fetch_update`/`try_update`: the former is deprecated on recent
+    // toolchains while the latter is not stable on the 1.85 MSRV, so no
+    // single method name is warning-free on both.
+    let mut current = buffered_bytes.load(Ordering::SeqCst);
+    loop {
+        let next = current.saturating_sub(amount);
+        match buffered_bytes.compare_exchange_weak(
+            current,
+            next,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 pub(crate) fn usize_limit(value: u64) -> Result<usize, AnyError> {

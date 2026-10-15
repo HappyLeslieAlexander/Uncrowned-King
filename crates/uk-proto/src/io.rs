@@ -108,16 +108,6 @@ impl<R> FrameReader<R> {
             limits,
         }
     }
-
-    /// Returns the frame limits applied to decoded headers.
-    pub fn limits(&self) -> FrameLimits {
-        self.limits
-    }
-
-    /// Returns true when buffered bytes are still waiting to be decoded.
-    pub fn has_buffered_bytes(&self) -> bool {
-        !self.buffer.is_empty()
-    }
 }
 
 impl<R> FrameReader<R>
@@ -579,7 +569,7 @@ mod tests {
 
         let mut written = Vec::new();
         reader.read_to_end(&mut written).await.unwrap();
-        assert!(written.is_empty());
+        assert!(written.is_empty(), "expected no bytes written");
     }
 
     #[tokio::test]
@@ -617,6 +607,6 @@ mod tests {
 
         let mut written = Vec::new();
         reader.read_to_end(&mut written).await.unwrap();
-        assert!(written.is_empty());
+        assert!(written.is_empty(), "expected no bytes written");
     }
 }

@@ -1317,7 +1317,7 @@ async fn run_client_disconnect_e2e() -> Result<(), TestError> {
     drop(socks);
 
     let target_received = target_task.await??;
-    assert!(target_received.is_empty());
+    assert!(target_received.is_empty(), "target must receive no data");
     Ok(())
 }
 
@@ -2398,7 +2398,7 @@ async fn run_buffered_limit_e2e() -> Result<(), TestError> {
     assert_eq!(socks.read(&mut eof).await?, 0);
 
     let target_received = target_task.await??;
-    assert!(target_received.is_empty());
+    assert!(target_received.is_empty(), "target must receive no data");
     Ok(())
 }
 
@@ -2436,7 +2436,10 @@ async fn run_client_flow_resource_limit_keeps_session_e2e() -> Result<(), TestEr
     )
     .await?;
     write_frame(&mut carrier, &tcp_close_frame(1, TCP_CLOSE_ERROR)?).await?;
-    assert!(first_target_task.await??.is_empty());
+    assert!(
+        first_target_task.await??.is_empty(),
+        "first target must receive no data"
+    );
 
     write_frame(&mut carrier, &tcp_open_frame(3, second_target_addr)?).await?;
     read_open_ack(&mut carrier, 3).await?;
@@ -2503,7 +2506,7 @@ async fn run_half_close_timeout_e2e() -> Result<(), TestError> {
     assert_eq!(socks.read(&mut eof).await?, 0);
 
     let target_received = target_task.await??;
-    assert!(target_received.is_empty());
+    assert!(target_received.is_empty(), "target must receive no data");
     Ok(())
 }
 
@@ -3047,7 +3050,7 @@ async fn run_duplicate_tcp_open_error_e2e() -> Result<(), TestError> {
     assert_eq!(TcpClose::decode(&mut payload)?.close_code, TCP_CLOSE_ERROR);
 
     let target_received = tokio::time::timeout(Duration::from_secs(3), target_task).await???;
-    assert!(target_received.is_empty());
+    assert!(target_received.is_empty(), "target must receive no data");
     Ok(())
 }
 
@@ -3121,7 +3124,7 @@ async fn run_wrong_protocol_udp_close_on_tcp_flow_e2e() -> Result<(), TestError>
     assert_flow_error(&mut carrier, 1, ErrorCode::Protocol).await?;
 
     let target_received = tokio::time::timeout(Duration::from_secs(3), target_task).await???;
-    assert!(target_received.is_empty());
+    assert!(target_received.is_empty(), "target must receive no data");
     Ok(())
 }
 
@@ -3192,7 +3195,7 @@ async fn run_wrong_protocol_udp_data_on_tcp_flow_e2e() -> Result<(), TestError> 
     assert_flow_error(&mut carrier, 1, ErrorCode::Protocol).await?;
 
     let target_received = tokio::time::timeout(Duration::from_secs(3), target_task).await???;
-    assert!(target_received.is_empty());
+    assert!(target_received.is_empty(), "target must receive no data");
     Ok(())
 }
 

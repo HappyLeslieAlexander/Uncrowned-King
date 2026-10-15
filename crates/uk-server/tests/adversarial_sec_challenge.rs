@@ -1,5 +1,11 @@
 //! Exhaustive adversarial verification tests for SEC-01, SEC-02, SEC-03, SEC-04.
 //! Designed and executed by Challenger 1.
+//!
+//! NOTE: this file lives under `uk-server/tests/` but deliberately exercises
+//! `uk-auth`, `uk-policy` and `uk-proto`, not the server itself. It is a
+//! workspace-wide adversarial suite, and `uk-server` is its home only because
+//! it is the crate whose dev-dependencies cover all three crates under test.
+//! Keep it cross-crate: do not let server-specific tests creep in here.
 
 #![allow(
     unknown_lints,
