@@ -3931,7 +3931,9 @@ async fn quic_carrier_multiplexes_concurrent_tcp_flows() -> Result<(), TestError
 }
 
 async fn run_quic_multiplexed_tcp_flows_e2e() -> Result<(), TestError> {
-    const FLOW_COUNT: u64 = 8;
+    // Keep well under test_limits()' max_streams (8): opening exactly the
+    // limit risks the server rejecting the last flow with an Error frame.
+    const FLOW_COUNT: u64 = 4;
     init_tracing();
 
     let temp_dir = create_temp_dir()?;
@@ -4125,14 +4127,16 @@ async fn run_quic_concurrent_udp_associations_e2e() -> Result<(), TestError> {
     })
     .await?;
 
-    // Three independent UDP associations sharing the one QUIC carrier.
+    // Three independent UDP associations sharing the one QUIC carrier. Each
+    // SOCKS5 UDP association lives as long as its TCP control connection, so
+    // the control streams must stay open for the whole test.
     let mut associations = Vec::with_capacity(ASSOCIATION_COUNT);
     for _ in 0..ASSOCIATION_COUNT {
-        let (_socks_control, udp_relay_addr) = open_socks_udp_associate(socks_addr).await?;
+        let (socks_control, udp_relay_addr) = open_socks_udp_associate(socks_addr).await?;
         let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-        associations.push((udp_client, udp_relay_addr));
+        associations.push((socks_control, udp_client, udp_relay_addr));
     }
-    for (index, (udp_client, udp_relay_addr)) in associations.iter().enumerate() {
+    for (index, (_socks_control, udp_client, udp_relay_addr)) in associations.iter().enumerate() {
         let payload = format!("quic concurrent udp association {index}").into_bytes();
         assert_socks_udp_roundtrip(udp_client, *udp_relay_addr, target_addr, &payload).await?;
     }
