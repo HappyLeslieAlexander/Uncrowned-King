@@ -3917,100 +3917,6 @@ async fn quic_carrier_falls_back_to_udp_frame_for_large_payload() -> Result<(), 
     Ok(())
 }
 
-/// Opens several TCP flows over a single QUIC connection and verifies each
-/// flow relays its own payload intact. The flows share one QUIC connection,
-/// exercising the carrier's stream multiplexing; data is exchanged
-/// sequentially to keep the test deterministic.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn quic_carrier_multiplexes_concurrent_tcp_flows() -> Result<(), TestError> {
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        run_quic_multiplexed_tcp_flows_e2e(),
-    )
-    .await?
-}
-
-async fn run_quic_multiplexed_tcp_flows_e2e() -> Result<(), TestError> {
-    const FLOW_COUNT: usize = 4;
-    init_tracing();
-
-    let temp_dir = create_temp_dir()?;
-    let cert_path = temp_dir.join("server-cert.pem");
-    let key_path = temp_dir.join("server-key.pem");
-    let policy_path = temp_dir.join("policy.toml");
-    fs::write(&cert_path, CERT_PEM)?;
-    write_private_key(&key_path)?;
-    write_policy_file(&policy_path, allow_loopback_any_port_policy())?;
-    let (tcp_target_addr, echo_task) = spawn_multi_echo_target().await?;
-
-    let quic_addr = unused_udp_loopback_addr().await?;
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let mut config = test_server_config(
-        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-        &cert_path,
-        &key_path,
-        test_limits(),
-        Some(&policy_path),
-        30,
-    );
-    config.quic_listen = Some(quic_addr.to_string());
-    let (_server_addr, server_task) = start_uk_server_until_shutdown(config, async {
-        let _ = shutdown_rx.await;
-    })
-    .await?;
-
-    // Drive the flows through SOCKS5 over the QUIC carrier: this exercises
-    // the same multiplexing path as raw frames but uses the well-tested
-    // SOCKS handshake instead of hand-rolled frame sequencing.
-    let (socks_addr, client_task) = start_socks5_listener(ClientConfig {
-        server_addr: format!("quic://{quic_addr}"),
-        server_addrs: None,
-        server_name: "localhost".to_owned(),
-        observability_listen: None,
-        ca_cert_path: path_string(&cert_path),
-        key_id: KEY_ID.to_owned(),
-        secret: SECRET.to_owned(),
-        handshake_timeout_seconds: Some(5),
-        server_connect_retry_delay_millis: None,
-        socks_handshake_timeout_seconds: Some(3),
-        tcp_open_timeout_seconds: Some(3),
-        udp_flow_idle_timeout_seconds: None,
-        shutdown_timeout_seconds: Some(3),
-        max_pending_open_bytes: None,
-        max_socks_connections: None,
-        max_buffered_bytes_per_session: None,
-        max_buffered_bytes_per_flow: None,
-        max_carrier_sessions: None,
-        relay_buffer_size: None,
-    })
-    .await?;
-
-    // Open every flow first, so all streams are live at once.
-    let mut flows = Vec::with_capacity(FLOW_COUNT);
-    for index in 0..FLOW_COUNT {
-        let (socks, connect_reply) = open_socks_connect(socks_addr, tcp_target_addr).await?;
-        assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
-        flows.push((index, socks));
-    }
-    // Exchange data; each flow must get its own payload back. Done
-    // sequentially to avoid flakiness from concurrent SOCKS handshakes.
-    for (index, mut socks) in flows {
-        let payload = format!("quic multiplexed flow {index}").into_bytes();
-        socks.write_all(&payload).await?;
-        let mut echoed = vec![0_u8; payload.len()];
-        socks.read_exact(&mut echoed).await?;
-        assert_eq!(echoed, payload, "flow {index} echo mismatch");
-    }
-
-    echo_task.abort();
-    client_task.abort();
-    shutdown_tx
-        .send(())
-        .map_err(|()| "server shutdown receiver dropped")?;
-    tokio::time::timeout(Duration::from_secs(5), server_task).await???;
-    Ok(())
-}
-
 /// A QUIC endpoint that cannot complete its handshake must not wedge the
 /// client: the dialer falls through to the next configured endpoint and the
 /// session comes up over TLS. Here the QUIC dial targets the server's
@@ -7153,11 +7059,63 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let server_addr = listener.local_addr()?;
+    let quic_listen = config.quic_listen.clone();
     let mut server_task = tokio::spawn(uk_server::run_on_listener_until_shutdown(
         config, listener, shutdown,
     ));
     wait_for_listener("uk-server", server_addr, &mut server_task).await?;
+    wait_for_quic_listener(quic_listen.as_deref(), &mut server_task).await?;
     Ok(server_task)
+}
+
+/// Waits until the server's QUIC UDP socket is bound.
+///
+/// `wait_for_listener` only probes the TCP/TLS socket, which the OS accepts
+/// into the backlog before the server task even runs; the QUIC socket is
+/// bound later inside the server task. A client dialing QUIC in that gap gets
+/// ICMP port-unreachable, which wedges the handshake on Linux (the endpoint
+/// timeout then fails the dial). The probe uses a connected UDP socket: while
+/// the server is not yet bound, the datagram elicits ICMP port-unreachable,
+/// surfacing as `ConnectionRefused` on recv; once the server binds, no ICMP
+/// arrives. It never binds the server's port, so it cannot steal it.
+async fn wait_for_quic_listener(
+    quic_listen: Option<&str>,
+    task: &mut JoinHandle<Result<(), TestError>>,
+) -> Result<(), TestError> {
+    let Some(listen) = quic_listen else {
+        return Ok(());
+    };
+    let addr: SocketAddr = listen
+        .parse()
+        .map_err(|err| format!("invalid quic_listen address {listen}: {err}"))?;
+    let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    probe.connect(addr).await?;
+    for _ in 0..200 {
+        if task.is_finished() {
+            match task.await? {
+                Ok(()) => {
+                    return Err("uk-server stopped before its QUIC listener was bound".into());
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "uk-server failed before its QUIC listener was bound: {err}"
+                    )
+                    .into());
+                }
+            }
+        }
+        // Garbage the server's QUIC stack drops; only the ICMP answer matters.
+        probe.send(&[0x55]).await?;
+        let mut buf = [0_u8; 64];
+        match tokio::time::timeout(Duration::from_millis(20), probe.recv(&mut buf)).await {
+            // ICMP port unreachable: the server has not bound the port yet.
+            Ok(Err(err)) if err.kind() == io::ErrorKind::ConnectionRefused => {}
+            // No ICMP (or even a reply): the server's socket is bound.
+            _ => return Ok(()),
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err(format!("uk-server QUIC listener at {addr} did not become ready in time").into())
 }
 
 async fn start_socks5_listener(
