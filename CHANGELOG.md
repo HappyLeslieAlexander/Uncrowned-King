@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Fuzz coverage for all untrusted-input parsers**: five new libfuzzer targets — `datagram_decode`, `settings_decode`, `error_payload_decode`, `frame_reader` (adversarial chunk splits plus a differential check that incremental decoding matches one-shot `Frame::decode`), and `auth_verify` (HMAC/tag/timestamp/replay paths on arbitrary bytes). All ran clean in smoke testing.
+- **QUIC relay tests**: concurrent TCP flow multiplexing over one QUIC carrier, QUIC handshake-failure fallback to TLS, and concurrent UDP associations over one carrier.
+- **Real SIGHUP end-to-end test** (`uk-server/tests/sighup_reload_e2e.rs`): spawns the actual server binary, rotates TLS certificates on disk, delivers SIGHUP, and verifies new connections serve the rotated identity while pre-existing connections survive — exercising the true signal path, not a simulation.
+- **Soak test runs in CI**: `soak_sustained_relay_and_chaos` is no longer `#[ignore]`d (passes reliably with a ~2s default); set `UK_SOAK_SECONDS` for manual long-duration runs.
+- **Criterion benchmarks**: handshake auth operations (`uk-auth/benches/auth.rs`) and the frame pipeline (`uk-proto/benches/pipeline.rs`: duplex round-trip, coalesced vs. single writes).
+
+### Changed
+
+- **Relay data plane no longer allocates per frame**: `write_frame` encodes the header into a 20-byte stack buffer and emits header+payload via vectored writes. Wire bytes are identical. Measured duplex throughput: 2.80 → 5.84 GiB/s (+108%).
+- **Handshake/auth buffers exactly pre-sized** (no more reserve→realloc growth): auth verify 4.0× faster, `Frame::encode` ~16% faster.
+- **Import hygiene**: removed all 16 `#![allow(unused_imports, clippy::wildcard_imports)]` attributes from relay modules; 39 glob imports replaced with explicit lists, 100+ unused imports dropped (net -207 lines). Unused imports now fail CI instead of being silently suppressed.
+
 ### Security
 
 - **Unauthenticated observability endpoint hardening**: wildcard binds (`0.0.0.0`, `[::]`) for `observability_listen` are now rejected at startup in both `uk-server` and `uk-client` — the `/healthz`, `/readyz` and `/metrics` endpoints have no authentication, so a wildcard bind on a host with a public address would expose them to the internet. Specific non-loopback binds (e.g. a Kubernetes pod IP) are still allowed but log a loud warning. New shared validator `uk_proto::validate_observability_bind`.
