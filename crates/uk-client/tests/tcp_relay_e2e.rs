@@ -3985,13 +3985,17 @@ async fn run_quic_multiplexed_tcp_flows_e2e() -> Result<(), TestError> {
     .await?;
 
     // Open every flow before exchanging data, so all streams are live at once.
-    for flow_id in 1..=FLOW_COUNT {
+    // Client-initiated flow IDs must be odd (see is_client_initiated_flow_id).
+    for index in 0..FLOW_COUNT {
+        let flow_id = index * 2 + 1;
         write_frame(&mut carrier, &tcp_open_frame(flow_id, tcp_target_addr)?).await?;
     }
-    for flow_id in 1..=FLOW_COUNT {
+    for index in 0..FLOW_COUNT {
+        let flow_id = index * 2 + 1;
         read_open_ack(&mut carrier, flow_id).await?;
     }
-    for flow_id in 1..=FLOW_COUNT {
+    for index in 0..FLOW_COUNT {
+        let flow_id = index * 2 + 1;
         let payload = Bytes::from(format!("quic multiplexed flow {flow_id}"));
         write_frame(
             &mut carrier,
@@ -4001,7 +4005,8 @@ async fn run_quic_multiplexed_tcp_flows_e2e() -> Result<(), TestError> {
     }
     // Read the echoes back; each must carry its own flow's payload even
     // though the frames arrive interleaved on the single connection.
-    for flow_id in 1..=FLOW_COUNT {
+    for index in 0..FLOW_COUNT {
+        let flow_id = index * 2 + 1;
         let expected = Bytes::from(format!("quic multiplexed flow {flow_id}"));
         let echo = read_relay_frame(&mut carrier, FrameType::TcpData, flow_id).await?;
         assert_eq!(echo.payload, expected, "flow {flow_id} echo mismatch");
