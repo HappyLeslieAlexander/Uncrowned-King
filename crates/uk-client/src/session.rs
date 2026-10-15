@@ -285,8 +285,13 @@ fn clear_endpoint_degraded(endpoint: &str) {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn clear_all_degraded_endpoints() {
+/// Clears all degraded-endpoint cooldowns.
+///
+/// Called when a config reload is applied: the operator just changed the
+/// network posture (possibly fixing whatever degraded the endpoint), so
+/// penalties recorded under the old config must not linger for up to
+/// `DEGRADED_COOLDOWN` on reused endpoints.
+pub(crate) fn clear_degraded_endpoints() {
     if let Ok(mut map) = DEGRADED_ENDPOINTS.lock() {
         map.clear();
     }
@@ -952,7 +957,7 @@ mod tests {
 
     #[test]
     fn tracks_and_clears_degraded_endpoints() {
-        clear_all_degraded_endpoints();
+        clear_degraded_endpoints();
         let ep = "quic://127.0.0.1:9443";
         assert!(!is_endpoint_degraded(ep));
         mark_endpoint_degraded(ep);
@@ -960,7 +965,7 @@ mod tests {
         clear_endpoint_degraded(ep);
         assert!(!is_endpoint_degraded(ep));
         mark_endpoint_degraded(ep);
-        clear_all_degraded_endpoints();
+        clear_degraded_endpoints();
         assert!(!is_endpoint_degraded(ep));
     }
 }

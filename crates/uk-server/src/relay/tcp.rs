@@ -47,6 +47,11 @@ use crate::observability::{
     ActiveFlowGuard, FlowOpenFailure, RelayDirection, RelayProtocol, ServerMetrics,
 };
 use crate::security::SecurityState;
+/// Whether a `TCP_CLOSE(NORMAL)` should start a half-close drain timer.
+///
+/// Only the close that actually half-closes the flow qualifies. Testing the
+/// target read side alone would arm a fresh timer for every duplicate
+/// `TCP_CLOSE`, since a repeat leaves the slot in place with that side open.
 pub(crate) const fn should_start_half_close_drain(target: &TargetFlow) -> bool {
     target.client_to_target_open && target.target_to_client_open
 }

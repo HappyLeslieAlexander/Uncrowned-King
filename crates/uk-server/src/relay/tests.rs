@@ -556,7 +556,7 @@ async fn carrier_write_is_refused_once_the_session_is_closing() {
     drop(writer);
     let mut written = Vec::new();
     reader.read_to_end(&mut written).await.unwrap();
-    assert!(written.is_empty());
+    assert!(written.is_empty(), "expected no bytes written");
 }
 
 /// Shutdown must not truncate a frame that is already going out: dropping

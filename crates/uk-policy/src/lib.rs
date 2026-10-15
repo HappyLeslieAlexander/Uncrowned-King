@@ -104,9 +104,14 @@ impl PolicySet {
         PolicyDecision::Deny
     }
 
-    /// Checks if the policy set contains any `Allow` rule that can match private
-    /// or loopback destinations without being preceded by a blanket
-    /// `action = "deny", private = true` rule, and without an explicit `private` constraint.
+    /// Checks if the policy set contains any `Allow` rule that explicitly
+    /// permits private or loopback destinations (`private = true`) without
+    /// being preceded by a blanket `action = "deny", private = true` rule.
+    ///
+    /// The evaluator already denies private targets for `Allow` rules unless
+    /// they opt in with `private = true` (see [`PolicySet::evaluate`]), so
+    /// only explicit opt-ins are reported here. Such rules are a deliberate
+    /// SSRF surface and deserve a startup warning.
     pub fn has_unrestricted_private_allow(&self) -> bool {
         let mut has_blanket_private_deny = false;
         for rule in &self.rules {
@@ -114,7 +119,7 @@ impl PolicySet {
                 has_blanket_private_deny = true;
             } else if rule.action == PolicyDecision::Allow
                 && !has_blanket_private_deny
-                && rule.private.is_none()
+                && rule.private == Some(true)
             {
                 return true;
             }
@@ -859,15 +864,26 @@ mod tests {
 
     #[test]
     fn detects_unrestricted_private_allow_rules() {
+        // `private` omitted on a programmatic rule: the evaluator treats this
+        // as "deny private", so it is not an unrestricted allow.
         let mut allow_rule = PolicyRule::new(PolicyDecision::Allow);
         allow_rule.private = None;
         allow_rule.domain_suffix = Some(".example.com".to_owned());
-        let insecure_policy = PolicySet::new(vec![allow_rule.clone()]);
+        let default_policy = PolicySet::new(vec![allow_rule.clone()]);
+        assert!(!default_policy.has_unrestricted_private_allow());
+
+        // Explicit `private = true` without a preceding blanket deny: this
+        // genuinely permits private/loopback targets and must be reported.
+        let mut allow_private = PolicyRule::new(PolicyDecision::Allow);
+        allow_private.private = Some(true);
+        let insecure_policy = PolicySet::new(vec![allow_private.clone()]);
         assert!(insecure_policy.has_unrestricted_private_allow());
 
+        // A preceding blanket `deny private = true` shadows the allow for
+        // private targets, so nothing is reported.
         let mut deny_private = PolicyRule::new(PolicyDecision::Deny);
         deny_private.private = Some(true);
-        let secure_policy = PolicySet::new(vec![deny_private, allow_rule.clone()]);
+        let secure_policy = PolicySet::new(vec![deny_private, allow_private.clone()]);
         assert!(!secure_policy.has_unrestricted_private_allow());
 
         let mut allow_public_only = allow_rule;

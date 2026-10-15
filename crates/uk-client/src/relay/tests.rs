@@ -1122,7 +1122,7 @@ async fn carrier_write_is_refused_once_the_session_is_closing() {
     drop(writer);
     let mut written = Vec::new();
     reader.read_to_end(&mut written).await.unwrap();
-    assert!(written.is_empty());
+    assert!(written.is_empty(), "expected no bytes written");
 }
 
 /// Shutdown must not truncate a frame that is already going out: dropping
@@ -2118,7 +2118,7 @@ async fn shutdown_flush_is_a_no_op_without_buffered_frames() {
 
     let mut received = Vec::new();
     reader.read_to_end(&mut received).await.unwrap();
-    assert!(received.is_empty());
+    assert!(received.is_empty(), "expected no bytes received");
 }
 
 #[tokio::test]

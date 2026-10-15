@@ -24,7 +24,7 @@ This document establishes the non-negotiable architectural invariants, security 
 
 - **Secure-by-Default Access Control (`uk-policy`)**:
   - Any `Allow` rule in `PolicyRule` must default to rejecting private/loopback IPs (`private = Some(false)`) unless explicitly configured with `private = true`.
-  - Cloud provider metadata service addresses (AWS `169.254.169.254`, GCP `100.100.100.200`, Azure WireServer `168.63.129.16`, AWS IPv6 `fd00:ec2::254`) must be permanently rejected before evaluating any user-defined rules.
+  - Cloud provider metadata service addresses (AWS/GCP `169.254.169.254`, Alibaba Cloud `100.100.100.200`, Azure WireServer `168.63.129.16`, AWS IPv6 `fd00:ec2::254`) must be permanently rejected before evaluating any user-defined rules.
   - Domain validation must strictly reject IP literal strings (`"127.0.0.1"`, `"::1"`) passed as `Target::Domain` to prevent policy bypass.
 
 - **Atomic Reload & State Isolation**:

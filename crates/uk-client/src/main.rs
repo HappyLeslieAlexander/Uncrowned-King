@@ -72,6 +72,14 @@ async fn main() -> Result<(), AnyError> {
         } => {
             check_config(&config)?;
             validate_host_port_endpoint("socks listen", &listen)?;
+            // Reject a forbidden bind *before* the socket exists: binding
+            // first and validating after would briefly expose an
+            // unauthenticated SOCKS5 listener the operator did not approve.
+            // Hostnames cannot be classified without DNS, so the post-bind
+            // check below stays as the second layer for those.
+            if let Ok(requested) = listen.parse::<SocketAddr>() {
+                validate_socks_listener_scope(requested, allow_non_loopback)?;
+            }
             let listener = TcpListener::bind(&listen).await?;
             let listen = listener.local_addr()?;
             validate_socks_listener_scope(listen, allow_non_loopback)?;

@@ -14,6 +14,21 @@ use crate::{
 /// Default maximum concurrent streams when SETTINGS omits `max_streams`.
 pub const DEFAULT_MAX_STREAMS: u64 = 64;
 
+/// Upper bound accepted for peer-advertised `max_streams` / `max_udp_flows`.
+///
+/// These values size admission semaphores and flow tables on the receiving
+/// side, so the wire protocol caps them even though honest peers advertise
+/// far less. One million concurrent flows is orders of magnitude above any
+/// realistic deployment; anything larger is treated as a hostile or broken
+/// peer and fails negotiation instead of silently sizing state.
+pub const MAX_NEGOTIATED_FLOWS: u64 = 1_000_000;
+
+/// Upper bound accepted for peer-advertised `idle_timeout_seconds`.
+///
+/// Thirty days; beyond that the value is meaningless for an idle timer and
+/// only risks `Duration` overflow in consumers that convert it directly.
+pub const MAX_NEGOTIATED_IDLE_TIMEOUT_SECONDS: u64 = 30 * 24 * 60 * 60;
+
 /// Wire protocol revision implemented by Uncrowned King v0.1.
 pub const PROTOCOL_REVISION_V0_1: u64 = 1;
 
@@ -167,6 +182,29 @@ impl Settings {
             SettingKey::MaxFrameSize,
             "max_frame_size",
             MAX_FRAME_PAYLOAD_SIZE,
+        )?;
+        // `max_streams`, `max_udp_flows` and `idle_timeout_seconds` have no
+        // lower structural bound beyond non-zero, but they must not be
+        // unbounded: they size semaphores, flow tables and timers on the
+        // receiving side. Cap them at the wire protocol level so every
+        // consumer gets sane values without having to clamp defensively.
+        reject_large_setting(
+            self,
+            SettingKey::MaxStreams,
+            "max_streams",
+            MAX_NEGOTIATED_FLOWS,
+        )?;
+        reject_large_setting(
+            self,
+            SettingKey::MaxUdpFlows,
+            "max_udp_flows",
+            MAX_NEGOTIATED_FLOWS,
+        )?;
+        reject_large_setting(
+            self,
+            SettingKey::IdleTimeoutSeconds,
+            "idle_timeout_seconds",
+            MAX_NEGOTIATED_IDLE_TIMEOUT_SECONDS,
         )?;
 
         let max_frame_size = self
@@ -450,6 +488,53 @@ mod tests {
             Err(ProtocolError::InvalidSettings(
                 "max_udp_flows exceeds max_streams"
             ))
+        );
+    }
+
+    #[test]
+    fn rejects_absurd_peer_advertised_flow_limits() {
+        for key in [SettingKey::MaxStreams, SettingKey::MaxUdpFlows] {
+            let mut settings = Settings::default();
+            settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V0_1);
+            settings.set(SettingKey::MaxStreams, MAX_NEGOTIATED_FLOWS);
+            settings.set(key, MAX_NEGOTIATED_FLOWS + 1);
+
+            assert!(
+                settings.negotiated_v0_1().is_err(),
+                "{key:?} above MAX_NEGOTIATED_FLOWS must fail negotiation"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_absurd_peer_advertised_idle_timeout() {
+        let mut settings = Settings::default();
+        settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V0_1);
+        settings.set(
+            SettingKey::IdleTimeoutSeconds,
+            MAX_NEGOTIATED_IDLE_TIMEOUT_SECONDS + 1,
+        );
+
+        assert!(settings.negotiated_v0_1().is_err());
+    }
+
+    #[test]
+    fn accepts_flow_limits_at_protocol_cap() {
+        let mut settings = Settings::default();
+        settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V0_1);
+        settings.set(SettingKey::MaxStreams, MAX_NEGOTIATED_FLOWS);
+        settings.set(SettingKey::MaxUdpFlows, MAX_NEGOTIATED_FLOWS);
+        settings.set(
+            SettingKey::IdleTimeoutSeconds,
+            MAX_NEGOTIATED_IDLE_TIMEOUT_SECONDS,
+        );
+
+        let negotiated = settings.negotiated_v0_1().unwrap();
+        assert_eq!(negotiated.max_streams, MAX_NEGOTIATED_FLOWS);
+        assert_eq!(negotiated.max_udp_flows, MAX_NEGOTIATED_FLOWS);
+        assert_eq!(
+            negotiated.idle_timeout_seconds,
+            MAX_NEGOTIATED_IDLE_TIMEOUT_SECONDS
         );
     }
 }

@@ -473,17 +473,14 @@ impl ReplayCache {
 
     /// Records a nonce pair or rejects it if it was already seen.
     ///
-    /// `now` is the caller's wall-clock reading. It is accepted for symmetry
-    /// with the freshness checks that share it but takes no part in retention,
-    /// which is measured monotonically; a wall clock that jumps therefore
-    /// cannot expire or resurrect an entry.
+    /// Retention is measured monotonically: unlike the wall-clock `now` used
+    /// by the freshness checks, this takes no clock parameter at all, so a
+    /// jumping wall clock can neither expire nor resurrect an entry.
     pub fn check_and_insert(
         &mut self,
-        now: u64,
         server_nonce: [u8; 32],
         client_nonce: [u8; 32],
     ) -> AuthResult<()> {
-        let _ = now;
         self.check_and_insert_at(Instant::now(), server_nonce, client_nonce)
     }
 
@@ -723,7 +720,7 @@ fn verify_auth_response_credential<'a>(
         now,
         allowed_skew,
     )?;
-    replay_cache.check_and_insert(now, challenge.server_nonce, response.client_nonce)?;
+    replay_cache.check_and_insert(challenge.server_nonce, response.client_nonce)?;
     Ok(credential)
 }
 
@@ -1070,7 +1067,7 @@ mod tests {
         let server_nonce = [0x55; 32];
         let client_nonce = [0x66; 32];
         replay_cache
-            .check_and_insert(100, server_nonce, client_nonce)
+            .check_and_insert(server_nonce, client_nonce)
             .unwrap();
 
         let debug = format!("{replay_cache:?}");
@@ -1509,20 +1506,20 @@ mod tests {
             client_nonce: [0x22; 32],
         };
         replay_cache
-            .check_and_insert(100, key.server_nonce, key.client_nonce)
+            .check_and_insert(key.server_nonce, key.client_nonce)
             .unwrap();
 
         // A wall clock that steps far past the retention window must not flush
         // the cache, and the pair it already holds must still be a replay.
         replay_cache
-            .check_and_insert(u64::MAX, [0x13; 32], [0x23; 32])
+            .check_and_insert([0x13; 32], [0x23; 32])
             .unwrap();
 
         assert!(replay_cache.entries.contains_key(&key));
         assert_eq!(replay_cache.entries.len(), 2);
         assert_eq!(replay_cache.order.len(), 2);
         assert_eq!(
-            replay_cache.check_and_insert(u64::MAX, key.server_nonce, key.client_nonce),
+            replay_cache.check_and_insert(key.server_nonce, key.client_nonce),
             Err(AuthError::Replay)
         );
     }
@@ -1535,11 +1532,11 @@ mod tests {
             client_nonce: [0x24; 32],
         };
         replay_cache
-            .check_and_insert(1_700_000_000, key.server_nonce, key.client_nonce)
+            .check_and_insert(key.server_nonce, key.client_nonce)
             .unwrap();
 
         assert_eq!(
-            replay_cache.check_and_insert(1, key.server_nonce, key.client_nonce),
+            replay_cache.check_and_insert(key.server_nonce, key.client_nonce),
             Err(AuthError::Replay)
         );
         assert_eq!(replay_cache.entries.len(), 1);
@@ -1562,13 +1559,13 @@ mod tests {
         };
 
         replay_cache
-            .check_and_insert(100, oldest.server_nonce, oldest.client_nonce)
+            .check_and_insert(oldest.server_nonce, oldest.client_nonce)
             .unwrap();
         replay_cache
-            .check_and_insert(101, middle.server_nonce, middle.client_nonce)
+            .check_and_insert(middle.server_nonce, middle.client_nonce)
             .unwrap();
         replay_cache
-            .check_and_insert(102, newest.server_nonce, newest.client_nonce)
+            .check_and_insert(newest.server_nonce, newest.client_nonce)
             .unwrap();
 
         assert!(!replay_cache.entries.contains_key(&oldest));
@@ -1586,11 +1583,11 @@ mod tests {
         };
 
         replay_cache
-            .check_and_insert(100, key.server_nonce, key.client_nonce)
+            .check_and_insert(key.server_nonce, key.client_nonce)
             .unwrap();
 
         assert_eq!(
-            replay_cache.check_and_insert(101, key.server_nonce, key.client_nonce),
+            replay_cache.check_and_insert(key.server_nonce, key.client_nonce),
             Err(AuthError::Replay)
         );
         assert_eq!(replay_cache.entries.len(), 1);
@@ -1602,7 +1599,7 @@ mod tests {
 
         for index in 0..64_u8 {
             replay_cache
-                .check_and_insert(u64::from(index), [index; 32], [index; 32])
+                .check_and_insert([index; 32], [index; 32])
                 .unwrap();
             assert_eq!(replay_cache.order.len(), replay_cache.entries.len());
             assert!(replay_cache.entries.len() <= 3);
@@ -1615,18 +1612,18 @@ mod tests {
         let server_nonce = [0x90; 32];
         let client_nonce = [0x91; 32];
         replay_cache
-            .check_and_insert(100, server_nonce, client_nonce)
+            .check_and_insert(server_nonce, client_nonce)
             .unwrap();
 
         for index in 0..512_u16 {
             let filler = [u8::try_from(index % 251).unwrap(); 32];
             let mut other = [0_u8; 32];
             other[0..2].copy_from_slice(&index.to_be_bytes());
-            replay_cache.check_and_insert(100, filler, other).unwrap();
+            replay_cache.check_and_insert(filler, other).unwrap();
         }
 
         assert_eq!(
-            replay_cache.check_and_insert(100, server_nonce, client_nonce),
+            replay_cache.check_and_insert(server_nonce, client_nonce),
             Err(AuthError::Replay)
         );
     }
@@ -1677,10 +1674,10 @@ mod tests {
         };
 
         replay_cache
-            .check_and_insert(100, first.server_nonce, first.client_nonce)
+            .check_and_insert(first.server_nonce, first.client_nonce)
             .unwrap();
         replay_cache
-            .check_and_insert(101, second.server_nonce, second.client_nonce)
+            .check_and_insert(second.server_nonce, second.client_nonce)
             .unwrap();
 
         assert!(!replay_cache.entries.contains_key(&first));
@@ -1743,11 +1740,11 @@ mod tests {
     fn unreadable_clock_sentinel_leaves_the_replay_cache_intact() {
         let mut replay_cache = ReplayCache::with_max_entries(Duration::from_secs(300), 8);
         replay_cache
-            .check_and_insert(1_700_000_000, [0xc0; 32], [0xd0; 32])
+            .check_and_insert([0xc0; 32], [0xd0; 32])
             .unwrap();
 
         replay_cache
-            .check_and_insert(UNREADABLE_CLOCK, [0xc1; 32], [0xd1; 32])
+            .check_and_insert([0xc1; 32], [0xd1; 32])
             .unwrap();
 
         // The sentinel fails every freshness check before the cache is reached,

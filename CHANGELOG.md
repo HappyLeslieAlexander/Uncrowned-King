@@ -6,6 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **Unauthenticated observability endpoint hardening**: wildcard binds (`0.0.0.0`, `[::]`) for `observability_listen` are now rejected at startup in both `uk-server` and `uk-client` — the `/healthz`, `/readyz` and `/metrics` endpoints have no authentication, so a wildcard bind on a host with a public address would expose them to the internet. Specific non-loopback binds (e.g. a Kubernetes pod IP) are still allowed but log a loud warning. New shared validator `uk_proto::validate_observability_bind`.
+- **Peer-advertised SETTINGS bounds**: `negotiated_v0_1` now rejects `max_streams`/`max_udp_flows` above 1,000,000 and `idle_timeout_seconds` above 30 days instead of trusting unbounded peer values when sizing admission semaphores and timers.
+
+### Fixed
+
+- **quinn-proto 0.11.16 → 0.11.19**: fixes RUSTSEC-2026-0338 through RUSTSEC-2026-0342 (remote peer could panic quinn-proto with zero-length STREAM frames during unordered reads, unbounded connection-ID retirement growth, ACK_FREQUENCY peer-delay panic, stream reassembly memory-exhaustion guard bypass, zero-length DATAGRAM receive-buffer bypass). This was the cause of the 2026-10-13/14 daily security-audit failures.
+- **rustls 0.23.45 → 0.23.46**: fixes RUSTSEC-2026-0346 through RUSTSEC-2026-0349 (`Debug` impls leaking TLS session secrets, buffered application data sent to outer server after ECH rejection, Brotli certificate decompression 1 GiB pre-authentication allocation, unauthenticated ServerHello downgrading later connections to classical key exchange). These advisories were published after the quinn-proto fix and would have failed the next scheduled audit run.
+
+- **`has_unrestricted_private_allow` reported the wrong condition**: it flagged `Allow` rules with *unset* `private` (which the evaluator already neuters to deny-private) and missed `Allow` rules with explicit `private = true` (the actual SSRF surface). It now reports explicit private opt-ins not preceded by a blanket `deny private = true` rule, so the startup `policy.unrestricted_private` warning can actually fire on real configs.
+- **Client SOCKS listener bound before scope check**: a forbidden non-loopback `--listen` address was briefly bound before `validate_socks_listener_scope` rejected it. IP-literal binds are now validated before the socket exists; the post-bind check remains as the second layer for hostnames.
+- **Degraded-endpoint penalties survived SIGHUP reloads**: the process-global 180s cooldown cache is now cleared when a config reload is applied, so fixed endpoints are not penalized under the new config.
+- **Shutdown could take ~2x `shutdown_timeout_seconds`**: session drains consumed the full timeout internally and the listener-level rejoin granted another full timeout on top. Both now share a single deadline computed at shutdown start.
+- **`ReplayCache::check_and_insert` took a `now` parameter it ignored** (`let _ = now;`): removed the misleading parameter; retention stays monotonic.
+- Removed dead public API (`FrameReader::limits`, `FrameReader::has_buffered_bytes`, `MIN_UDP_RELAY_FRAME_SIZE` — the TCP bound of 262 already covers UDP's 260) and deduplicated the TCP/UDP `validate_close_code` implementations into one shared check.
+- Moved the misplaced half-close-drain doc comment from `handle_udp_open_frame` to `should_start_half_close_drain`, renamed the stale `review_settings_tests` module, and fixed assert messages that described the old buggy behavior instead of the expected one.
+- Extracted the shared TCP/QUIC connection admission checks (`admit_connection`) instead of maintaining two near-duplicate accept paths.
+- Centralized the tokio-rustls `"tls handshake eof"` sentinel behind `TLS_HANDSHAKE_EOF_MESSAGE` with a pinning test, and corrected the test's `ErrorKind` to the real `UnexpectedEof`.
+- Documented that the dialer's fixed 60s target-socket keepalive is intentional (`TARGET_TCP_KEEPALIVE_SECONDS`; `tcp_keepalive_seconds` governs accepted carriers) and fixed the AGENTS.md misattribution of `100.100.100.200` (Alibaba Cloud, not GCP, metadata service).
+- **CI determinism**: pinned `EmbarkStudios/cargo-deny-action` to the v2.1.1 commit SHA (which itself pins cargo-deny 0.20.2) and `actions/checkout` to the v5 commit SHA in all workflows, replacing the floating `@v2`/`@v4` tags that let the audit tool change under a frozen repo.
+
+### Not changed (deliberate)
+
+- `AuthChallenge.session_id` stays on the wire: it is covered by the authentication MAC and part of the published spec/test vectors; removing 16 bytes of challenge entropy is not worth a breaking wire-format change. Candidate for the next protocol revision, not this one.
+- The TLS *certificate* file is still not permission-checked (only the private key is): a certificate is public material by design — it is presented to every connecting peer during the handshake — so demanding `0600` on it provides no confidentiality benefit while breaking standard deployments (Kubernetes Secret mounts default to `0444`/`0644`, system trust stores are world-readable). An earlier revision of this change did enforce it and was reverted after the project's own e2e harness (which generates normally-permissioned certs) failed. AGENTS.md's certificate-permission line should be revisited with this in mind.
+
 ## [0.1.3] - 2026-09-06
 
 ### Security

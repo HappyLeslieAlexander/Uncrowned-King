@@ -166,9 +166,11 @@ failed handshakes, authenticated and rejected sessions, TCP/UDP open requests
 and bounded failure reasons, active flows, and successfully relayed payload
 bytes by protocol and direction in Prometheus text format. Security config
 generation and reload attempt, success, and failure counters make reload
-outcomes observable. The endpoint has no authentication; bind it to loopback or
-a firewall-protected management network. Requests are limited to an 8 KiB
-header, a five-second read timeout, and 32 concurrent connections.
+outcomes observable. The endpoint has no authentication: wildcard binds
+(`0.0.0.0`, `[::]`) are rejected at startup, so bind it to loopback or a
+specific internal interface address (a non-loopback bind logs a warning).
+Requests are limited to an 8 KiB header, a five-second read timeout, and 32
+concurrent connections.
 
 The client supports the same operational endpoints with
 `observability_listen = "127.0.0.1:9091"`. Its Prometheus metrics report the

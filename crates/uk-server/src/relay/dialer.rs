@@ -198,9 +198,14 @@ pub(crate) async fn connect_socket_addr(addr: SocketAddr) -> (SocketAddr, io::Re
     let result = match TcpStream::connect(addr).await {
         Ok(stream) => {
             let _ = stream.set_nodelay(true);
+            // Fixed keepalive for *outbound* target sockets. This is
+            // intentionally not `tcp_keepalive_seconds`: that knob governs
+            // accepted carrier connections (documented in `ServerConfig`),
+            // while these are short-lived per-flow relay legs where a fixed
+            // 60s idle/interval probe is the sane default.
             let keepalive = socket2::TcpKeepalive::new()
-                .with_time(Duration::from_secs(60))
-                .with_interval(Duration::from_secs(60));
+                .with_time(Duration::from_secs(TARGET_TCP_KEEPALIVE_SECONDS))
+                .with_interval(Duration::from_secs(TARGET_TCP_KEEPALIVE_SECONDS));
             let _ = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive);
             Ok(stream)
         }

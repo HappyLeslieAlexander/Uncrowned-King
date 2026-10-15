@@ -198,6 +198,9 @@ impl ClientSessionManager {
                 })??;
             let generation = self.config.replace(candidate);
             self.clear_connect_failure().await;
+            // Degraded-endpoint penalties were recorded under the old config;
+            // do not let them linger on endpoints the new config reuses.
+            crate::session::clear_degraded_endpoints();
             let previous: Vec<Arc<ClientSession>> = self.pool.lock().await.drain(..).collect();
             for session in previous {
                 session.begin_drain().await;

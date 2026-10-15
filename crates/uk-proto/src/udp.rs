@@ -10,9 +10,6 @@ pub const UDP_CLOSE_NORMAL: u16 = 0;
 /// Generic UDP flow close caused by an error.
 pub const UDP_CLOSE_ERROR: u16 = 1;
 
-/// Minimum `max_frame_size` that can carry every valid v0.1 UDP control payload.
-pub const MIN_UDP_RELAY_FRAME_SIZE: u64 = 260;
-
 /// Payload carried by a `UDP_OPEN` frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UdpOpen {
@@ -76,9 +73,10 @@ impl UdpClose {
 }
 
 fn validate_close_code(close_code: u16) -> ProtocolResult<()> {
-    match close_code {
-        UDP_CLOSE_NORMAL | UDP_CLOSE_ERROR => Ok(()),
-        _ => Err(ProtocolError::InvalidUdpPayload("unknown udp close code")),
+    if crate::is_valid_close_code(close_code) {
+        Ok(())
+    } else {
+        Err(ProtocolError::InvalidUdpPayload("unknown udp close code"))
     }
 }
 

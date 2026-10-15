@@ -61,11 +61,11 @@ pub(crate) fn handle_udp_read_closed(
     }
 }
 
-/// Whether a `TCP_CLOSE(NORMAL)` should start a half-close drain timer.
+/// Handles a `UDP_OPEN` frame: admits the flow id, resolves and policy-checks
+/// the target, then spawns the UDP relay tasks.
 ///
-/// Only the close that actually half-closes the flow qualifies. Testing the
-/// target read side alone would arm a fresh timer for every duplicate
-/// `TCP_CLOSE`, since a repeat leaves the slot in place with that side open.
+/// A duplicate flow id or an exhausted flow budget is answered with an error
+/// frame and a `UDP_CLOSE(ERROR)`; the slot is only installed on success.
 pub(crate) async fn handle_udp_open_frame(
     context: &RelaySessionContext<'_>,
     frame: Frame,

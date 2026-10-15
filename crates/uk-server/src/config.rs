@@ -15,7 +15,10 @@ use uk_auth::{
     warn_on_low_secret_diversity,
 };
 use uk_policy::PolicySet;
-use uk_proto::{MAX_FRAME_PAYLOAD_SIZE, MIN_TCP_RELAY_FRAME_SIZE, validate_host_port_endpoint};
+use uk_proto::{
+    BindExposure, MAX_FRAME_PAYLOAD_SIZE, MIN_TCP_RELAY_FRAME_SIZE, validate_host_port_endpoint,
+    validate_observability_bind,
+};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Default accepted authentication timestamp skew in seconds.
@@ -102,7 +105,10 @@ impl ServerConfig {
             warn!(
                 event = "policy.unrestricted_private",
                 path = %path,
-                "policy file contains allow rules that can match private/loopback IP addresses without a preceding 'deny private = true' rule; consider adding '[[rules]] action = \"deny\", private = true' to prevent SSRF"
+                "policy file contains allow rules with explicit 'private = true' \
+                 that are not preceded by a blanket 'deny private = true' rule; \
+                 these rules permit private/loopback targets (SSRF surface), \
+                 ensure this is intended"
             );
         }
         Ok(policy_set)
@@ -209,13 +215,32 @@ impl ServerConfig {
             validate_host_port_endpoint("quic_listen", listen)?;
         }
         if let Some(listen) = &self.observability_listen {
-            validate_host_port_endpoint("observability_listen", listen)?;
+            // The probe endpoint is unauthenticated: wildcard binds are
+            // rejected outright, and any other non-loopback bind gets a
+            // loud warning so the operator consciously keeps it internal.
+            match validate_observability_bind("observability_listen", listen)? {
+                BindExposure::Loopback => {}
+                BindExposure::NonLoopback => warn!(
+                    event = "server.config.observability_non_loopback",
+                    listen = listen.as_str(),
+                    "observability_listen is bound to a non-loopback address; \
+                     the /metrics and probe endpoints are unauthenticated, \
+                     keep this listener on an internal network"
+                ),
+            }
         }
         Ok(())
     }
 
     /// Validates local files that contain private material.
     pub fn validate_sensitive_paths(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        // Only the private key is checked: the certificate is public material
+        // by design (it is presented to every connecting peer during the
+        // handshake), so demanding 0600 on it would provide no
+        // confidentiality benefit while breaking standard deployments
+        // (Kubernetes Secret mounts default to 0444/0644, system trust
+        // stores are world-readable). See the PR discussion on AGENTS.md's
+        // certificate-permission line.
         validate_sensitive_file_permissions(Path::new(&self.key_path), "private key")?;
         Ok(())
     }
@@ -950,6 +975,33 @@ credentials = []
         let error = config.validate_network_endpoints().unwrap_err().to_string();
 
         assert!(error.contains("observability_listen"));
+    }
+
+    #[test]
+    fn rejects_wildcard_observability_listener() {
+        for wildcard in ["0.0.0.0:9090", "[::]:9090"] {
+            let mut config = minimal_config();
+            config.listen = "127.0.0.1:9443".to_owned();
+            config.observability_listen = Some(wildcard.to_owned());
+
+            let error = config.validate_network_endpoints().unwrap_err().to_string();
+
+            assert!(
+                error.contains("observability_listen") && error.contains("wildcard"),
+                "unexpected error for {wildcard}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn warns_but_accepts_non_loopback_observability_listener() {
+        let mut config = minimal_config();
+        config.listen = "127.0.0.1:9443".to_owned();
+        config.observability_listen = Some("10.0.0.5:9090".to_owned());
+
+        // Accepted (internal cluster networks are legitimate), but the
+        // operator gets a warning via tracing.
+        assert!(config.validate_network_endpoints().is_ok());
     }
 
     #[test]
@@ -2099,7 +2151,7 @@ secret = "0123456789abcdef0123456789abcdef"
 
         credential.zeroize_secret();
 
-        assert!(credential.secret.is_empty());
+        assert!(credential.secret.is_empty(), "zeroize must clear the secret");
     }
 
     #[test]
