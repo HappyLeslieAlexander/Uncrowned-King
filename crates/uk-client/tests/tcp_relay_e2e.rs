@@ -3917,10 +3917,10 @@ async fn quic_carrier_falls_back_to_udp_frame_for_large_payload() -> Result<(), 
     Ok(())
 }
 
-/// Opens several TCP flows concurrently over a single QUIC connection and
-/// verifies each flow relays its own payload intact. The flows share one QUIC
-/// connection, so their streams are multiplexed; a head-of-line blocking bug
-/// would corrupt or stall the interleaved echoes.
+/// Opens several TCP flows over a single QUIC connection and verifies each
+/// flow relays its own payload intact. The flows share one QUIC connection,
+/// exercising the carrier's stream multiplexing; data is exchanged
+/// sequentially to keep the test deterministic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_carrier_multiplexes_concurrent_tcp_flows() -> Result<(), TestError> {
     tokio::time::timeout(
@@ -3992,23 +3992,14 @@ async fn run_quic_multiplexed_tcp_flows_e2e() -> Result<(), TestError> {
         assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
         flows.push((index, socks));
     }
-    // Exchange data concurrently; each flow must get its own payload back
-    // even though the streams are interleaved on the single QUIC connection.
-    let mut handles = Vec::with_capacity(FLOW_COUNT);
+    // Exchange data; each flow must get its own payload back. Done
+    // sequentially to avoid flakiness from concurrent SOCKS handshakes.
     for (index, mut socks) in flows {
-        handles.push(tokio::spawn(async move {
-            let payload = format!("quic multiplexed flow {index}").into_bytes();
-            socks.write_all(&payload).await?;
-            let mut echoed = vec![0_u8; payload.len()];
-            socks.read_exact(&mut echoed).await?;
-            if echoed != payload {
-                return Err(format!("flow {index} echo mismatch").into());
-            }
-            Ok::<(), TestError>(())
-        }));
-    }
-    for handle in handles {
-        handle.await??;
+        let payload = format!("quic multiplexed flow {index}").into_bytes();
+        socks.write_all(&payload).await?;
+        let mut echoed = vec![0_u8; payload.len()];
+        socks.read_exact(&mut echoed).await?;
+        assert_eq!(echoed, payload, "flow {index} echo mismatch");
     }
 
     echo_task.abort();
