@@ -2436,7 +2436,10 @@ async fn run_client_flow_resource_limit_keeps_session_e2e() -> Result<(), TestEr
     )
     .await?;
     write_frame(&mut carrier, &tcp_close_frame(1, TCP_CLOSE_ERROR)?).await?;
-    assert!(first_target_task.await??.is_empty(), "first target must receive no data");
+    assert!(
+        first_target_task.await??.is_empty(),
+        "first target must receive no data"
+    );
 
     write_frame(&mut carrier, &tcp_open_frame(3, second_target_addr)?).await?;
     read_open_ack(&mut carrier, 3).await?;

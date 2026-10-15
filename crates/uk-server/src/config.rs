@@ -2151,7 +2151,10 @@ secret = "0123456789abcdef0123456789abcdef"
 
         credential.zeroize_secret();
 
-        assert!(credential.secret.is_empty(), "zeroize must clear the secret");
+        assert!(
+            credential.secret.is_empty(),
+            "zeroize must clear the secret"
+        );
     }
 
     #[test]
