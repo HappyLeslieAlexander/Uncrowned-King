@@ -9,6 +9,11 @@
 #     cargo +nightly fuzz run auth_payload
 #     cargo +nightly fuzz run tcp_state
 #     cargo +nightly fuzz run udp_state
+#     cargo +nightly fuzz run datagram_decode
+#     cargo +nightly fuzz run settings_decode
+#     cargo +nightly fuzz run error_payload_decode
+#     cargo +nightly fuzz run frame_reader
+#     cargo +nightly fuzz run auth_verify
 
 [package]
 name = "uk-proto-fuzz"
@@ -22,6 +27,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 bytes = "1"
+tokio = { version = "1", features = ["rt"] }
 uk-proto = { path = ".." }
 uk-auth = { path = "../../uk-auth" }
 
@@ -61,6 +67,41 @@ bench = false
 [[bin]]
 name = "udp_state"
 path = "fuzz_targets/udp_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "datagram_decode"
+path = "fuzz_targets/datagram_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "settings_decode"
+path = "fuzz_targets/settings_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "error_payload_decode"
+path = "fuzz_targets/error_payload_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_reader"
+path = "fuzz_targets/frame_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "auth_verify"
+path = "fuzz_targets/auth_verify.rs"
 test = false
 doc = false
 bench = false

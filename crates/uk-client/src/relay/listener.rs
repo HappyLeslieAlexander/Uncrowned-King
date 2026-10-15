@@ -1,50 +1,22 @@
-#![allow(unused_imports, clippy::wildcard_imports)]
+use std::{future::Future, io, sync::Arc, time::Duration};
 
-use std::{
-    collections::{HashMap, hash_map::Entry},
-    error::Error,
-    fmt,
-    future::Future,
-    io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    pin::Pin,
-    sync::{
-        Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
-
-use bytes::{Bytes, BytesMut};
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream, UdpSocket},
-    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
-    task::{Id, JoinError, JoinSet},
+    net::TcpListener,
+    sync::{Semaphore, watch},
+    task::{JoinError, JoinSet},
     time,
 };
-use tracing::{Instrument, debug, error, info, info_span, warn};
-use uk_auth::{AuthenticatedIdentity, unix_now};
-use uk_proto::{
-    BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, DatagramSendOutcome, ErrorCode,
-    ErrorPayload, FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, Frame, FrameIoError, FrameLimits, FrameType,
-    NegotiatedSettings, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose,
-    TcpOpen, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose, UdpOpen, datagram,
-    is_client_initiated_flow_id, read_frame, validate_connection_frame, varint::MAX_VARINT,
-    write_frame,
-};
+use tracing::{debug, info, warn};
 
-use super::carrier::*;
-use super::context::*;
-use super::session_manager::*;
-use super::tcp::*;
-use super::udp::*;
+use super::context::{
+    AnyError, ClientSessionTaskKind, ClientSessionTasks, ListenerAcceptBackoff, timeout,
+    usize_limit,
+};
+use super::session_manager::{ClientSessionManager, SocksConnectionRuntime};
 use crate::{
     ClientReloadReceiver, ClientReloadRequest,
     config::{ClientConfig, validate_endpoint},
-    config_state::{ClientConfigSnapshot, ClientConfigState},
-    observability::{ActiveFlowGuard, ClientMetrics, RelayDirection, RelayProtocol},
-    session, socks5,
+    observability::ClientMetrics,
 };
 pub(crate) async fn run_socks5_listener_until_shutdown<F>(
     config: ClientConfig,

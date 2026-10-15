@@ -1,49 +1,66 @@
-#![allow(unused_imports, clippy::wildcard_imports)]
-
 use std::{
-    collections::HashMap,
-    error::Error,
-    fmt,
-    future::Future,
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{Ipv4Addr, SocketAddr},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
-use super::context::*;
-use super::dialer::*;
-use super::session::*;
-use super::tasks::*;
-use super::tcp::*;
-use super::udp::*;
+use super::context::{
+    BoxedConnectFuture, BufferedTargetData, CarrierWriter, FlowEvent, FlowIdRejection, FlowSlot,
+    FlowTable, FlowToken, FlowTokenAllocator, HalfCloseSide, OpenDialLimiter, OpenFailure,
+    OpenFlowCancel, OpenSlotRejection, RELAY_BUFFER_SIZE, RelayLimits,
+    SESSION_EVENT_QUEUE_BASE_CAPACITY, SESSION_EVENT_QUEUE_MAX_CAPACITY,
+    SESSION_EVENT_QUEUE_PER_FLOW_CAPACITY, ServerCarrier, ServerSessionState, SessionBufferControl,
+    SessionEvent, SessionShutdown, SessionTaskKind, TARGET_RESOLUTION_ADDR_LIMIT,
+    TARGET_WRITE_QUEUE_MAX_CAPACITY, TARGET_WRITE_QUEUE_MIN_CAPACITY, TargetCommand,
+    TargetConnector, TargetFlow, TargetFlowControl, TargetFlowIdentity, TcpDataDisposition,
+    UdpDataDisposition, UdpOpenSlotRejection, UdpTargetFlow, is_valid_session_transition,
+    open_target_flow_mut, remove_flow_slot, tcp_data_frame_size,
+};
+use super::dialer::{
+    collect_resolved_addrs, connect_first_successful, connect_udp_socket_addr,
+    target_connect_deadline, with_target_connect_deadline,
+};
+use super::session::{
+    close_session, close_target_flows, drain_session_tasks, flow_event_counts_as_session_activity,
+    map_frame_event, relay_session, send_flow_event_or_shutdown, session_event_queue_capacity,
+    session_has_activity_flows, shutdown_carrier_writer, target_write_queue_capacity,
+    try_record_flow_activity, validate_client_relay_flow_id, validate_session_control_frame,
+    write_flow_frame_locked, write_frame_locked, write_frame_or_shutdown,
+};
+use super::tasks::{
+    ConnectTasks, SessionTasks, TargetWriterTask, relay_client_to_target, relay_target_to_client,
+    spawn_half_close_timer, spawn_target_writer, wait_for_open_task,
+};
+use super::tcp::{
+    HalfCloseDrainDecision, abort_client_flow, check_open_slot, expire_half_close_drain,
+    handle_target_read_closed, handle_target_write_closed, should_start_half_close_drain,
+    tcp_data_disposition, validate_client_flow_status_payload,
+};
+use super::udp::{
+    check_udp_open_slot, handle_udp_read_closed, udp_data_disposition,
+    udp_payload_exceeds_frame_limit,
+};
 use crate::observability::*;
 use crate::security::*;
 use bytes::{Bytes, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{
-        TcpStream, UdpSocket, lookup_host,
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-    },
-    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
-    task::{Id, JoinError, JoinSet},
+    net::{TcpStream, UdpSocket},
+    sync::{mpsc, watch},
     time,
 };
-use tracing::{Instrument, Span, debug, info, warn};
-use uk_auth::{AuthenticatedIdentity, unix_now};
-use uk_policy::{PolicyContext, PolicyDecision, PolicySet};
+use uk_auth::AuthenticatedIdentity;
+use uk_policy::PolicySet;
 use uk_proto::*;
 
 use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-
-use super::*;
 
 const TEST_FLOW_TOKEN: FlowToken = FlowToken(1);
 const STALE_FLOW_TOKEN: FlowToken = FlowToken(2);

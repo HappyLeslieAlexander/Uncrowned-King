@@ -1,52 +1,46 @@
-#![allow(unused_imports, clippy::wildcard_imports)]
-
 use std::{
     collections::HashMap,
-    error::Error,
-    fmt,
     future::Future,
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    pin::Pin,
+    net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{
-        TcpStream, UdpSocket, lookup_host,
+        UdpSocket,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
-    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
-    task::{AbortHandle, Id, JoinError, JoinSet},
-    time,
+    sync::mpsc,
+    task::{Id, JoinSet},
 };
-use tracing::{Instrument, Span, debug, info, warn};
-use uk_auth::{AuthenticatedIdentity, unix_now};
-use uk_policy::{PolicyContext, PolicyDecision, PolicySet};
+use tracing::{Instrument, Span, debug, warn};
+use uk_auth::AuthenticatedIdentity;
+use uk_policy::PolicySet;
 use uk_proto::{
-    BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, DatagramSendOutcome, ErrorCode,
-    ErrorPayload, Frame, FrameIoError, FrameLimits, FrameReader, FrameType, TCP_CLOSE_ERROR,
-    TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR,
-    UDP_CLOSE_NORMAL, UdpClose, UdpOpen, datagram, is_client_initiated_flow_id,
-    validate_connection_frame, write_frame,
+    BoxedDatagramChannel, ErrorCode, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, Target, UDP_CLOSE_ERROR,
+    datagram, is_client_initiated_flow_id,
 };
 
-use super::context::*;
-use super::dialer::*;
-use super::session::*;
-use super::tcp::*;
-use super::udp::*;
-
-use crate::observability::{
-    ActiveFlowGuard, FlowOpenFailure, RelayDirection, RelayProtocol, ServerMetrics,
+use super::context::{
+    AnyError, CarrierWriter, FlowEvent, FlowEventSender, FlowToken, HalfCloseSide, OpenDialLimiter,
+    OpenDialPermit, OpenFlowCancel, SessionShutdown, SessionTaskHandle, SessionTaskKind,
+    TargetCommand, TargetFlowControl, TargetFlowIdentity, UDP_TARGET_BUFFER_SIZE,
 };
-use crate::security::SecurityState;
+use super::dialer::{connect_allowed_target, connect_allowed_udp_target};
+use super::session::{
+    log_session_task_error, send_error, send_flow_event_or_shutdown, try_record_flow_activity,
+};
+use super::tcp::{send_tcp_close, send_tcp_data};
+use super::udp::{UdpEmit, emit_udp_to_client, send_udp_close};
+
+use crate::observability::{RelayDirection, RelayProtocol, ServerMetrics};
 pub(crate) struct ConnectTasks<T: 'static> {
     pub(crate) tasks: JoinSet<(SocketAddr, io::Result<T>)>,
     pub(crate) permits: HashMap<Id, OpenDialPermit>,

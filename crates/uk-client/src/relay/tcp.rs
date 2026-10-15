@@ -1,50 +1,24 @@
-#![allow(unused_imports, clippy::wildcard_imports)]
+use std::{sync::Arc, time::Duration};
 
-use std::{
-    collections::{HashMap, hash_map::Entry},
-    error::Error,
-    fmt,
-    future::Future,
-    io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    pin::Pin,
-    sync::{
-        Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
-
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream, UdpSocket},
-    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
-    task::{Id, JoinError, JoinSet},
+    net::TcpStream,
+    sync::{mpsc, watch},
     time,
 };
-use tracing::{Instrument, debug, error, info, info_span, warn};
-use uk_auth::{AuthenticatedIdentity, unix_now};
-use uk_proto::{
-    BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, DatagramSendOutcome, ErrorCode,
-    ErrorPayload, FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, Frame, FrameIoError, FrameLimits, FrameType,
-    NegotiatedSettings, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose,
-    TcpOpen, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose, UdpOpen, datagram,
-    is_client_initiated_flow_id, read_frame, validate_connection_frame, varint::MAX_VARINT,
-    write_frame,
-};
+use tracing::debug;
+use uk_proto::{FrameType, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TcpClose};
 
-use super::carrier::*;
-use super::context::*;
-use super::listener::*;
-use super::session_manager::*;
-use super::udp::*;
+use super::carrier::validate_flow_status;
+use super::context::{
+    AnyError, BufferedFlowFrame, ClientConnectionState, ClientFlow, OpenOutcome, transition,
+};
+use super::session_manager::ClientSessionManager;
+use super::udp::relay_udp_association;
 use crate::{
-    ClientReloadReceiver, ClientReloadRequest,
-    config::{ClientConfig, validate_endpoint},
-    config_state::{ClientConfigSnapshot, ClientConfigState},
-    observability::{ActiveFlowGuard, ClientMetrics, RelayDirection, RelayProtocol},
-    session, socks5,
+    observability::{ClientMetrics, RelayDirection, RelayProtocol},
+    socks5,
 };
 pub(crate) async fn handle_socks_connection(
     mut local: TcpStream,

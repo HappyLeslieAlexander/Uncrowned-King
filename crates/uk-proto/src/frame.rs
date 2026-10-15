@@ -105,6 +105,10 @@ pub struct FrameHeader {
 }
 
 impl FrameHeader {
+    /// Maximum wire size of an encoded header: version (1 byte) + frame type
+    /// (1 byte) + flags (2 bytes) + two varints (8 bytes each, worst case).
+    pub const MAX_ENCODED_LEN: usize = 1 + 1 + 2 + 8 + 8;
+
     /// Creates a new validated header.
     pub fn new(frame_type: FrameType, flags: u16, id: u64, length: u64) -> ProtocolResult<Self> {
         validate_flags(flags)?;
@@ -199,7 +203,8 @@ impl Frame {
 
     /// Encodes the complete frame into a new byte buffer.
     pub fn encode(&self) -> ProtocolResult<Bytes> {
-        let mut out = BytesMut::new();
+        // Pre-size for header + payload so the buffer never reallocates.
+        let mut out = BytesMut::with_capacity(FrameHeader::MAX_ENCODED_LEN + self.payload.len());
         self.encode_into(&mut out)?;
         Ok(out.freeze())
     }

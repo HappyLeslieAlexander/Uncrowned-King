@@ -1,52 +1,41 @@
-#![allow(unused_imports, clippy::wildcard_imports)]
+use std::{io, sync::Arc, time::Duration};
 
-use std::{
-    collections::HashMap,
-    error::Error,
-    fmt,
-    future::Future,
-    io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
-
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{
-        TcpStream, UdpSocket, lookup_host,
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-    },
-    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
-    task::{Id, JoinError, JoinSet},
+    io::{AsyncWrite, AsyncWriteExt},
+    sync::{mpsc, watch},
+    task::JoinError,
     time,
 };
-use tracing::{Instrument, Span, debug, info, warn};
-use uk_auth::{AuthenticatedIdentity, unix_now};
-use uk_policy::{PolicyContext, PolicyDecision, PolicySet};
+use tracing::{debug, info, warn};
+use uk_auth::AuthenticatedIdentity;
 use uk_proto::{
-    BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, DatagramSendOutcome, ErrorCode,
-    ErrorPayload, Frame, FrameIoError, FrameLimits, FrameReader, FrameType, TCP_CLOSE_ERROR,
-    TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR,
-    UDP_CLOSE_NORMAL, UdpClose, UdpOpen, datagram, is_client_initiated_flow_id,
-    validate_connection_frame, write_frame,
+    BoxedCarrierReader, ErrorCode, ErrorPayload, Frame, FrameIoError, FrameReader, FrameType,
+    TCP_CLOSE_ERROR, UDP_CLOSE_ERROR, is_client_initiated_flow_id, validate_connection_frame,
+    write_frame,
 };
 
-use super::context::*;
-use super::dialer::*;
-use super::tasks::*;
-use super::tcp::*;
-use super::udp::*;
+use super::context::{
+    AnyError, CarrierWriter, FlowEvent, FlowEventReceiver, FlowEventSender, FlowIdRejection,
+    FlowSlot, FlowTable, FlowTokenAllocator, OpenDialLimiter, RelayLimits, RelaySessionContext,
+    SESSION_EVENT_QUEUE_BASE_CAPACITY, SESSION_EVENT_QUEUE_MAX_CAPACITY,
+    SESSION_EVENT_QUEUE_PER_FLOW_CAPACITY, ServerCarrier, SessionBufferControl, SessionShutdown,
+    SessionTaskKind, TARGET_WRITE_QUEUE_MAX_CAPACITY, TARGET_WRITE_QUEUE_MIN_CAPACITY,
+    TARGET_WRITE_QUEUE_NOMINAL_FRAME_BYTES, TargetFlowControl, transition, udp_target_flow_mut,
+};
+use super::tasks::{SessionTasks, maybe_spawn_datagram_reader};
+use super::tcp::{
+    handle_client_flow_status_frame, handle_half_close_drain_expired, handle_target_read_closed,
+    handle_target_write_closed, handle_tcp_close_frame, handle_tcp_data_frame,
+    handle_tcp_open_completed, handle_tcp_open_frame, send_tcp_close,
+};
+use super::udp::{
+    close_idle_udp_flows, forward_udp_datagram, handle_udp_close_frame, handle_udp_data_frame,
+    handle_udp_open_completed, handle_udp_open_frame, handle_udp_read_closed, send_udp_close,
+};
 
 pub(crate) use super::context::{ServerSessionState, SessionEvent};
-use crate::observability::{
-    ActiveFlowGuard, FlowOpenFailure, RelayDirection, RelayProtocol, ServerMetrics,
-};
+use crate::observability::{FlowOpenFailure, RelayProtocol, ServerMetrics};
 use crate::security::SecurityState;
 
 pub(crate) async fn relay_session(

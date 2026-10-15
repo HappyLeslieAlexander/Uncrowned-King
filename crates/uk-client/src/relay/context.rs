@@ -1,50 +1,33 @@
-#![allow(unused_imports, clippy::wildcard_imports)]
-
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::HashMap,
     error::Error,
     fmt,
     future::Future,
-    io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    pin::Pin,
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream, UdpSocket},
-    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
-    task::{Id, JoinError, JoinSet},
+    io::AsyncReadExt,
+    net::TcpStream,
+    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc},
+    task::{Id, JoinSet},
     time,
 };
-use tracing::{Instrument, debug, error, info, info_span, warn};
-use uk_auth::{AuthenticatedIdentity, unix_now};
-use uk_proto::{
-    BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, DatagramSendOutcome, ErrorCode,
-    ErrorPayload, FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, Frame, FrameIoError, FrameLimits, FrameType,
-    NegotiatedSettings, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose,
-    TcpOpen, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose, UdpOpen, datagram,
-    is_client_initiated_flow_id, read_frame, validate_connection_frame, varint::MAX_VARINT,
-    write_frame,
-};
+use tracing::{debug, warn};
+use uk_proto::{BoxedCarrierWriter, Frame, FrameLimits, NegotiatedSettings, Target};
 
-use super::carrier::*;
-use super::listener::*;
-use super::session_manager::*;
-use super::tcp::*;
-use super::udp::*;
+use super::carrier::peek_when_pending_buffer_full;
+use super::listener::log_client_session_task_error;
+use super::session_manager::ClientSession;
+use super::udp::UdpAssociationFlow;
 use crate::{
-    ClientReloadReceiver, ClientReloadRequest,
-    config::{ClientConfig, validate_endpoint},
-    config_state::{ClientConfigSnapshot, ClientConfigState},
-    observability::{ActiveFlowGuard, ClientMetrics, RelayDirection, RelayProtocol},
-    session, socks5,
+    observability::{ActiveFlowGuard, RelayProtocol},
+    socks5,
 };
 pub(crate) const FLOW_ID_ALLOCATION_ATTEMPTS: usize = 1024;
 /// Floor, ceiling, and nominal frame size used to size a flow's inbound frame
