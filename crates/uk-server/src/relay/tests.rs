@@ -2405,8 +2405,14 @@ async fn review_real_relay_drain_loses_tail_of_upload() {
     .await
     .unwrap();
     let (mut target, _) = listener.accept().await.unwrap();
+    // Keep the receive buffer small (and fixed for the life of the
+    // connection) so the 1 MiB upload actually queues in the relay instead
+    // of fitting into kernel buffers. Do NOT enlarge SO_RCVBUF mid-test:
+    // growing the receive buffer on a live connection can stall TCP window
+    // updates and deadlock the transfer (observed: 1 KiB -> 128 KiB left
+    // read_to_end hanging with only ~130 KiB received).
     socket2::SockRef::from(&target)
-        .set_recv_buffer_size(1024)
+        .set_recv_buffer_size(64 * 1024)
         .unwrap();
     let ack = frames.read_frame().await.unwrap();
     assert_eq!(ack.header.frame_type, FrameType::TcpData);
@@ -2442,7 +2448,6 @@ async fn review_real_relay_drain_loses_tail_of_upload() {
     .unwrap();
     // Delay consumption briefly to keep upload writes queued within the 30s drain budget.
     time::sleep(Duration::from_millis(50)).await;
-    let _ = socket2::SockRef::from(&target).set_recv_buffer_size(128 * 1024);
     let mut received = Vec::new();
     let _ = time::timeout(Duration::from_secs(5), target.read_to_end(&mut received))
         .await
