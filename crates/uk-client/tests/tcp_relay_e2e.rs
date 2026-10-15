@@ -3990,9 +3990,24 @@ async fn run_quic_multiplexed_tcp_flows_e2e() -> Result<(), TestError> {
         let flow_id = index * 2 + 1;
         write_frame(&mut carrier, &tcp_open_frame(flow_id, tcp_target_addr)?).await?;
     }
-    for index in 0..FLOW_COUNT {
-        let flow_id = index * 2 + 1;
-        read_open_ack(&mut carrier, flow_id).await?;
+    // The server handles the opens concurrently, so acks can arrive in any
+    // order. Collect them all, then verify every flow was acknowledged.
+    {
+        let mut acked = std::collections::HashSet::new();
+        for _ in 0..FLOW_COUNT {
+            let frame = tokio::time::timeout(
+                Duration::from_secs(3),
+                read_frame(&mut carrier, FrameLimits::default()),
+            )
+            .await??;
+            assert_eq!(frame.header.frame_type, FrameType::TcpData);
+            assert!(frame.payload.is_empty(), "open ack must carry no payload");
+            acked.insert(frame.header.id);
+        }
+        for index in 0..FLOW_COUNT {
+            let flow_id = index * 2 + 1;
+            assert!(acked.contains(&flow_id), "missing open ack for flow {flow_id}");
+        }
     }
     for index in 0..FLOW_COUNT {
         let flow_id = index * 2 + 1;
