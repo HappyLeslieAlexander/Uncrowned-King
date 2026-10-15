@@ -197,7 +197,15 @@ where
     }
 }
 
+/// Maximum wire size of a [`FrameHeader`]; see [`FrameHeader::MAX_ENCODED_LEN`].
+const MAX_FRAME_HEADER_LEN: usize = FrameHeader::MAX_ENCODED_LEN;
+
 /// Writes one complete frame to an async stream.
+///
+/// The header is encoded into a small stack buffer and written together with
+/// the payload via a vectored write, so no intermediate allocation is needed
+/// (unlike [`Frame::encode`], which concatenates header and payload into a
+/// fresh buffer). The bytes on the wire are identical.
 ///
 /// # Cancellation safety
 ///
@@ -208,9 +216,60 @@ pub async fn write_frame<W>(writer: &mut W, frame: &Frame) -> FrameIoResult<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let encoded = frame.encode()?;
-    writer.write_all(&encoded).await?;
+    // Preserve the header/payload consistency check that `Frame::encode_into`
+    // performs, so malformed frames are rejected before any bytes go out.
+    let payload_len =
+        u64::try_from(frame.payload.len()).map_err(|_| ProtocolError::InvalidVarint)?;
+    if frame.header.length != payload_len {
+        return Err(ProtocolError::InvalidFrame(
+            "frame header length does not match payload length",
+        )
+        .into());
+    }
+    let mut header_buf = [0u8; MAX_FRAME_HEADER_LEN];
+    let header_len = {
+        let mut dst: &mut [u8] = &mut header_buf;
+        let before = dst.len();
+        frame.header.encode(&mut dst)?;
+        before - dst.len()
+    };
+    write_all_vectored(writer, &header_buf[..header_len], &frame.payload).await?;
     writer.flush().await?;
+    Ok(())
+}
+
+/// Writes two byte slices fully via vectored writes.
+async fn write_all_vectored<W>(
+    writer: &mut W,
+    mut first: &[u8],
+    mut second: &[u8],
+) -> FrameIoResult<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    use std::io::IoSlice;
+    while !first.is_empty() || !second.is_empty() {
+        let slices = [IoSlice::new(first), IoSlice::new(second)];
+        // Skip a leading empty slice so writers never see a zero-length head.
+        let active = if first.is_empty() {
+            &slices[1..]
+        } else {
+            &slices[..]
+        };
+        let written = std::future::poll_fn(|cx| {
+            std::pin::Pin::new(&mut *writer).poll_write_vectored(cx, active)
+        })
+        .await?;
+        if written == 0 {
+            return Err(std::io::Error::new(ErrorKind::WriteZero, "failed to write frame").into());
+        }
+        let mut remaining = written;
+        let first_take = first.len().min(remaining);
+        first = &first[first_take..];
+        remaining -= first_take;
+        let second_take = second.len().min(remaining);
+        second = &second[second_take..];
+    }
     Ok(())
 }
 

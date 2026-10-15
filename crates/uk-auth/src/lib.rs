@@ -808,7 +808,17 @@ fn timestamp_within_skew(timestamp: u64, now: u64, allowed_skew: Duration) -> bo
 }
 
 fn encoded_challenge_payload(challenge: &AuthChallenge) -> AuthResult<BytesMut> {
-    let mut payload = BytesMut::new();
+    // Size the buffer exactly: nonce (32) + time (8) + session id (16) +
+    // varint-prefixed capabilities and limits. This runs once per handshake;
+    // exact sizing avoids any reallocation.
+    let capacity = 32
+        + 8
+        + 16
+        + varint::encoded_len(challenge.server_capabilities.len() as u64)?
+        + challenge.server_capabilities.len()
+        + varint::encoded_len(challenge.limits.len() as u64)?
+        + challenge.limits.len();
+    let mut payload = BytesMut::with_capacity(capacity);
     challenge.encode(&mut payload)?;
     Ok(payload)
 }
@@ -819,7 +829,15 @@ fn encoded_response_prefix(
     client_time: u64,
     client_capabilities: &[u8],
 ) -> AuthResult<BytesMut> {
-    let mut payload = BytesMut::new();
+    // Size the buffer exactly: varint-prefixed key id + nonce (32) +
+    // time (8) + varint-prefixed capabilities.
+    let capacity = varint::encoded_len(key_id.len() as u64)?
+        + key_id.len()
+        + 32
+        + 8
+        + varint::encoded_len(client_capabilities.len() as u64)?
+        + client_capabilities.len();
+    let mut payload = BytesMut::with_capacity(capacity);
     varint::encode(key_id.len() as u64, &mut payload)?;
     payload.put_slice(key_id);
     payload.put_slice(client_nonce);

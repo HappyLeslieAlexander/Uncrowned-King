@@ -20,5 +20,12 @@ tracing.workspace = true
 uk-proto = { path = "../uk-proto" }
 zeroize.workspace = true
 
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "auth"
+harness = false
+
 [lints]
 workspace = true

@@ -21,5 +21,9 @@ criterion.workspace = true
 name = "codec"
 harness = false
 
+[[bench]]
+name = "pipeline"
+harness = false
+
 [lints]
 workspace = true
