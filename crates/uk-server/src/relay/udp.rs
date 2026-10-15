@@ -1,52 +1,28 @@
-#![allow(unused_imports, clippy::wildcard_imports)]
-
-use std::{
-    collections::HashMap,
-    error::Error,
-    fmt,
-    future::Future,
-    io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::{io, sync::Arc};
 
 use bytes::{Bytes, BytesMut};
-use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{
-        TcpStream, UdpSocket, lookup_host,
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-    },
-    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
-    task::{Id, JoinError, JoinSet},
-    time,
-};
-use tracing::{Instrument, Span, debug, info, warn};
-use uk_auth::{AuthenticatedIdentity, unix_now};
-use uk_policy::{PolicyContext, PolicyDecision, PolicySet};
+use tokio::{net::UdpSocket, time};
+use tracing::{debug, info, warn};
+use uk_auth::unix_now;
 use uk_proto::{
-    BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, DatagramSendOutcome, ErrorCode,
-    ErrorPayload, Frame, FrameIoError, FrameLimits, FrameReader, FrameType, TCP_CLOSE_ERROR,
-    TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR,
-    UDP_CLOSE_NORMAL, UdpClose, UdpOpen, datagram, is_client_initiated_flow_id,
-    validate_connection_frame, write_frame,
+    BoxedDatagramChannel, DatagramSendOutcome, ErrorCode, Frame, FrameType, TCP_CLOSE_ERROR,
+    Target, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose, UdpOpen, datagram,
+    is_client_initiated_flow_id,
 };
 
-use super::context::*;
-use super::dialer::*;
-use super::session::*;
-use super::tasks::*;
-use super::tcp::*;
-
-use crate::observability::{
-    ActiveFlowGuard, FlowOpenFailure, RelayDirection, RelayProtocol, ServerMetrics,
+use super::context::{
+    AnyError, CarrierWriter, FlowSlot, FlowTable, FlowToken, OpenFailure, OpenFlowCancel,
+    OpenSlotRejection, RelaySessionContext, TargetFlowControl, UdpDataDisposition,
+    UdpOpenSlotRejection, UdpTargetFlow, remove_flow_slot, udp_target_flow_mut,
 };
-use crate::security::SecurityState;
+use super::session::{
+    reject_invalid_udp_relay_flow_id, send_error, send_policy_denied, send_resource_limit,
+    validate_client_relay_flow_id, write_frame_locked,
+};
+use super::tasks::{SessionTasks, UdpOpenTask, UdpReaderTask, spawn_udp_open, spawn_udp_reader};
+use super::tcp::{check_open_slot, send_tcp_close};
+
+use crate::observability::{FlowOpenFailure, RelayDirection, RelayProtocol};
 pub(crate) fn handle_udp_read_closed(
     flow_id: u64,
     token: FlowToken,

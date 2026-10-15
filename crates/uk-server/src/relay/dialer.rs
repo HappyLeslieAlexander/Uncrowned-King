@@ -1,52 +1,28 @@
-#![allow(unused_imports, clippy::wildcard_imports)]
-
 use std::{
     collections::HashMap,
-    error::Error,
-    fmt,
     future::Future,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    },
+    sync::Arc,
     time::Duration,
 };
 
-use bytes::{Bytes, BytesMut};
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{
-        TcpStream, UdpSocket, lookup_host,
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-    },
-    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
-    task::{Id, JoinError, JoinSet},
+    net::{TcpStream, UdpSocket, lookup_host},
+    task::JoinSet,
     time,
 };
-use tracing::{Instrument, Span, debug, info, warn};
-use uk_auth::{AuthenticatedIdentity, unix_now};
+use tracing::debug;
+use uk_auth::AuthenticatedIdentity;
 use uk_policy::{PolicyContext, PolicyDecision, PolicySet};
-use uk_proto::{
-    BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, DatagramSendOutcome, ErrorCode,
-    ErrorPayload, Frame, FrameIoError, FrameLimits, FrameReader, FrameType, TCP_CLOSE_ERROR,
-    TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR,
-    UDP_CLOSE_NORMAL, UdpClose, UdpOpen, datagram, is_client_initiated_flow_id,
-    validate_connection_frame, write_frame,
-};
+use uk_proto::Target;
 
-use super::context::*;
-use super::session::*;
-use super::tasks::*;
-use super::tcp::*;
-use super::udp::*;
-
-use crate::observability::{
-    ActiveFlowGuard, FlowOpenFailure, RelayDirection, RelayProtocol, ServerMetrics,
+use super::context::{
+    BoxedConnectFuture, OpenDialLimiter, OpenDialPermit, OpenFailure, TARGET_CONNECT_PARALLELISM,
+    TARGET_RESOLUTION_ADDR_LIMIT, TARGET_TCP_KEEPALIVE_SECONDS, TargetConnector,
 };
-use crate::security::SecurityState;
+use super::tasks::ConnectTasks;
+
 pub(crate) async fn connect_allowed_target(
     target: &Target,
     identity: &AuthenticatedIdentity,

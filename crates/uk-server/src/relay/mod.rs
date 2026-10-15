@@ -1,5 +1,4 @@
 //! Server-side UK TCP and UDP relay.
-#![allow(unused_imports, clippy::wildcard_imports)]
 
 pub(crate) mod context;
 pub(crate) mod dialer;

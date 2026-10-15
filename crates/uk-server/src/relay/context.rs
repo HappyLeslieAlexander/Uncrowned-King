@@ -1,12 +1,10 @@
-#![allow(unused_imports, clippy::wildcard_imports)]
-
 use std::{
     collections::HashMap,
     error::Error,
     fmt,
     future::Future,
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::SocketAddr,
     pin::Pin,
     sync::{
         Arc,
@@ -15,37 +13,21 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{
-        TcpStream, UdpSocket, lookup_host,
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-    },
-    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
-    task::{AbortHandle, Id, JoinError, JoinSet},
+    net::{TcpStream, UdpSocket},
+    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc},
+    task::AbortHandle,
     time,
 };
-use tracing::{Instrument, Span, debug, info, warn};
-use uk_auth::{AuthenticatedIdentity, unix_now};
-use uk_policy::{PolicyContext, PolicyDecision, PolicySet};
+use tracing::debug;
+use uk_auth::AuthenticatedIdentity;
 use uk_proto::{
-    BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, DatagramSendOutcome, ErrorCode,
-    ErrorPayload, Frame, FrameIoError, FrameLimits, FrameReader, FrameType, TCP_CLOSE_ERROR,
-    TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR,
-    UDP_CLOSE_NORMAL, UdpClose, UdpOpen, datagram, is_client_initiated_flow_id,
-    validate_connection_frame, write_frame,
+    BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, Frame, FrameIoError, FrameLimits,
+    Target,
 };
 
-use super::dialer::*;
-use super::session::*;
-use super::tasks::*;
-use super::tcp::*;
-use super::udp::*;
-
-use crate::observability::{
-    ActiveFlowGuard, FlowOpenFailure, RelayDirection, RelayProtocol, ServerMetrics,
-};
+use crate::observability::{ActiveFlowGuard, ServerMetrics};
 use crate::security::SecurityState;
 
 pub(crate) const RELAY_BUFFER_SIZE: usize = 16 * 1024;

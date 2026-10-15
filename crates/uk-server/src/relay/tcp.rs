@@ -1,52 +1,32 @@
-#![allow(unused_imports, clippy::wildcard_imports)]
-
-use std::{
-    collections::HashMap,
-    error::Error,
-    fmt,
-    future::Future,
-    io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{
-        TcpStream, UdpSocket, lookup_host,
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-    },
-    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
-    task::{Id, JoinError, JoinSet},
-    time,
-};
-use tracing::{Instrument, Span, debug, info, warn};
-use uk_auth::{AuthenticatedIdentity, unix_now};
-use uk_policy::{PolicyContext, PolicyDecision, PolicySet};
+use tokio::{net::TcpStream, sync::mpsc};
+use tracing::{debug, info, warn};
+use uk_auth::unix_now;
 use uk_proto::{
-    BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, DatagramSendOutcome, ErrorCode,
-    ErrorPayload, Frame, FrameIoError, FrameLimits, FrameReader, FrameType, TCP_CLOSE_ERROR,
-    TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR,
-    UDP_CLOSE_NORMAL, UdpClose, UdpOpen, datagram, is_client_initiated_flow_id,
-    validate_connection_frame, write_frame,
+    ErrorCode, ErrorPayload, Frame, FrameType, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL,
+    TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR, is_client_initiated_flow_id,
 };
 
-use super::context::*;
-use super::dialer::*;
-use super::session::*;
-use super::tasks::*;
-use super::udp::*;
-
-use crate::observability::{
-    ActiveFlowGuard, FlowOpenFailure, RelayDirection, RelayProtocol, ServerMetrics,
+use super::context::{
+    AnyError, CarrierWriter, EnqueueError, FlowEventSender, FlowSlot, FlowTable, FlowToken,
+    HalfCloseSide, OpenFailure, OpenFlowCancel, OpenSlotRejection, RelaySessionContext,
+    SessionShutdown, TargetFlow, TargetFlowControl, TargetFlowIdentity, TcpDataDisposition,
+    open_target_flow_mut, remove_flow_slot,
 };
-use crate::security::SecurityState;
+use super::session::{
+    reject_invalid_client_relay_flow_id, send_error, send_policy_denied, send_resource_limit,
+    target_write_queue_capacity, validate_client_relay_flow_id, write_flow_frame_locked,
+    write_frame_locked,
+};
+use super::tasks::{
+    SessionTasks, TargetOpenTask, TargetReaderTask, TargetWriterTask, spawn_half_close_timer,
+    spawn_target_open, spawn_target_reader, spawn_target_writer,
+};
+use super::udp::send_udp_close;
+
+use crate::observability::{FlowOpenFailure, RelayProtocol};
 /// Whether a `TCP_CLOSE(NORMAL)` should start a half-close drain timer.
 ///
 /// Only the close that actually half-closes the flow qualifies. Testing the

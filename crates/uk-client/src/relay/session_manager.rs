@@ -1,16 +1,9 @@
-#![allow(unused_imports, clippy::wildcard_imports)]
-
 use std::{
     collections::{HashMap, hash_map::Entry},
-    error::Error,
-    fmt,
-    future::Future,
-    io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    pin::Pin,
+    net::SocketAddr,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -19,33 +12,41 @@ use rand::Rng;
 
 use bytes::{Bytes, BytesMut};
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream, UdpSocket},
-    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch},
-    task::{Id, JoinError, JoinSet},
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    sync::{Mutex, Notify, Semaphore, mpsc, watch},
+    task::JoinSet,
     time,
 };
-use tracing::{Instrument, debug, error, info, info_span, warn};
-use uk_auth::{AuthenticatedIdentity, unix_now};
+use tracing::{Instrument, debug, info, info_span, warn};
 use uk_proto::{
-    BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, DatagramSendOutcome, ErrorCode,
-    ErrorPayload, FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, Frame, FrameIoError, FrameLimits, FrameType,
-    NegotiatedSettings, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, Target, TcpClose,
-    TcpOpen, UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose, UdpOpen, datagram,
-    is_client_initiated_flow_id, read_frame, validate_connection_frame, varint::MAX_VARINT,
-    write_frame,
+    BoxedDatagramChannel, DatagramSendOutcome, ErrorCode, FIRST_CLIENT_FLOW_ID, Frame, FrameLimits,
+    FrameType, TCP_CLOSE_ERROR, TCP_OPEN_FLAGS_NONE, Target, TcpClose, TcpOpen, UDP_CLOSE_ERROR,
+    UdpClose, UdpOpen, datagram, is_client_initiated_flow_id,
 };
 
-use super::carrier::*;
-use super::context::*;
-use super::listener::*;
-use super::tcp::*;
-use super::udp::*;
+use super::carrier::{
+    allocate_client_flow_id, decode_open_response, decode_udp_open_response,
+    keepalive_nonce_payload, next_keepalive_nonce, record_matching_pong, report_protocol_error,
+    spawn_carrier_reader, spawn_datagram_reader, spawn_keepalive, status_frame, write_frame_locked,
+};
+use super::context::{
+    AdmissionRefusal, AnyError, BufferedFlowFrame, CachedConnectFailure, CarrierWriter, ClientFlow,
+    ClientFlowRoute, ClientSessionBufferControl, ClientSessionMetricState, ClientSessionShutdown,
+    ClientSessionTasks, FLOW_ID_ALLOCATION_ATTEMPTS, FlowAdmission, FlowAdmissionControl,
+    FlowProtocol, FlowTable, KeepalivePong, NEXT_CLIENT_SESSION_ID, NEXT_SOCKS_CONNECTION_ID,
+    OpenOutcome, OpenResponse, OpenWaitOutcome, PendingClientSession, PendingOpenLocalData,
+    PendingOpenLocalRead, PoolAdmissionRefusal, SERVER_CONNECT_RETRY_MAX_MILLIS,
+    SessionDrainingError, UdpOpenWaitOutcome, cached_connect_failure_error,
+    flow_frame_queue_capacity, is_session_draining_error, keepalive_interval, retry_delay,
+    retry_delay_expires_at, tcp_data_frame_size, timeout, usize_limit,
+};
+use super::listener::{drain_client_session_tasks, is_clean_socks_disconnect};
+use super::tcp::handle_socks_connection;
 use crate::{
-    ClientReloadReceiver, ClientReloadRequest,
-    config::{ClientConfig, validate_endpoint},
+    config::ClientConfig,
     config_state::{ClientConfigSnapshot, ClientConfigState},
-    observability::{ActiveFlowGuard, ClientMetrics, RelayDirection, RelayProtocol},
+    observability::{ClientMetrics, RelayDirection, RelayProtocol},
     session, socks5,
 };
 pub(crate) struct ClientSession {

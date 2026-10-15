@@ -1,5 +1,4 @@
 //! Client-side SOCKS5 and UK relay.
-#![allow(unused_imports, clippy::wildcard_imports)]
 
 pub(crate) mod carrier;
 pub(crate) mod context;

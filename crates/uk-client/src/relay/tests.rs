@@ -1,15 +1,10 @@
-#![allow(unused_imports, clippy::wildcard_imports)]
-
 use std::{
-    collections::{HashMap, hash_map::Entry},
-    error::Error,
-    fmt,
-    future::Future,
+    collections::HashMap,
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -20,23 +15,15 @@ use super::listener::*;
 use super::session_manager::*;
 use super::tcp::*;
 use super::udp::*;
-use crate::{
-    ClientReloadReceiver, ClientReloadRequest, config::*, config_state::*, observability::*,
-    session, socks5,
-};
+use crate::{config::*, observability::*, socks5};
 use bytes::{Bytes, BytesMut};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{
-        TcpListener, TcpStream, UdpSocket,
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-    },
-    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
-    task::{Id, JoinError, JoinSet},
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, TcpStream, UdpSocket},
+    sync::{Mutex, Notify, Semaphore, mpsc, watch},
+    task::JoinSet,
     time,
 };
-use tracing::{Instrument, Span, debug, error, info, warn};
-use uk_auth::{AuthenticatedIdentity, unix_now};
 use uk_proto::{varint::MAX_VARINT, *};
 
 const FLOW_ID: u64 = 1;
