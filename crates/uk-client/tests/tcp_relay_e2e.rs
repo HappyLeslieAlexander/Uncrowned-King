@@ -1673,7 +1673,8 @@ const THROUGHPUT_CHUNK: usize = 64 * 1024;
 //
 // See docs/performance.md for the finding, numbers, and mitigations.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "load-sensitive throughput benchmark; run manually with --ignored"]
+#[ignore = "load-sensitive throughput benchmark; run manually with --ignored. \
+               Requires UDP (QUIC); not run in sandboxed CI without UDP egress."]
 async fn measures_quic_carrier_throughput() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(30), run_quic_throughput_e2e()).await?
 }
@@ -1706,7 +1707,8 @@ const ISOLATION_BULK_CHUNK: usize = 64 * 1024;
 //
 // See docs/performance.md for observed numbers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "load-sensitive latency benchmark; run manually with --ignored"]
+#[ignore = "load-sensitive latency benchmark; run manually with --ignored. \
+               Measurement only (no assertions); not a CI correctness test."]
 async fn measures_connection_pool_latency_isolation() -> Result<(), TestError> {
     tokio::time::timeout(Duration::from_secs(60), run_pool_isolation_benchmark()).await?
 }
@@ -2019,8 +2021,10 @@ fn soak_limits() -> LimitConfig {
     }
 }
 
+// Soak/chaos test: duration configurable via UK_SOAK_SECONDS (default 2s).
+// Runs in CI with the default short duration; set UK_SOAK_SECONDS higher
+// (e.g. 86400) for manual long-duration soak testing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "duration-based soak/chaos; run manually with --ignored (UK_SOAK_SECONDS)"]
 async fn soak_sustained_relay_and_chaos() -> Result<(), TestError> {
     init_tracing();
 
@@ -3903,6 +3907,235 @@ async fn quic_carrier_falls_back_to_udp_frame_for_large_payload() -> Result<(), 
     let (reply_target, reply_payload) = parse_socks_udp_datagram(&reply_buf[..read])?;
     assert_eq!(reply_target, target_addr);
     assert_eq!(reply_payload, payload);
+
+    echo_task.await??;
+    client_task.abort();
+    shutdown_tx
+        .send(())
+        .map_err(|()| "server shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(5), server_task).await???;
+    Ok(())
+}
+
+/// Opens several TCP flows concurrently over a single QUIC connection and
+/// verifies each flow relays its own payload intact. The flows share one QUIC
+/// connection, so their streams are multiplexed; a head-of-line blocking bug
+/// would corrupt or stall the interleaved echoes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quic_carrier_multiplexes_concurrent_tcp_flows() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        run_quic_multiplexed_tcp_flows_e2e(),
+    )
+    .await?
+}
+
+async fn run_quic_multiplexed_tcp_flows_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    let policy_path = temp_dir.join("policy.toml");
+    fs::write(&cert_path, CERT_PEM)?;
+    write_private_key(&key_path)?;
+    write_policy_file(&policy_path, allow_loopback_any_port_policy())?;
+    let (tcp_target_addr, echo_task) = spawn_multi_echo_target().await?;
+
+    let quic_addr = unused_udp_loopback_addr().await?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut config = test_server_config(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        &cert_path,
+        &key_path,
+        test_limits(),
+        Some(&policy_path),
+        30,
+    );
+    config.quic_listen = Some(quic_addr.to_string());
+    let (_server_addr, server_task) = start_uk_server_until_shutdown(config, async {
+        let _ = shutdown_rx.await;
+    })
+    .await?;
+
+    let (mut carrier, _settings) = connect_authenticated_carrier(ClientConfig {
+        server_addr: format!("quic://{quic_addr}"),
+        server_addrs: None,
+        server_name: "localhost".to_owned(),
+        observability_listen: None,
+        ca_cert_path: path_string(&cert_path),
+        key_id: KEY_ID.to_owned(),
+        secret: SECRET.to_owned(),
+        handshake_timeout_seconds: Some(5),
+        server_connect_retry_delay_millis: None,
+        socks_handshake_timeout_seconds: Some(3),
+        tcp_open_timeout_seconds: Some(3),
+        udp_flow_idle_timeout_seconds: None,
+        shutdown_timeout_seconds: Some(3),
+        max_pending_open_bytes: None,
+        max_socks_connections: None,
+        max_buffered_bytes_per_session: None,
+        max_buffered_bytes_per_flow: None,
+        max_carrier_sessions: None,
+        relay_buffer_size: None,
+    })
+    .await?;
+
+    // Open every flow before exchanging data, so all streams are live at once.
+    const FLOW_COUNT: u64 = 8;
+    for flow_id in 1..=FLOW_COUNT {
+        write_frame(&mut carrier, &tcp_open_frame(flow_id, tcp_target_addr)?).await?;
+    }
+    for flow_id in 1..=FLOW_COUNT {
+        read_open_ack(&mut carrier, flow_id).await?;
+    }
+    for flow_id in 1..=FLOW_COUNT {
+        let payload = Bytes::from(format!("quic multiplexed flow {flow_id}"));
+        write_frame(
+            &mut carrier,
+            &Frame::new(FrameType::TcpData, 0, flow_id, payload)?,
+        )
+        .await?;
+    }
+    // Read the echoes back; each must carry its own flow's payload even
+    // though the frames arrive interleaved on the single connection.
+    for flow_id in 1..=FLOW_COUNT {
+        let expected = Bytes::from(format!("quic multiplexed flow {flow_id}"));
+        let echo = read_relay_frame(&mut carrier, FrameType::TcpData, flow_id).await?;
+        assert_eq!(echo.payload, expected, "flow {flow_id} echo mismatch");
+    }
+
+    echo_task.abort();
+    shutdown_tx
+        .send(())
+        .map_err(|()| "server shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(5), server_task).await???;
+    drop(carrier);
+    Ok(())
+}
+
+/// A QUIC endpoint that cannot complete its handshake must not wedge the
+/// client: the dialer falls through to the next configured endpoint and the
+/// session comes up over TLS. Here the QUIC dial targets the server's
+/// TLS/TCP port, where no UDP listener exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quic_handshake_failure_falls_back_to_tls() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(30), run_quic_to_tls_fallback_e2e()).await?
+}
+
+async fn run_quic_to_tls_fallback_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    // Server listens on TLS/TCP only.
+    let harness =
+        ServerHarness::start_with_policy(test_limits(), Some(allow_loopback_any_port_policy()))
+            .await?;
+    let tls_addr = harness.server_addr;
+
+    let mut config = harness.client_config(SECRET);
+    config.server_addr = format!("quic://{tls_addr}");
+    config.server_addrs = Some(vec![tls_addr.to_string()]);
+    // Short handshake timeout so the doomed QUIC dial does not dominate the
+    // test runtime even if the failure surfaces as a timeout.
+    config.handshake_timeout_seconds = Some(3);
+
+    // Must succeed via the TLS fallback despite the QUIC dial failing.
+    let (mut carrier, _settings) = connect_authenticated_carrier(config).await?;
+
+    let (tcp_target_addr, tcp_target_task) = spawn_echo_target().await?;
+    let tcp_payload = Bytes::from_static(b"quic fallback to tls payload");
+    write_frame(&mut carrier, &tcp_open_frame(1, tcp_target_addr)?).await?;
+    read_open_ack(&mut carrier, 1).await?;
+    write_frame(
+        &mut carrier,
+        &Frame::new(FrameType::TcpData, 0, 1, tcp_payload.clone())?,
+    )
+    .await?;
+    let tcp_echo = read_relay_frame(&mut carrier, FrameType::TcpData, 1).await?;
+    assert_eq!(tcp_echo.payload, tcp_payload);
+    tcp_target_task.await??;
+    drop(carrier);
+    Ok(())
+}
+
+/// Drives several concurrent SOCKS5 UDP ASSOCIATE sessions over one QUIC
+/// carrier, verifying that independent datagram flows do not cross or lose
+/// datagrams when multiplexed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quic_carrier_handles_concurrent_udp_associations() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        run_quic_concurrent_udp_associations_e2e(),
+    )
+    .await?
+}
+
+async fn run_quic_concurrent_udp_associations_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, echo_task) = spawn_udp_echo_target_roundtrips(3).await?;
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    let policy_path = temp_dir.join("policy.toml");
+    fs::write(&cert_path, CERT_PEM)?;
+    write_private_key(&key_path)?;
+    write_policy_file(&policy_path, allow_loopback_policy(target_addr.port()))?;
+
+    let quic_addr = unused_udp_loopback_addr().await?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut limits = test_limits();
+    limits.shutdown_timeout_seconds = Some(1);
+    let mut config = test_server_config(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        &cert_path,
+        &key_path,
+        limits,
+        Some(&policy_path),
+        30,
+    );
+    config.quic_listen = Some(quic_addr.to_string());
+    let (_server_addr, server_task) = start_uk_server_until_shutdown(config, async {
+        let _ = shutdown_rx.await;
+    })
+    .await?;
+
+    let (socks_addr, client_task) = start_socks5_listener(ClientConfig {
+        server_addr: format!("quic://{quic_addr}"),
+        server_addrs: None,
+        server_name: "localhost".to_owned(),
+        observability_listen: None,
+        ca_cert_path: path_string(&cert_path),
+        key_id: KEY_ID.to_owned(),
+        secret: SECRET.to_owned(),
+        handshake_timeout_seconds: Some(5),
+        server_connect_retry_delay_millis: None,
+        socks_handshake_timeout_seconds: Some(3),
+        tcp_open_timeout_seconds: Some(3),
+        udp_flow_idle_timeout_seconds: None,
+        shutdown_timeout_seconds: Some(3),
+        max_pending_open_bytes: None,
+        max_socks_connections: None,
+        max_buffered_bytes_per_session: None,
+        max_buffered_bytes_per_flow: None,
+        max_carrier_sessions: None,
+        relay_buffer_size: None,
+    })
+    .await?;
+
+    // Three independent UDP associations sharing the one QUIC carrier.
+    const ASSOCIATION_COUNT: usize = 3;
+    let mut associations = Vec::with_capacity(ASSOCIATION_COUNT);
+    for _ in 0..ASSOCIATION_COUNT {
+        let (_socks_control, udp_relay_addr) = open_socks_udp_associate(socks_addr).await?;
+        let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        associations.push((udp_client, udp_relay_addr));
+    }
+    for (index, (udp_client, udp_relay_addr)) in associations.iter().enumerate() {
+        let payload = format!("quic concurrent udp association {index}").into_bytes();
+        assert_socks_udp_roundtrip(udp_client, *udp_relay_addr, target_addr, &payload).await?;
+    }
 
     echo_task.await??;
     client_task.abort();
