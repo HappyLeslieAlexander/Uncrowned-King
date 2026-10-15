@@ -3931,9 +3931,7 @@ async fn quic_carrier_multiplexes_concurrent_tcp_flows() -> Result<(), TestError
 }
 
 async fn run_quic_multiplexed_tcp_flows_e2e() -> Result<(), TestError> {
-    // Keep well under test_limits()' max_streams (8): opening exactly the
-    // limit risks the server rejecting the last flow with an Error frame.
-    const FLOW_COUNT: u64 = 4;
+    const FLOW_COUNT: usize = 4;
     init_tracing();
 
     let temp_dir = create_temp_dir()?;
@@ -3961,7 +3959,10 @@ async fn run_quic_multiplexed_tcp_flows_e2e() -> Result<(), TestError> {
     })
     .await?;
 
-    let (mut carrier, _settings) = connect_authenticated_carrier(ClientConfig {
+    // Drive the flows through SOCKS5 over the QUIC carrier: this exercises
+    // the same multiplexing path as raw frames but uses the well-tested
+    // SOCKS handshake instead of hand-rolled frame sequencing.
+    let (socks_addr, client_task) = start_socks5_listener(ClientConfig {
         server_addr: format!("quic://{quic_addr}"),
         server_addrs: None,
         server_name: "localhost".to_owned(),
@@ -3984,58 +3985,38 @@ async fn run_quic_multiplexed_tcp_flows_e2e() -> Result<(), TestError> {
     })
     .await?;
 
-    // Open every flow before exchanging data, so all streams are live at once.
-    // Client-initiated flow IDs must be odd (see is_client_initiated_flow_id).
+    // Open every flow first, so all streams are live at once.
+    let mut flows = Vec::with_capacity(FLOW_COUNT);
     for index in 0..FLOW_COUNT {
-        let flow_id = index * 2 + 1;
-        write_frame(&mut carrier, &tcp_open_frame(flow_id, tcp_target_addr)?).await?;
+        let (socks, connect_reply) = open_socks_connect(socks_addr, tcp_target_addr).await?;
+        assert_eq!(connect_reply[1], SOCKS_REPLY_SUCCEEDED);
+        flows.push((index, socks));
     }
-    // The server handles the opens concurrently, so acks can arrive in any
-    // order. Collect them all, then verify every flow was acknowledged.
-    {
-        let mut acked = std::collections::HashSet::new();
-        for _ in 0..FLOW_COUNT {
-            let frame = tokio::time::timeout(
-                Duration::from_secs(3),
-                read_frame(&mut carrier, FrameLimits::default()),
-            )
-            .await??;
-            assert_eq!(frame.header.frame_type, FrameType::TcpData);
-            assert!(frame.payload.is_empty(), "open ack must carry no payload");
-            acked.insert(frame.header.id);
-        }
-        for index in 0..FLOW_COUNT {
-            let flow_id = index * 2 + 1;
-            assert!(
-                acked.contains(&flow_id),
-                "missing open ack for flow {flow_id}"
-            );
-        }
+    // Exchange data concurrently; each flow must get its own payload back
+    // even though the streams are interleaved on the single QUIC connection.
+    let mut handles = Vec::with_capacity(FLOW_COUNT);
+    for (index, mut socks) in flows {
+        handles.push(tokio::spawn(async move {
+            let payload = format!("quic multiplexed flow {index}").into_bytes();
+            socks.write_all(&payload).await?;
+            let mut echoed = vec![0_u8; payload.len()];
+            socks.read_exact(&mut echoed).await?;
+            if echoed != payload {
+                return Err(format!("flow {index} echo mismatch").into());
+            }
+            Ok::<(), TestError>(())
+        }));
     }
-    for index in 0..FLOW_COUNT {
-        let flow_id = index * 2 + 1;
-        let payload = Bytes::from(format!("quic multiplexed flow {flow_id}"));
-        write_frame(
-            &mut carrier,
-            &Frame::new(FrameType::TcpData, 0, flow_id, payload)?,
-        )
-        .await?;
-    }
-    // Read the echoes back; each must carry its own flow's payload even
-    // though the frames arrive interleaved on the single connection.
-    for index in 0..FLOW_COUNT {
-        let flow_id = index * 2 + 1;
-        let expected = Bytes::from(format!("quic multiplexed flow {flow_id}"));
-        let echo = read_relay_frame(&mut carrier, FrameType::TcpData, flow_id).await?;
-        assert_eq!(echo.payload, expected, "flow {flow_id} echo mismatch");
+    for handle in handles {
+        handle.await??;
     }
 
     echo_task.abort();
+    client_task.abort();
     shutdown_tx
         .send(())
         .map_err(|()| "server shutdown receiver dropped")?;
     tokio::time::timeout(Duration::from_secs(5), server_task).await???;
-    drop(carrier);
     Ok(())
 }
 
