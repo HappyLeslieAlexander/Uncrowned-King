@@ -4006,7 +4006,10 @@ async fn run_quic_multiplexed_tcp_flows_e2e() -> Result<(), TestError> {
         }
         for index in 0..FLOW_COUNT {
             let flow_id = index * 2 + 1;
-            assert!(acked.contains(&flow_id), "missing open ack for flow {flow_id}");
+            assert!(
+                acked.contains(&flow_id),
+                "missing open ack for flow {flow_id}"
+            );
         }
     }
     for index in 0..FLOW_COUNT {
