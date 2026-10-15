@@ -20,7 +20,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-const CERT1_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+const CERT1_PEM: &str = r"-----BEGIN CERTIFICATE-----
 MIIDFzCCAf+gAwIBAgIUXmIluOxd2BJQUtdcW7NeCvqISpowDQYJKoZIhvcNAQEL
 BQAwGzEZMBcGA1UEAwwQdWstdGVzdC1zZXJ2ZXItMTAeFw0yNjEwMTUxNzMwMjVa
 Fw0zNjEwMTIxNzMwMjVaMBsxGTAXBgNVBAMMEHVrLXRlc3Qtc2VydmVyLTEwggEi
@@ -39,8 +39,8 @@ Y22v4EUc+CUJawhBs4cU/NIDZ8VHcQIywaaYupeQSn7hq1RGmwRs7efSbqM8TLbU
 qoMtc99+IW2HuewF6IaxsJ4lKY9IiiMTcT8gdH2ZJy8M1O3G2HwPKSQG6wc4oJDw
 fFDi4p5s8Sv51rlh6QMFwMDPFmCz+lyJjXqR
 -----END CERTIFICATE-----
-"#;
-const KEY1_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+";
+const KEY1_PEM: &str = r"-----BEGIN PRIVATE KEY-----
 MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQCwUWiURQqTVXVT
 x8QOVyuTDhjXJH1H1SuiZ1+x5fwFuNuFQseIRmlKjuf9xFfHneckA0SWG5Apnqje
 uOA6LNXaq4kAYYHlm/KDI0thcuF3Payp2ljRklcxEas2DmPzn7Zu6NdNYebFw9Qu
@@ -68,8 +68,8 @@ Rzmf4hFIC/HUcSoa30xwymN2nOGs8enVbkANGe8fuwcOH1SnO1atXGaoPK2/5DFE
 9QncJZ8VKk0Rb7nh29cj8wnp1qGkBv5UB0Hzr7tklAhw1zvZFfrXbV1Im7p0K3do
 04LbBQOnLlg0XVEXEJzY+1HmbQ==
 -----END PRIVATE KEY-----
-"#;
-const CERT2_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+";
+const CERT2_PEM: &str = r"-----BEGIN CERTIFICATE-----
 MIIDFzCCAf+gAwIBAgIUOw62/sVz/oJQPv5bcEQkPzj+F1gwDQYJKoZIhvcNAQEL
 BQAwGzEZMBcGA1UEAwwQdWstdGVzdC1zZXJ2ZXItMjAeFw0yNjEwMTUxNzMwMjZa
 Fw0zNjEwMTIxNzMwMjZaMBsxGTAXBgNVBAMMEHVrLXRlc3Qtc2VydmVyLTIwggEi
@@ -88,8 +88,8 @@ DQEBCwUAA4IBAQC4atsuRt7mvBJEHl57B9Bl/QVyse0vEgbC6rasjjyqTA8gGVq9
 TJU0GgcnYhq7L0DP/GZrpnJGWmPB3SiAzEkGMQWhWsXLMbxEJ5H+ZAJkT9jDJowo
 9nSg4BtrLw9H/suEhouV9hw2w7Km1Qhh5GF/
 -----END CERTIFICATE-----
-"#;
-const KEY2_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+";
+const KEY2_PEM: &str = r"-----BEGIN PRIVATE KEY-----
 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDNHcfvR44oZB+T
 z3RA5vBIw+C0wdZ6jusd6JtdmtyyXaU0CX5WqCaIpEXJ18nOmA2IxampeMf3zD6w
 Ily+dur2FfIWw/4PBPkycO20t81IWuWuhIYKqbH1tTJs86q3kDpJeKbBMh7bUjLg
@@ -117,7 +117,7 @@ RPtkza7xhBAlJ/eLnhftn2V73meawEa5+IJeW5xv6ix6rCnQobALlj2lfCieEPHY
 ANEf7ihzp0odb4pxebcwvDn9zFkjnIAB2DhgOVLfrlyQ3JuVSIjk9gnhJTvmOSkG
 Cl5aqngt+UYmktrsXtcFSZ4=
 -----END PRIVATE KEY-----
-"#;
+";
 
 /// rustls verifier that accepts any certificate but records the presented
 /// end-entity DER, so the test can assert which identity the server served.
@@ -405,15 +405,12 @@ async fn sighup_reloads_tls_identity_without_dropping_connections() -> Result<()
     let read_result =
         tokio::time::timeout(Duration::from_secs(3), pre_reload_tls.read(&mut probe_buf)).await;
     match read_result {
-        Err(_) => {
-            // Timeout: connection open but idle (challenge already consumed
-            // or server waiting for the auth response). This is fine.
-        }
         Ok(Ok(0)) => {
             panic!("pre-reload connection was dropped by SIGHUP reload (EOF)");
         }
-        Ok(Ok(_)) => {
-            // Got data (e.g. the AuthChallenge): connection is alive.
+        Err(_) | Ok(Ok(_)) => {
+            // Timeout (connection open but idle) or data (e.g. the
+            // AuthChallenge): the pre-reload connection survived. Fine.
         }
         Ok(Err(e)) => {
             panic!("pre-reload connection errored after SIGHUP reload: {e}");

@@ -3931,6 +3931,7 @@ async fn quic_carrier_multiplexes_concurrent_tcp_flows() -> Result<(), TestError
 }
 
 async fn run_quic_multiplexed_tcp_flows_e2e() -> Result<(), TestError> {
+    const FLOW_COUNT: u64 = 8;
     init_tracing();
 
     let temp_dir = create_temp_dir()?;
@@ -3982,7 +3983,6 @@ async fn run_quic_multiplexed_tcp_flows_e2e() -> Result<(), TestError> {
     .await?;
 
     // Open every flow before exchanging data, so all streams are live at once.
-    const FLOW_COUNT: u64 = 8;
     for flow_id in 1..=FLOW_COUNT {
         write_frame(&mut carrier, &tcp_open_frame(flow_id, tcp_target_addr)?).await?;
     }
@@ -4071,6 +4071,7 @@ async fn quic_carrier_handles_concurrent_udp_associations() -> Result<(), TestEr
 }
 
 async fn run_quic_concurrent_udp_associations_e2e() -> Result<(), TestError> {
+    const ASSOCIATION_COUNT: usize = 3;
     init_tracing();
 
     let (target_addr, echo_task) = spawn_udp_echo_target_roundtrips(3).await?;
@@ -4125,7 +4126,6 @@ async fn run_quic_concurrent_udp_associations_e2e() -> Result<(), TestError> {
     .await?;
 
     // Three independent UDP associations sharing the one QUIC carrier.
-    const ASSOCIATION_COUNT: usize = 3;
     let mut associations = Vec::with_capacity(ASSOCIATION_COUNT);
     for _ in 0..ASSOCIATION_COUNT {
         let (_socks_control, udp_relay_addr) = open_socks_udp_associate(socks_addr).await?;
