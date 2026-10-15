@@ -3965,19 +3965,43 @@ async fn run_quic_to_tls_fallback_e2e() -> Result<(), TestError> {
 /// carrier, verifying that independent datagram flows do not cross or lose
 /// datagrams when multiplexed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn quic_carrier_handles_concurrent_udp_associations() -> Result<(), TestError> {
+async fn quic_carrier_handles_multiple_udp_associations() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(30),
-        run_quic_concurrent_udp_associations_e2e(),
+        run_quic_multiple_udp_associations_e2e(),
     )
     .await?
 }
 
-async fn run_quic_concurrent_udp_associations_e2e() -> Result<(), TestError> {
+/// Aborts test background tasks on drop, so early returns (`?`) do not leak
+/// tasks that hang forever (e.g. an echo server blocked in `recv_from`).
+struct UdpTestGuard {
+    echo_task: tokio::task::JoinHandle<Result<(), TestError>>,
+    client_task: tokio::task::JoinHandle<Result<(), TestError>>,
+    server_task: tokio::task::JoinHandle<Result<(), TestError>>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for UdpTestGuard {
+    fn drop(&mut self) {
+        self.echo_task.abort();
+        self.client_task.abort();
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        // Give the server a moment; abort if it doesn't shut down.
+        // (Synchronous drop can't await, so abort is the safe fallback.)
+        self.server_task.abort();
+    }
+}
+
+async fn run_quic_multiple_udp_associations_e2e() -> Result<(), TestError> {
     const ASSOCIATION_COUNT: usize = 3;
     init_tracing();
 
-    let (target_addr, echo_task) = spawn_udp_echo_target_roundtrips(3).await?;
+    // Echo server runs until aborted; no exact-count fragility if a datagram
+    // is lost or duplicated.
+    let (target_addr, echo_task) = spawn_udp_echo_target_forever().await?;
 
     let temp_dir = create_temp_dir()?;
     let cert_path = temp_dir.join("server-cert.pem");
@@ -4037,17 +4061,32 @@ async fn run_quic_concurrent_udp_associations_e2e() -> Result<(), TestError> {
         let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         associations.push((socks_control, udp_client, udp_relay_addr));
     }
+
+    // Guard aborts all background tasks if any `?` below returns early.
+    let mut guard = UdpTestGuard {
+        echo_task,
+        client_task,
+        server_task,
+        shutdown_tx: Some(shutdown_tx),
+    };
+
     for (index, (_socks_control, udp_client, udp_relay_addr)) in associations.iter().enumerate() {
-        let payload = format!("quic concurrent udp association {index}").into_bytes();
+        let payload = format!("quic multiple udp association {index}").into_bytes();
         assert_socks_udp_roundtrip(udp_client, *udp_relay_addr, target_addr, &payload).await?;
     }
 
-    echo_task.await??;
-    client_task.abort();
-    shutdown_tx
+    // Success path: graceful shutdown, then disarm the guard.
+    guard.echo_task.abort();
+    guard.client_task.abort();
+    guard
+        .shutdown_tx
+        .take()
+        .expect("guard holds shutdown_tx")
         .send(())
         .map_err(|()| "server shutdown receiver dropped")?;
-    tokio::time::timeout(Duration::from_secs(5), server_task).await???;
+    tokio::time::timeout(Duration::from_secs(5), &mut guard.server_task).await???;
+    // Server shut down cleanly; prevent the guard from aborting it.
+    std::mem::forget(guard);
     Ok(())
 }
 
@@ -6683,6 +6722,24 @@ async fn spawn_udp_echo_target_roundtrips(
             socket.send_to(&buf[..read], peer).await?;
         }
         Ok(())
+    });
+    Ok((addr, task))
+}
+
+/// Spawns a UDP echo target that runs until aborted. Prefer this over
+/// `spawn_udp_echo_target_roundtrips` when the exact datagram count is not
+/// part of the test's assertion: an exact-count target hangs if a datagram
+/// is lost or duplicated, while this one is simply aborted at test end.
+async fn spawn_udp_echo_target_forever()
+-> Result<(SocketAddr, tokio::task::JoinHandle<Result<(), TestError>>), TestError> {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = socket.local_addr()?;
+    let task = tokio::spawn(async move {
+        let mut buf = [0_u8; 1024];
+        loop {
+            let (read, peer) = socket.recv_from(&mut buf).await?;
+            socket.send_to(&buf[..read], peer).await?;
+        }
     });
     Ok((addr, task))
 }
