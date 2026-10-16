@@ -6467,7 +6467,7 @@ fn server_exporter(stream: &ServerTlsStream<TcpStream>) -> Result<[u8; 32], Test
 
 fn fake_server_settings() -> Settings {
     let mut settings = Settings::default();
-    settings.set(SettingKey::ProtocolRevision, 1);
+    settings.set(SettingKey::ProtocolRevision, 2);
     settings.set(SettingKey::MaxFrameSize, 65_536);
     settings.set(SettingKey::MaxStreams, 8);
     settings.set(SettingKey::MaxUdpFlows, 8);

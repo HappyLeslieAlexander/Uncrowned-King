@@ -277,6 +277,15 @@ where
 ///
 /// This reduces write system calls and minimizes packet fragmentation when sending
 /// batches of frames.
+///
+/// This is part of the stable 1.0 public API: the signature is frozen and the
+/// relay hot path depends on it.
+///
+/// # Cancellation safety
+///
+/// This function is **not** cancellation safe: dropping the returned future can
+/// leave a partially written frame on the wire. Callers that race it against a
+/// shutdown signal must discard the carrier rather than write to it again.
 pub async fn write_frames<'a, W, I>(writer: &mut W, frames: I) -> FrameIoResult<()>
 where
     W: AsyncWrite + Unpin,

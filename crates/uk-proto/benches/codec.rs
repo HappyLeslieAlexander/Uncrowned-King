@@ -14,7 +14,7 @@ use bytes::{Bytes, BytesMut};
 use criterion::{Criterion, criterion_group, criterion_main};
 use uk_proto::{
     Frame, FrameLimits, FrameType, Settings, Target, datagram,
-    settings::{PROTOCOL_REVISION_V0_1, SettingKey},
+    settings::{PROTOCOL_REVISION_V1_0, SettingKey},
     varint,
 };
 
@@ -107,7 +107,7 @@ fn bench_datagram(c: &mut Criterion) {
 
 fn bench_settings(c: &mut Criterion) {
     let mut settings = Settings::default();
-    settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V0_1);
+    settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V1_0);
     settings.set(SettingKey::MaxFrameSize, 65_536);
     settings.set(SettingKey::MaxStreams, 64);
     settings.set(SettingKey::MaxUdpFlows, 64);
@@ -122,7 +122,7 @@ fn bench_settings(c: &mut Criterion) {
         b.iter(|| {
             let mut cursor = encoded.clone();
             let decoded = Settings::decode(&mut cursor).unwrap();
-            black_box(decoded.negotiated_v0_1().unwrap())
+            black_box(decoded.negotiated_v1_0().unwrap())
         });
     });
     group.finish();

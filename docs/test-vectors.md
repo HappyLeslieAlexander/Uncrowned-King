@@ -1,6 +1,10 @@
-# Uncrowned King v0.1 Test Vectors
+# Uncrowned King v1.0 Test Vectors
 
 All bytes are hexadecimal.
+
+> These vectors target the frozen 1.0 wire format (`protocol_revision = 2`).
+> The v0.1 vectors differed only in the `AUTH_CHALLENGE` payload (which carried
+> a 16-byte `session_id`) and `protocol_revision = 1`.
 
 ## 1. Varint
 
@@ -73,7 +77,6 @@ secret = "0123456789abcdef0123456789abcdef"
 exporter_32 = 11 repeated 32 times
 server_nonce = 22 repeated 32 times
 server_time = 1700000000
-session_id = 33 repeated 16 times
 server_capabilities = 01 02 03
 limits = 04 05 06
 client_nonce = 44 repeated 32 times
@@ -85,18 +88,18 @@ client_capabilities = "cap"
 Expected HMAC-SHA256 tag:
 
 ```text
-52 9e d7 26 b1 af ea 54 cf ca ac 09 2b 73 e3 17
-1f eb b7 e0 06 59 c1 0b b8 9c f6 86 e7 d5 3c 71
+2c b6 09 ad 46 52 47 c1 98 54 76 0c a3 a2 24 8f
+b7 e5 ea 8d 73 05 02 2b 55 6e 59 2a 71 a7 ac fc
 ```
 
 ## 6. Settings
 
 `SETTINGS` payload with `max_frame_size = 65536`, `max_streams = 64`,
 `max_udp_flows = 64`, `supports_udp_datagram = 0`,
-`supports_udp_stream_fallback = 1`, and `protocol_revision = 1`:
+`supports_udp_stream_fallback = 1`, and `protocol_revision = 2`:
 
 ```text
-06 01 80 01 00 00 02 40 40 03 40 40 04 00 05 01 07 01
+06 01 80 01 00 00 02 40 40 03 40 40 04 00 05 01 07 02
 ```
 
 ## 7. Error Frame

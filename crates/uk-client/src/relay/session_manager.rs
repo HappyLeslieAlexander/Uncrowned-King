@@ -699,7 +699,7 @@ impl ClientSession {
             metrics.record_endpoint_attempt(outcome);
         })
         .await?;
-        let negotiated = settings.negotiated_v0_1()?;
+        let negotiated = settings.negotiated_v1_0()?;
         let limits = negotiated.frame_limits();
         let (carrier_reader, carrier_writer, datagrams) = carrier.into_parts();
         // Native UDP over QUIC DATAGRAM requires the peer to advertise it, a

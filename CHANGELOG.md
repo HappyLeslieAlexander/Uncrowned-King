@@ -16,6 +16,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Removed `AuthChallenge.session_id` from the wire format** (1.0 protocol-freeze decision, 2026-10-16): the 16-byte field was generated per handshake and covered by the authentication MAC but consumed by nothing — replay protection uses `server_nonce`, whose 32 bytes already supply fresh challenge entropy. This supersedes the earlier "keep `session_id`" note, which was recorded without approval. Test vectors regenerated.
+- **`protocol_revision` is now 2**: revision 1 denotes the retired 0.x experimental wire format and is rejected. Negotiation stays exact-match with no fallback (fail closed).
+- **Frame type registry frozen for 1.0**: `0x00` is permanently illegal; `0x06–0x0F`, `0x13–0x1F`, `0x23–0x2F`, `0x33–0xEF` are reserved for future standard types; `0xF0–0xFF` is the experimental range (bilateral agreement required, negotiated out of band). Unknown frame types still terminate the session (fail closed) — now a documented 1.0 guarantee.
 - **Relay data plane no longer allocates per frame**: `write_frame` encodes the header into a 20-byte stack buffer and emits header+payload via vectored writes. Wire bytes are identical. Measured duplex throughput: 2.80 → 5.84 GiB/s (+108%).
 - **Handshake/auth buffers exactly pre-sized** (no more reserve→realloc growth): auth verify 4.0× faster, `Frame::encode` ~16% faster.
 - **Import hygiene**: removed all 16 `#![allow(unused_imports, clippy::wildcard_imports)]` attributes from relay modules; 39 glob imports replaced with explicit lists, 100+ unused imports dropped (net -207 lines). Unused imports now fail CI instead of being silently suppressed.
@@ -44,7 +47,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Not changed (deliberate)
 
-- `AuthChallenge.session_id` stays on the wire: it is covered by the authentication MAC and part of the published spec/test vectors; removing 16 bytes of challenge entropy is not worth a breaking wire-format change. Candidate for the next protocol revision, not this one.
 - The TLS *certificate* file is still not permission-checked (only the private key is): a certificate is public material by design — it is presented to every connecting peer during the handshake — so demanding `0600` on it provides no confidentiality benefit while breaking standard deployments (Kubernetes Secret mounts default to `0444`/`0644`, system trust stores are world-readable). An earlier revision of this change did enforce it and was reverted after the project's own e2e harness (which generates normally-permissioned certs) failed. AGENTS.md's certificate-permission line should be revisited with this in mind.
 
 ## [0.1.3] - 2026-09-06

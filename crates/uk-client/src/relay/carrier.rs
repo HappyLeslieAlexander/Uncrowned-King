@@ -471,7 +471,7 @@ pub(crate) fn status_frame(
 
 pub(crate) fn decode_open_response(frame: Frame) -> Result<OpenResponse, AnyError> {
     match frame.header.frame_type {
-        // Must be zero-length: `docs/spec-v0.1.md` defines the acknowledgement
+        // Must be zero-length: `docs/spec-v1.0.md` defines the acknowledgement
         // as an empty TCP_DATA and makes anything else a protocol error, so a
         // coalesced ack is a non-conforming peer, not an optimisation to accept.
         FrameType::TcpData if frame.payload.is_empty() => Ok(OpenResponse::Accepted),
