@@ -32,6 +32,30 @@ impl Default for FrameLimits {
 }
 
 /// UK frame type.
+///
+/// # 1.0 frame type registry
+///
+/// Frame type values are frozen for 1.0. The allocation rules below are part
+/// of the protocol contract; a second implementation must follow them.
+///
+/// - `0x00` is permanently illegal. It exists only so that an uninitialized
+///   or zeroed type byte is rejected instead of misinterpreted.
+/// - Assigned ranges: `0x01..=0x05` (connection control), `0x10..=0x12` (TCP
+///   relay), `0x20..=0x22` (UDP relay), `0x30..=0x32` (errors).
+/// - Reserved ranges — `0x06..=0x0F`, `0x13..=0x1F`, `0x23..=0x2F`,
+///   `0x33..=0xEF` — are held for future standard frame types, which are
+///   allocated nearest to the range they extend. Implementations must not
+///   assign private meanings to reserved values.
+/// - `0xF0..=0xFF` is the experimental range. Implementations may use it only
+///   by prior bilateral agreement (negotiated out of band, e.g. via SETTINGS);
+///   a receiver that has not agreed to a given experimental type must reject
+///   it exactly like any other unknown type.
+///
+/// An unknown frame type is a protocol error: [`TryFrom<u8>`] returns
+/// [`ProtocolError::UnknownFrameType`]
+/// and the session is terminated (fail closed). There is no "skip and
+/// continue" path — silently ignoring unknown types would let a peer smuggle
+/// semantics past middleboxes and policy checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FrameType {

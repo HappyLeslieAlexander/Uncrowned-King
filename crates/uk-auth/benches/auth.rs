@@ -25,7 +25,6 @@ fn fixture() -> (Vec<Credential>, [u8; 32], AuthChallenge, AuthResponse) {
     let challenge = AuthChallenge {
         server_nonce: [0x22; 32],
         server_time: 1_700_000_000,
-        session_id: [0x33; 16],
         server_capabilities: vec![1, 2, 3],
         limits: vec![4, 5, 6],
     };

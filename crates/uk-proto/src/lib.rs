@@ -44,7 +44,7 @@ pub use frame::{
 pub use io::{FrameIoError, FrameIoResult, FrameReader, read_frame, write_frame, write_frames};
 pub use settings::{
     DEFAULT_MAX_STREAMS, MAX_NEGOTIATED_FLOWS, MAX_NEGOTIATED_IDLE_TIMEOUT_SECONDS,
-    NegotiatedSettings, PROTOCOL_REVISION_V0_1, SettingKey, Settings,
+    NegotiatedSettings, PROTOCOL_REVISION_V1_0, SettingKey, Settings,
 };
 pub use status::{ErrorCode, ErrorPayload};
 pub use target::Target;

@@ -221,8 +221,6 @@ pub struct AuthChallenge {
     pub server_nonce: [u8; 32],
     /// Server unix time in seconds.
     pub server_time: u64,
-    /// Opaque 16-byte session id.
-    pub session_id: [u8; 16],
     /// Server capability bytes.
     pub server_capabilities: Vec<u8>,
     /// Server limit bytes.
@@ -235,7 +233,6 @@ impl fmt::Debug for AuthChallenge {
             .debug_struct("AuthChallenge")
             .field("server_nonce", &"<redacted>")
             .field("server_time", &self.server_time)
-            .field("session_id", &"<redacted>")
             .field("server_capabilities", &self.server_capabilities)
             .field("limits", &self.limits)
             .finish()
@@ -246,13 +243,10 @@ impl AuthChallenge {
     /// Generates a fresh challenge for `now`.
     pub fn generate(now: u64) -> Self {
         let mut server_nonce = [0_u8; 32];
-        let mut session_id = [0_u8; 16];
         rand::thread_rng().fill_bytes(&mut server_nonce);
-        rand::thread_rng().fill_bytes(&mut session_id);
         Self {
             server_nonce,
             server_time: now,
-            session_id,
             server_capabilities: Vec::new(),
             limits: Vec::new(),
         }
@@ -262,7 +256,6 @@ impl AuthChallenge {
     pub fn encode(&self, dst: &mut impl BufMut) -> AuthResult<()> {
         dst.put_slice(&self.server_nonce);
         dst.put_u64(self.server_time);
-        dst.put_slice(&self.session_id);
         varint::encode(self.server_capabilities.len() as u64, dst)?;
         dst.put_slice(&self.server_capabilities);
         varint::encode(self.limits.len() as u64, dst)?;
@@ -272,14 +265,12 @@ impl AuthChallenge {
 
     /// Decodes an `AUTH_CHALLENGE` payload.
     pub fn decode(src: &mut impl Buf) -> AuthResult<Self> {
-        if src.remaining() < 56 {
+        if src.remaining() < 40 {
             return Err(AuthError::InvalidPayload("challenge is truncated"));
         }
         let mut server_nonce = [0_u8; 32];
         src.copy_to_slice(&mut server_nonce);
         let server_time = src.get_u64();
-        let mut session_id = [0_u8; 16];
-        src.copy_to_slice(&mut session_id);
         let server_capabilities = read_varbytes(src, "server capabilities")?;
         let limits = read_varbytes(src, "limits")?;
         if src.has_remaining() {
@@ -288,7 +279,6 @@ impl AuthChallenge {
         Ok(Self {
             server_nonce,
             server_time,
-            session_id,
             server_capabilities,
             limits,
         })
@@ -317,14 +307,13 @@ pub struct AuthResponse {
 /// fields travel in the clear on the wire.
 /// Compares the freshness-critical fields in constant time.
 ///
-/// `server_nonce` and `session_id` are unpredictable values the peer must not
-/// be able to learn by probing; comparing them with a short-circuiting `==`
+/// `server_nonce` is an unpredictable value the peer must not
+/// be able to learn by probing; comparing it with a short-circuiting `==`
 /// would leak a prefix to any future call site, the same trap the derived
 /// `PartialEq` left on [`Credential`] and [`AuthResponse`].
 impl PartialEq for AuthChallenge {
     fn eq(&self, other: &Self) -> bool {
-        let secrets =
-            self.server_nonce.ct_eq(&other.server_nonce) & self.session_id.ct_eq(&other.session_id);
+        let secrets = self.server_nonce.ct_eq(&other.server_nonce);
         bool::from(secrets)
             && self.server_time == other.server_time
             && self.server_capabilities == other.server_capabilities
@@ -808,12 +797,11 @@ fn timestamp_within_skew(timestamp: u64, now: u64, allowed_skew: Duration) -> bo
 }
 
 fn encoded_challenge_payload(challenge: &AuthChallenge) -> AuthResult<BytesMut> {
-    // Size the buffer exactly: nonce (32) + time (8) + session id (16) +
+    // Size the buffer exactly: nonce (32) + time (8) +
     // varint-prefixed capabilities and limits. This runs once per handshake;
     // exact sizing avoids any reallocation.
     let capacity = 32
         + 8
-        + 16
         + varint::encoded_len(challenge.server_capabilities.len() as u64)?
         + challenge.server_capabilities.len()
         + varint::encoded_len(challenge.limits.len() as u64)?
@@ -976,7 +964,6 @@ mod tests {
         let challenge = AuthChallenge {
             server_nonce: [0x22; 32],
             server_time: 1_700_000_000,
-            session_id: [0x33; 16],
             server_capabilities: vec![1, 2, 3],
             limits: vec![4, 5, 6],
         };
@@ -1054,16 +1041,14 @@ mod tests {
     }
 
     #[test]
-    fn auth_challenge_debug_redacts_nonce_and_session_id() {
+    fn auth_challenge_debug_redacts_nonce() {
         let (_, _, challenge, _) = fixture();
 
         let debug = format!("{challenge:?}");
 
         assert!(debug.contains("<redacted>"));
         let server_nonce = challenge.server_nonce;
-        let session_id = challenge.session_id;
         assert!(!debug.contains(&format!("{server_nonce:?}")));
-        assert!(!debug.contains(&format!("{session_id:?}")));
     }
 
     #[test]
@@ -1119,9 +1104,9 @@ mod tests {
         assert_eq!(
             response.tag,
             [
-                0x52, 0x9e, 0xd7, 0x26, 0xb1, 0xaf, 0xea, 0x54, 0xcf, 0xca, 0xac, 0x09, 0x2b, 0x73,
-                0xe3, 0x17, 0x1f, 0xeb, 0xb7, 0xe0, 0x06, 0x59, 0xc1, 0x0b, 0xb8, 0x9c, 0xf6, 0x86,
-                0xe7, 0xd5, 0x3c, 0x71,
+                0x2c, 0xb6, 0x09, 0xad, 0x46, 0x52, 0x47, 0xc1, 0x98, 0x54, 0x76, 0x0c, 0xa3, 0xa2,
+                0x24, 0x8f, 0xb7, 0xe5, 0xea, 0x8d, 0x73, 0x05, 0x02, 0x2b, 0x55, 0x6e, 0x59, 0x2a,
+                0x71, 0xa7, 0xac, 0xfc,
             ]
         );
     }

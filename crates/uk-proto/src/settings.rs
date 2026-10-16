@@ -29,10 +29,13 @@ pub const MAX_NEGOTIATED_FLOWS: u64 = 1_000_000;
 /// only risks `Duration` overflow in consumers that convert it directly.
 pub const MAX_NEGOTIATED_IDLE_TIMEOUT_SECONDS: u64 = 30 * 24 * 60 * 60;
 
-/// Wire protocol revision implemented by Uncrowned King v0.1.
-pub const PROTOCOL_REVISION_V0_1: u64 = 1;
+/// Wire protocol revision implemented by Uncrowned King v1.0.
+///
+/// Revision 1 denotes the pre-freeze 0.x experimental wire format and is no
+/// longer accepted: revision 2 is the first frozen protocol revision.
+pub const PROTOCOL_REVISION_V1_0: u64 = 2;
 
-/// Known v0.1 setting keys.
+/// Known v1.0 setting keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u64)]
 pub enum SettingKey {
@@ -148,12 +151,15 @@ impl Settings {
         Ok(settings)
     }
 
-    /// Applies v0.1 SETTINGS defaults and rejects unsupported peer values.
-    pub fn negotiated_v0_1(&self) -> ProtocolResult<NegotiatedSettings> {
+    /// Applies v1.0 SETTINGS defaults and rejects unsupported peer values.
+    ///
+    /// The protocol revision must match [`PROTOCOL_REVISION_V1_0`] exactly;
+    /// there is no version negotiation. A mismatch fails closed.
+    pub fn negotiated_v1_0(&self) -> ProtocolResult<NegotiatedSettings> {
         let Some(revision) = self.get(SettingKey::ProtocolRevision) else {
             return Err(ProtocolError::InvalidSettings("missing protocol revision"));
         };
-        if revision != PROTOCOL_REVISION_V0_1 {
+        if revision != PROTOCOL_REVISION_V1_0 {
             return Err(ProtocolError::InvalidSettings(
                 "unsupported protocol revision",
             ));
@@ -294,7 +300,7 @@ mod tests {
     fn roundtrips_settings() {
         let mut settings = Settings::default();
         settings.set(SettingKey::MaxFrameSize, 65_536);
-        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::ProtocolRevision, 2);
 
         let mut out = Vec::new();
         settings.encode(&mut out).unwrap();
@@ -310,7 +316,7 @@ mod tests {
         settings.set(SettingKey::MaxUdpFlows, 64);
         settings.set(SettingKey::SupportsUdpDatagram, 0);
         settings.set(SettingKey::SupportsUdpStreamFallback, 1);
-        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::ProtocolRevision, 2);
 
         let mut out = Vec::new();
         settings.encode(&mut out).unwrap();
@@ -318,7 +324,7 @@ mod tests {
             out,
             [
                 0x06, 0x01, 0x80, 0x01, 0x00, 0x00, 0x02, 0x40, 0x40, 0x03, 0x40, 0x40, 0x04, 0x00,
-                0x05, 0x01, 0x07, 0x01
+                0x05, 0x01, 0x07, 0x02
             ]
         );
     }
@@ -349,11 +355,11 @@ mod tests {
     }
 
     #[test]
-    fn negotiates_v0_1_settings_with_defaults() {
+    fn negotiates_v1_0_settings_with_defaults() {
         let mut settings = Settings::default();
-        settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V0_1);
+        settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V1_0);
 
-        let negotiated = settings.negotiated_v0_1().unwrap();
+        let negotiated = settings.negotiated_v1_0().unwrap();
 
         assert_eq!(negotiated.max_frame_size, DEFAULT_MAX_FRAME_SIZE);
         assert_eq!(negotiated.max_streams, DEFAULT_MAX_STREAMS);
@@ -364,9 +370,9 @@ mod tests {
     }
 
     #[test]
-    fn negotiates_v0_1_settings_with_explicit_values() {
+    fn negotiates_v1_0_settings_with_explicit_values() {
         let mut settings = Settings::default();
-        settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V0_1);
+        settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V1_0);
         settings.set(SettingKey::MaxFrameSize, 4096);
         settings.set(SettingKey::MaxStreams, 8);
         settings.set(SettingKey::MaxUdpFlows, 3);
@@ -374,7 +380,7 @@ mod tests {
         settings.set(SettingKey::SupportsUdpStreamFallback, 0);
         settings.set(SettingKey::IdleTimeoutSeconds, 42);
 
-        let negotiated = settings.negotiated_v0_1().unwrap();
+        let negotiated = settings.negotiated_v1_0().unwrap();
 
         assert_eq!(
             negotiated.frame_limits(),
@@ -393,12 +399,12 @@ mod tests {
     #[test]
     fn disables_udp_stream_fallback_without_udp_flow_capacity() {
         let mut settings = Settings::default();
-        settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V0_1);
+        settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V1_0);
         settings.set(SettingKey::MaxStreams, 8);
         settings.set(SettingKey::MaxUdpFlows, 0);
         settings.set(SettingKey::SupportsUdpStreamFallback, 1);
 
-        let negotiated = settings.negotiated_v0_1().unwrap();
+        let negotiated = settings.negotiated_v1_0().unwrap();
 
         assert_eq!(negotiated.max_udp_flows, 0);
         assert!(!negotiated.udp_stream_fallback_enabled());
@@ -407,7 +413,7 @@ mod tests {
     #[test]
     fn rejects_missing_protocol_revision() {
         assert_eq!(
-            Settings::default().negotiated_v0_1(),
+            Settings::default().negotiated_v1_0(),
             Err(ProtocolError::InvalidSettings("missing protocol revision"))
         );
     }
@@ -415,10 +421,12 @@ mod tests {
     #[test]
     fn rejects_unsupported_protocol_revision() {
         let mut settings = Settings::default();
-        settings.set(SettingKey::ProtocolRevision, 2);
+        // Revision 1 is the retired 0.x experimental wire format: it must
+        // fail closed now that revision 2 is the frozen protocol revision.
+        settings.set(SettingKey::ProtocolRevision, 1);
 
         assert_eq!(
-            settings.negotiated_v0_1(),
+            settings.negotiated_v1_0(),
             Err(ProtocolError::InvalidSettings(
                 "unsupported protocol revision"
             ))
@@ -432,11 +440,11 @@ mod tests {
             (SettingKey::MaxStreams, "max_streams"),
         ] {
             let mut settings = Settings::default();
-            settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V0_1);
+            settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V1_0);
             settings.set(key, 0);
 
             assert_eq!(
-                settings.negotiated_v0_1(),
+                settings.negotiated_v1_0(),
                 Err(ProtocolError::InvalidSettings(name))
             );
         }
@@ -446,11 +454,11 @@ mod tests {
     fn rejects_frame_size_outside_tcp_relay_bounds() {
         for value in [MIN_TCP_RELAY_FRAME_SIZE - 1, MAX_FRAME_PAYLOAD_SIZE + 1] {
             let mut settings = Settings::default();
-            settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V0_1);
+            settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V1_0);
             settings.set(SettingKey::MaxFrameSize, value);
 
             assert_eq!(
-                settings.negotiated_v0_1(),
+                settings.negotiated_v1_0(),
                 Err(ProtocolError::InvalidSettings("max_frame_size"))
             );
         }
@@ -466,11 +474,11 @@ mod tests {
             ),
         ] {
             let mut settings = Settings::default();
-            settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V0_1);
+            settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V1_0);
             settings.set(key, 2);
 
             assert_eq!(
-                settings.negotiated_v0_1(),
+                settings.negotiated_v1_0(),
                 Err(ProtocolError::InvalidSettings(name))
             );
         }
@@ -479,12 +487,12 @@ mod tests {
     #[test]
     fn rejects_udp_flow_limit_above_stream_limit() {
         let mut settings = Settings::default();
-        settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V0_1);
+        settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V1_0);
         settings.set(SettingKey::MaxStreams, 8);
         settings.set(SettingKey::MaxUdpFlows, 9);
 
         assert_eq!(
-            settings.negotiated_v0_1(),
+            settings.negotiated_v1_0(),
             Err(ProtocolError::InvalidSettings(
                 "max_udp_flows exceeds max_streams"
             ))
@@ -495,12 +503,12 @@ mod tests {
     fn rejects_absurd_peer_advertised_flow_limits() {
         for key in [SettingKey::MaxStreams, SettingKey::MaxUdpFlows] {
             let mut settings = Settings::default();
-            settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V0_1);
+            settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V1_0);
             settings.set(SettingKey::MaxStreams, MAX_NEGOTIATED_FLOWS);
             settings.set(key, MAX_NEGOTIATED_FLOWS + 1);
 
             assert!(
-                settings.negotiated_v0_1().is_err(),
+                settings.negotiated_v1_0().is_err(),
                 "{key:?} above MAX_NEGOTIATED_FLOWS must fail negotiation"
             );
         }
@@ -509,19 +517,19 @@ mod tests {
     #[test]
     fn rejects_absurd_peer_advertised_idle_timeout() {
         let mut settings = Settings::default();
-        settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V0_1);
+        settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V1_0);
         settings.set(
             SettingKey::IdleTimeoutSeconds,
             MAX_NEGOTIATED_IDLE_TIMEOUT_SECONDS + 1,
         );
 
-        assert!(settings.negotiated_v0_1().is_err());
+        assert!(settings.negotiated_v1_0().is_err());
     }
 
     #[test]
     fn accepts_flow_limits_at_protocol_cap() {
         let mut settings = Settings::default();
-        settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V0_1);
+        settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V1_0);
         settings.set(SettingKey::MaxStreams, MAX_NEGOTIATED_FLOWS);
         settings.set(SettingKey::MaxUdpFlows, MAX_NEGOTIATED_FLOWS);
         settings.set(
@@ -529,7 +537,7 @@ mod tests {
             MAX_NEGOTIATED_IDLE_TIMEOUT_SECONDS,
         );
 
-        let negotiated = settings.negotiated_v0_1().unwrap();
+        let negotiated = settings.negotiated_v1_0().unwrap();
         assert_eq!(negotiated.max_streams, MAX_NEGOTIATED_FLOWS);
         assert_eq!(negotiated.max_udp_flows, MAX_NEGOTIATED_FLOWS);
         assert_eq!(

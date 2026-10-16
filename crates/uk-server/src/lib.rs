@@ -37,7 +37,7 @@ use uk_auth::{
 };
 use uk_proto::{
     BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, ErrorCode, ErrorPayload, Frame,
-    FrameIoError, FrameLimits, FrameType, SettingKey, Settings, read_frame,
+    FrameIoError, FrameLimits, FrameType, PROTOCOL_REVISION_V1_0, SettingKey, Settings, read_frame,
     validate_connection_frame, write_frame,
 };
 
@@ -1343,7 +1343,7 @@ fn connection_error_frame(code: ErrorCode) -> Result<Frame, AnyError> {
 
 fn server_settings(config: &ServerConfig, supports_udp_datagram: bool) -> Settings {
     let mut settings = Settings::default();
-    settings.set(SettingKey::ProtocolRevision, 1);
+    settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V1_0);
     settings.set(SettingKey::MaxFrameSize, config.max_frame_size());
     settings.set(SettingKey::MaxStreams, config.max_streams());
     settings.set(SettingKey::MaxUdpFlows, config.max_udp_flows());
@@ -1590,7 +1590,10 @@ mod tests {
 
         let settings = server_settings(&config, false);
 
-        assert_eq!(settings.get(SettingKey::ProtocolRevision), Some(1));
+        assert_eq!(
+            settings.get(SettingKey::ProtocolRevision),
+            Some(PROTOCOL_REVISION_V1_0)
+        );
         assert_eq!(settings.get(SettingKey::MaxFrameSize), Some(32_768));
         assert_eq!(settings.get(SettingKey::MaxStreams), Some(17));
         assert_eq!(settings.get(SettingKey::MaxUdpFlows), Some(11));

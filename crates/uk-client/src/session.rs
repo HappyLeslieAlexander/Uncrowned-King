@@ -528,7 +528,7 @@ async fn authenticate_over_carrier(
         .await
         .map_err(|err| phase_error("read server settings", EndpointFailurePhase::Auth, err))?;
     let settings = decode_server_settings_frame(settings_frame)?;
-    let negotiated = settings.negotiated_v0_1().map_err(|err| {
+    let negotiated = settings.negotiated_v1_0().map_err(|err| {
         phase_error(
             "negotiate server settings",
             EndpointFailurePhase::Settings,
@@ -560,7 +560,7 @@ fn decode_server_settings_frame(frame: Frame) -> Result<Settings, AnyError> {
                     err,
                 )
             })?;
-            settings.negotiated_v0_1().map_err(|err| {
+            settings.negotiated_v1_0().map_err(|err| {
                 phase_error(
                     "negotiate server settings",
                     EndpointFailurePhase::Settings,
@@ -682,15 +682,15 @@ mod tests {
     #[test]
     fn accepts_supported_protocol_revision() {
         let mut settings = Settings::default();
-        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::ProtocolRevision, 2);
 
-        assert!(settings.negotiated_v0_1().is_ok());
+        assert!(settings.negotiated_v1_0().is_ok());
     }
 
     #[test]
     fn decodes_server_settings_frame() {
         let mut settings = Settings::default();
-        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::ProtocolRevision, 2);
         settings.set(SettingKey::MaxFrameSize, 4096);
         settings.set(SettingKey::MaxStreams, 8);
 
@@ -856,7 +856,7 @@ mod tests {
     fn rejects_missing_protocol_revision() {
         let settings = Settings::default();
 
-        assert!(settings.negotiated_v0_1().is_err());
+        assert!(settings.negotiated_v1_0().is_err());
     }
 
     #[test]
@@ -874,85 +874,86 @@ mod tests {
     #[test]
     fn rejects_unsupported_protocol_revision() {
         let mut settings = Settings::default();
-        settings.set(SettingKey::ProtocolRevision, 2);
+        // Revision 1 is the retired 0.x experimental wire format.
+        settings.set(SettingKey::ProtocolRevision, 1);
 
-        assert!(settings.negotiated_v0_1().is_err());
+        assert!(settings.negotiated_v1_0().is_err());
     }
 
     #[test]
     fn rejects_zero_max_frame_size() {
         let mut settings = Settings::default();
-        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::ProtocolRevision, 2);
         settings.set(SettingKey::MaxFrameSize, 0);
 
-        assert!(settings.negotiated_v0_1().is_err());
+        assert!(settings.negotiated_v1_0().is_err());
     }
 
     #[test]
     fn rejects_too_small_max_frame_size() {
         let mut settings = Settings::default();
-        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::ProtocolRevision, 2);
         settings.set(SettingKey::MaxFrameSize, MIN_TCP_RELAY_FRAME_SIZE - 1);
 
-        assert!(settings.negotiated_v0_1().is_err());
+        assert!(settings.negotiated_v1_0().is_err());
     }
 
     #[test]
     fn rejects_too_large_max_frame_size() {
         let mut settings = Settings::default();
-        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::ProtocolRevision, 2);
         settings.set(SettingKey::MaxFrameSize, MAX_FRAME_PAYLOAD_SIZE + 1);
 
-        assert!(settings.negotiated_v0_1().is_err());
+        assert!(settings.negotiated_v1_0().is_err());
     }
 
     #[test]
     fn rejects_zero_max_streams() {
         let mut settings = Settings::default();
-        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::ProtocolRevision, 2);
         settings.set(SettingKey::MaxStreams, 0);
 
-        assert!(settings.negotiated_v0_1().is_err());
+        assert!(settings.negotiated_v1_0().is_err());
     }
 
     #[test]
     fn rejects_udp_flow_limit_above_stream_limit() {
         let mut settings = Settings::default();
-        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::ProtocolRevision, 2);
         settings.set(SettingKey::MaxStreams, 8);
         settings.set(SettingKey::MaxUdpFlows, 9);
 
-        let error = settings.negotiated_v0_1().unwrap_err();
+        let error = settings.negotiated_v1_0().unwrap_err();
         assert!(error.to_string().contains("max_udp_flows"));
     }
 
     #[test]
     fn rejects_udp_flow_limit_above_default_stream_limit() {
         let mut settings = Settings::default();
-        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::ProtocolRevision, 2);
         settings.set(SettingKey::MaxUdpFlows, uk_proto::DEFAULT_MAX_STREAMS + 1);
 
-        let error = settings.negotiated_v0_1().unwrap_err();
+        let error = settings.negotiated_v1_0().unwrap_err();
         assert!(error.to_string().contains("max_udp_flows"));
     }
 
     #[test]
     fn accepts_boolean_udp_support_settings() {
         let mut settings = Settings::default();
-        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::ProtocolRevision, 2);
         settings.set(SettingKey::SupportsUdpDatagram, 0);
         settings.set(SettingKey::SupportsUdpStreamFallback, 1);
 
-        assert!(settings.negotiated_v0_1().is_ok());
+        assert!(settings.negotiated_v1_0().is_ok());
     }
 
     #[test]
     fn rejects_non_boolean_udp_support_settings() {
         let mut settings = Settings::default();
-        settings.set(SettingKey::ProtocolRevision, 1);
+        settings.set(SettingKey::ProtocolRevision, 2);
         settings.set(SettingKey::SupportsUdpStreamFallback, 2);
 
-        assert!(settings.negotiated_v0_1().is_err());
+        assert!(settings.negotiated_v1_0().is_err());
     }
 
     #[test]

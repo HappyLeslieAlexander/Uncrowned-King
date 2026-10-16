@@ -1,6 +1,8 @@
-# Uncrowned King Protocol Specification v0.1
+# Uncrowned King Protocol Specification v1.0
 
-This document turns the whitepaper into the first implementable wire contract.
+This document is the frozen 1.0 wire contract (`protocol_revision = 2`).
+It supersedes the v0.1 experimental specification: the only wire changes are
+the removal of `AuthChallenge.session_id` and the revision bump from 1 to 2.
 It intentionally covers only the pieces required by the initial Rust crates.
 
 ## 0. Carrier Requirements
@@ -201,7 +203,6 @@ implemented, tests pass this value explicitly.
 ```text
 bytes[32] server_nonce
 u64       server_time
-bytes[16] session_id
 varint    server_capabilities_len
 bytes     server_capabilities
 varint    limits_len
@@ -249,7 +250,7 @@ encoded above, including `server_time`, `server_capabilities_len`, and
 
 ## 7. SETTINGS Payload
 
-v0.1 settings use repeated key/value pairs:
+v1.0 settings use repeated key/value pairs:
 
 ```text
 varint setting_count
@@ -274,11 +275,11 @@ Unknown optional settings may be ignored. Required setting semantics will be
 added after v0.1. Decoders must reject duplicate known setting keys and
 trailing bytes after the declared setting pairs.
 
-Peers must send `protocol_revision = 1` in v0.1 SETTINGS. A peer that receives a
+Peers must send `protocol_revision = 2` in v1.0 SETTINGS. A peer that receives a
 missing or unsupported protocol revision must fail the session.
 If `max_frame_size` or `max_streams` is present, the value must be greater than
 zero. TCP relay implementations must reject `max_frame_size < 262`, the minimum
-needed to carry every valid v0.1 `TCP_OPEN` payload. Implementations must reject
+needed to carry every valid v1.0 `TCP_OPEN` payload. Implementations must reject
 `max_frame_size > 16777216`.
 If `max_udp_flows` is absent, peers should treat it as equal to `max_streams`.
 `max_udp_flows = 0` disables new UDP relay flows; otherwise the value limits the

@@ -293,7 +293,7 @@ for example `[::1]:9443`; port `0` is rejected by config validation.
 ```text
 docs/
   whitepaper.md      Original protocol whitepaper
-  spec-v0.1.md       Implementable v0.1 wire specification
+  spec-v1.0.md       Frozen 1.0 wire specification
   test-vectors.md    Fixed examples for protocol tests
 crates/
   uk-proto/          Frame, varint, target, settings, and errors

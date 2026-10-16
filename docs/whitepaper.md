@@ -119,7 +119,6 @@ Server sends:
 AUTH_CHALLENGE {
   server_nonce: 32 bytes
   server_time: u64 unix seconds
-  session_id: 16 bytes
   server_capabilities: CapabilityList
   limits: ServerLimits
 }
@@ -148,7 +147,6 @@ HMAC-SHA256(
   tls_exporter("EXPORTER-UK-v1", 32) ||
   server_nonce ||
   client_nonce ||
-  session_id ||
   key_id ||
   client_time ||
   client_capabilities
