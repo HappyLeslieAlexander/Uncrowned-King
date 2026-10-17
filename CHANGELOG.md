@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-17
+
 ### Added
 
 - **Fuzz coverage for all untrusted-input parsers**: five new libfuzzer targets — `datagram_decode`, `settings_decode`, `error_payload_decode`, `frame_reader` (adversarial chunk splits plus a differential check that incremental decoding matches one-shot `Frame::decode`), and `auth_verify` (HMAC/tag/timestamp/replay paths on arbitrary bytes). All ran clean in smoke testing.
@@ -410,7 +412,8 @@ policy-enforced SOCKS5 → UK → target relay over TLS/TCP and QUIC.
   saturating bulk flow); and a soak/chaos harness showing flat memory across
   sustained load. See `docs/performance.md`.
 
-[Unreleased]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v0.1.3...v1.0.0
 [0.1.3]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v0.1.0...v0.1.1
