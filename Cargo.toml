@@ -1,0 +1,58 @@
+[workspace]
+members = [
+    "crates/uk-auth",
+    "crates/uk-client",
+    "crates/uk-policy",
+    "crates/uk-proto",
+    "crates/uk-server",
+]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+authors = ["Uncrowned King Contributors"]
+repository = "https://github.com/HappyLeslieAlexander/Uncrowned-King"
+# These are application crates (a proxy client/server and supporting libraries),
+# not libraries intended for crates.io publication.
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+cast_possible_truncation = "allow"
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+
+[workspace.dependencies]
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+criterion = "0.7"
+hmac = "0.12"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+rand = "0.8"
+rustls = "0.23"
+rustls-pki-types = { version = "1.11", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+socket2 = "0.6"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = "0.26"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+zeroize = "1"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"

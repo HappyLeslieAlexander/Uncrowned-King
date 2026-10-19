@@ -1,0 +1,63 @@
+{{- if .Values.server.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "uncrowned-king.server.fullname" . }}-config
+  labels:
+    {{- include "uncrowned-king.labels" . | nindent 4 }}
+data:
+  server.toml: |
+    listen = "{{ .Values.server.config.listen }}"
+    {{- if .Values.server.config.quic_listen }}
+    quic_listen = "{{ .Values.server.config.quic_listen }}"
+    {{- end }}
+    {{- if .Values.server.config.observability_listen }}
+    observability_listen = "{{ .Values.server.config.observability_listen }}"
+    {{- end }}
+    cert_path = "/etc/uncrowned-king/tls/tls.crt"
+    key_path = "/etc/uncrowned-king/tls/tls.key"
+    policy_path = "/etc/uncrowned-king/policy/policy.toml"
+
+    [limits]
+    max_frame_size = {{ int64 .Values.server.config.limits.max_frame_size }}
+    max_sessions = {{ int64 .Values.server.config.limits.max_sessions }}
+    max_handshakes = {{ int64 .Values.server.config.limits.max_handshakes }}
+    max_streams = {{ int64 .Values.server.config.limits.max_streams }}
+    max_udp_flows = {{ int64 .Values.server.config.limits.max_udp_flows }}
+    max_buffered_bytes_per_session = {{ int64 .Values.server.config.limits.max_buffered_bytes_per_session }}
+    max_buffered_bytes_per_flow = {{ int64 .Values.server.config.limits.max_buffered_bytes_per_flow }}
+    relay_buffer_size = {{ int64 .Values.server.config.limits.relay_buffer_size }}
+    auth_rate_limit_failures = {{ int64 .Values.server.config.limits.auth_rate_limit_failures }}
+    auth_rate_limit_window_seconds = {{ int64 .Values.server.config.limits.auth_rate_limit_window_seconds }}
+    auth_rate_limit_ban_seconds = {{ int64 .Values.server.config.limits.auth_rate_limit_ban_seconds }}
+
+  policy.toml: |
+    {{- range .Values.server.policy.rules }}
+    [[rules]]
+    action = "{{ .action }}"
+    {{- if .key_id }}
+    key_id = "{{ .key_id }}"
+    {{- end }}
+    {{- if .policy_group }}
+    policy_group = "{{ .policy_group }}"
+    {{- end }}
+    {{- if .cidr }}
+    cidr = "{{ .cidr }}"
+    {{- end }}
+    {{- if .domain }}
+    domain = "{{ .domain }}"
+    {{- end }}
+    {{- if .domain_suffix }}
+    domain_suffix = "{{ .domain_suffix }}"
+    {{- end }}
+    {{- if .port_start }}
+    port_start = {{ int64 .port_start }}
+    {{- end }}
+    {{- if .port_end }}
+    port_end = {{ int64 .port_end }}
+    {{- end }}
+    {{- if hasKey . "private" }}
+    private = {{ .private }}
+    {{- end }}
+    {{- end }}
+{{- end }}

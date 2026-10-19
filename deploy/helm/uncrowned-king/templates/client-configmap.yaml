@@ -1,0 +1,19 @@
+{{- if .Values.client.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "uncrowned-king.client.fullname" . }}-config
+  labels:
+    {{- include "uncrowned-king.labels" . | nindent 4 }}
+data:
+  client.toml: |
+    server_addr = "{{ .Values.client.config.server_addr }}"
+    server_name = "{{ .Values.client.config.server_name }}"
+    {{- if .Values.client.config.observability_listen }}
+    observability_listen = "{{ .Values.client.config.observability_listen }}"
+    {{- end }}
+    ca_cert_path = "/etc/uncrowned-king/ca/ca.crt"
+    {{- if .Values.client.config.relay_buffer_size }}
+    relay_buffer_size = {{ int64 .Values.client.config.relay_buffer_size }}
+    {{- end }}
+{{- end }}

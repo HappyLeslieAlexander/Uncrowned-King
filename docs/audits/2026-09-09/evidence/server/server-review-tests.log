@@ -1,0 +1,42 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/lib.rs (target/debug/deps/uk_server-7f0d2ad94e6b54ce)
+
+running 5 tests
+
+thread 'relay::tests::review_drain_drops_data_after_both_half_closes' (349560) panicked at crates/uk-server/src/relay/tests.rs:2005:5:
+assertion `left == right` failed: drain acknowledged both closes but discarded queued target data
+  left: []
+ right: [108, 97, 115, 116, 32, 114, 101, 113, 117, 101, 115, 116, 32, 98, 121, 116, 101, 115]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test relay::tests::review_drain_drops_data_after_both_half_closes ... FAILED
+
+thread 'relay::tests::review_closed_flows_leave_half_close_timers' (349559) panicked at crates/uk-server/src/relay/tests.rs:2022:5:
+max_streams=1 but 100 timers remain after 100 fully closed flows
+test relay::tests::review_closed_flows_leave_half_close_timers ... FAILED
+
+thread 'relay::tests::review_aborted_flow_still_sends_queued_data' (349558) panicked at crates/uk-server/src/relay/tests.rs:2044:5:
+old flow emitted data after abort instead of discarding queued frame
+test relay::tests::review_aborted_flow_still_sends_queued_data ... FAILED
+
+thread 'relay::tests::review_real_relay_drain_loses_tail_of_upload' (349561) panicked at crates/uk-server/src/relay/tests.rs:2096:5:
+assertion `left == right` failed: graceful shutdown reported success while truncating upload
+  left: 0
+ right: 1048576
+test relay::tests::review_real_relay_drain_loses_tail_of_upload ... FAILED
+
+thread 'review_settings_tests::review_settings_write_holds_session_after_shutdown' (349562) panicked at crates/uk-server/src/lib.rs:2042:9:
+SETTINGS write ignores shutdown and has no write deadline; slot remains held
+test review_settings_tests::review_settings_write_holds_session_after_shutdown ... FAILED
+
+failures:
+
+failures:
+    relay::tests::review_aborted_flow_still_sends_queued_data
+    relay::tests::review_closed_flows_leave_half_close_timers
+    relay::tests::review_drain_drops_data_after_both_half_closes
+    relay::tests::review_real_relay_drain_loses_tail_of_upload
+    review_settings_tests::review_settings_write_holds_session_after_shutdown
+
+test result: FAILED. 0 passed; 5 failed; 0 ignored; 0 measured; 239 filtered out; finished in 0.10s
+
+error: test failed, to rerun pass `-p uk-server --lib`

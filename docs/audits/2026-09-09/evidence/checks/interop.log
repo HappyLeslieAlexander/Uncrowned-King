@@ -1,0 +1,5 @@
+==> Building uk-server and uk-client
+==> Starting HTTP target on 127.0.0.1:50398
+==> Starting uk-server (TLS 127.0.0.1:50403, QUIC 127.0.0.1:50404)
+==> curl over TLS/TCP carrier
+curl: (97) Can't complete SOCKS5 connection to 127.0.0.1. (1)

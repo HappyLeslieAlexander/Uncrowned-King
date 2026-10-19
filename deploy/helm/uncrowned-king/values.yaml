@@ -1,0 +1,141 @@
+# Default values for uncrowned-king.
+
+global:
+  imagePullSecrets: []
+  nameOverride: ""
+  fullnameOverride: ""
+
+# Server component configuration
+server:
+  enabled: true
+  replicaCount: 2
+
+  image:
+    repository: ghcr.io/happylesliealexander/uncrowned-king-server
+    pullPolicy: IfNotPresent
+    tag: "v1.0.0"
+
+  service:
+    type: LoadBalancer
+    annotations: {}
+    ports:
+      tls:
+        port: 443
+        targetPort: 8443
+        protocol: TCP
+      quic:
+        port: 443
+        targetPort: 8443
+        protocol: UDP
+
+  metricsService:
+    enabled: true
+    port: 9090
+    targetPort: 9090
+    annotations: {}
+
+  resources:
+    limits:
+      cpu: "2"
+      memory: 2Gi
+    requests:
+      cpu: "500m"
+      memory: 512Mi
+
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 75
+    targetMemoryUtilizationPercentage: 80
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+  config:
+    listen: "0.0.0.0:8443"
+    quic_listen: "0.0.0.0:8443"
+    observability_listen: "0.0.0.0:9090"
+    log_format: "json"
+    limits:
+      max_frame_size: 65536
+      max_sessions: 10000
+      max_handshakes: 1000
+      max_streams: 1024
+      max_udp_flows: 512
+      max_buffered_bytes_per_session: 16777216 # 16MB
+      max_buffered_bytes_per_flow: 4194304     # 4MB
+      relay_buffer_size: 16384                 # 16KB
+      auth_rate_limit_failures: 5
+      auth_rate_limit_window_seconds: 60
+      auth_rate_limit_ban_seconds: 300
+
+  # Credentials for authenticating clients.
+  # WARNING: You MUST replace the placeholder secret with a secure 64-character hex secret!
+  # Helm deployment will fail closed if a placeholder secret is detected.
+  credentials:
+    - id: "client-default"
+      secret: "replace-with-a-64-character-hex-secret-in-production-00000000000000"
+      policy_group: "default"
+
+  # Access policies
+  # WARNING: Configure allowed destination CIDRs, domains, and ports according to your
+  # environment. The default rule below allows all destinations for the 'default' policy group.
+  policy:
+    rules:
+      - action: "allow"
+        policy_group: "default"
+        cidr: "0.0.0.0/0"
+        port_start: 1
+        port_end: 65535
+
+  # Existing TLS secret name containing tls.crt and tls.key (e.g. from cert-manager)
+  existingTlsSecret: ""
+
+  # Existing credentials secret name containing credentials.toml
+  existingSecret: ""
+
+# Client DaemonSet / Deployment component configuration
+client:
+  enabled: false # Set true to deploy client as cluster-wide sidecar / DaemonSet
+  kind: DaemonSet # DaemonSet or Deployment
+
+  image:
+    repository: ghcr.io/happylesliealexander/uncrowned-king-client
+    pullPolicy: IfNotPresent
+    tag: "v1.0.0"
+
+  socks5:
+    port: 1080
+    hostPort: null # Disabled by default to prevent exposing unauthenticated SOCKS5 to cluster nodes
+
+  metrics:
+    port: 9091
+
+  resources:
+    limits:
+      cpu: "1"
+      memory: 1Gi
+    requests:
+      cpu: "200m"
+      memory: 256Mi
+
+  config:
+    server_addr: "uk-server.default.svc.cluster.local:443"
+    server_name: "uk.example.com"
+    observability_listen: "0.0.0.0:9091"
+    key_id: "client-default"
+    secret: "replace-with-a-64-character-hex-secret-in-production-00000000000000"
+    relay_buffer_size: 16384
+
+  existingCaSecret: ""
+
+  # Existing credentials secret name containing credentials.toml
+  existingSecret: ""
+
+# Prometheus Operator ServiceMonitor
+serviceMonitor:
+  enabled: false
+  interval: 15s
+  labels: {}

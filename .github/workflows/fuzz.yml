@@ -1,0 +1,62 @@
+name: Fuzz smoke
+
+# Short libFuzzer runs over the strict-parser fuzz targets (whitepaper §20).
+# Guards the invariant that parsing arbitrary bytes never panics. Runs when the
+# parsers or fuzz harness change, on a daily schedule, and on demand — not on
+# every PR, since it needs a nightly toolchain and cargo-fuzz.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/uk-proto/**'
+      - 'crates/uk-auth/**'
+      - '.github/workflows/fuzz.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'crates/uk-proto/**'
+      - 'crates/uk-auth/**'
+      - '.github/workflows/fuzz.yml'
+  schedule:
+    - cron: '41 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-smoke:
+    name: Fuzz smoke (strict parsers)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      # Pinned, not floating. Nightlies from 2026-07-24 onwards ICE while
+      # building tokio under `-Zsanitizer=address`, which cargo-fuzz always
+      # enables:
+      #   rustc_codegen_ssa/src/mir/operand.rs: "not immediate: OperandRef(Uninit
+      #   @ ... UnsafeCell<MaybeUninit<runtime::task::Notified<...>>>)"
+      # This is a compiler bug, not a fault in the fuzz targets — it broke the
+      # scheduled run on main three days running while nothing in this repo
+      # changed. 2026-07-23 is the last channel observed green here. Revisit
+      # once upstream lands a fix; unpinning is a one-line change.
+      - name: Install nightly toolchain
+        run: |
+          rustup toolchain install nightly-2026-07-23 --profile minimal
+          rustup default nightly-2026-07-23
+          rustc --version
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run fuzz targets
+        working-directory: crates/uk-proto/fuzz
+        run: |
+          set -euo pipefail
+          for target in frame_header target_decoder auth_payload tcp_state udp_state; do
+            echo "::group::fuzz $target"
+            cargo fuzz run "$target" -- -max_total_time=30 -runs=2000000
+            echo "::endgroup::"
+          done

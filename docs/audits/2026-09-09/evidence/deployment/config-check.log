@@ -1,0 +1,8 @@
+as-rendered: exit 1
+Error: "invalid server config /tmp/uk-audit-20260909-config/as-rendered.toml: TOML parse error at line 13, column 34\n   |\n13 | max_buffered_bytes_per_session = 6.7108864e+07\n   |                                  ^^^^^^^^^^^^^\ninvalid type: floating point `67108864.0`, expected u64\n"
+
+integer-only: exit 1
+Error: "max_buffered_bytes_per_session must be at most 16777216"
+
+integer-and-limit: exit 1
+Error: "invalid policy file /tmp/uk-audit-20260909-config/policy.toml: invalid policy toml: TOML parse error at line 1, column 1\n  |\n1 | default_action = \"deny\"\n  | ^^^^^^^^^^^^^^\nunknown field `default_action`, expected `rules`\n"

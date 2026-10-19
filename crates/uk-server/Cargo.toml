@@ -1,0 +1,35 @@
+[package]
+name = "uk-server"
+description = "TLS server and TCP relay for Uncrowned King."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "uk-server"
+path = "src/main.rs"
+
+[dependencies]
+socket2.workspace = true
+bytes.workspace = true
+clap.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uk-auth = { path = "../uk-auth" }
+uk-policy = { path = "../uk-policy" }
+uk-proto = { path = "../uk-proto" }
+zeroize.workspace = true
+
+[lints]
+workspace = true
