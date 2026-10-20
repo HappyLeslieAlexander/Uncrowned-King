@@ -147,10 +147,12 @@ async fn queue_config_reload(config_path: &str, reload_handle: &ServerReloadHand
         Ok(Ok(config)) => config,
         Ok(Err(err)) => {
             warn!(event = "server.config.reload_load_failure", error = %err);
+            let _ = reload_handle.report_load_failure(err.to_string()).await;
             return true;
         }
         Err(err) => {
             warn!(event = "server.config.reload_task_failure", error = %err);
+            let _ = reload_handle.report_load_failure(err.to_string()).await;
             return true;
         }
     };

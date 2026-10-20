@@ -49,6 +49,12 @@ pub(crate) fn handle_target_read_closed(
         if target.token != token {
             return;
         }
+        if target.control.is_aborted() {
+            target.abort();
+            remove_flow_slot(target_writers, flow_id);
+            info!(event = "tcp.closed", flow_id);
+            return;
+        }
         target.mark_target_to_client_closed();
         info!(event = "tcp.target_read_closed", flow_id);
         if target.client_to_target_open {
@@ -89,6 +95,12 @@ pub(crate) async fn handle_half_close_drain_expired(
                 info!(event = "tcp.half_close_timeout", flow_id, side = ?closed_side);
             }
         }
+        HalfCloseDrainDecision::Abort { remove } => {
+            if remove {
+                remove_flow_slot(target_writers, flow_id);
+                info!(event = "tcp.half_close_timeout", flow_id, side = ?closed_side);
+            }
+        }
     }
     Ok(())
 }
@@ -106,28 +118,24 @@ pub(crate) fn expire_half_close_drain(
         return HalfCloseDrainDecision::Ignored;
     }
 
-    let should_close_peer = match closed_side {
+    match closed_side {
         HalfCloseSide::TargetToClient
             if !target.target_to_client_open && target.client_to_target_open =>
         {
-            target.close_client_to_target();
-            true
+            target.abort();
+            HalfCloseDrainDecision::Abort {
+                remove: target.is_removable(),
+            }
         }
         HalfCloseSide::ClientToTarget
             if !target.client_to_target_open && target.target_to_client_open =>
         {
             target.abort();
-            true
+            HalfCloseDrainDecision::ClosePeer {
+                remove: target.is_removable(),
+            }
         }
-        _ => false,
-    };
-    if should_close_peer {
-        target.cancel_half_close_timer();
-        HalfCloseDrainDecision::ClosePeer {
-            remove: target.is_removable(),
-        }
-    } else {
-        HalfCloseDrainDecision::Ignored
+        _ => HalfCloseDrainDecision::Ignored,
     }
 }
 
@@ -135,6 +143,7 @@ pub(crate) fn expire_half_close_drain(
 pub(crate) enum HalfCloseDrainDecision {
     Ignored,
     ClosePeer { remove: bool },
+    Abort { remove: bool },
 }
 
 pub(crate) fn handle_target_write_closed(
@@ -147,6 +156,9 @@ pub(crate) fn handle_target_write_closed(
             return;
         }
         target.mark_target_write_closed();
+        if target.control.is_aborted() {
+            target.abort();
+        }
         if target.is_removable() {
             target.cancel_half_close_timer();
             remove_flow_slot(target_writers, flow_id);
@@ -271,21 +283,26 @@ pub(crate) async fn handle_tcp_close_frame(
                 let should_start_drain_timer = should_start_half_close_drain(target);
                 let token = target.token;
                 target.close_client_to_target();
-                if should_start_drain_timer {
-                    if let Some(timeout) = context.limits.tcp_half_close_timeout {
-                        let timer = spawn_half_close_timer(
-                            session_tasks,
-                            flow_id,
-                            token,
-                            HalfCloseSide::ClientToTarget,
-                            timeout,
-                            context.event_tx.clone(),
-                            context.shutdown.clone(),
-                        );
-                        target.set_half_close_timer(timer);
+                if target.target_to_client_open {
+                    if should_start_drain_timer {
+                        if let Some(timeout) = context.limits.tcp_half_close_timeout {
+                            let timer = spawn_half_close_timer(
+                                session_tasks,
+                                flow_id,
+                                token,
+                                HalfCloseSide::ClientToTarget,
+                                timeout,
+                                context.event_tx.clone(),
+                                context.shutdown.clone(),
+                            );
+                            target.set_half_close_timer(timer);
+                        }
                     }
+                    false
+                } else {
+                    target.cancel_half_close_timer();
+                    target.is_removable()
                 }
-                false
             } else {
                 target.abort();
                 true

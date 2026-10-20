@@ -67,7 +67,7 @@ pub struct ServerReloadReceiver {
 
 #[derive(Debug)]
 struct ServerReloadRequest {
-    config: ServerConfig,
+    config: Result<ServerConfig, String>,
     response: oneshot::Sender<Result<u64, String>>,
 }
 
@@ -96,12 +96,32 @@ impl ServerReloadHandle {
     pub async fn reload(&self, config: ServerConfig) -> Result<u64, ServerReloadError> {
         let (response, result) = oneshot::channel();
         self.tx
-            .send(ServerReloadRequest { config, response })
+            .send(ServerReloadRequest {
+                config: Ok(config),
+                response,
+            })
             .await
             .map_err(|_| ServerReloadError::ServerStopped)?;
         result
             .await
             .map_err(|_| ServerReloadError::ServerStopped)?
+            .map_err(ServerReloadError::Rejected)
+    }
+
+    /// Reports a disk-load or parse failure so the reload failure counter is incremented.
+    pub async fn report_load_failure(&self, reason: String) -> Result<(), ServerReloadError> {
+        let (response, result) = oneshot::channel();
+        self.tx
+            .send(ServerReloadRequest {
+                config: Err(reason),
+                response,
+            })
+            .await
+            .map_err(|_| ServerReloadError::ServerStopped)?;
+        result
+            .await
+            .map_err(|_| ServerReloadError::ServerStopped)?
+            .map(|_| ())
             .map_err(ServerReloadError::Rejected)
     }
 }
@@ -485,8 +505,21 @@ where
 /// internally, so the listener-level rejoin below must wait on the *same*
 /// deadline rather than granting another full timeout on top — otherwise
 /// worst-case shutdown would be ~2x the configured value.
+/// Additional grace period granted to connection tasks so they can cleanly
+/// finish internal teardown after session drainage before the server aborts them.
+const SHUTDOWN_DRAIN_BUFFER: Duration = Duration::from_secs(2);
+
 fn shutdown_deadline(shutdown_timeout: Option<Duration>) -> Option<time::Instant> {
-    shutdown_timeout.map(|timeout| time::Instant::now() + timeout)
+    shutdown_timeout.and_then(|timeout| {
+        let timeout = if timeout >= Duration::from_secs(1) {
+            timeout
+                .checked_add(SHUTDOWN_DRAIN_BUFFER)
+                .unwrap_or(timeout)
+        } else {
+            timeout
+        };
+        time::Instant::now().checked_add(timeout)
+    })
 }
 
 /// Builds the QUIC endpoint (when configured) and logs its listen address.
@@ -507,7 +540,10 @@ fn build_quic_endpoint(config: &ServerConfig) -> Result<Option<quinn::Endpoint>,
         .parse()
         .map_err(|err| format!("invalid quic_listen address {listen}: {err}"))?;
     let rustls_config = tls::server_config(&config.cert_path, &config.key_path)?;
-    let quic_config = quic::server_config(rustls_config)?;
+    let quic_config = quic::server_config_with_idle_timeout(
+        rustls_config,
+        idle_timeout(config.idle_timeout_seconds()),
+    )?;
     let endpoint = quic::bind_endpoint(quic_config, addr)?;
     Ok(Some(endpoint))
 }
@@ -530,13 +566,15 @@ async fn handle_reload_request(
     let current = config.clone();
     let security = security.clone();
     let quic_endpoint = quic_endpoint.cloned();
-    let candidate = request.config;
 
-    let result = tokio::task::spawn_blocking(move || {
-        apply_security_reload(&current, &security, quic_endpoint.as_ref(), candidate)
-    })
-    .await
-    .unwrap_or_else(|err| Err(Box::new(err)));
+    let result: Result<u64, AnyError> = match request.config {
+        Ok(candidate) => tokio::task::spawn_blocking(move || {
+            apply_security_reload(&current, &security, quic_endpoint.as_ref(), candidate)
+        })
+        .await
+        .unwrap_or_else(|err| Err(Box::new(err))),
+        Err(reason) => Err(Box::<dyn std::error::Error + Send + Sync>::from(reason)),
+    };
 
     match result {
         Ok(generation) => {
@@ -656,6 +694,8 @@ fn apply_security_reload(
     mut candidate: ServerConfig,
 ) -> Result<u64, AnyError> {
     ensure_reload_compatible(current, &candidate)?;
+    candidate.validate_network_endpoints()?;
+    candidate.validate_limits()?;
     candidate.validate_sensitive_paths()?;
     // Build both carrier crypto configs before touching any live state so an
     // invalid certificate or key fails the reload atomically, leaving the
@@ -665,7 +705,10 @@ fn apply_security_reload(
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_server_config));
     let quic_config = if quic_endpoint.is_some() {
         let quic_tls_config = tls::server_config_from_memory(certs, key)?;
-        Some(quic::server_config(quic_tls_config)?)
+        Some(quic::server_config_with_idle_timeout(
+            quic_tls_config,
+            idle_timeout(candidate.idle_timeout_seconds()),
+        )?)
     } else {
         None
     };
@@ -1003,11 +1046,11 @@ async fn run_authenticated_session(
     shutdown_rx: watch::Receiver<bool>,
     metrics: Arc<ServerMetrics>,
 ) -> Result<(), AnyError> {
+    let write_timeout = carrier_write_timeout(config.carrier_write_timeout_seconds());
     let Ok(session_permit) = session_permits.try_acquire_owned() else {
         metrics.record_rejected_session();
         warn!(event = "server.session.limit", peer = %peer, max_sessions);
-        let _ = write_connection_error(&mut carrier_writer, ErrorCode::ResourceLimit).await;
-        let _ = carrier_writer.shutdown().await;
+        reject_over_limit_session(&mut carrier_writer, write_timeout, &shutdown_rx).await;
         return Err("authenticated session limit exceeded".into());
     };
     let _session_permit = session_permit;
@@ -1017,7 +1060,7 @@ async fn run_authenticated_session(
     // a datagram channel (QUIC) and the peer enabled the datagram extension.
     let datagrams = datagrams.filter(|channel| channel.max_datagram_size().is_some());
     let supports_udp_datagram = datagrams.is_some();
-    let settings_timeout = carrier_write_timeout(config.carrier_write_timeout_seconds());
+    let settings_timeout = write_timeout;
     {
         let mut shutdown_watch = shutdown_rx.clone();
         let wait_shutdown = async {
@@ -1106,7 +1149,13 @@ pub fn check_config(config: &ServerConfig) -> Result<(), AnyError> {
     config.validate_sensitive_paths()?;
     let _credentials = config.credentials()?;
     let _policy_set = config.policy_set()?;
-    let _tls_config = tls::server_config(&config.cert_path, &config.key_path)?;
+    let tls_config = tls::server_config(&config.cert_path, &config.key_path)?;
+    if config.quic_listen.is_some() {
+        let _quic_config = quic::server_config_with_idle_timeout(
+            tls_config,
+            idle_timeout(config.idle_timeout_seconds()),
+        )?;
+    }
     Ok(())
 }
 
@@ -1317,12 +1366,53 @@ where
     Ok(())
 }
 
+const CARRIER_ERROR_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn reject_over_limit_session(
+    carrier_writer: &mut BoxedCarrierWriter,
+    write_timeout: Option<Duration>,
+    shutdown_rx: &watch::Receiver<bool>,
+) {
+    let mut shutdown_watch = shutdown_rx.clone();
+    let wait_shutdown = async {
+        if *shutdown_watch.borrow() {
+            return;
+        }
+        while let Ok(()) = shutdown_watch.changed().await {
+            if *shutdown_watch.borrow() {
+                return;
+            }
+        }
+    };
+    let reject_session = async {
+        let _ = write_connection_error(carrier_writer, ErrorCode::ResourceLimit).await;
+        let _ = carrier_writer.shutdown().await;
+    };
+    tokio::pin!(reject_session);
+    tokio::pin!(wait_shutdown);
+    match write_timeout {
+        Some(timeout) => {
+            tokio::select! {
+                () = &mut reject_session => {}
+                () = &mut wait_shutdown => {}
+                () = tokio::time::sleep(timeout) => {}
+            }
+        }
+        None => {
+            tokio::select! {
+                () = &mut reject_session => {}
+                () = &mut wait_shutdown => {}
+            }
+        }
+    }
+}
+
 async fn write_connection_error<W>(stream: &mut W, code: ErrorCode) -> Result<(), AnyError>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let frame = connection_error_frame(code)?;
-    write_frame(stream, &frame).await?;
+    time::timeout(CARRIER_ERROR_WRITE_TIMEOUT, write_frame(stream, &frame)).await??;
     Ok(())
 }
 
@@ -1686,6 +1776,72 @@ mod tests {
             security.authentication_snapshot().credentials[0].key_id,
             b"client"
         );
+    }
+
+    #[test]
+    fn security_reload_rejects_invalid_endpoints_and_limits() {
+        let current = minimal_config();
+        let security = SecurityState::new(
+            test_tls_acceptor(),
+            current.credentials().unwrap(),
+            current.policy_set().unwrap(),
+            Duration::from_secs(current.auth_skew_seconds()),
+        );
+
+        // Invalid observability bind address
+        let mut candidate = current.clone();
+        candidate.observability_listen = Some("0.0.0.0:9090".to_owned());
+        assert!(apply_security_reload(&current, &security, None, candidate).is_err());
+        assert_eq!(security.generation(), 1);
+
+        // Invalid reloadable auth_skew_seconds (0 is rejected by validate_limits)
+        let mut candidate = current.clone();
+        candidate.auth_skew_seconds = Some(0);
+        assert!(apply_security_reload(&current, &security, None, candidate).is_err());
+        assert_eq!(security.generation(), 1);
+        assert_eq!(
+            security.authentication_snapshot().auth_skew,
+            Duration::from_secs(30)
+        );
+
+        // Invalid reloadable auth_skew_seconds (2 * 200 > 300s replay cache window)
+        let mut candidate = current.clone();
+        candidate.auth_skew_seconds = Some(200);
+        assert!(apply_security_reload(&current, &security, None, candidate).is_err());
+        assert_eq!(security.generation(), 1);
+        assert_eq!(
+            security.authentication_snapshot().auth_skew,
+            Duration::from_secs(30)
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_reload_request_load_failure_increments_metric() {
+        let current = minimal_config();
+        let security = SecurityState::new(
+            test_tls_acceptor(),
+            current.credentials().unwrap(),
+            current.policy_set().unwrap(),
+            Duration::from_secs(current.auth_skew_seconds()),
+        );
+        let metrics = ServerMetrics::default();
+        let (response, rx) = oneshot::channel();
+        let request = ServerReloadRequest {
+            config: Err("disk read failed".to_string()),
+            response,
+        };
+
+        handle_reload_request(&current, &security, None, &metrics, request).await;
+
+        let result = rx.await.unwrap();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "disk read failed");
+        assert!(
+            metrics
+                .render()
+                .contains("uncrowned_king_server_config_reload_failures_total 1")
+        );
+        assert_eq!(security.generation(), 1);
     }
 
     #[test]

@@ -511,9 +511,12 @@ impl ClientSessionManager {
         reapers.spawn(async move { session.close_and_wait().await });
     }
 
-    /// Returns the first live pooled session, if any.
+    /// Returns the first live pooled session, if any, that is not draining.
     pub(crate) async fn first_live_session(&self) -> Option<Arc<ClientSession>> {
-        self.live_sessions().await.into_iter().next()
+        self.live_sessions()
+            .await
+            .into_iter()
+            .find(|session| !session.is_draining())
     }
 
     /// Atomically admits a flow on the least-loaded live, non-draining session

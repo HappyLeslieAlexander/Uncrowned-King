@@ -17,7 +17,7 @@ use super::context::{
 };
 use super::session::{
     reject_invalid_udp_relay_flow_id, send_error, send_policy_denied, send_resource_limit,
-    validate_client_relay_flow_id, write_frame_locked,
+    validate_client_relay_flow_id, write_flow_frame_locked, write_frame_locked,
 };
 use super::tasks::{SessionTasks, UdpOpenTask, UdpReaderTask, spawn_udp_open, spawn_udp_reader};
 use super::tcp::{check_open_slot, send_tcp_close};
@@ -404,7 +404,7 @@ pub(crate) async fn accept_open_udp_target(
     let target_socket = Arc::new(target_socket);
     let flow_control = TargetFlowControl::new(context.session_buffer.clone());
     let token = context.flow_tokens.next();
-    send_udp_data(context.carrier_writer, flow_id, Bytes::new()).await?;
+    send_udp_data(context.carrier_writer, flow_id, Bytes::new(), &flow_control).await?;
     let target_flow = UdpTargetFlow::new(token, Arc::clone(&target_socket), flow_control.clone())
         .track_metrics(context.metrics.begin_flow(RelayProtocol::Udp));
     spawn_udp_reader(
@@ -496,6 +496,7 @@ pub(crate) async fn emit_udp_to_client(
     flow_id: u64,
     payload: &[u8],
     data_frame_size: usize,
+    flow_control: &TargetFlowControl,
 ) -> Result<UdpEmit, AnyError> {
     if let Some(channel) = datagrams {
         match try_send_udp_datagram(channel, flow_id, payload) {
@@ -506,7 +507,13 @@ pub(crate) async fn emit_udp_to_client(
     if udp_payload_exceeds_frame_limit(payload.len(), data_frame_size) {
         return Ok(UdpEmit::DroppedTooLarge);
     }
-    send_udp_data(carrier_writer, flow_id, Bytes::copy_from_slice(payload)).await?;
+    send_udp_data(
+        carrier_writer,
+        flow_id,
+        Bytes::copy_from_slice(payload),
+        flow_control,
+    )
+    .await?;
     Ok(UdpEmit::Sent)
 }
 
@@ -552,9 +559,10 @@ pub(crate) async fn send_udp_data(
     writer: &CarrierWriter,
     flow_id: u64,
     payload: Bytes,
+    flow_control: &TargetFlowControl,
 ) -> Result<(), AnyError> {
     let frame = Frame::new(FrameType::UdpData, 0, flow_id, payload)?;
-    write_frame_locked(writer, &frame).await
+    write_flow_frame_locked(writer, &frame, flow_control).await
 }
 
 pub(crate) async fn send_udp_close(

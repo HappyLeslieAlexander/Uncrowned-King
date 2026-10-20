@@ -85,9 +85,11 @@ pub(crate) async fn relay_session(
     };
     let mut idle_deadline = next_idle_deadline(idle_timeout);
     let mut udp_idle_interval = udp_idle_interval(limits.udp_flow_idle_timeout);
+    let mut drain_deadline_set = false;
     let mut drain_deadline: Option<time::Instant> = None;
 
     let result = loop {
+        let is_draining = state == ServerSessionState::Draining;
         let event = match next_session_event(
             &mut carrier_reader,
             &mut event_rx,
@@ -96,6 +98,7 @@ pub(crate) async fn relay_session(
             &mut udp_idle_interval,
             &mut shutdown_rx,
             &shutdown,
+            is_draining,
             drain_deadline,
         )
         .await
@@ -126,15 +129,11 @@ pub(crate) async fn relay_session(
                 info!(event = "server.session.drain_complete");
                 break Ok(());
             }
-            if drain_deadline.is_none() {
-                let timeout = limits
+            if !drain_deadline_set {
+                drain_deadline_set = true;
+                drain_deadline = limits
                     .session_task_shutdown_timeout
-                    .unwrap_or(Duration::from_secs(30));
-                drain_deadline = Some(
-                    time::Instant::now()
-                        .checked_add(timeout)
-                        .unwrap_or_else(time::Instant::now),
-                );
+                    .and_then(|timeout| time::Instant::now().checked_add(timeout));
             }
         }
     };
@@ -354,9 +353,9 @@ pub(crate) async fn next_session_event(
     udp_idle_interval: &mut Option<time::Interval>,
     shutdown_rx: &mut watch::Receiver<bool>,
     session_shutdown: &SessionShutdown,
+    is_draining: bool,
     drain_deadline: Option<time::Instant>,
 ) -> Result<SessionEvent, AnyError> {
-    let is_draining = drain_deadline.is_some();
     if !is_draining && *shutdown_rx.borrow() {
         return Ok(SessionEvent::Shutdown);
     }

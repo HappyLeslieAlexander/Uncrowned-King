@@ -396,7 +396,15 @@ impl AuthResponse {
 
     /// Decodes an `AUTH_RESPONSE` payload.
     pub fn decode(src: &mut impl Buf) -> AuthResult<Self> {
-        let key_id = read_varbytes(src, "key id")?;
+        let key_id_len =
+            usize::try_from(varint::decode(src)?).map_err(|_| ProtocolError::InvalidVarint)?;
+        if key_id_len == 0 || key_id_len > MAX_KEY_ID_LEN {
+            return Err(AuthError::InvalidKeyIdLength);
+        }
+        if src.remaining() < key_id_len {
+            return Err(AuthError::InvalidPayload("key id"));
+        }
+        let key_id = src.copy_to_bytes(key_id_len).to_vec();
         validate_key_id(&key_id)?;
         if src.remaining() < MIN_RESPONSE_TAIL_LEN {
             return Err(AuthError::InvalidPayload("response is truncated"));
@@ -1220,6 +1228,29 @@ mod tests {
 
         assert_eq!(
             response.encode(&mut out),
+            Err(AuthError::InvalidKeyIdLength)
+        );
+    }
+
+    #[test]
+    fn rejects_decoding_empty_response_key_id() {
+        let mut buf = BytesMut::new();
+        varint::encode(0, &mut buf).unwrap();
+        let mut src = buf.freeze();
+        assert_eq!(
+            AuthResponse::decode(&mut src),
+            Err(AuthError::InvalidKeyIdLength)
+        );
+    }
+
+    #[test]
+    fn rejects_decoding_oversized_response_key_id() {
+        let mut buf = BytesMut::new();
+        varint::encode((MAX_KEY_ID_LEN + 1) as u64, &mut buf).unwrap();
+        buf.extend_from_slice(&[0x41; MAX_KEY_ID_LEN + 1]);
+        let mut src = buf.freeze();
+        assert_eq!(
+            AuthResponse::decode(&mut src),
             Err(AuthError::InvalidKeyIdLength)
         );
     }

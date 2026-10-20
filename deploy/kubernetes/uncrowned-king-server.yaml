@@ -38,12 +38,13 @@ metadata:
   namespace: uncrowned-king
 type: Opaque
 stringData:
-  # Observability binds to 0.0.0.0 so the kubelet can reach the probes; it is
-  # NOT exposed by the Service. The listeners bind all interfaces inside the pod.
+  # Observability binds to the pod's IP via Downward API so the kubelet can
+  # reach the probes; it is NOT exposed by the Service. The listeners bind all
+  # interfaces inside the pod.
   server.toml: |
     listen = "0.0.0.0:9443"
     quic_listen = "0.0.0.0:9443"
-    observability_listen = "0.0.0.0:9090"
+    observability_listen = "__POD_IP__:9090"
     cert_path = "/etc/uncrowned-king/server-cert.pem"
     key_path = "/etc/uncrowned-king/server-key.pem"
     policy_path = "/etc/uncrowned-king/policy.toml"
@@ -86,6 +87,7 @@ spec:
     spec:
       # Nothing in this pod talks to the Kubernetes API server.
       automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 40
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -115,10 +117,17 @@ spec:
                  /staging/secret/server-key.pem \
                  /etc/uncrowned-king/
               cp /staging/policy/policy.toml /etc/uncrowned-king/
+              case "${POD_IP}" in *:*) POD_HOST="[${POD_IP}]" ;; *) POD_HOST="${POD_IP}" ;; esac
+              sed -i "s/__POD_IP__/${POD_HOST}/g" /etc/uncrowned-king/server.toml
               chmod 0600 /etc/uncrowned-king/server.toml \
                          /etc/uncrowned-king/server-cert.pem \
                          /etc/uncrowned-king/server-key.pem \
                          /etc/uncrowned-king/policy.toml
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

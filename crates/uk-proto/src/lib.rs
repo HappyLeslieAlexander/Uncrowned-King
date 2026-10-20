@@ -39,7 +39,8 @@ pub use flow::{
     FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, is_client_initiated_flow_id, is_server_initiated_flow_id,
 };
 pub use frame::{
-    Frame, FrameHeader, FrameLimits, FrameType, MAX_FRAME_PAYLOAD_SIZE, validate_connection_frame,
+    Frame, FrameHeader, FrameLimits, FrameType, MAX_FRAME_PAYLOAD_SIZE, VERSION,
+    validate_connection_frame,
 };
 pub use io::{FrameIoError, FrameIoResult, FrameReader, read_frame, write_frame, write_frames};
 pub use settings::{

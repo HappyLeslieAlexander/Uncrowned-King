@@ -65,8 +65,9 @@ Key points:
   manifest. Apply changes with `kubectl rollout restart deployment/uncrowned-king-server`
   (the rollout strategy and PodDisruptionBudget keep capacity during the roll).
 - **Probes**: `livenessProbe` → `/healthz`, `readinessProbe` → `/readyz` on the
-  metrics port (9090). The config binds `observability_listen` to `0.0.0.0:9090`
-  so the kubelet can reach the probes; the Service does **not** expose 9090.
+  metrics port (9090). The template stages `observability_listen` bound to the pod's IP
+  via Downward API (`status.podIP`) so the kubelet and internal Prometheus can reach the probes;
+  the Service does **not** expose 9090. Wildcard binds (`0.0.0.0`) are strictly rejected.
 - **Secrets**: replace every `REPLACE_ME` with real values. In practice, build
   the Secret out of band (e.g. `kubectl create secret …`) and keep it out of
   version control.

@@ -130,10 +130,17 @@ pub fn validate_observability_bind(
     let host = endpoint_host(value)
         .ok_or_else(|| EndpointError::new(name, EndpointErrorKind::InvalidHost))?;
     let exposure = match host.parse::<IpAddr>() {
-        Ok(ip) if ip.is_unspecified() => {
-            return Err(EndpointError::new(name, EndpointErrorKind::WildcardBind));
+        Ok(ip) => {
+            let ip = ip.to_canonical();
+            if ip.is_unspecified() {
+                return Err(EndpointError::new(name, EndpointErrorKind::WildcardBind));
+            }
+            if ip.is_loopback() {
+                BindExposure::Loopback
+            } else {
+                BindExposure::NonLoopback
+            }
         }
-        Ok(ip) if ip.is_loopback() => BindExposure::Loopback,
         _ => BindExposure::NonLoopback,
     };
     Ok(exposure)
@@ -225,6 +232,10 @@ mod tests {
             validate_observability_bind("observability_listen", "[::1]:9090"),
             Ok(BindExposure::Loopback)
         );
+        assert_eq!(
+            validate_observability_bind("observability_listen", "[::ffff:127.0.0.1]:9090"),
+            Ok(BindExposure::Loopback)
+        );
     }
 
     #[test]
@@ -238,6 +249,13 @@ mod tests {
         );
         assert_eq!(
             validate_observability_bind("observability_listen", "[::]:9090"),
+            Err(EndpointError::new(
+                "observability_listen",
+                EndpointErrorKind::WildcardBind
+            ))
+        );
+        assert_eq!(
+            validate_observability_bind("observability_listen", "[::ffff:0.0.0.0]:9090"),
             Err(EndpointError::new(
                 "observability_listen",
                 EndpointErrorKind::WildcardBind

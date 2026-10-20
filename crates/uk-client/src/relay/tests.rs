@@ -2274,3 +2274,42 @@ async fn audit_rejected_reload_must_preserve_active_ca_cache() {
         "rejected reload replaced active cached TLS trust"
     );
 }
+
+#[tokio::test]
+async fn first_live_session_filters_out_draining_sessions() {
+    let manager = test_session_manager(minimal_config());
+    let draining_session = test_session(8, 8);
+    let _active_flow = draining_session
+        .reserve_flow(FlowProtocol::Tcp)
+        .await
+        .unwrap()
+        .unwrap();
+    draining_session.begin_drain().await;
+    assert!(draining_session.is_draining());
+    assert!(!draining_session.is_closed());
+
+    let active_session = test_session(8, 8);
+
+    {
+        let mut pool = manager.pool.lock().await;
+        pool.push(Arc::clone(&draining_session));
+        pool.push(Arc::clone(&active_session));
+    }
+
+    let selected = manager
+        .first_live_session()
+        .await
+        .expect("should find non-draining live session");
+    assert_eq!(selected.correlation_id, active_session.correlation_id);
+
+    let _active_flow2 = active_session
+        .reserve_flow(FlowProtocol::Tcp)
+        .await
+        .unwrap()
+        .unwrap();
+    active_session.begin_drain().await;
+    assert!(
+        manager.first_live_session().await.is_none(),
+        "must return None when all live sessions are draining"
+    );
+}

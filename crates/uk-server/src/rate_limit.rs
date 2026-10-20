@@ -216,7 +216,7 @@ impl AuthRateLimiter {
         record.failures = record.failures.saturating_add(1);
 
         if record.failures >= self.config.max_failures {
-            record.banned_until = Some(now + Duration::from_secs(self.config.ban_secs));
+            record.banned_until = now.checked_add(Duration::from_secs(self.config.ban_secs));
             true
         } else {
             false

@@ -303,6 +303,7 @@ where
 pub(crate) fn spawn_target_reader(session_tasks: &mut SessionTasks, task: TargetReaderTask) {
     session_tasks.spawn(SessionTaskKind::TargetReader, async move {
         let flow_id = task.identity.flow_id;
+        let flow_control = task.flow_control.clone();
         match relay_target_to_client(
             flow_id,
             task.target_reader,
@@ -316,6 +317,7 @@ pub(crate) fn spawn_target_reader(session_tasks: &mut SessionTasks, task: Target
         {
             Err(err) if !task.shutdown.is_closed() => {
                 warn!(event = "tcp.target.read.error", flow_id, error = %err);
+                flow_control.abort();
                 let _ =
                     send_error(&task.carrier_writer, flow_id, ErrorCode::TargetUnavailable).await;
                 let _ = send_tcp_close(&task.carrier_writer, flow_id, TCP_CLOSE_ERROR).await;
@@ -397,6 +399,7 @@ pub(crate) fn spawn_datagram_reader(
 
 pub(crate) fn spawn_udp_reader(session_tasks: &mut SessionTasks, task: UdpReaderTask) {
     session_tasks.spawn(SessionTaskKind::UdpReader, async move {
+        let flow_control = task.flow_control.clone();
         match relay_udp_target_to_client(
             task.flow_id,
             task.target_socket,
@@ -412,6 +415,7 @@ pub(crate) fn spawn_udp_reader(session_tasks: &mut SessionTasks, task: UdpReader
             Err(err) if !task.shutdown.is_closed() => {
                 let flow_id = task.flow_id;
                 warn!(event = "udp.target.read.error", flow_id, error = %err);
+                flow_control.abort();
                 let _ =
                     send_error(&task.carrier_writer, flow_id, ErrorCode::TargetUnavailable).await;
                 let _ = send_udp_close(&task.carrier_writer, flow_id, UDP_CLOSE_ERROR).await;
@@ -433,6 +437,7 @@ pub(crate) fn spawn_udp_reader(session_tasks: &mut SessionTasks, task: UdpReader
 pub(crate) fn spawn_target_writer(session_tasks: &mut SessionTasks, task: TargetWriterTask) {
     session_tasks.spawn(SessionTaskKind::TargetWriter, async move {
         let flow_id = task.identity.flow_id;
+        let flow_control = task.flow_control.clone();
         match relay_client_to_target(
             task.target_writer,
             task.commands,
@@ -446,6 +451,7 @@ pub(crate) fn spawn_target_writer(session_tasks: &mut SessionTasks, task: Target
         {
             Err(err) if !task.shutdown.is_closed() => {
                 warn!(event = "tcp.target.write.error", flow_id, error = %err);
+                flow_control.abort();
                 let _ =
                     send_error(&task.carrier_writer, flow_id, ErrorCode::TargetUnavailable).await;
                 let _ = send_tcp_close(&task.carrier_writer, flow_id, TCP_CLOSE_ERROR).await;
@@ -668,8 +674,15 @@ pub(crate) async fn relay_udp_target_to_client(
             return Ok(());
         }
         let payload = &target_buf[..read];
-        match emit_udp_to_client(carrier_writer, datagrams, flow_id, payload, data_frame_size)
-            .await?
+        match emit_udp_to_client(
+            carrier_writer,
+            datagrams,
+            flow_id,
+            payload,
+            data_frame_size,
+            &flow_control,
+        )
+        .await?
         {
             UdpEmit::Sent => {
                 carrier_writer.metrics.record_relay_bytes(

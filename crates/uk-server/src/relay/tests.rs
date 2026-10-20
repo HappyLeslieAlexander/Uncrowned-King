@@ -405,6 +405,33 @@ fn matching_target_write_close_updates_original_flow() {
 }
 
 #[test]
+fn aborted_target_write_close_removes_flow_and_releases_metrics_when_read_side_open() {
+    let metrics = Arc::new(ServerMetrics::default());
+    let mut target_writers = FlowTable::new();
+    let flow = test_target_flow_with_token(TEST_FLOW_TOKEN)
+        .track_metrics(metrics.begin_flow(RelayProtocol::Tcp));
+    assert!(
+        metrics
+            .render()
+            .contains("uncrowned_king_server_active_flows{protocol=\"tcp\"} 1")
+    );
+    flow.control.abort();
+    target_writers.insert(1, FlowSlot::Tcp(flow));
+
+    handle_target_write_closed(1, TEST_FLOW_TOKEN, &mut target_writers);
+
+    assert!(
+        !target_writers.contains_key(&1),
+        "aborted flow must be immediately removed even if target read half was still open"
+    );
+    assert!(
+        metrics
+            .render()
+            .contains("uncrowned_king_server_active_flows{protocol=\"tcp\"} 0")
+    );
+}
+
+#[test]
 fn matching_half_close_timer_closes_original_flow() {
     let mut target_writers = FlowTable::new();
     let mut flow = test_target_flow_with_token(TEST_FLOW_TOKEN);
@@ -418,12 +445,12 @@ fn matching_half_close_timer_closes_original_flow() {
             HalfCloseSide::TargetToClient,
             &mut target_writers
         ),
-        HalfCloseDrainDecision::ClosePeer { remove: false }
+        HalfCloseDrainDecision::Abort { remove: true }
     );
 
     let target = open_target_flow_mut(&mut target_writers, 1).expect("removal is caller-owned");
     assert!(!target.client_to_target_open);
-    assert!(target.control.is_closed());
+    assert!(target.control.is_aborted());
 }
 
 #[test]

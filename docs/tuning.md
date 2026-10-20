@@ -10,16 +10,23 @@
 适用于带宽充裕（> 100Mbps）且并发连接数适中的环境：
 
 ```toml
-# server.toml / client.toml
+# server.toml
 [limits]
-# 增加帧大小上限（默认 64KB）
+# 增加帧大小上限（默认 64KB，硬上限 16MB）
 max_frame_size = 65536
 
 # 增加中继数据块大小（支持 1KB ~ 1MB，推荐 64KB ~ 128KB）
 relay_buffer_size = 65536
 
-# 提高单会话和单流允许的缓冲队列上限，防止大吞吐时频繁触发背压暂停
-max_buffered_bytes_per_session = 134217728 # 128MB
+# 提高单会话和单流允许的缓冲队列上限，防止大吞吐时频繁触发背压暂停（硬上限 16MB）
+max_buffered_bytes_per_session = 16777216 # 16MB
+max_buffered_bytes_per_flow = 8388608      # 8MB
+```
+
+```toml
+# client.toml（客户端中均为顶层配置项）
+# 提高客户端单会话与单流缓冲队列上限（硬上限 16MB）
+max_buffered_bytes_per_session = 16777216 # 16MB
 max_buffered_bytes_per_flow = 8388608      # 8MB
 ```
 
@@ -40,7 +47,7 @@ max_udp_flows = 2048
 # 减小单流缓冲，保证海量流不会耗尽服务端内存
 relay_buffer_size = 16384                  # 16KB
 max_buffered_bytes_per_flow = 1048576      # 1MB
-max_buffered_bytes_per_session = 67108864  # 64MB
+max_buffered_bytes_per_session = 16777216  # 16MB（硬上限 16MB）
 
 # 缩短空闲流清理超时，加速释放非活跃资源
 idle_timeout_seconds = 60

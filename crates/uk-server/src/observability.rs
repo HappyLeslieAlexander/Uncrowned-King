@@ -275,7 +275,7 @@ impl ServerMetrics {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
-    fn render(&self) -> String {
+    pub(super) fn render(&self) -> String {
         let ready = u8::from(self.is_ready());
         let mut output = format!(
             concat!(

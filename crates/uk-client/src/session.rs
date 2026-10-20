@@ -347,10 +347,21 @@ where
             }
             Err(err) => {
                 let failure_phase = endpoint_failure_phase(&err);
-                if failure_phase == EndpointFailurePhase::Timeout {
+                credential_rejection = is_credential_rejection(&err);
+                let is_quic_transport_failure = matches!(
+                    crate::config::parse_endpoint(endpoint),
+                    Ok((CarrierKind::Quic, _))
+                ) && matches!(
+                    failure_phase,
+                    EndpointFailurePhase::Tls
+                        | EndpointFailurePhase::Tcp
+                        | EndpointFailurePhase::Timeout
+                );
+                if (failure_phase == EndpointFailurePhase::Timeout || is_quic_transport_failure)
+                    && !credential_rejection
+                {
                     mark_endpoint_degraded(endpoint);
                 }
-                credential_rejection = is_credential_rejection(&err);
                 observe(EndpointAttemptOutcome::Failed(failure_phase));
                 warn!(
                     event = "client.session.connect_endpoint_failed",
@@ -968,5 +979,48 @@ mod tests {
         mark_endpoint_degraded(ep);
         clear_degraded_endpoints();
         assert!(!is_endpoint_degraded(ep));
+    }
+
+    #[tokio::test]
+    async fn quic_transport_failure_marks_endpoint_degraded() {
+        clear_degraded_endpoints();
+        let path =
+            std::env::temp_dir().join(format!("quic-degraded-test-ca-{}.pem", std::process::id()));
+        std::fs::write(
+            &path,
+            include_str!("../../../docs/audits/2026-09-09/evidence/client/audit-ca-one.pem"),
+        )
+        .unwrap();
+        let quic_ep = "quic://127.0.0.1:1";
+        let config = ClientConfig {
+            server_addr: quic_ep.to_owned(),
+            server_addrs: None,
+            server_name: "localhost".to_owned(),
+            observability_listen: None,
+            ca_cert_path: path.to_string_lossy().into_owned(),
+            key_id: "client-a".to_owned(),
+            secret: "0123456789abcdef0123456789abcdef".to_owned(),
+            handshake_timeout_seconds: Some(1),
+            server_connect_retry_delay_millis: Some(0),
+            socks_handshake_timeout_seconds: None,
+            tcp_open_timeout_seconds: None,
+            udp_flow_idle_timeout_seconds: None,
+            shutdown_timeout_seconds: None,
+            max_pending_open_bytes: None,
+            max_socks_connections: None,
+            max_buffered_bytes_per_session: None,
+            max_buffered_bytes_per_flow: None,
+            max_carrier_sessions: None,
+            relay_buffer_size: None,
+        };
+        assert!(!is_endpoint_degraded(quic_ep));
+        let res = connect_authenticated(&config).await;
+        std::fs::remove_file(&path).ok();
+        assert!(res.is_err());
+        assert!(
+            is_endpoint_degraded(quic_ep),
+            "failed QUIC connection attempt must mark endpoint as degraded"
+        );
+        clear_degraded_endpoints();
     }
 }

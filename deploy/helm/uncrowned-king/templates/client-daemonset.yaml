@@ -1,12 +1,21 @@
-{{- if and .Values.client.enabled (eq .Values.client.kind "DaemonSet") }}
+{{- if .Values.client.enabled }}
+{{- if not (has .Values.client.kind (list "DaemonSet" "Deployment")) }}
+{{- fail (printf "client.kind must be DaemonSet or Deployment, got %q" .Values.client.kind) }}
+{{- end }}
+{{- if not .Values.client.existingCaSecret }}
+{{- fail "Security error: client.existingCaSecret must be set to a Kubernetes Secret containing ca.crt" }}
+{{- end }}
 apiVersion: apps/v1
-kind: DaemonSet
+kind: {{ .Values.client.kind }}
 metadata:
   name: {{ include "uncrowned-king.client.fullname" . }}
   labels:
     {{- include "uncrowned-king.labels" . | nindent 4 }}
     app.kubernetes.io/component: client
 spec:
+  {{- if eq .Values.client.kind "Deployment" }}
+  replicas: {{ .Values.client.replicaCount | default 1 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "uncrowned-king.client.selectorLabels" . | nindent 6 }}
@@ -20,6 +29,7 @@ spec:
       labels:
         {{- include "uncrowned-king.client.selectorLabels" . | nindent 8 }}
     spec:
+      terminationGracePeriodSeconds: 40
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -40,7 +50,14 @@ spec:
               set -eu
               mkdir -p /etc/uncrowned-king
               cat /staging/config/client.toml /staging/credentials/credentials.toml > /etc/uncrowned-king/client.toml
+              case "${POD_IP}" in *:*) POD_HOST="[${POD_IP}]" ;; *) POD_HOST="${POD_IP}" ;; esac
+              sed -i "s/__POD_IP__/${POD_HOST}/g" /etc/uncrowned-king/client.toml
               chmod 0600 /etc/uncrowned-king/client.toml
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

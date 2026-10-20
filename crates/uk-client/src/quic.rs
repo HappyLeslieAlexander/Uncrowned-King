@@ -70,29 +70,72 @@ pub async fn connect(
     ),
     QuicError,
 > {
-    let addr = resolve(endpoint).await?;
-    let mut client_endpoint = Endpoint::client(unspecified_addr(addr))
-        .map_err(|err| format!("failed to bind local QUIC socket: {err}"))?;
-    client_endpoint.set_default_client_config(client_config(rustls_config)?);
+    let addrs = resolve(endpoint).await?;
+    let quinn_client_config = client_config(rustls_config)?;
 
-    let connection = client_endpoint
-        .connect(addr, server_name)
-        .map_err(|err| format!("failed to start QUIC connection to {addr}: {err}"))?
-        .await
-        .map_err(|err| format!("QUIC handshake with {addr} failed: {err}"))?;
-    verify_alpn(&connection)?;
-    let exporter = exporter(&connection)?;
+    let mut last_err = None;
+    for addr in addrs {
+        let mut client_endpoint = match Endpoint::client(unspecified_addr(addr)) {
+            Ok(endpoint) => endpoint,
+            Err(err) => {
+                last_err =
+                    Some(format!("failed to bind local QUIC socket for {addr}: {err}").into());
+                continue;
+            }
+        };
+        client_endpoint.set_default_client_config(quinn_client_config.clone());
 
-    let (send, recv) = connection
-        .accept_bi()
-        .await
-        .map_err(|err| format!("failed to accept QUIC control stream: {err}"))?;
-    let datagrams = datagram_channel(&connection);
-    // Hold the connection open for the session lifetime by leaking it into the
-    // endpoint's driver; the send/recv halves keep the connection state alive,
-    // and the endpoint is kept alive by the spawned driver task.
-    keep_endpoint_alive(client_endpoint);
-    Ok((Box::new(recv), Box::new(send), exporter, datagrams))
+        let connection = match client_endpoint.connect(addr, server_name) {
+            Ok(connecting) => match connecting.await {
+                Ok(conn) => conn,
+                Err(err) => {
+                    client_endpoint.close(0u32.into(), b"");
+                    last_err = Some(format!("QUIC handshake with {addr} failed: {err}").into());
+                    continue;
+                }
+            },
+            Err(err) => {
+                client_endpoint.close(0u32.into(), b"");
+                last_err = Some(format!("failed to start QUIC connection to {addr}: {err}").into());
+                continue;
+            }
+        };
+
+        if let Err(err) = verify_alpn(&connection) {
+            connection.close(0u32.into(), b"");
+            client_endpoint.close(0u32.into(), b"");
+            last_err = Some(err);
+            continue;
+        }
+        let exporter = match exporter(&connection) {
+            Ok(exp) => exp,
+            Err(err) => {
+                connection.close(0u32.into(), b"");
+                client_endpoint.close(0u32.into(), b"");
+                last_err = Some(err);
+                continue;
+            }
+        };
+
+        let (send, recv) = match connection.accept_bi().await {
+            Ok(bi) => bi,
+            Err(err) => {
+                connection.close(0u32.into(), b"");
+                client_endpoint.close(0u32.into(), b"");
+                last_err =
+                    Some(format!("failed to accept QUIC control stream from {addr}: {err}").into());
+                continue;
+            }
+        };
+        let datagrams = datagram_channel(&connection);
+        // Hold the connection open for the session lifetime by leaking it into the
+        // endpoint's driver; the send/recv halves keep the connection state alive,
+        // and the endpoint is kept alive by the spawned driver task.
+        keep_endpoint_alive(client_endpoint);
+        return Ok((Box::new(recv), Box::new(send), exporter, datagrams));
+    }
+
+    Err(last_err.unwrap_or_else(|| format!("failed to connect to QUIC endpoint {endpoint}").into()))
 }
 
 fn client_config(rustls_config: RustlsClientConfig) -> Result<QuinnClientConfig, QuicError> {
@@ -101,12 +144,15 @@ fn client_config(rustls_config: RustlsClientConfig) -> Result<QuinnClientConfig,
     Ok(QuinnClientConfig::new(Arc::new(crypto)))
 }
 
-async fn resolve(endpoint: &str) -> Result<SocketAddr, QuicError> {
-    lookup_host(endpoint)
+async fn resolve(endpoint: &str) -> Result<Vec<SocketAddr>, QuicError> {
+    let addrs: Vec<SocketAddr> = lookup_host(endpoint)
         .await
         .map_err(|err| format!("failed to resolve QUIC endpoint {endpoint}: {err}"))?
-        .next()
-        .ok_or_else(|| format!("QUIC endpoint {endpoint} resolved to no addresses").into())
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("QUIC endpoint {endpoint} resolved to no addresses").into());
+    }
+    Ok(addrs)
 }
 
 fn unspecified_addr(addr: SocketAddr) -> SocketAddr {

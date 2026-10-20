@@ -187,6 +187,26 @@ impl ServerConfig {
             reject_small_limit("relay_buffer_size", buf_size as u64, 1024)?;
             reject_large_limit("relay_buffer_size", buf_size as u64, 1024 * 1024)?;
         }
+        let rate_limit = self.auth_rate_limit_config();
+        reject_large_limit(
+            "auth_rate_limit_failures",
+            u64::from(rate_limit.max_failures),
+            100_000,
+        )?;
+        if rate_limit.max_failures > 0 {
+            reject_zero_limit("auth_rate_limit_window_seconds", rate_limit.window_secs)?;
+            reject_zero_limit("auth_rate_limit_ban_seconds", rate_limit.ban_secs)?;
+        }
+        reject_large_limit(
+            "auth_rate_limit_window_seconds",
+            rate_limit.window_secs,
+            2_592_000,
+        )?;
+        reject_large_limit(
+            "auth_rate_limit_ban_seconds",
+            rate_limit.ban_secs,
+            2_592_000,
+        )?;
         Ok(())
     }
 
@@ -213,6 +233,9 @@ impl ServerConfig {
         validate_host_port_endpoint("listen", &self.listen)?;
         if let Some(listen) = &self.quic_listen {
             validate_host_port_endpoint("quic_listen", listen)?;
+            listen
+                .parse::<std::net::SocketAddr>()
+                .map_err(|err| format!("invalid quic_listen address {listen}: {err}"))?;
         }
         if let Some(listen) = &self.observability_listen {
             // The probe endpoint is unauthenticated: wildcard binds are
@@ -1203,6 +1226,24 @@ max_udp_flows = 3
     }
 
     #[test]
+    fn accepts_socket_addr_quic_listen() {
+        let mut config = minimal_config();
+        config.listen = "127.0.0.1:9443".to_owned();
+        config.quic_listen = Some("127.0.0.1:9443".to_owned());
+
+        assert!(config.validate_network_endpoints().is_ok());
+    }
+
+    #[test]
+    fn rejects_domain_quic_listen() {
+        let mut config = minimal_config();
+        config.listen = "127.0.0.1:9443".to_owned();
+        config.quic_listen = Some("localhost:9443".to_owned());
+
+        assert!(config.validate_network_endpoints().is_err());
+    }
+
+    #[test]
     fn parses_buffered_bytes_per_flow_limit() {
         let config: ServerConfig = toml::from_str(
             r#"
@@ -1498,6 +1539,65 @@ shutdown_timeout_seconds = 0
         assert_eq!(config.tcp_half_close_timeout_seconds(), 0);
         assert_eq!(config.udp_flow_idle_timeout_seconds(), 0);
         assert_eq!(config.shutdown_timeout_seconds(), 0);
+        assert!(config.validate_limits().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_auth_rate_limit_config() {
+        let base = minimal_config();
+
+        // Zero max_failures disables rate limiting and is valid.
+        let mut config = base.clone();
+        config.limits = Some(LimitConfig {
+            auth_rate_limit_failures: Some(0),
+            auth_rate_limit_window_seconds: Some(0),
+            auth_rate_limit_ban_seconds: Some(0),
+            ..LimitConfig::default()
+        });
+        assert!(config.validate_limits().is_ok());
+
+        let mut config = base.clone();
+        config.limits = Some(LimitConfig {
+            auth_rate_limit_failures: Some(1_000_000),
+            ..LimitConfig::default()
+        });
+        assert!(config.validate_limits().is_err());
+
+        let mut config = base.clone();
+        config.limits = Some(LimitConfig {
+            auth_rate_limit_window_seconds: Some(0),
+            ..LimitConfig::default()
+        });
+        assert!(config.validate_limits().is_err());
+
+        let mut config = base.clone();
+        config.limits = Some(LimitConfig {
+            auth_rate_limit_ban_seconds: Some(0),
+            ..LimitConfig::default()
+        });
+        assert!(config.validate_limits().is_err());
+
+        let mut config = base.clone();
+        config.limits = Some(LimitConfig {
+            auth_rate_limit_window_seconds: Some(2_592_001),
+            ..LimitConfig::default()
+        });
+        assert!(config.validate_limits().is_err());
+
+        let mut config = base.clone();
+        config.limits = Some(LimitConfig {
+            auth_rate_limit_ban_seconds: Some(2_592_001),
+            ..LimitConfig::default()
+        });
+        assert!(config.validate_limits().is_err());
+
+        let mut config = base;
+        config.limits = Some(LimitConfig {
+            auth_rate_limit_failures: Some(10),
+            auth_rate_limit_window_seconds: Some(60),
+            auth_rate_limit_ban_seconds: Some(300),
+            ..LimitConfig::default()
+        });
         assert!(config.validate_limits().is_ok());
     }
 

@@ -16,7 +16,7 @@ use std::time::Duration;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig as RustlsClientConfig, DigitallySignedStruct, Error as RustlsError};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
@@ -187,12 +187,19 @@ fn write_restricted(path: &std::path::Path, contents: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
-fn server_config_toml(listen: &str, cert_path: &str, key_path: &str) -> String {
+fn server_config_toml_with_skew(
+    listen: &str,
+    observability_listen: &str,
+    cert_path: &str,
+    key_path: &str,
+    auth_skew_seconds: u64,
+) -> String {
     format!(
         r#"listen = "{listen}"
+observability_listen = "{observability_listen}"
 cert_path = "{cert_path}"
 key_path = "{key_path}"
-auth_skew_seconds = 30
+auth_skew_seconds = {auth_skew_seconds}
 
 [limits]
 handshake_timeout_seconds = 60
@@ -203,6 +210,16 @@ secret = "sighup-test-secret-0123456789abcdef"
 status = "active"
 "#
     )
+}
+
+async fn fetch_metrics(addr: std::net::SocketAddr) -> Result<String, TestError> {
+    let mut stream = TcpStream::connect(addr).await?;
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await?;
+    Ok(response)
 }
 
 /// Performs a TLS handshake against `addr` offering the UK ALPN and returns
@@ -288,6 +305,7 @@ impl From<tokio::time::error::Elapsed> for TestError {
 /// pre-existing connection is not dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(unix)]
+#[allow(clippy::too_many_lines)]
 async fn sighup_reloads_tls_identity_without_dropping_connections() -> Result<(), TestError> {
     let temp_dir: PathBuf =
         std::env::temp_dir().join(format!("uk-sighup-test-{}", std::process::id()));
@@ -302,17 +320,22 @@ async fn sighup_reloads_tls_identity_without_dropping_connections() -> Result<()
     write_restricted(&cert_path, CERT1_PEM);
     write_restricted(&key_path, KEY1_PEM);
 
-    // Pick a free loopback port for the child server.
+    // Pick free loopback ports for the child server and its observability listener.
     let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
     let listen_addr = probe.local_addr()?;
     drop(probe);
+    let obs_probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let obs_addr = obs_probe.local_addr()?;
+    drop(obs_probe);
 
     write_restricted(
         &config_path,
-        &server_config_toml(
+        &server_config_toml_with_skew(
             &listen_addr.to_string(),
+            &obs_addr.to_string(),
             &cert_path.to_string_lossy(),
             &key_path.to_string_lossy(),
+            30,
         ),
     );
 
@@ -416,6 +439,52 @@ async fn sighup_reloads_tls_identity_without_dropping_connections() -> Result<()
             panic!("pre-reload connection errored after SIGHUP reload: {e}");
         }
     }
+
+    // Next, test SIGHUP reload with an invalid auth_skew_seconds (200s > half of 300s replay cache window)
+    // and rotated cert back to CERT1. The reload must be rejected, the reload_failures metric must increment,
+    // and CERT2 must remain active.
+    write_restricted(&cert_path, CERT1_PEM);
+    write_restricted(&key_path, KEY1_PEM);
+    write_restricted(
+        &config_path,
+        &server_config_toml_with_skew(
+            &listen_addr.to_string(),
+            &obs_addr.to_string(),
+            &cert_path.to_string_lossy(),
+            &key_path.to_string_lossy(),
+            200,
+        ),
+    );
+    let kill_status = std::process::Command::new("kill")
+        .arg("-HUP")
+        .arg(pid.to_string())
+        .status()?;
+    assert!(
+        kill_status.success(),
+        "failed to deliver second SIGHUP to the server process"
+    );
+
+    let fail_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if tokio::time::Instant::now() > fail_deadline {
+            return Err(TestError(
+                "server did not record reload failure metric after invalid SIGHUP".to_owned(),
+            ));
+        }
+        while log_rx.try_recv().is_ok() {}
+        if let Ok(metrics_body) = fetch_metrics(obs_addr).await {
+            if metrics_body.contains("uncrowned_king_server_config_reload_failures_total 1") {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let (_, after_failed_reload_der) = tls_handshake_capture_cert(listen_addr).await?;
+    assert_eq!(
+        after_failed_reload_der, second_cert_der,
+        "failed reload must preserve the active CERT2 configuration"
+    );
 
     let _ = child.kill();
     let _ = child.wait();

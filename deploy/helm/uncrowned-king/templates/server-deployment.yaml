@@ -1,4 +1,7 @@
 {{- if .Values.server.enabled }}
+{{- if not .Values.server.existingTlsSecret }}
+{{- fail "Security error: server.existingTlsSecret must be set to a Kubernetes Secret containing tls.crt and tls.key" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -23,6 +26,7 @@ spec:
       labels:
         {{- include "uncrowned-king.server.selectorLabels" . | nindent 8 }}
     spec:
+      terminationGracePeriodSeconds: 40
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -44,6 +48,8 @@ spec:
               mkdir -p /etc/uncrowned-king/policy
               cat /staging/config/server.toml /staging/credentials/credentials.toml > /etc/uncrowned-king/server.toml
               cp /staging/config/policy.toml /etc/uncrowned-king/policy/policy.toml
+              case "${POD_IP}" in *:*) POD_HOST="[${POD_IP}]" ;; *) POD_HOST="${POD_IP}" ;; esac
+              sed -i "s/__POD_IP__/${POD_HOST}/g" /etc/uncrowned-king/server.toml
               {{- if .Values.server.existingTlsSecret }}
               if [ -d /staging/tls ]; then
                 mkdir -p /etc/uncrowned-king/tls
@@ -52,6 +58,11 @@ spec:
               fi
               {{- end }}
               chmod 0600 /etc/uncrowned-king/server.toml /etc/uncrowned-king/policy/policy.toml
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

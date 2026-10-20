@@ -260,7 +260,7 @@ pub fn validate_connection_frame(frame: &Frame, expected_type: FrameType) -> Pro
     Ok(())
 }
 
-fn validate_flags(flags: u16) -> ProtocolResult<()> {
+pub(crate) fn validate_flags(flags: u16) -> ProtocolResult<()> {
     let required = flags & REQUIRED_FLAG_MASK;
     if required == 0 {
         Ok(())

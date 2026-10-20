@@ -10,7 +10,7 @@
 //! application data is never accepted: the stream is only opened after the
 //! 1-RTT handshake finishes.
 
-use std::{future::Future, io, net::SocketAddr, pin::Pin, sync::Arc};
+use std::{future::Future, io, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use quinn::{
@@ -68,14 +68,21 @@ pub const QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 1024 * 1024;
 /// Datagram receive buffer size for QUIC UDP datagram relay (256 KiB).
 pub const QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE: usize = 256 * 1024;
 
-/// Builds a QUIC server config from a TLS 1.3 rustls config.
+/// Builds a QUIC server config from a TLS 1.3 rustls config without idle timeout.
+pub fn server_config(rustls_config: RustlsServerConfig) -> Result<QuinnServerConfig, QuicError> {
+    server_config_with_idle_timeout(rustls_config, None)
+}
+
+/// Builds a QUIC server config from a TLS 1.3 rustls config and sets the transport
+/// idle timeout.
 ///
 /// The rustls config must already restrict the protocol version to TLS 1.3
 /// (QUIC forbids earlier versions). ALPN is pinned to `uk/1` and 0-RTT is
 /// disabled so UK application data is only processed after the full handshake.
 /// Transport limits prevent unauthenticated peers from allocating arbitrary streams.
-pub fn server_config(
+pub fn server_config_with_idle_timeout(
     mut rustls_config: RustlsServerConfig,
+    idle_timeout: Option<Duration>,
 ) -> Result<QuinnServerConfig, QuicError> {
     rustls_config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
     rustls_config.max_early_data_size = 0;
@@ -89,6 +96,11 @@ pub fn server_config(
     transport.stream_receive_window(quinn::VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW));
     transport.receive_window(quinn::VarInt::from_u32(QUIC_CONNECTION_RECEIVE_WINDOW));
     transport.datagram_receive_buffer_size(Some(QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE));
+    let quic_idle_timeout = idle_timeout
+        .map(quinn::IdleTimeout::try_from)
+        .transpose()
+        .map_err(|err| format!("invalid QUIC idle timeout: {err}"))?;
+    transport.max_idle_timeout(quic_idle_timeout);
     config.transport_config(Arc::new(transport));
 
     Ok(config)
@@ -201,5 +213,31 @@ mod tests {
         assert_eq!(QUIC_CONNECTION_RECEIVE_WINDOW, 1024 * 1024);
         assert_eq!(QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE, 256 * 1024);
         drop(quic_config);
+    }
+
+    #[test]
+    fn server_config_sets_idle_timeout() {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
+        let quic_config =
+            server_config_with_idle_timeout(config.clone(), Some(Duration::from_secs(300)))
+                .expect("QUIC server config with idle timeout should succeed");
+        let debug_repr = format!("{quic_config:?}");
+        assert!(
+            debug_repr.contains("max_idle_timeout: Some(300000)"),
+            "max_idle_timeout must be configured to 300s (300000ms)"
+        );
+
+        let quic_config_none = server_config_with_idle_timeout(config, None)
+            .expect("QUIC server config without idle timeout should succeed");
+        let debug_repr_none = format!("{quic_config_none:?}");
+        assert!(
+            debug_repr_none.contains("max_idle_timeout: None"),
+            "max_idle_timeout must be None when idle timeout is disabled"
+        );
     }
 }

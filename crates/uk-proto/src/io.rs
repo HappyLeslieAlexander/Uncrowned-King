@@ -6,7 +6,10 @@ use bytes::{BufMut, BytesMut};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::{Frame, FrameHeader, FrameLimits, ProtocolError, varint};
+use crate::{
+    Frame, FrameHeader, FrameLimits, FrameType, ProtocolError, VERSION, frame::validate_flags,
+    varint,
+};
 
 /// Result alias for async frame IO.
 pub type FrameIoResult<T> = Result<T, FrameIoError>;
@@ -56,6 +59,14 @@ where
     };
     fixed[0] = first;
     read_exact_or_truncated(reader, &mut fixed[1..]).await?;
+
+    let version = fixed[0];
+    if version != VERSION {
+        return Err(ProtocolError::UnsupportedVersion(version).into());
+    }
+    let _frame_type = FrameType::try_from(fixed[1])?;
+    let flags = u16::from_be_bytes([fixed[2], fixed[3]]);
+    validate_flags(flags)?;
 
     let mut header_bytes = BytesMut::from(&fixed[..]);
     let id = read_varint_async(reader, &mut header_bytes).await?;
@@ -676,5 +687,44 @@ mod tests {
         let mut written = Vec::new();
         reader.read_to_end(&mut written).await.unwrap();
         assert!(written.is_empty(), "expected no bytes written");
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_unsupported_version_early() {
+        let (mut peer, mut carrier) = tokio::io::duplex(64);
+        peer.write_all(&[0x02, 0x11, 0x00, 0x00]).await.unwrap();
+        let err = read_frame(&mut carrier, FrameLimits::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            FrameIoError::Protocol(ProtocolError::UnsupportedVersion(2))
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_invalid_frame_type_early() {
+        let (mut peer, mut carrier) = tokio::io::duplex(64);
+        peer.write_all(&[0x01, 0x00, 0x00, 0x00]).await.unwrap();
+        let err = read_frame(&mut carrier, FrameLimits::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            FrameIoError::Protocol(ProtocolError::UnknownFrameType(0))
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_invalid_flags_early() {
+        let (mut peer, mut carrier) = tokio::io::duplex(64);
+        peer.write_all(&[0x01, 0x11, 0x01, 0x00]).await.unwrap();
+        let err = read_frame(&mut carrier, FrameLimits::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            FrameIoError::Protocol(ProtocolError::UnsupportedFlag(0x0100))
+        ));
     }
 }
