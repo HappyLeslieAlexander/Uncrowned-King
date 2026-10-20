@@ -1286,7 +1286,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "uk-auth"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bytes",
  "criterion",
@@ -1302,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "uk-client"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bytes",
  "clap",
@@ -1326,7 +1326,7 @@ dependencies = [
 
 [[package]]
 name = "uk-policy"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "serde",
  "thiserror",
@@ -1337,7 +1337,7 @@ dependencies = [
 
 [[package]]
 name = "uk-proto"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bytes",
  "criterion",
@@ -1347,7 +1347,7 @@ dependencies = [
 
 [[package]]
 name = "uk-server"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bytes",
  "clap",

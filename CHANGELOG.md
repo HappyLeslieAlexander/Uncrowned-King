@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-20
+
+### Security
+
+- **Early fixed-header bounds validation (`uk-proto`)**: `read_frame` now validates fixed-header wire bounds (`is_valid_type`, minimum payload length) before decoding variable-length integers, preventing malformed frame parsing denial-of-service.
+- **IPv4-mapped IPv6 address canonicalization (`uk-proto`)**: `validate_observability_bind` canonicalizes IPv4-mapped IPv6 addresses (e.g. `::ffff:0.0.0.0`) to reject wildcard bindings consistently across address families.
+- **Pre-allocation bounded validation (`uk-auth`)**: `AuthResponse::decode` strictly validates `key_id_len <= MAX_KEY_ID_LEN` before reserving buffer memory, preventing pre-authentication memory exhaustion from inflated headers.
+- **Configurable auth rate limiting (`uk-server`)**: support explicitly disabling auth failure rate limiting with `auth_rate_limit_failures = 0` without thread panics or infinite loops.
+- **Endpoint address validation (`uk-server`)**: added strict socket address validation for the QUIC listener on startup and SIGHUP reload, matching TLS listener invariants.
+- **Fail-closed Helm secret guardrails (`deploy`)**: Helm templates now validate authentication keys and TLS secrets at render time, failing closed if placeholder or empty values are provided.
+- **Tightened default network egress policies (`deploy`)**: Kubernetes and Helm deployment manifests restrict egress to cluster DNS and proxy targets, preventing lateral cluster movement.
+
+### Fixed
+
+- **QUIC idle timeout configuration (`uk-server`)**: `quic::listen` now correctly applies the configured `idle_timeout` into `quinn::TransportConfig` instead of relying on default timeout settings.
+- **Relay flow cleanup on peer dial/error (`uk-server`)**: TCP and UDP relay workers immediately tear down active flow registrations (`finish_tcp_flow` / `finish_udp_flow`) when dialer or peer errors occur, preventing dead flow table leaks.
+- **Session limit error delivery timeout (`uk-server`)**: error frame writes during session limit rejection are now guarded by a 5-second timeout and listener shutdown cancellation watcher, preventing stalled error tasks during connection surges.
+- **Active state limits validation on SIGHUP (`uk-server`)**: configuration reload validates that current active session counts and listener configurations remain compliant before applying changes atomically.
+- **QUIC client multi-address fallback & socket cleanup (`uk-client`)**: QUIC client resolves and iterates through all candidate `SocketAddr` entries, immediately releasing unbound/failed sockets to eliminate UDP socket leaks.
+- **QUIC transport degradation caching (`uk-client`)**: transport-level handshake failures record an endpoint penalty immediately, triggering fast TLS fallback without redundant timeout stalls.
+- **Filter draining sessions in connection pool (`uk-client`)**: `first_live_session` excludes sessions in `Draining` state, ensuring new application streams are only scheduled on fully active carriers.
+- **Downward API POD_IP observability binding (`deploy`)**: Kubernetes manifests and Helm templates inject `status.podIP` via Downward API for metrics and health listeners, ensuring non-wildcard binding compliance in dual-stack and IPv6 environments.
+- **Flexible client deployment modes (`deploy`)**: added Helm support for running clients as standard `Deployment`s alongside `DaemonSet`s for specialized cluster topologies.
+- **Documentation buffer limits (`docs`)**: corrected `docs/tuning.md` buffer recommendations to align with the 16 MiB protocol ceiling.
+
 ## [1.0.0] - 2026-10-17
 
 ### Added
@@ -412,7 +437,8 @@ policy-enforced SOCKS5 → UK → target relay over TLS/TCP and QUIC.
   saturating bulk flow); and a soak/chaos harness showing flat memory across
   sustained load. See `docs/performance.md`.
 
-[Unreleased]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v0.1.3...v1.0.0
 [0.1.3]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v0.1.1...v0.1.2

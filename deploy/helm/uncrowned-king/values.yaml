@@ -13,7 +13,7 @@ server:
   image:
     repository: ghcr.io/happylesliealexander/uncrowned-king-server
     pullPolicy: IfNotPresent
-    tag: "v1.0.0"
+    tag: "v1.0.1"
 
   service:
     type: LoadBalancer
@@ -107,7 +107,7 @@ client:
   image:
     repository: ghcr.io/happylesliealexander/uncrowned-king-client
     pullPolicy: IfNotPresent
-    tag: "v1.0.0"
+    tag: "v1.0.1"
 
   socks5:
     port: 1080
