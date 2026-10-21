@@ -2153,6 +2153,7 @@ async fn review_closed_flows_leave_half_close_timers() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn stress_rapid_flow_churn_and_timer_counts() {
     let mut tasks = SessionTasks::default();
     let mut table = FlowTable::new();
@@ -2247,7 +2248,11 @@ async fn stress_rapid_flow_churn_and_timer_counts() {
         assert_eq!(tasks.len(), 0, "Timer must be cancelled upon abort");
     }
 
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !tasks.tasks.is_empty() && tokio::time::Instant::now() < deadline {
+        tasks.join_next().await;
+    }
+    assert!(tasks.tasks.is_empty(), "all aborted tasks must complete");
     assert_eq!(tasks.len(), 0);
     assert_eq!(
         tasks.kinds.len(),
@@ -2505,5 +2510,89 @@ async fn review_real_relay_drain_loses_tail_of_upload() {
         received.len(),
         payload.len(),
         "graceful shutdown reported success while truncating upload"
+    );
+}
+
+#[tokio::test]
+async fn carrier_disconnect_without_client_close_flushes_pending_writes() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (client, server) = tokio::io::duplex(4 * 1024 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server);
+    let carrier = ServerCarrier::new(Box::new(server_reader), Box::new(server_writer), None);
+    let cred = uk_auth::Credential::active(
+        b"user".to_vec(),
+        b"0123456789abcdef0123456789abcdef".to_vec(),
+    )
+    .unwrap();
+    let identity = AuthenticatedIdentity::from(&cred);
+    let mut rule = uk_policy::PolicyRule::new(uk_policy::PolicyDecision::Allow);
+    rule.private = Some(true);
+    let security = SecurityState::new(
+        crate::security::test_tls_acceptor(),
+        vec![cred],
+        PolicySet::new(vec![rule]),
+        Duration::from_secs(30),
+    );
+    let mut limits = test_relay_limits(1);
+    limits.max_buffered_bytes_per_flow = 2 * 1024 * 1024;
+    limits.max_buffered_bytes_per_session = 16 * 1024 * 1024;
+    limits.carrier_write_timeout = Some(Duration::from_secs(30));
+    limits.tcp_half_close_timeout = Some(Duration::from_secs(30));
+    limits.session_task_shutdown_timeout = Some(Duration::from_secs(30));
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let metrics = Arc::new(ServerMetrics::default());
+    let session = tokio::spawn(relay_session(
+        carrier,
+        identity,
+        security,
+        limits,
+        None,
+        shutdown_rx,
+        metrics,
+    ));
+    let (client_reader, mut client_writer) = tokio::io::split(client);
+    let mut frames = FrameReader::new(client_reader, FrameLimits::default());
+    let mut open = BytesMut::new();
+    TcpOpen::new(
+        Target::Ipv4(Ipv4Addr::LOCALHOST, address.port()),
+        TCP_OPEN_FLAGS_NONE,
+    )
+    .encode(&mut open)
+    .unwrap();
+    write_frame(
+        &mut client_writer,
+        &Frame::new(FrameType::TcpOpen, 0, 1, open.freeze()).unwrap(),
+    )
+    .await
+    .unwrap();
+    let (mut target, _) = listener.accept().await.unwrap();
+    let ack = frames.read_frame().await.unwrap();
+    assert_eq!(ack.header.frame_type, FrameType::TcpData);
+
+    let payload = Bytes::from(vec![0x7a; 65536]);
+    write_frame(
+        &mut client_writer,
+        &Frame::new(FrameType::TcpData, 0, 1, payload.clone()).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Abruptly drop client_writer (carrier disconnect) without sending TcpClose
+    drop(client_writer);
+    drop(frames);
+
+    let mut received = Vec::new();
+    let _ = time::timeout(Duration::from_secs(5), target.read_to_end(&mut received))
+        .await
+        .unwrap();
+    let _ = time::timeout(Duration::from_secs(2), session)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        received.len(),
+        payload.len(),
+        "all queued data must be flushed on carrier disconnect"
     );
 }
