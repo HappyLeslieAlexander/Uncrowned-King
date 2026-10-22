@@ -1,4 +1,5 @@
 {{- if .Values.client.enabled }}
+{{- $knownClientFields := list "server_addr" "server_addrs" "server_name" "observability_listen" "relay_buffer_size" "handshake_timeout_seconds" "server_connect_retry_delay_millis" "socks_handshake_timeout_seconds" "tcp_open_timeout_seconds" "udp_flow_idle_timeout_seconds" "shutdown_timeout_seconds" "max_pending_open_bytes" "max_socks_connections" "max_buffered_bytes_per_session" "max_buffered_bytes_per_flow" "max_carrier_sessions" }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -7,13 +8,27 @@ metadata:
     {{- include "uncrowned-king.labels" . | nindent 4 }}
 data:
   client.toml: |
-    server_addr = "{{ .Values.client.config.server_addr }}"
+    server_addr = "{{ .Values.client.config.server_addr | default (printf "%s.%s.svc.cluster.local:443" (include "uncrowned-king.server.fullname" .) .Release.Namespace) }}"
     server_name = "{{ .Values.client.config.server_name }}"
+    ca_cert_path = "/etc/uncrowned-king/ca/ca.crt"
     {{- if .Values.client.config.observability_listen }}
     observability_listen = "{{ .Values.client.config.observability_listen }}"
     {{- end }}
-    ca_cert_path = "/etc/uncrowned-king/ca/ca.crt"
-    {{- if .Values.client.config.relay_buffer_size }}
-    relay_buffer_size = {{ int64 .Values.client.config.relay_buffer_size }}
+    {{- if .Values.client.config.server_addrs }}
+    server_addrs = [
+      {{- range .Values.client.config.server_addrs }}
+      "{{ . }}",
+      {{- end }}
+    ]
+    {{- end }}
+    {{- range $key, $val := .Values.client.config }}
+    {{- if not (has $key $knownClientFields) }}
+    {{- if not (has $key (list "key_id" "secret")) }}
+    {{- fail (printf "Unknown client config field %q in client.config" $key) }}
+    {{- end }}
+    {{- end }}
+    {{- if and (not (has $key (list "server_addr" "server_addrs" "server_name" "observability_listen" "key_id" "secret"))) (not (kindIs "invalid" $val)) }}
+    {{ $key }} = {{ int64 $val }}
+    {{- end }}
     {{- end }}
 {{- end }}

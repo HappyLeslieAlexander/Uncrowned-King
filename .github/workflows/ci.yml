@@ -56,3 +56,40 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1 (cargo-deny 0.20.2)
         with:
           command: check
+
+  helm-validation:
+    name: Helm Chart Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Helm
+        uses: azure/setup-helm@b7246b12e77f713476503ba86817b96053f3e1b1 # v4.3.0
+
+      - name: Helm Lint
+        run: helm lint deploy/helm/uncrowned-king
+
+      - name: Assert Placeholder Secret Fails Closed
+        run: |
+          if helm template test deploy/helm/uncrowned-king \
+            --set server.existingTlsSecret=dummy 2>&1 | grep -q "placeholder credential secret found"; then
+            echo "Helm correctly rejected placeholder credentials"
+          else
+            echo "Helm failed to reject placeholder credentials"
+            exit 1
+          fi
+
+      - name: Helm Template Validation
+        run: |
+          helm template test-release deploy/helm/uncrowned-king \
+            --set server.existingTlsSecret=my-tls-secret \
+            --set 'server.credentials[0].id=test-client' \
+            --set 'server.credentials[0].secret=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
+            --set client.enabled=true \
+            --set client.existingCaSecret=my-ca-secret \
+            --set client.config.key_id=test-client \
+            --set client.config.secret=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+            --set client.config.max_socks_connections=500 \
+            --set networkPolicy.enabled=true > /dev/null
+

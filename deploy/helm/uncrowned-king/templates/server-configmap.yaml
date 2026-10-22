@@ -17,19 +17,22 @@ data:
     cert_path = "/etc/uncrowned-king/tls/tls.crt"
     key_path = "/etc/uncrowned-king/tls/tls.key"
     policy_path = "/etc/uncrowned-king/policy/policy.toml"
+    {{- if .Values.server.config.auth_skew_seconds }}
+    auth_skew_seconds = {{ int64 .Values.server.config.auth_skew_seconds }}
+    {{- end }}
 
+    {{- if .Values.server.config.limits }}
+    {{- $knownLimits := list "max_pre_auth_bytes" "max_frame_size" "max_sessions" "max_handshakes" "max_streams" "max_udp_flows" "max_outbound_dials_per_session" "max_buffered_bytes_per_session" "max_buffered_bytes_per_flow" "relay_buffer_size" "idle_timeout_seconds" "handshake_timeout_seconds" "target_connect_timeout_seconds" "tcp_half_close_timeout_seconds" "carrier_write_timeout_seconds" "tcp_keepalive_seconds" "udp_flow_idle_timeout_seconds" "shutdown_timeout_seconds" "auth_rate_limit_failures" "auth_rate_limit_window_seconds" "auth_rate_limit_ban_seconds" "replay_cache_window_seconds" "replay_cache_max_entries" "quic_stream_receive_window" "quic_connection_receive_window" }}
     [limits]
-    max_frame_size = {{ int64 .Values.server.config.limits.max_frame_size }}
-    max_sessions = {{ int64 .Values.server.config.limits.max_sessions }}
-    max_handshakes = {{ int64 .Values.server.config.limits.max_handshakes }}
-    max_streams = {{ int64 .Values.server.config.limits.max_streams }}
-    max_udp_flows = {{ int64 .Values.server.config.limits.max_udp_flows }}
-    max_buffered_bytes_per_session = {{ int64 .Values.server.config.limits.max_buffered_bytes_per_session }}
-    max_buffered_bytes_per_flow = {{ int64 .Values.server.config.limits.max_buffered_bytes_per_flow }}
-    relay_buffer_size = {{ int64 .Values.server.config.limits.relay_buffer_size }}
-    auth_rate_limit_failures = {{ int64 .Values.server.config.limits.auth_rate_limit_failures }}
-    auth_rate_limit_window_seconds = {{ int64 .Values.server.config.limits.auth_rate_limit_window_seconds }}
-    auth_rate_limit_ban_seconds = {{ int64 .Values.server.config.limits.auth_rate_limit_ban_seconds }}
+    {{- range $key, $val := .Values.server.config.limits }}
+    {{- if not (has $key $knownLimits) }}
+    {{- fail (printf "Unknown server limit %q in server.config.limits" $key) }}
+    {{- end }}
+    {{- if not (kindIs "invalid" $val) }}
+    {{ $key }} = {{ int64 $val }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
 
   policy.toml: |
     {{- range .Values.server.policy.rules }}

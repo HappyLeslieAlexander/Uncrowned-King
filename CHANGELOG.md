@@ -6,7 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-10-22
+
+### Security
+
+- **QUIC stateless source address validation (`uk-server`)**: `spawn_accepted_quic` now enforces QUIC address validation by invoking `incoming.retry()` when `!incoming.remote_address_validated() && incoming.may_retry()`, preventing handshake permit exhaustion and reflection attacks from spoofed Initial packets before any handshake resources are allocated. Added metric `uncrowned_king_server_quic_retries_total`.
+- **Kubernetes PodDisruptionBudget & NetworkPolicy (`deploy`)**: added configurable `PodDisruptionBudget` (`minAvailable: 1`) and hardened `NetworkPolicy` templates in Helm chart. The network policy whitelists DNS, Kubernetes API, and external target egress while explicitly denying access to private IP ranges (RFC 1918) and cloud metadata services (AWS/GCP `169.254.169.254`, Azure `168.63.129.16`, Alibaba `100.100.100.200`, AWS IPv6 `fd00:ec2::254`). Observability metrics ingress is restricted to Prometheus namespaces.
+- **Fail-closed Helm configuration validation (`deploy`)**: server and client ConfigMaps now validate configuration knobs against strict whitelists at render time (`server-configmap.yaml` and `client-configmap.yaml`), failing closed if misspelled or unrecognised parameters are configured. Client `server_addr` now automatically defaults to `<fullname>.<namespace>.svc.cluster.local:443`.
+- **Supply chain action SHA & digest pinning (`ci`)**: all GitHub Actions in `.github/workflows/release.yml` and `.github/workflows/security.yml` are pinned to immutable commit SHA-1 digests (`taiki-e/create-gh-release-action`, `taiki-e/upload-rust-binary-action`, `docker/setup-qemu-action`, `docker/setup-buildx-action`, `docker/login-action`, `docker/build-push-action`, `sigstore/cosign-installer`, `rustsec/audit-check`). Base container images in `Dockerfile` are pinned to SHA-256 digests.
+- **Historical audit documentation archival (`docs`)**: archived 2026-09-09 audit reports (`PRODUCTION_AUDIT_2026-09-09.md` and `PRODUCTION_READINESS_REPORT.md`) into `docs/audits/2026-09-09/` with explicit historical notices clarifying applicability to `v0.1.3`.
+
+### Fixed
+
+- **QUIC client transport keep-alive & idle timeout bounds (`uk-client`)**: configured QUIC `TransportConfig` with 15-second `keep_alive_interval`, 60-second `max_idle_timeout`, 1 MiB stream/connection receive windows, and 256 KiB datagram receive buffers, preventing stateful NAT firewall session silent drops on idle connections.
+- **Carrier disconnect write flushing & drain before drop (`uk-server`)**: `ServerSession::close_target_flows` now closes the client-to-target half while marking target-to-client closed before draining active target flows, ensuring queued client writes flush to targets rather than being prematurely aborted during carrier teardown.
+- **Client SIGHUP reload failure metrics (`uk-client`)**: `ClientReloadHandle` now reports config reload parse/read failures, incrementing `uncrowned_king_client_config_reload_failures_total` and preventing silent SIGHUP failures from going unnoticed.
+- **Configurable QUIC flow control windows (`uk-server`)**: added `limits.quic_stream_receive_window` and `limits.quic_connection_receive_window` (default 1 MiB, configurable between 64 KiB and 16 MiB), enabling transport window tuning for high-BDP environments while enforcing static limit restart invariants.
+
 ## [1.0.1] - 2026-10-20
+
+> *Erratum (2026-10-21):* The `NetworkPolicy` template referenced in the 1.0.1 notes was drafted as part of hardening research but was not packaged into the Helm chart tree until 1.0.2.
 
 ### Security
 
@@ -437,7 +456,8 @@ policy-enforced SOCKS5 → UK → target relay over TLS/TCP and QUIC.
   saturating bulk flow); and a soak/chaos harness showing flat memory across
   sustained load. See `docs/performance.md`.
 
-[Unreleased]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v0.1.3...v1.0.0
 [0.1.3]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v0.1.2...v0.1.3

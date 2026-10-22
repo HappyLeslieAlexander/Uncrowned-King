@@ -107,7 +107,7 @@ spec:
       # "must not be accessible by group or other users".
       initContainers:
         - name: stage-config
-          image: busybox:1.36
+          image: busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
           command: ["/bin/sh", "-c"]
           args:
             - |
@@ -151,7 +151,7 @@ spec:
               mountPath: /etc/uncrowned-king
       containers:
         - name: uk-server
-          image: ghcr.io/happylesliealexander/uncrowned-king-server:v1.0.1
+          image: ghcr.io/happylesliealexander/uncrowned-king-server:v1.0.2
           args:
             - "--config"
             - "/etc/uncrowned-king/server.toml"
@@ -250,3 +250,64 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: uncrowned-king-server
+---
+# Dual-stack hardened NetworkPolicy restricting ingress and egress traffic.
+# Egress is restricted to cluster DNS and external target destinations, strictly
+# excluding private RFC 1918 networks, loopback, and cloud provider metadata addresses.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: uncrowned-king-server
+  namespace: uncrowned-king
+  labels:
+    app.kubernetes.io/name: uncrowned-king-server
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: uncrowned-king-server
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow incoming client carrier connections on TLS and QUIC ports
+    - from: []
+      ports:
+        - protocol: TCP
+          port: 9443
+        - protocol: UDP
+          port: 9443
+    # Allow metrics scraping on internal management port
+    - from: []
+      ports:
+        - protocol: TCP
+          port: 9090
+  egress:
+    # Allow DNS resolution
+    - to: []
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow outbound traffic to target destinations, strictly excluding
+    # private RFC 1918 networks, loopback, and cloud provider metadata addresses.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 127.0.0.0/8
+              - 169.254.169.254/32
+              - 100.100.100.200/32
+              - 168.63.129.16/32
+        - ipBlock:
+            cidr: "::/0"
+            except:
+              - "::1/128"
+              - "fc00::/7"
+              - "fe80::/10"
+              - "fd00:ec2::254/128"
+              - "::ffff:0:0/96"
+

@@ -163,6 +163,7 @@ pub(super) struct ServerMetrics {
     config_reload_failures_total: AtomicU64,
     accepted_connections_total: AtomicU64,
     rate_limited_connections_total: AtomicU64,
+    quic_retries_total: AtomicU64,
     rejected_handshakes_total: AtomicU64,
     failed_handshakes_total: AtomicU64,
     handshake_failures_total: [AtomicU64; HANDSHAKE_FAILURE_COUNT],
@@ -214,6 +215,10 @@ impl ServerMetrics {
     pub(super) fn record_rate_limited_connection(&self) {
         self.rate_limited_connections_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_quic_retry(&self) {
+        self.quic_retries_total.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn record_rejected_handshake(&self) {
@@ -300,6 +305,9 @@ impl ServerMetrics {
                 "# HELP uncrowned_king_server_rate_limited_connections_total Carrier connections rejected by authentication rate limiting.\n",
                 "# TYPE uncrowned_king_server_rate_limited_connections_total counter\n",
                 "uncrowned_king_server_rate_limited_connections_total {rate_limited_connections_total}\n",
+                "# HELP uncrowned_king_server_quic_retries_total Stateless QUIC Retry tokens issued for source address validation.\n",
+                "# TYPE uncrowned_king_server_quic_retries_total counter\n",
+                "uncrowned_king_server_quic_retries_total {quic_retries_total}\n",
                 "# HELP uncrowned_king_server_rejected_handshakes_total Carrier connections rejected by the handshake concurrency limit.\n",
                 "# TYPE uncrowned_king_server_rejected_handshakes_total counter\n",
                 "uncrowned_king_server_rejected_handshakes_total {rejected_handshakes_total}\n",
@@ -330,6 +338,7 @@ impl ServerMetrics {
             accepted_connections_total = self.accepted_connections_total.load(Ordering::Relaxed),
             rate_limited_connections_total =
                 self.rate_limited_connections_total.load(Ordering::Relaxed),
+            quic_retries_total = self.quic_retries_total.load(Ordering::Relaxed),
             rejected_handshakes_total = self.rejected_handshakes_total.load(Ordering::Relaxed),
             failed_handshakes_total = self.failed_handshakes_total.load(Ordering::Relaxed),
             active_handshakes = self.active_handshakes.load(Ordering::Relaxed),
@@ -596,6 +605,7 @@ mod tests {
         metrics.record_config_reload_success(2);
         metrics.record_config_reload_failure();
         metrics.record_accepted_connection();
+        metrics.record_quic_retry();
         metrics.record_rejected_handshake();
         metrics.record_failed_handshake(HandshakeFailureReason::Auth);
         let handshake = metrics.begin_handshake();
@@ -619,6 +629,7 @@ mod tests {
         assert!(response.contains("uncrowned_king_server_config_reload_successes_total 1\n"));
         assert!(response.contains("uncrowned_king_server_config_reload_failures_total 1\n"));
         assert!(response.contains("uncrowned_king_server_accepted_connections_total 1\n"));
+        assert!(response.contains("uncrowned_king_server_quic_retries_total 1\n"));
         assert!(response.contains("uncrowned_king_server_active_handshakes 1\n"));
         assert!(
             response

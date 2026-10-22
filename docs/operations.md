@@ -54,6 +54,12 @@ around 70 MiB (see `docs/performance.md`). Set `LimitNOFILE` well above
   session (`server.session.carrier_failed`). `tcp_keepalive_seconds` covers the
   other half — a peer that vanished without closing, which no write deadline can
   see because there is nothing to write.
+- **QUIC flow control receive windows** (`limits.quic_stream_receive_window` and
+  `limits.quic_connection_receive_window`, default 1 MiB each, valid range 64 KiB
+  to 16 MiB, with connection window ≥ stream window) govern Quinn transport
+  buffering for QUIC carriers. Raise them on high-BDP (bandwidth-delay product)
+  links to prevent transport-level flow control stalls. Like other limits, changes
+  require a restart.
 - Reloadable via SIGHUP: credentials, policy, and the TLS/QUIC identity.
   **Not** reloadable (need a restart): `listen`, `quic_listen`, all limits and
   timeouts, and the observability listener.

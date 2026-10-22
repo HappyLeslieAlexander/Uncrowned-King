@@ -255,6 +255,7 @@ pub(crate) async fn close_session(
     shutdown.close();
     close_target_flows(target_writers);
     drain_session_tasks(session_tasks, task_shutdown_timeout).await;
+    target_writers.clear();
     shutdown_carrier_writer(carrier_writer).await;
     transition(state, ServerSessionState::Closed);
 }
@@ -668,7 +669,10 @@ pub(crate) fn close_target_flows(target_writers: &mut FlowTable) {
     for slot in target_writers.drain().map(|(_, target)| target) {
         match slot {
             FlowSlot::OpeningTcp(cancel) | FlowSlot::OpeningUdp(cancel) => cancel.cancel(),
-            FlowSlot::Tcp(mut target) => target.close_client_to_target(),
+            FlowSlot::Tcp(mut target) => {
+                target.mark_target_to_client_closed();
+                target.close_client_to_target();
+            }
             FlowSlot::Udp(target) => target.abort(),
         }
     }

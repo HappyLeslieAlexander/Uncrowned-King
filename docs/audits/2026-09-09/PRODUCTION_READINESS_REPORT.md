@@ -1,5 +1,9 @@
 # Uncrowned King (UK) — Production Readiness Evaluation Report
 
+> [!NOTE]
+> **Archival Notice & Scope of Applicability**  
+> This document is a historical audit evaluation report for workspace version `v0.1.3` conducted on 2026-09-09 and preserved solely for audit traceability. All defects and production blockers identified herein have been completely resolved, hardened, and verified in `v1.0.0`, `v1.0.1`, and `v1.0.2`. For current system status and production deployment guidelines, refer to the repository documentation, [CHANGELOG.md](../../../CHANGELOG.md), and modern operations guides.
+
 **Document ID:** UK-PRR-2026-09  
 **Evaluation Date:** 2026-09-09  
 **Target Repository:** `HappyLeslieAlexander/Uncrowned-King`  

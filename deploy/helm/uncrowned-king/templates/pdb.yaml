@@ -1,0 +1,13 @@
+{{- if and .Values.server.enabled .Values.server.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "uncrowned-king.server.fullname" . }}
+  labels:
+    {{- include "uncrowned-king.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.server.podDisruptionBudget.minAvailable | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "uncrowned-king.server.selectorLabels" . | nindent 6 }}
+{{- end }}

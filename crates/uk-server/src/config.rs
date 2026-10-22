@@ -187,6 +187,54 @@ impl ServerConfig {
             reject_small_limit("relay_buffer_size", buf_size as u64, 1024)?;
             reject_large_limit("relay_buffer_size", buf_size as u64, 1024 * 1024)?;
         }
+        self.validate_quic_window_limits()?;
+        self.validate_auth_rate_limits()?;
+        Ok(())
+    }
+
+    fn validate_quic_window_limits(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if let Some(stream_window) = self
+            .limits
+            .as_ref()
+            .and_then(|l| l.quic_stream_receive_window)
+        {
+            reject_small_limit(
+                "quic_stream_receive_window",
+                stream_window,
+                u64::from(crate::quic::MIN_QUIC_RECEIVE_WINDOW),
+            )?;
+            reject_large_limit(
+                "quic_stream_receive_window",
+                stream_window,
+                u64::from(crate::quic::MAX_QUIC_RECEIVE_WINDOW),
+            )?;
+        }
+        if let Some(conn_window) = self
+            .limits
+            .as_ref()
+            .and_then(|l| l.quic_connection_receive_window)
+        {
+            reject_small_limit(
+                "quic_connection_receive_window",
+                conn_window,
+                u64::from(crate::quic::MIN_QUIC_RECEIVE_WINDOW),
+            )?;
+            reject_large_limit(
+                "quic_connection_receive_window",
+                conn_window,
+                u64::from(crate::quic::MAX_QUIC_RECEIVE_WINDOW),
+            )?;
+        }
+        if self.quic_connection_receive_window() < self.quic_stream_receive_window() {
+            return Err(
+                "quic_connection_receive_window must be greater than or equal to quic_stream_receive_window"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_auth_rate_limits(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let rate_limit = self.auth_rate_limit_config();
         reject_large_limit(
             "auth_rate_limit_failures",
@@ -457,6 +505,26 @@ impl ServerConfig {
         }
     }
 
+    /// QUIC stream receive window in bytes.
+    pub fn quic_stream_receive_window(&self) -> u32 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.quic_stream_receive_window)
+            .map_or(crate::quic::DEFAULT_QUIC_STREAM_RECEIVE_WINDOW, |w| {
+                w as u32
+            })
+    }
+
+    /// QUIC connection receive window in bytes.
+    pub fn quic_connection_receive_window(&self) -> u32 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.quic_connection_receive_window)
+            .map_or(crate::quic::DEFAULT_QUIC_CONNECTION_RECEIVE_WINDOW, |w| {
+                w as u32
+            })
+    }
+
     fn resolve_paths(&mut self, base_dir: &Path) {
         self.cert_path = resolve_config_relative_path(base_dir, &self.cert_path);
         self.key_path = resolve_config_relative_path(base_dir, &self.key_path);
@@ -563,6 +631,10 @@ pub struct LimitConfig {
     pub auth_rate_limit_window_seconds: Option<u64>,
     /// Ban duration in seconds when auth_rate_limit_failures is exceeded.
     pub auth_rate_limit_ban_seconds: Option<u64>,
+    /// QUIC stream receive window in bytes. Default: 1 MiB (1048576). Range: 64 KiB .. 16 MiB.
+    pub quic_stream_receive_window: Option<u64>,
+    /// QUIC connection receive window in bytes. Default: 1 MiB (1048576). Range: 64 KiB .. 16 MiB.
+    pub quic_connection_receive_window: Option<u64>,
 }
 
 /// One configured credential.
@@ -2096,6 +2168,60 @@ replay_cache_window_seconds = 120
         .unwrap();
 
         assert!(config.validate_limits().is_ok());
+    }
+
+    #[test]
+    fn validates_quic_receive_windows() {
+        let mut config = minimal_config();
+        config.limits = Some(LimitConfig {
+            quic_stream_receive_window: Some(u64::from(crate::quic::MIN_QUIC_RECEIVE_WINDOW) - 1),
+            ..LimitConfig::default()
+        });
+        assert!(config.validate_limits().is_err());
+
+        let mut config = minimal_config();
+        config.limits = Some(LimitConfig {
+            quic_stream_receive_window: Some(u64::from(crate::quic::MAX_QUIC_RECEIVE_WINDOW) + 1),
+            ..LimitConfig::default()
+        });
+        assert!(config.validate_limits().is_err());
+
+        let mut config = minimal_config();
+        config.limits = Some(LimitConfig {
+            quic_connection_receive_window: Some(
+                u64::from(crate::quic::MIN_QUIC_RECEIVE_WINDOW) - 1,
+            ),
+            ..LimitConfig::default()
+        });
+        assert!(config.validate_limits().is_err());
+
+        let mut config = minimal_config();
+        config.limits = Some(LimitConfig {
+            quic_connection_receive_window: Some(
+                u64::from(crate::quic::MAX_QUIC_RECEIVE_WINDOW) + 1,
+            ),
+            ..LimitConfig::default()
+        });
+        assert!(config.validate_limits().is_err());
+
+        let mut config = minimal_config();
+        config.limits = Some(LimitConfig {
+            quic_stream_receive_window: Some(2 * 1024 * 1024),
+            quic_connection_receive_window: Some(1024 * 1024),
+            ..LimitConfig::default()
+        });
+        let err = config.validate_limits().unwrap_err().to_string();
+        assert!(err.contains("quic_connection_receive_window must be greater than or equal to quic_stream_receive_window"));
+
+        let mut config = minimal_config();
+        config.limits = Some(LimitConfig {
+            quic_stream_receive_window: Some(2 * 1024 * 1024),
+            quic_connection_receive_window: Some(4 * 1024 * 1024),
+            ..LimitConfig::default()
+        });
+        assert!(config.validate_limits().is_ok());
+        assert_eq!(config.quic_stream_receive_window(), 2 * 1024 * 1024);
+        assert_eq!(config.quic_connection_receive_window(), 4 * 1024 * 1024);
     }
 
     #[cfg(unix)]

@@ -290,6 +290,16 @@ impl ConnectionRuntime {
         peer: SocketAddr,
         shutdown_rx: watch::Receiver<bool>,
     ) {
+        // Validate the source address before it can consume any shared budget:
+        // a Retry costs one stateless packet and proves the peer can receive
+        // at the claimed address, so spoofed Initials never hold a permit.
+        if !incoming.remote_address_validated() && incoming.may_retry() {
+            if let Err(err) = incoming.retry() {
+                err.into_incoming().ignore();
+            }
+            self.metrics.record_quic_retry();
+            return;
+        }
         let Some(handshake_permit) = self.admit_connection(peer, "quic") else {
             incoming.refuse();
             return;
@@ -540,9 +550,11 @@ fn build_quic_endpoint(config: &ServerConfig) -> Result<Option<quinn::Endpoint>,
         .parse()
         .map_err(|err| format!("invalid quic_listen address {listen}: {err}"))?;
     let rustls_config = tls::server_config(&config.cert_path, &config.key_path)?;
-    let quic_config = quic::server_config_with_idle_timeout(
+    let quic_config = quic::server_config_with_transport_params(
         rustls_config,
         idle_timeout(config.idle_timeout_seconds()),
+        config.quic_stream_receive_window(),
+        config.quic_connection_receive_window(),
     )?;
     let endpoint = quic::bind_endpoint(quic_config, addr)?;
     Ok(Some(endpoint))
@@ -705,9 +717,11 @@ fn apply_security_reload(
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_server_config));
     let quic_config = if quic_endpoint.is_some() {
         let quic_tls_config = tls::server_config_from_memory(certs, key)?;
-        Some(quic::server_config_with_idle_timeout(
+        Some(quic::server_config_with_transport_params(
             quic_tls_config,
             idle_timeout(candidate.idle_timeout_seconds()),
+            candidate.quic_stream_receive_window(),
+            candidate.quic_connection_receive_window(),
         )?)
     } else {
         None
@@ -761,7 +775,7 @@ fn changed_static_config_field(
     }
 }
 
-fn reload_static_limits(config: &ServerConfig) -> [(&'static str, u64); 23] {
+fn reload_static_limits(config: &ServerConfig) -> [(&'static str, u64); 25] {
     [
         ("max_pre_auth_bytes", config.max_pre_auth_bytes()),
         ("max_frame_size", config.max_frame_size()),
@@ -827,6 +841,14 @@ fn reload_static_limits(config: &ServerConfig) -> [(&'static str, u64); 23] {
         (
             "auth_rate_limit_ban_seconds",
             config.auth_rate_limit_config().ban_secs,
+        ),
+        (
+            "quic_stream_receive_window",
+            u64::from(config.quic_stream_receive_window()),
+        ),
+        (
+            "quic_connection_receive_window",
+            u64::from(config.quic_connection_receive_window()),
         ),
     ]
 }
@@ -1151,9 +1173,11 @@ pub fn check_config(config: &ServerConfig) -> Result<(), AnyError> {
     let _policy_set = config.policy_set()?;
     let tls_config = tls::server_config(&config.cert_path, &config.key_path)?;
     if config.quic_listen.is_some() {
-        let _quic_config = quic::server_config_with_idle_timeout(
+        let _quic_config = quic::server_config_with_transport_params(
             tls_config,
             idle_timeout(config.idle_timeout_seconds()),
+            config.quic_stream_receive_window(),
+            config.quic_connection_receive_window(),
         )?;
     }
     Ok(())
@@ -1885,6 +1909,34 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("auth_rate_limit_failures"));
+        assert!(error.contains("requires a restart"));
+    }
+
+    #[test]
+    fn security_reload_rejects_quic_receive_window_changes() {
+        let current = minimal_config();
+        let mut candidate_stream = current.clone();
+        candidate_stream.limits = Some(LimitConfig {
+            quic_stream_receive_window: Some(2 * 1024 * 1024),
+            quic_connection_receive_window: Some(2 * 1024 * 1024),
+            ..LimitConfig::default()
+        });
+
+        let error = ensure_reload_compatible(&current, &candidate_stream)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("quic_stream_receive_window"));
+        assert!(error.contains("requires a restart"));
+
+        let mut candidate_conn = current.clone();
+        candidate_conn.limits = Some(LimitConfig {
+            quic_connection_receive_window: Some(4 * 1024 * 1024),
+            ..LimitConfig::default()
+        });
+        let error = ensure_reload_compatible(&current, &candidate_conn)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("quic_connection_receive_window"));
         assert!(error.contains("requires a restart"));
     }
 

@@ -207,7 +207,7 @@ impl ClientMetrics {
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
-    fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         let ready = u8::from(self.is_ready());
         let mut output = format!(
             concat!(

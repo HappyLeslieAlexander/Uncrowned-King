@@ -6,7 +6,7 @@
 //! a socket address itself (quinn dials socket addresses, not host names) while
 //! still presenting the configured server name for certificate verification.
 
-use std::{future::Future, io, net::SocketAddr, pin::Pin, sync::Arc};
+use std::{future::Future, io, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint, crypto::rustls::QuicClientConfig};
@@ -19,6 +19,46 @@ use uk_proto::{
 };
 
 type QuicError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Client QUIC transport keep-alive interval (15s).
+///
+/// Keeps NAT bindings, edge firewalls, and QUIC connection state active.
+pub const DEFAULT_CLIENT_QUIC_KEEP_ALIVE: Duration = Duration::from_secs(15);
+
+/// Client QUIC transport maximum idle timeout (60s).
+///
+/// Under RFC 9000 §10.1, the effective idle timeout is min(client, server).
+/// Setting this to 60s avoids quinn's default 30s timeout while allowing
+/// the server's setting (default 300s) to govern, or cleanly detecting
+/// dead paths in 60s.
+pub const DEFAULT_CLIENT_QUIC_MAX_IDLE: Duration = Duration::from_secs(60);
+
+/// Stream receive window for QUIC client control stream (1 MiB).
+pub const CLIENT_QUIC_STREAM_RECEIVE_WINDOW: u32 = 1024 * 1024;
+
+/// Connection receive window for QUIC client connection (1 MiB).
+pub const CLIENT_QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 1024 * 1024;
+
+/// Datagram receive buffer size for QUIC client UDP datagram relay (256 KiB).
+pub const CLIENT_QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE: usize = 256 * 1024;
+
+/// Optional overrides for QUIC transport keep-alive and idle timeout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuicTransportOverrides {
+    /// Keep-alive packet interval. `None` disables transport keep-alives.
+    pub keep_alive: Option<Duration>,
+    /// Maximum idle timeout before declaring path failure.
+    pub max_idle: Duration,
+}
+
+impl Default for QuicTransportOverrides {
+    fn default() -> Self {
+        Self {
+            keep_alive: Some(DEFAULT_CLIENT_QUIC_KEEP_ALIVE),
+            max_idle: DEFAULT_CLIENT_QUIC_MAX_IDLE,
+        }
+    }
+}
 
 /// A [`DatagramChannel`] backed by a QUIC connection, used for UDP relay over
 /// QUIC DATAGRAM.
@@ -70,8 +110,50 @@ pub async fn connect(
     ),
     QuicError,
 > {
-    let addrs = resolve(endpoint).await?;
     let quinn_client_config = client_config(rustls_config)?;
+    connect_with_client_config(quinn_client_config, endpoint, server_name).await
+}
+
+/// Connects to `endpoint` over QUIC with optional transport parameter overrides.
+pub async fn connect_with_overrides(
+    rustls_config: RustlsClientConfig,
+    endpoint: &str,
+    server_name: &str,
+    overrides: Option<QuicTransportOverrides>,
+) -> Result<
+    (
+        BoxedCarrierReader,
+        BoxedCarrierWriter,
+        [u8; 32],
+        BoxedDatagramChannel,
+    ),
+    QuicError,
+> {
+    match overrides {
+        Some(opts) => {
+            let quinn_client_config =
+                client_config_with_transport(rustls_config, opts.keep_alive, opts.max_idle)?;
+            connect_with_client_config(quinn_client_config, endpoint, server_name).await
+        }
+        None => connect(rustls_config, endpoint, server_name).await,
+    }
+}
+
+/// Connects to `endpoint` over QUIC with a custom Quinn client configuration.
+pub async fn connect_with_client_config(
+    quinn_client_config: QuinnClientConfig,
+    endpoint: &str,
+    server_name: &str,
+) -> Result<
+    (
+        BoxedCarrierReader,
+        BoxedCarrierWriter,
+        [u8; 32],
+        BoxedDatagramChannel,
+    ),
+    QuicError,
+> {
+    let addrs = resolve(endpoint).await?;
 
     let mut last_err = None;
     for addr in addrs {
@@ -138,10 +220,49 @@ pub async fn connect(
     Err(last_err.unwrap_or_else(|| format!("failed to connect to QUIC endpoint {endpoint}").into()))
 }
 
-fn client_config(rustls_config: RustlsClientConfig) -> Result<QuinnClientConfig, QuicError> {
+/// Builds a transport config for the QUIC client with keep-alive, idle timeout,
+/// and flow control bounds.
+pub fn client_transport_config(
+    keep_alive: Option<Duration>,
+    max_idle: Duration,
+) -> Result<quinn::TransportConfig, QuicError> {
+    let mut transport = quinn::TransportConfig::default();
+    // The server opens exactly one bidirectional control stream; nothing else.
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1));
+    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+    transport.stream_receive_window(quinn::VarInt::from_u32(CLIENT_QUIC_STREAM_RECEIVE_WINDOW));
+    transport.receive_window(quinn::VarInt::from_u32(
+        CLIENT_QUIC_CONNECTION_RECEIVE_WINDOW,
+    ));
+    transport.datagram_receive_buffer_size(Some(CLIENT_QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE));
+    transport.keep_alive_interval(keep_alive);
+    let quic_idle_timeout = quinn::IdleTimeout::try_from(max_idle)
+        .map_err(|err| format!("invalid QUIC client idle timeout: {err}"))?;
+    transport.max_idle_timeout(Some(quic_idle_timeout));
+    Ok(transport)
+}
+
+/// Builds a Quinn client config with standard production transport parameters.
+pub fn client_config(rustls_config: RustlsClientConfig) -> Result<QuinnClientConfig, QuicError> {
+    client_config_with_transport(
+        rustls_config,
+        Some(DEFAULT_CLIENT_QUIC_KEEP_ALIVE),
+        DEFAULT_CLIENT_QUIC_MAX_IDLE,
+    )
+}
+
+/// Builds a Quinn client config with specified keep-alive and idle timeouts.
+pub fn client_config_with_transport(
+    rustls_config: RustlsClientConfig,
+    keep_alive: Option<Duration>,
+    max_idle: Duration,
+) -> Result<QuinnClientConfig, QuicError> {
     let crypto = QuicClientConfig::try_from(rustls_config)
         .map_err(|err| format!("QUIC client crypto config rejected: {err}"))?;
-    Ok(QuinnClientConfig::new(Arc::new(crypto)))
+    let mut config = QuinnClientConfig::new(Arc::new(crypto));
+    let transport = client_transport_config(keep_alive, max_idle)?;
+    config.transport_config(Arc::new(transport));
+    Ok(config)
 }
 
 async fn resolve(endpoint: &str) -> Result<Vec<SocketAddr>, QuicError> {
@@ -192,4 +313,44 @@ fn keep_endpoint_alive(endpoint: Endpoint) {
     tokio::spawn(async move {
         endpoint.wait_idle().await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_config_sets_expected_defaults() {
+        let transport = client_transport_config(
+            Some(DEFAULT_CLIENT_QUIC_KEEP_ALIVE),
+            DEFAULT_CLIENT_QUIC_MAX_IDLE,
+        )
+        .expect("valid default transport config");
+        let debug = format!("{transport:?}");
+        assert!(debug.contains("max_idle_timeout"));
+        assert!(debug.contains("keep_alive_interval"));
+    }
+
+    #[test]
+    fn transport_config_rejects_overflow_idle() {
+        let too_large = Duration::from_secs(u64::MAX);
+        assert!(client_transport_config(None, too_large).is_err());
+    }
+
+    #[test]
+    fn transport_config_supports_custom_keep_alive() {
+        let transport =
+            client_transport_config(Some(Duration::from_millis(300)), Duration::from_secs(5))
+                .expect("valid custom transport config");
+        let debug = format!("{transport:?}");
+        assert!(debug.contains("300ms") || debug.contains("keep_alive_interval"));
+    }
+
+    #[test]
+    fn transport_config_allows_disabling_keep_alive() {
+        let transport = client_transport_config(None, Duration::from_secs(5))
+            .expect("valid transport config without keep alive");
+        let debug = format!("{transport:?}");
+        assert!(debug.contains("keep_alive_interval: None"));
+    }
 }

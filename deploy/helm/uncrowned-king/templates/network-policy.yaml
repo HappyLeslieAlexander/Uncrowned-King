@@ -1,0 +1,64 @@
+{{- if and .Values.server.enabled .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "uncrowned-king.server.fullname" . }}
+  labels:
+    {{- include "uncrowned-king.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "uncrowned-king.server.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow incoming client carrier connections on TLS and QUIC ports
+    - from: []
+      ports:
+        - protocol: TCP
+          port: {{ .Values.server.service.ports.tls.targetPort | default 8443 }}
+        - protocol: UDP
+          port: {{ .Values.server.service.ports.quic.targetPort | default 8443 }}
+    # Allow metrics scraping from Prometheus
+    - from:
+        {{- if .Values.networkPolicy.prometheusNamespace }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.prometheusNamespace }}
+        {{- else }}
+        - namespaceSelector: {}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.server.metricsService.targetPort | default 9090 }}
+  egress:
+    # Allow DNS resolution
+    - to: []
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow outbound traffic to target destinations, strictly excluding
+    # private RFC1918 networks, loopback, and cloud provider metadata addresses.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 127.0.0.0/8
+              - 169.254.169.254/32
+              - 100.100.100.200/32
+              - 168.63.129.16/32
+        - ipBlock:
+            cidr: "::/0"
+            except:
+              - "::1/128"
+              - "fc00::/7"
+              - "fe80::/10"
+              - "fd00:ec2::254/128"
+              - "::ffff:0:0/96"
+{{- end }}

@@ -206,7 +206,13 @@ pub(crate) async fn handle_reload_request(
     sessions: &ClientSessionManager,
     request: ClientReloadRequest,
 ) {
-    let result = sessions.reload(request.config).await;
+    let result = match request.config {
+        Ok(config) => sessions.reload(config).await,
+        Err(reason) => {
+            sessions.record_reload_failure();
+            Err(reason.into())
+        }
+    };
     match &result {
         Ok(generation) => info!(
             event = "client.config.reload_success",

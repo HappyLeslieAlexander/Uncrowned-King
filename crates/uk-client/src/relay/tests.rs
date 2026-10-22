@@ -2313,3 +2313,26 @@ async fn first_live_session_filters_out_draining_sessions() {
         "must return None when all live sessions are draining"
     );
 }
+
+#[tokio::test]
+async fn client_handle_reload_request_load_failure_increments_metric() {
+    let config = minimal_config();
+    let manager = test_session_manager(config);
+    let (response, rx) = tokio::sync::oneshot::channel();
+    let request = crate::ClientReloadRequest {
+        config: Err("failed to read client.toml".to_string()),
+        response,
+    };
+
+    crate::relay::listener::handle_reload_request(&manager, request).await;
+
+    let result = rx.await.unwrap();
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), "failed to read client.toml");
+    let metrics = manager.metrics.render();
+    assert!(
+        metrics.contains("uncrowned_king_client_config_reload_failures_total 1\n"),
+        "metrics should report reload failure, got:\n{metrics}"
+    );
+    assert_eq!(manager.config.generation(), 1);
+}

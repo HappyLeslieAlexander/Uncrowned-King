@@ -243,6 +243,23 @@ pub async fn connect_authenticated(
     connect_authenticated_observed(config, |_| {}).await
 }
 
+/// Connects to the configured server and completes UK authentication with
+/// optional QUIC transport parameter overrides.
+pub async fn connect_authenticated_with_quic_overrides(
+    config: &ClientConfig,
+    overrides: Option<crate::quic::QuicTransportOverrides>,
+) -> Result<(ClientCarrier, Settings), AnyError> {
+    config.validate_network_endpoints()?;
+    config.validate_auth_material()?;
+    connect_authenticated_inner_with_overrides(
+        config,
+        handshake_timeout(config.handshake_timeout_seconds()),
+        overrides,
+        |_| {},
+    )
+    .await
+}
+
 pub(crate) async fn connect_authenticated_observed<F>(
     config: &ClientConfig,
     observe: F,
@@ -300,6 +317,18 @@ pub(crate) fn clear_degraded_endpoints() {
 async fn connect_authenticated_inner<F>(
     config: &ClientConfig,
     endpoint_timeout: Option<Duration>,
+    observe: F,
+) -> Result<(ClientCarrier, Settings), AnyError>
+where
+    F: FnMut(EndpointAttemptOutcome),
+{
+    connect_authenticated_inner_with_overrides(config, endpoint_timeout, None, observe).await
+}
+
+async fn connect_authenticated_inner_with_overrides<F>(
+    config: &ClientConfig,
+    endpoint_timeout: Option<Duration>,
+    overrides: Option<crate::quic::QuicTransportOverrides>,
     mut observe: F,
 ) -> Result<(ClientCarrier, Settings), AnyError>
 where
@@ -337,6 +366,7 @@ where
             server_name.clone(),
             endpoint,
             endpoint_timeout,
+            overrides,
         )
         .await
         {
@@ -399,11 +429,12 @@ async fn connect_authenticated_endpoint_with_timeout(
     server_name: ServerName<'static>,
     endpoint: &str,
     endpoint_timeout: Option<Duration>,
+    overrides: Option<crate::quic::QuicTransportOverrides>,
 ) -> Result<(ClientCarrier, Settings), AnyError> {
     if let Some(timeout) = endpoint_timeout {
         match time::timeout(
             timeout,
-            connect_authenticated_endpoint(config, tls_config, server_name, endpoint),
+            connect_authenticated_endpoint(config, tls_config, server_name, endpoint, overrides),
         )
         .await
         {
@@ -415,7 +446,7 @@ async fn connect_authenticated_endpoint_with_timeout(
             )),
         }
     } else {
-        connect_authenticated_endpoint(config, tls_config, server_name, endpoint).await
+        connect_authenticated_endpoint(config, tls_config, server_name, endpoint, overrides).await
     }
 }
 
@@ -424,6 +455,7 @@ async fn connect_authenticated_endpoint(
     tls_config: &Arc<TlsClientConfig>,
     server_name: ServerName<'static>,
     endpoint: &str,
+    overrides: Option<crate::quic::QuicTransportOverrides>,
 ) -> Result<(ClientCarrier, Settings), AnyError> {
     let (carrier, addr) = crate::config::parse_endpoint(endpoint)
         .map_err(|err| phase_error("parse endpoint", EndpointFailurePhase::Other, err))?;
@@ -434,7 +466,7 @@ async fn connect_authenticated_endpoint(
             let connector = tls::connector_from(Arc::clone(tls_config));
             establish_tls_carrier(&connector, server_name, addr).await?
         }
-        CarrierKind::Quic => establish_quic_carrier(config, tls_config, addr).await?,
+        CarrierKind::Quic => establish_quic_carrier(config, tls_config, addr, overrides).await?,
     };
     authenticate_over_carrier(config, reader, writer, exporter, datagrams).await
 }
@@ -474,6 +506,7 @@ async fn establish_quic_carrier(
     config: &ClientConfig,
     tls_config: &Arc<TlsClientConfig>,
     addr: &str,
+    overrides: Option<crate::quic::QuicTransportOverrides>,
 ) -> Result<
     (
         BoxedCarrierReader,
@@ -483,12 +516,14 @@ async fn establish_quic_carrier(
     ),
     AnyError,
 > {
-    // quinn takes the rustls config by value; cloning it is a handful of `Arc`
-    // bumps and, unlike rebuilding it, never touches the filesystem.
-    let (reader, writer, exporter, datagrams) =
-        crate::quic::connect(tls_config.as_ref().clone(), addr, &config.server_name)
-            .await
-            .map_err(|err| phase_error("quic connect", EndpointFailurePhase::Tls, err))?;
+    let (reader, writer, exporter, datagrams) = crate::quic::connect_with_overrides(
+        tls_config.as_ref().clone(),
+        addr,
+        &config.server_name,
+        overrides,
+    )
+    .await
+    .map_err(|err| phase_error("quic connect", EndpointFailurePhase::Tls, err))?;
     Ok((reader, writer, exporter, Some(datagrams)))
 }
 

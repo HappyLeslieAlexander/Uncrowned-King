@@ -61,16 +61,30 @@ fn datagram_channel(connection: &quinn::Connection) -> BoxedDatagramChannel {
     })
 }
 
+/// Default maximum stream receive window for QUIC control streams (1 MiB).
+pub const DEFAULT_QUIC_STREAM_RECEIVE_WINDOW: u32 = 1024 * 1024;
+/// Default maximum connection receive window for QUIC connections (1 MiB).
+pub const DEFAULT_QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 1024 * 1024;
+/// Minimum allowed QUIC receive window (64 KiB).
+pub const MIN_QUIC_RECEIVE_WINDOW: u32 = 64 * 1024;
+/// Maximum allowed QUIC receive window (16 MiB).
+pub const MAX_QUIC_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
+
 /// Maximum stream receive window for QUIC control streams (1 MiB).
-pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = 1024 * 1024;
+pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = DEFAULT_QUIC_STREAM_RECEIVE_WINDOW;
 /// Maximum connection receive window for QUIC connections (1 MiB).
-pub const QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 1024 * 1024;
+pub const QUIC_CONNECTION_RECEIVE_WINDOW: u32 = DEFAULT_QUIC_CONNECTION_RECEIVE_WINDOW;
 /// Datagram receive buffer size for QUIC UDP datagram relay (256 KiB).
 pub const QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE: usize = 256 * 1024;
 
 /// Builds a QUIC server config from a TLS 1.3 rustls config without idle timeout.
 pub fn server_config(rustls_config: RustlsServerConfig) -> Result<QuinnServerConfig, QuicError> {
-    server_config_with_idle_timeout(rustls_config, None)
+    server_config_with_transport_params(
+        rustls_config,
+        None,
+        DEFAULT_QUIC_STREAM_RECEIVE_WINDOW,
+        DEFAULT_QUIC_CONNECTION_RECEIVE_WINDOW,
+    )
 }
 
 /// Builds a QUIC server config from a TLS 1.3 rustls config and sets the transport
@@ -81,8 +95,24 @@ pub fn server_config(rustls_config: RustlsServerConfig) -> Result<QuinnServerCon
 /// disabled so UK application data is only processed after the full handshake.
 /// Transport limits prevent unauthenticated peers from allocating arbitrary streams.
 pub fn server_config_with_idle_timeout(
+    rustls_config: RustlsServerConfig,
+    idle_timeout: Option<Duration>,
+) -> Result<QuinnServerConfig, QuicError> {
+    server_config_with_transport_params(
+        rustls_config,
+        idle_timeout,
+        DEFAULT_QUIC_STREAM_RECEIVE_WINDOW,
+        DEFAULT_QUIC_CONNECTION_RECEIVE_WINDOW,
+    )
+}
+
+/// Builds a QUIC server config from a TLS 1.3 rustls config and sets transport
+/// idle timeout and receive window parameters.
+pub fn server_config_with_transport_params(
     mut rustls_config: RustlsServerConfig,
     idle_timeout: Option<Duration>,
+    stream_receive_window: u32,
+    connection_receive_window: u32,
 ) -> Result<QuinnServerConfig, QuicError> {
     rustls_config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
     rustls_config.max_early_data_size = 0;
@@ -93,8 +123,8 @@ pub fn server_config_with_idle_timeout(
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(0));
     transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
-    transport.stream_receive_window(quinn::VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW));
-    transport.receive_window(quinn::VarInt::from_u32(QUIC_CONNECTION_RECEIVE_WINDOW));
+    transport.stream_receive_window(quinn::VarInt::from_u32(stream_receive_window));
+    transport.receive_window(quinn::VarInt::from_u32(connection_receive_window));
     transport.datagram_receive_buffer_size(Some(QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE));
     let quic_idle_timeout = idle_timeout
         .map(quinn::IdleTimeout::try_from)
@@ -232,12 +262,29 @@ mod tests {
             "max_idle_timeout must be configured to 300s (300000ms)"
         );
 
-        let quic_config_none = server_config_with_idle_timeout(config, None)
+        let quic_config_none = server_config_with_idle_timeout(config.clone(), None)
             .expect("QUIC server config without idle timeout should succeed");
         let debug_repr_none = format!("{quic_config_none:?}");
         assert!(
             debug_repr_none.contains("max_idle_timeout: None"),
             "max_idle_timeout must be None when idle timeout is disabled"
+        );
+
+        let custom_quic = server_config_with_transport_params(
+            config,
+            Some(Duration::from_secs(60)),
+            2 * 1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .expect("QUIC server config with custom transport params should succeed");
+        let custom_debug = format!("{custom_quic:?}");
+        assert!(
+            custom_debug.contains("stream_receive_window: 2097152"),
+            "custom stream receive window must be 2 MiB"
+        );
+        assert!(
+            custom_debug.contains("receive_window: 4194304"),
+            "custom connection receive window must be 4 MiB"
         );
     }
 }

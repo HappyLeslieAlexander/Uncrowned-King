@@ -216,6 +216,10 @@ impl ClientSessionManager {
         result
     }
 
+    pub(crate) fn record_reload_failure(&self) {
+        self.metrics.record_reload_failure();
+    }
+
     pub(crate) async fn open_flow(
         &self,
         target: Target,

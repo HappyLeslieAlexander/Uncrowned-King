@@ -13,7 +13,7 @@ server:
   image:
     repository: ghcr.io/happylesliealexander/uncrowned-king-server
     pullPolicy: IfNotPresent
-    tag: "v1.0.1"
+    tag: "v1.0.2"
 
   service:
     type: LoadBalancer
@@ -48,6 +48,10 @@ server:
     maxReplicas: 10
     targetCPUUtilizationPercentage: 75
     targetMemoryUtilizationPercentage: 80
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
 
   nodeSelector: {}
   tolerations: []
@@ -107,7 +111,7 @@ client:
   image:
     repository: ghcr.io/happylesliealexander/uncrowned-king-client
     pullPolicy: IfNotPresent
-    tag: "v1.0.1"
+    tag: "v1.0.2"
 
   socks5:
     port: 1080
@@ -125,7 +129,7 @@ client:
       memory: 256Mi
 
   config:
-    server_addr: "uk-server.default.svc.cluster.local:443"
+    server_addr: "" # Defaults to internal server Service: <release>-uncrowned-king-server.<namespace>.svc.cluster.local:443
     server_name: "uk.example.com"
     observability_listen: "__POD_IP__:9091"
     key_id: "client-default"
@@ -142,3 +146,9 @@ serviceMonitor:
   enabled: false
   interval: 15s
   labels: {}
+
+# NetworkPolicy restricting ingress and egress traffic
+networkPolicy:
+  enabled: false
+  prometheusNamespace: ""
+

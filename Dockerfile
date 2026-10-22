@@ -7,7 +7,7 @@
 # The runtime is a distroless image (glibc + libgcc, no shell or package
 # manager) running as the non-root `nonroot` user (uid 65532).
 
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.85-bookworm@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4 AS builder
 WORKDIR /build
 # No dependency-only cache layer: `COPY crates` below carries the workspace
 # member manifests as well as the sources, so any source edit invalidates the
@@ -18,7 +18,7 @@ COPY crates ./crates
 RUN cargo build --release --locked -p uk-server -p uk-client
 
 # --- server -------------------------------------------------------------------
-FROM gcr.io/distroless/cc-debian12:nonroot AS server
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS server
 COPY --from=builder /build/target/release/uk-server /usr/local/bin/uk-server
 USER nonroot:nonroot
 # The server needs a config; mount one at /etc/uncrowned-king/server.toml. It and
@@ -28,7 +28,7 @@ ENTRYPOINT ["/usr/local/bin/uk-server"]
 CMD ["--config", "/etc/uncrowned-king/server.toml", "serve"]
 
 # --- client -------------------------------------------------------------------
-FROM gcr.io/distroless/cc-debian12:nonroot AS client
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS client
 COPY --from=builder /build/target/release/uk-client /usr/local/bin/uk-client
 USER nonroot:nonroot
 # The client needs a config; mount one at /etc/uncrowned-king/client.toml. It

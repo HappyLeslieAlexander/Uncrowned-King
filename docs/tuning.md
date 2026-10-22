@@ -21,6 +21,11 @@ relay_buffer_size = 65536
 # 提高单会话和单流允许的缓冲队列上限，防止大吞吐时频繁触发背压暂停（硬上限 16MB）
 max_buffered_bytes_per_session = 16777216 # 16MB
 max_buffered_bytes_per_flow = 8388608      # 8MB
+
+# 调整 QUIC 单流与连接级流控接收窗口（默认 1MB，支持 64KB ~ 16MB）
+# 连接窗口必须大于等于单流窗口。跨国高带宽大延迟（高 BDP）链路建议调高
+quic_stream_receive_window = 4194304      # 4MB
+quic_connection_receive_window = 8388608  # 8MB
 ```
 
 ```toml
@@ -56,6 +61,7 @@ udp_flow_idle_timeout_seconds = 30
 
 ### 1.3 弱网 / 跨国跨境链路场景
 - **传输载体建议**：优先选用 **QUIC 载体**。QUIC 基于 UDP，具备抗丢包能力、多路复用无队头阻塞（HOL Blocking）以及 0-RTT/1-RTT 极速连接特性。
+- **QUIC 接收窗口调优**：对于高丢包但有较大带宽延时积（BDP）的跨国链路，建议将 `limits.quic_stream_receive_window` 调至 `4194304` (4MB)，并将 `limits.quic_connection_receive_window` 调至 `8388608` (8MB)，避免传输层过早触发 QUIC 流控窗口等待。
 - **UDP 流量优化**：利用 QUIC 原生 `DATAGRAM` 扩展转发 UDP，不引入流控与重传开销。
 
 ---

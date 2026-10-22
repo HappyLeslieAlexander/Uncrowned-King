@@ -48,6 +48,14 @@ This document establishes the non-negotiable architectural invariants, security 
   - **Socket Leak Prevention**: Multi-address dial loops must immediately close failed or unused candidate sockets before trying next addresses.
   - **Draining Session Exclusion**: Connection pool dispatchers (`first_live_session`) must strictly exclude sessions in `Draining` state, routing new application streams only to active carriers.
 
+- **Carrier Disconnect Target Flow Flushing (`uk-server`)**:
+  - When an authenticated carrier disconnects or encounters an unrecoverable transport error, the server must mark target flows half-closed before initiating drain (`target.mark_target_to_client_closed()` and `target.close_client_to_target()`), ensuring all in-flight client payload bytes queued in relay buffers flush cleanly to targets rather than triggering instantaneous drop aborts.
+
+- **QUIC Transport & Stateless Retry Discipline**:
+  - QUIC client transport configs must explicitly configure active keep-alive (e.g. 15s) and bounded idle timeout (e.g. 60s) to keep stateful firewall NAT mappings alive on idle connections.
+  - Server QUIC listeners must enforce stateless source address validation (`incoming.retry()`) against unvalidated remote addresses before allocating handshake resources or permits.
+  - QUIC connection receive window must always be validated to be greater than or equal to stream receive window (`quic_connection_receive_window >= quic_stream_receive_window`).
+
 ---
 
 ## 4. Operational Readiness & Deployment Standards
@@ -55,9 +63,14 @@ This document establishes the non-negotiable architectural invariants, security 
 - **Strict File Permissions (`mode & 0o077 == 0`)**:
   - Server strictly enforces that configuration files and certificates have no group or other permissions (e.g. `0600` or `0400`).
   - **Kubernetes / Helm Manifests**: ConfigMaps are mounted with `0644` by default; deployment templates must use an `initContainer` to copy and `chmod 0600` configuration files into a shared emptyDir volume before the main container starts.
-  - **Zero Plaintext & Fail-Closed Secrets**: Authentication keys and private keys must never be placed in plain `ConfigMap` templates. Always use Kubernetes `Secret` resources, and fail closed in Helm templates if secret values are missing or placeholders.
+  - **Zero Plaintext & Fail-Closed Secrets**: Authentication keys and private keys must never be placed in plain `ConfigMap` templates. Always use Kubernetes `Secret` resources, and fail closed in Helm templates if secret values are missing, empty, or placeholders. Credential generation templates must strictly enforce non-empty `key_id` (or `id`) alongside secrets to prevent silent generation of invalid empty identifiers that crash services at startup.
   - **Downward API IP Binding**: In containerized deployments, unauthenticated metrics and health endpoints must bind to `status.podIP` via Downward API, never wildcards.
-  - **GPG-Signed Releases & Version Consistency**: Release commits and git tags must be cryptographically signed (`git commit -S`, `git tag -s`). Version bumps must atomically synchronize root `Cargo.toml`, `Cargo.lock`, `Chart.yaml`, `values.yaml`, and `CHANGELOG.md`.
+  - **Dual-Stack NetworkPolicy Hardening**: When NetworkPolicies are enabled, egress rules must support dual-stack clusters by including both IPv4 (`0.0.0.0/0`) and IPv6 (`::/0`) blocks. Both address families must strictly exclude private/loopback/link-local ranges (RFC 1918, `fc00::/7`, `fe80::/10`, `::1/128`, `::ffff:0:0/96`) and cloud metadata endpoints (AWS/GCP `169.254.169.254`, Azure `168.63.129.16`, Alibaba `100.100.100.200`, AWS IPv6 `fd00:ec2::254/128`).
+  - **GPG-Signed Releases & Version Consistency**: Release commits and git tags must be cryptographically signed (`git commit -S`, `git tag -s`). Version bumps must atomically synchronize root `Cargo.toml`, `Cargo.lock`, `Chart.yaml`, `values.yaml` (both server and client image tags), `deploy/kubernetes/uncrowned-king-server.yaml`, and `CHANGELOG.md` (both the release header and the bottom compare links).
+
+- **Immutable Supply Chain Pinning**:
+  - All third-party GitHub Actions in CI/CD release and security workflows must be pinned to immutable 40-character commit SHAs with trailing version comments (e.g. `uses: action@<sha> # vX.Y.Z`).
+  - Dockerfile base images and deployment manifest `initContainer` images (e.g., config-staging busybox images) must be pinned to immutable `@sha256:` content digests rather than floating tags.
 
 - **Prometheus & Observability Standards**:
   - All metrics exported via the `/metrics` endpoint must strictly follow Prometheus text format conventions (including `# HELP` and `# TYPE` declarations).

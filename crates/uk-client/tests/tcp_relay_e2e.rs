@@ -36,9 +36,10 @@ use uk_auth::{
     verify_auth_response,
 };
 use uk_client::{
-    ClientReloadError, ClientReloadHandle, client_reload_channel, config::ClientConfig,
-    connect_authenticated_carrier, run_handshake, run_socks5_listener_on_until_shutdown,
-    run_socks5_listener_on_until_shutdown_with_reload,
+    ClientReloadError, ClientReloadHandle, QuicTransportOverrides, client_reload_channel,
+    config::ClientConfig, connect_authenticated_carrier,
+    connect_authenticated_carrier_with_quic_overrides, run_handshake,
+    run_socks5_listener_on_until_shutdown, run_socks5_listener_on_until_shutdown_with_reload,
 };
 use uk_proto::{
     ALPN_PROTOCOL, ErrorCode, ErrorPayload, Frame, FrameHeader, FrameIoError, FrameLimits,
@@ -3742,6 +3743,325 @@ async fn quic_carrier_round_trips_tcp_relay() -> Result<(), TestError> {
     Ok(())
 }
 
+#[tokio::test]
+async fn quic_transport_keep_alive_preserves_idle_connection() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    let policy_path = temp_dir.join("policy.toml");
+    fs::write(&cert_path, CERT_PEM)?;
+    write_private_key(&key_path)?;
+    write_policy_file(&policy_path, allow_loopback_any_port_policy())?;
+    let (tcp_target_addr, tcp_target_task) = spawn_echo_target_roundtrips(2).await?;
+
+    let quic_addr = unused_udp_loopback_addr().await?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut config = test_server_config(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        &cert_path,
+        &key_path,
+        test_limits_with_idle_timeout(5),
+        Some(&policy_path),
+        30,
+    );
+    config.quic_listen = Some(quic_addr.to_string());
+    let (_server_addr, server_task) = start_uk_server_until_shutdown(config, async {
+        let _ = shutdown_rx.await;
+    })
+    .await?;
+
+    let client_config = ClientConfig {
+        server_addr: format!("quic://{quic_addr}"),
+        server_addrs: None,
+        server_name: "localhost".to_owned(),
+        observability_listen: None,
+        ca_cert_path: path_string(&cert_path),
+        key_id: KEY_ID.to_owned(),
+        secret: SECRET.to_owned(),
+        handshake_timeout_seconds: Some(5),
+        server_connect_retry_delay_millis: None,
+        socks_handshake_timeout_seconds: Some(3),
+        tcp_open_timeout_seconds: Some(3),
+        udp_flow_idle_timeout_seconds: None,
+        shutdown_timeout_seconds: Some(3),
+        max_pending_open_bytes: None,
+        max_socks_connections: None,
+        max_buffered_bytes_per_session: None,
+        max_buffered_bytes_per_flow: None,
+        max_carrier_sessions: None,
+        relay_buffer_size: None,
+    };
+
+    // QUIC transport idle timeout is min(2s, 5s) = 2s.
+    // Client keep-alive is 200ms.
+    // Over a 2.6s silence (which exceeds QUIC's 2s max_idle),
+    // the QUIC keep-alive packets keep the transport from timing out,
+    // while remaining within the server's 5s application idle timeout.
+    let (mut carrier, _settings) = connect_authenticated_carrier_with_quic_overrides(
+        client_config,
+        Some(QuicTransportOverrides {
+            keep_alive: Some(Duration::from_millis(200)),
+            max_idle: Duration::from_secs(2),
+        }),
+    )
+    .await?;
+
+    let payload1 = Bytes::from_static(b"before idle silence");
+    write_frame(&mut carrier, &tcp_open_frame(1, tcp_target_addr)?).await?;
+    read_open_ack(&mut carrier, 1).await?;
+    write_frame(
+        &mut carrier,
+        &Frame::new(FrameType::TcpData, 0, 1, payload1.clone())?,
+    )
+    .await?;
+    let echo1 = read_relay_frame(&mut carrier, FrameType::TcpData, 1).await?;
+    assert_eq!(echo1.payload, payload1);
+
+    // Sleep 2.6s (exceeds QUIC transport 2s max_idle, but within server's 5s app idle)
+    tokio::time::sleep(Duration::from_millis(2600)).await;
+
+    // Send payload2 on the existing connection
+    let payload2 = Bytes::from_static(b"after idle silence with keep-alive");
+    write_frame(
+        &mut carrier,
+        &Frame::new(FrameType::TcpData, 0, 1, payload2.clone())?,
+    )
+    .await?;
+    let echo2 = read_relay_frame(&mut carrier, FrameType::TcpData, 1).await?;
+    assert_eq!(echo2.payload, payload2);
+
+    tcp_target_task.await??;
+    shutdown_tx
+        .send(())
+        .map_err(|()| "server shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(5), server_task).await???;
+    drop(carrier);
+    Ok(())
+}
+
+#[tokio::test]
+async fn quic_transport_without_keep_alive_times_out_on_idle() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    let policy_path = temp_dir.join("policy.toml");
+    fs::write(&cert_path, CERT_PEM)?;
+    write_private_key(&key_path)?;
+    write_policy_file(&policy_path, allow_loopback_any_port_policy())?;
+    let (tcp_target_addr, tcp_target_task) = spawn_echo_target().await?;
+
+    let quic_addr = unused_udp_loopback_addr().await?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut config = test_server_config(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        &cert_path,
+        &key_path,
+        test_limits_with_idle_timeout(1),
+        Some(&policy_path),
+        30,
+    );
+    config.quic_listen = Some(quic_addr.to_string());
+    let (_server_addr, server_task) = start_uk_server_until_shutdown(config, async {
+        let _ = shutdown_rx.await;
+    })
+    .await?;
+
+    let client_config = ClientConfig {
+        server_addr: format!("quic://{quic_addr}"),
+        server_addrs: None,
+        server_name: "localhost".to_owned(),
+        observability_listen: None,
+        ca_cert_path: path_string(&cert_path),
+        key_id: KEY_ID.to_owned(),
+        secret: SECRET.to_owned(),
+        handshake_timeout_seconds: Some(5),
+        server_connect_retry_delay_millis: None,
+        socks_handshake_timeout_seconds: Some(3),
+        tcp_open_timeout_seconds: Some(3),
+        udp_flow_idle_timeout_seconds: None,
+        shutdown_timeout_seconds: Some(3),
+        max_pending_open_bytes: None,
+        max_socks_connections: None,
+        max_buffered_bytes_per_session: None,
+        max_buffered_bytes_per_flow: None,
+        max_carrier_sessions: None,
+        relay_buffer_size: None,
+    };
+
+    // Keep-alive is disabled (None); max_idle is 1s.
+    let (mut carrier, _settings) = connect_authenticated_carrier_with_quic_overrides(
+        client_config,
+        Some(QuicTransportOverrides {
+            keep_alive: None,
+            max_idle: Duration::from_secs(1),
+        }),
+    )
+    .await?;
+
+    let payload1 = Bytes::from_static(b"before idle timeout");
+    write_frame(&mut carrier, &tcp_open_frame(1, tcp_target_addr)?).await?;
+    read_open_ack(&mut carrier, 1).await?;
+    write_frame(
+        &mut carrier,
+        &Frame::new(FrameType::TcpData, 0, 1, payload1.clone())?,
+    )
+    .await?;
+    let echo1 = read_relay_frame(&mut carrier, FrameType::TcpData, 1).await?;
+    assert_eq!(echo1.payload, payload1);
+
+    // Sleep 1.6s without any keep-alive packets -> QUIC connection should time out
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+
+    // Subsequent write or read must fail
+    let payload2 = Bytes::from_static(b"should fail after timeout");
+    let write_res = write_frame(
+        &mut carrier,
+        &Frame::new(FrameType::TcpData, 0, 1, payload2)?,
+    )
+    .await;
+    let read_res = read_frame(&mut carrier, FrameLimits::default()).await;
+    assert!(
+        write_res.is_err() || read_res.is_err(),
+        "connection must fail after exceeding idle timeout without keep-alive"
+    );
+
+    let _ = tcp_target_task.await;
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+    Ok(())
+}
+
+fn test_rustls_client_config(cert_path: &Path) -> Result<RustlsClientConfig, TestError> {
+    let mut roots = RootCertStore::empty();
+    for cert in load_certs(cert_path)? {
+        roots.add(cert)?;
+    }
+    let mut config = RustlsClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+    config.enable_early_data = false;
+    Ok(config)
+}
+
+async fn spawn_one_way_forwarder(
+    dest_addr: SocketAddr,
+) -> Result<(SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>), TestError> {
+    let forwarder = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let forwarder_addr = forwarder.local_addr()?;
+    let (stop_tx, mut stop_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut buf = vec![0_u8; 65536];
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                res = forwarder.recv_from(&mut buf) => {
+                    if let Ok((len, peer)) = res {
+                        if peer != dest_addr {
+                            let _ = forwarder.send_to(&buf[..len], dest_addr).await;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    Ok((forwarder_addr, stop_tx, task))
+}
+
+#[tokio::test]
+async fn quic_stateless_retry_protects_handshake_permits_from_spoofed_initials()
+-> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    let policy_path = temp_dir.join("policy.toml");
+    fs::write(&cert_path, CERT_PEM)?;
+    write_private_key(&key_path)?;
+    write_policy_file(&policy_path, allow_loopback_any_port_policy())?;
+
+    let quic_addr = unused_udp_loopback_addr().await?;
+    let observability_addr = unused_loopback_addr().await?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let mut limits = test_limits();
+    limits.max_handshakes = Some(4);
+    limits.handshake_timeout_seconds = Some(10);
+
+    let mut config = test_server_config(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        &cert_path,
+        &key_path,
+        limits,
+        Some(&policy_path),
+        30,
+    );
+    config.quic_listen = Some(quic_addr.to_string());
+    config.observability_listen = Some(observability_addr.to_string());
+    let (server_tcp_addr, server_task) = start_uk_server_until_shutdown(config, async {
+        let _ = shutdown_rx.await;
+    })
+    .await?;
+
+    let (forwarder_addr, stop_forwarder_tx, forwarder_task) =
+        spawn_one_way_forwarder(quic_addr).await?;
+
+    let dummy_client_sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let mut client_endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        dummy_client_sock.into_std()?,
+        Arc::new(quinn::TokioRuntime),
+    )?;
+    let quinn_client_config =
+        uk_client::quic::client_config(test_rustls_client_config(&cert_path)?)?;
+    client_endpoint.set_default_client_config(quinn_client_config);
+
+    for _ in 0..20 {
+        let _ = client_endpoint.connect(forwarder_addr, "localhost");
+    }
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    wait_for_server_metric(
+        observability_addr,
+        "uncrowned_king_server_active_handshakes 0\n",
+    )
+    .await?;
+
+    let metrics = http_get(observability_addr, "/metrics").await?;
+    assert!(
+        metrics.contains("uncrowned_king_server_quic_retries_total 20\n"),
+        "expected exactly 20 stateless retries, got:\n{metrics}"
+    );
+
+    let tls_config = test_client_config(server_tcp_addr, &cert_path, SECRET);
+    let (mut carrier, _settings) = connect_authenticated_carrier(tls_config).await?;
+    let (tcp_target_addr, tcp_target_task) = spawn_echo_target().await?;
+    let tcp_payload = Bytes::from_static(b"valid tls client succeeds");
+    write_frame(&mut carrier, &tcp_open_frame(1, tcp_target_addr)?).await?;
+    read_open_ack(&mut carrier, 1).await?;
+    write_frame(
+        &mut carrier,
+        &Frame::new(FrameType::TcpData, 0, 1, tcp_payload.clone())?,
+    )
+    .await?;
+    let echo = read_relay_frame(&mut carrier, FrameType::TcpData, 1).await?;
+    assert_eq!(echo.payload, tcp_payload);
+    tcp_target_task.await??;
+    drop(carrier);
+
+    let _ = stop_forwarder_tx.send(());
+    let _ = forwarder_task.await;
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), server_task).await???;
+    Ok(())
+}
+
 /// Drives a real SOCKS5 UDP ASSOCIATE round trip over the QUIC carrier, so the
 /// UDP data plane exercises native QUIC DATAGRAM on both the client
 /// (`send_udp_data`) and server (`relay_udp_target_to_client`) plus the client
@@ -6693,13 +7013,24 @@ impl Drop for RelayHarness {
 
 async fn spawn_echo_target()
 -> Result<(SocketAddr, tokio::task::JoinHandle<Result<(), TestError>>), TestError> {
+    spawn_echo_target_roundtrips(1).await
+}
+
+async fn spawn_echo_target_roundtrips(
+    roundtrips: usize,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<Result<(), TestError>>), TestError> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let addr = listener.local_addr()?;
     let task = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await?;
         let mut buf = [0_u8; 1024];
-        let read = stream.read(&mut buf).await?;
-        stream.write_all(&buf[..read]).await?;
+        for _ in 0..roundtrips {
+            let read = stream.read(&mut buf).await?;
+            if read == 0 {
+                break;
+            }
+            stream.write_all(&buf[..read]).await?;
+        }
         Ok(())
     });
     Ok((addr, task))
@@ -7796,6 +8127,8 @@ fn test_limits() -> LimitConfig {
         auth_rate_limit_failures: None,
         auth_rate_limit_window_seconds: None,
         auth_rate_limit_ban_seconds: None,
+        quic_stream_receive_window: None,
+        quic_connection_receive_window: None,
     }
 }
 

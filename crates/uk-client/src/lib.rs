@@ -4,7 +4,8 @@ pub mod config;
 
 mod config_state;
 mod observability;
-mod quic;
+#[doc(hidden)]
+pub mod quic;
 mod relay;
 mod session;
 mod socks5;
@@ -15,6 +16,7 @@ use std::{error::Error, fmt, future, future::Future};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::ClientConfig;
+pub use crate::quic::QuicTransportOverrides;
 pub use crate::session::ClientCarrier;
 
 const RELOAD_CHANNEL_CAPACITY: usize = 1;
@@ -35,9 +37,9 @@ pub struct ClientReloadReceiver {
 }
 
 #[derive(Debug)]
-struct ClientReloadRequest {
-    config: ClientConfig,
-    response: oneshot::Sender<Result<u64, String>>,
+pub(crate) struct ClientReloadRequest {
+    pub(crate) config: Result<ClientConfig, String>,
+    pub(crate) response: oneshot::Sender<Result<u64, String>>,
 }
 
 /// Error returned when a client config reload cannot be applied.
@@ -65,12 +67,32 @@ impl ClientReloadHandle {
     pub async fn reload(&self, config: ClientConfig) -> Result<u64, ClientReloadError> {
         let (response, result) = oneshot::channel();
         self.tx
-            .send(ClientReloadRequest { config, response })
+            .send(ClientReloadRequest {
+                config: Ok(config),
+                response,
+            })
             .await
             .map_err(|_| ClientReloadError::ClientStopped)?;
         result
             .await
             .map_err(|_| ClientReloadError::ClientStopped)?
+            .map_err(ClientReloadError::Rejected)
+    }
+
+    /// Reports a disk-load or parse failure so the reload failure counter is incremented.
+    pub async fn report_load_failure(&self, reason: String) -> Result<(), ClientReloadError> {
+        let (response, result) = oneshot::channel();
+        self.tx
+            .send(ClientReloadRequest {
+                config: Err(reason),
+                response,
+            })
+            .await
+            .map_err(|_| ClientReloadError::ClientStopped)?;
+        result
+            .await
+            .map_err(|_| ClientReloadError::ClientStopped)?
+            .map(|_| ())
             .map_err(ClientReloadError::Rejected)
     }
 }
@@ -102,6 +124,15 @@ pub async fn connect_authenticated_carrier(
     config: ClientConfig,
 ) -> Result<(ClientCarrier, uk_proto::Settings), AnyError> {
     session::connect_authenticated(&config).await
+}
+
+/// Connects to the server, authenticates, and returns the live UK carrier with
+/// optional QUIC transport parameter overrides.
+pub async fn connect_authenticated_carrier_with_quic_overrides(
+    config: ClientConfig,
+    overrides: Option<QuicTransportOverrides>,
+) -> Result<(ClientCarrier, uk_proto::Settings), AnyError> {
+    session::connect_authenticated_with_quic_overrides(&config, overrides).await
 }
 
 /// Starts a SOCKS5 listener backed by UK TCP and UDP relay.
