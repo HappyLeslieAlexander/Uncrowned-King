@@ -270,21 +270,18 @@ spec:
     - Egress
   ingress:
     # Allow incoming client carrier connections on TLS and QUIC ports
-    - from: []
-      ports:
+    - ports:
         - protocol: TCP
           port: 9443
         - protocol: UDP
           port: 9443
-    # Allow metrics scraping on internal management port
-    - from: []
-      ports:
+    # Allow metrics scraping and health probes on internal management port
+    - ports:
         - protocol: TCP
           port: 9090
   egress:
     # Allow DNS resolution
-    - to: []
-      ports:
+    - ports:
         - protocol: UDP
           port: 53
         - protocol: TCP

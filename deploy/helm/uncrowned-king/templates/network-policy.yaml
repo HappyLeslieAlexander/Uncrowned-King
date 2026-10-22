@@ -14,8 +14,7 @@ spec:
     - Egress
   ingress:
     # Allow incoming client carrier connections on TLS and QUIC ports
-    - from: []
-      ports:
+    - ports:
         - protocol: TCP
           port: {{ .Values.server.service.ports.tls.targetPort | default 8443 }}
         - protocol: UDP
@@ -34,8 +33,7 @@ spec:
           port: {{ .Values.server.metricsService.targetPort | default 9090 }}
   egress:
     # Allow DNS resolution
-    - to: []
-      ports:
+    - ports:
         - protocol: UDP
           port: 53
         - protocol: TCP
@@ -61,4 +59,56 @@ spec:
               - "fe80::/10"
               - "fd00:ec2::254/128"
               - "::ffff:0:0/96"
+{{- end }}
+{{- if and .Values.client.enabled .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "uncrowned-king.client.fullname" . }}
+  labels:
+    {{- include "uncrowned-king.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "uncrowned-king.client.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow incoming SOCKS5 connections from within the cluster
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.client.socks5.port }}
+    # Allow metrics scraping from Prometheus
+    - from:
+        {{- if .Values.networkPolicy.prometheusNamespace }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.prometheusNamespace }}
+        {{- else }}
+        - namespaceSelector: {}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.client.metrics.port }}
+  egress:
+    # Allow DNS resolution
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow outbound carrier connections to UK server
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.server.service.ports.tls.port | default 443 }}
+        - protocol: UDP
+          port: {{ .Values.server.service.ports.quic.port | default 443 }}
+        - protocol: TCP
+          port: {{ .Values.server.service.ports.tls.targetPort | default 8443 }}
+        - protocol: UDP
+          port: {{ .Values.server.service.ports.quic.targetPort | default 8443 }}
 {{- end }}

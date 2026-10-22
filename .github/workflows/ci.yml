@@ -73,10 +73,21 @@ jobs:
       - name: Assert Placeholder Secret Fails Closed
         run: |
           if helm template test deploy/helm/uncrowned-king \
-            --set server.existingTlsSecret=dummy 2>&1 | grep -q "placeholder credential secret found"; then
-            echo "Helm correctly rejected placeholder credentials"
+            --set server.existingTlsSecret=dummy 2>&1 | grep -q "placeholder or empty credential secret found"; then
+            echo "Helm correctly rejected placeholder server credentials"
           else
-            echo "Helm failed to reject placeholder credentials"
+            echo "Helm failed to reject placeholder server credentials"
+            exit 1
+          fi
+          if helm template test deploy/helm/uncrowned-king \
+            --set server.existingTlsSecret=my-tls \
+            --set 'server.credentials[0].id=server-id' \
+            --set 'server.credentials[0].secret=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
+            --set client.enabled=true \
+            --set client.existingCaSecret=my-ca 2>&1 | grep -q "placeholder or empty credential secret found in client.config.secret"; then
+            echo "Helm correctly rejected placeholder client credentials"
+          else
+            echo "Helm failed to reject placeholder client credentials"
             exit 1
           fi
 
