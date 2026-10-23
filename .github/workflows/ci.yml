@@ -48,6 +48,10 @@ jobs:
         if: matrix.toolchain == 'stable'
         run: cargo build --workspace --release --locked
 
+      - name: Interoperability Verification (curl over TLS & QUIC)
+        if: matrix.toolchain == 'stable' && matrix.os == 'ubuntu-latest'
+        run: ./scripts/interop-curl.sh
+
   security-and-license:
     name: Security & License Audit
     runs-on: ubuntu-latest

@@ -617,7 +617,10 @@ async fn carrier_write_in_flight_is_not_truncated_by_shutdown() {
 
     let write_task =
         tokio::spawn(async move { write_frame_or_shutdown(&mut writer, &frame, &shutdown).await });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Read the first byte to deterministically ensure write_task has started writing
+    // and is stalled on the 1-byte duplex pipe without any wall-clock sleep.
+    let mut received = vec![0_u8; encoded_len];
+    reader.read_exact(&mut received[..1]).await.unwrap();
     assert!(
         !write_task.is_finished(),
         "the 1-byte duplex should stall it"
@@ -625,12 +628,14 @@ async fn carrier_write_in_flight_is_not_truncated_by_shutdown() {
 
     shutdown_handle.close();
 
-    // Drain the peer: the whole frame must still arrive.
-    let mut received = vec![0_u8; encoded_len];
-    tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut received))
-        .await
-        .expect("the in-flight frame must complete")
-        .unwrap();
+    // Drain the peer: the remainder of the frame must still arrive.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        reader.read_exact(&mut received[1..]),
+    )
+    .await
+    .expect("the in-flight frame must complete")
+    .unwrap();
     assert_eq!(&received[received.len() - payload.len()..], &payload[..]);
 
     tokio::time::timeout(Duration::from_secs(5), write_task)
@@ -694,7 +699,9 @@ async fn carrier_write_timeout_releases_writers_queued_behind_it() {
         tokio::spawn(async move { write_frame_locked(&carrier, &frame).await })
     };
     // Let the first writer take the lock and park inside the write.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    while carrier.inner.try_lock().is_ok() {
+        tokio::task::yield_now().await;
+    }
     let queued = {
         let carrier = carrier.clone();
         let frame = frame.clone();
@@ -1179,7 +1186,7 @@ async fn reliable_flow_event_send_exits_on_session_shutdown() {
         )
         .await;
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::task::yield_now().await;
     assert!(!sender.is_finished());
 
     shutdown_handle.close();
@@ -1881,7 +1888,7 @@ async fn server_session_graceful_drain_completes_active_flows_and_rejects_new() 
 
     // 2. Trigger graceful shutdown signal
     shutdown_tx.send(true).unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::task::yield_now().await;
 
     // 3. Client attempts to open new Flow 2 during Draining -> must be rejected with ResourceLimit
     let target2 = Target::Ipv4(Ipv4Addr::LOCALHOST, target_addr.port());
@@ -2303,7 +2310,7 @@ async fn review_aborted_flow_still_sends_queued_data() {
         )
         .await
     });
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    tokio::task::yield_now().await;
     control.abort(); // Client closes ID 1 while old reader waits for carrier lock.
     drop(guard);
     task.await.unwrap().unwrap();
@@ -2362,7 +2369,7 @@ async fn review_aborted_flow_contended_locks_drops_only_aborted_data() {
         write_flow_frame_locked(&writer4, &frame, &control4_clone).await
     });
 
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    tokio::task::yield_now().await;
 
     // Abort flows 2 and 3
     control2.abort();
@@ -2469,7 +2476,7 @@ async fn review_real_relay_drain_loses_tail_of_upload() {
     let close = frames.read_frame().await.unwrap();
     assert_eq!(close.header.frame_type, FrameType::TcpClose);
     shutdown_tx.send(true).unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::task::yield_now().await;
     let payload = Bytes::from(vec![0x6d; 1024 * 1024]);
     for start in (0..payload.len()).step_by(65536) {
         write_frame(

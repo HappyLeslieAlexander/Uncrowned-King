@@ -71,21 +71,18 @@ impl Target {
             return Err(ProtocolError::Truncated);
         }
         let addr_type = src.get_u8();
+        // Early header bounds validation: validate fixed field `addr_type`
+        // before decoding variable-length integers or checking buffer sizes.
+        if !matches!(addr_type, ADDR_DOMAIN | ADDR_IPV4 | ADDR_IPV6) {
+            return Err(ProtocolError::InvalidTarget("unknown address type"));
+        }
+
         let host_len =
             usize::try_from(varint::decode(src)?).map_err(|_| ProtocolError::InvalidVarint)?;
 
-        // `host_len` is attacker-controlled and only bounded by `usize`: on a
-        // 32-bit target `usize::try_from` accepts values up to `u32::MAX`, where
-        // a plain `+ 2` would wrap to a tiny number, pass this check and panic
-        // in `copy_to_bytes` below.
-        if src.remaining() < host_len.saturating_add(2) {
-            return Err(ProtocolError::Truncated);
-        }
-
-        // Validate `host_len` against `addr_type` BEFORE allocating memory.
-        // Without this, an attacker can send packets with large `host_len`
-        // (up to `max_frame_size`) and an invalid address type, forcing the
-        // server to repeatedly allocate and discard large buffers.
+        // Validate `host_len` against `addr_type` BEFORE checking buffer remaining length
+        // or allocating memory. This prevents invalid lengths on unknown or mismatched types
+        // from returning `Truncated` and causing stream readers to hang waiting for more bytes.
         match addr_type {
             ADDR_DOMAIN if host_len == 0 || host_len > 255 => {
                 return Err(ProtocolError::InvalidTarget("invalid domain length"));
@@ -97,7 +94,15 @@ impl Target {
                 return Err(ProtocolError::InvalidTarget("invalid ipv6 length"));
             }
             ADDR_DOMAIN | ADDR_IPV4 | ADDR_IPV6 => {}
-            _ => return Err(ProtocolError::InvalidTarget("unknown address type")),
+            _ => unreachable!("addr_type validated above"),
+        }
+
+        // `host_len` is attacker-controlled and only bounded by `usize`: on a
+        // 32-bit target `usize::try_from` accepts values up to `u32::MAX`, where
+        // a plain `+ 2` would wrap to a tiny number, pass this check and panic
+        // in `copy_to_bytes` below.
+        if src.remaining() < host_len.saturating_add(2) {
+            return Err(ProtocolError::Truncated);
         }
 
         let host = src.copy_to_bytes(host_len);
@@ -318,13 +323,40 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_address_type_early() {
+        // Even with truncated buffer or huge varint, unknown addr_type must fail immediately
+        let mut bytes = Bytes::from_static(&[0xff, 0xc0, 0x00, 0x00, 0x00, 0x01]);
+        assert_eq!(
+            Target::decode(&mut bytes),
+            Err(ProtocolError::InvalidTarget("unknown address type"))
+        );
+    }
+
+    #[test]
     fn rejects_huge_declared_host_length() {
         // `0xffff_ffff` as a minimal varint: large enough to wrap `host_len + 2`
         // on a 32-bit target, where `usize::try_from` still succeeds.
+        // Validating `host_len` against `addr_type` before buffer length checks
+        // rejects this as invalid domain length immediately rather than Truncated.
         let mut bytes = Bytes::from_static(&[
             0x01, 0xc0, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, b'a', 0x01, 0xbb,
         ]);
-        assert_eq!(Target::decode(&mut bytes), Err(ProtocolError::Truncated));
+        assert_eq!(
+            Target::decode(&mut bytes),
+            Err(ProtocolError::InvalidTarget("invalid domain length"))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_address_type_with_large_declared_length_immediately() {
+        // Unknown address type 0x7f with large declared length varint (e.g. 1000)
+        // must fail immediately with InvalidTarget("unknown address type")
+        // without waiting or returning Truncated.
+        let mut bytes = Bytes::from_static(&[0x7f, 0x80, 0x00, 0x03, 0xe8]);
+        assert_eq!(
+            Target::decode(&mut bytes),
+            Err(ProtocolError::InvalidTarget("unknown address type"))
+        );
     }
 
     #[test]

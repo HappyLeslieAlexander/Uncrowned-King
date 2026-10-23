@@ -101,4 +101,11 @@ mod tests {
             Err(ProtocolError::Truncated)
         );
     }
+
+    #[test]
+    fn rejects_non_minimal_varint_in_datagram() {
+        // Non-minimal encoding of flow_id = 1 as 2 bytes (0x40, 0x01)
+        let bytes = Bytes::from_static(&[0x40, 0x01, b'p', b'a', b'y', b'l', b'o', b'a', b'd']);
+        assert_eq!(decode(bytes), Err(ProtocolError::InvalidVarint));
+    }
 }

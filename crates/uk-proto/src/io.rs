@@ -526,13 +526,16 @@ mod tests {
         peer.write_all(&wire[..4]).await.unwrap();
         peer.flush().await.unwrap();
 
-        // Cancel repeatedly while the frame is incomplete.
+        // Cancel repeatedly while the frame is incomplete using deterministic polling.
         for _ in 0..8 {
-            let cancelled =
-                tokio::time::timeout(std::time::Duration::from_millis(20), reader.read_frame())
-                    .await;
+            let mut read_fut = std::pin::pin!(reader.read_frame());
+            let completed = std::future::poll_fn(|cx| match read_fut.as_mut().poll(cx) {
+                std::task::Poll::Ready(res) => std::task::Poll::Ready(Some(res)),
+                std::task::Poll::Pending => std::task::Poll::Ready(None),
+            })
+            .await;
             assert!(
-                cancelled.is_err(),
+                completed.is_none(),
                 "frame is incomplete, read must not finish"
             );
         }
@@ -555,7 +558,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<u8>(1);
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
             let _ = tx.send(1).await;
         });
         let lost_race = tokio::select! {

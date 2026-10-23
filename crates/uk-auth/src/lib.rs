@@ -915,8 +915,18 @@ fn distinct_byte_count(secret: &[u8]) -> usize {
     seen.into_iter().filter(|&was_seen| was_seen).count()
 }
 
+/// Maximum length in bytes accepted for auth capability and limits payloads.
+pub const MAX_AUTH_CAPABILITIES_LEN: usize = 1024;
+/// Alias for backwards compatibility.
+pub const MAX_AUTH_PAYLOAD_FIELD_LEN: usize = MAX_AUTH_CAPABILITIES_LEN;
+
 fn read_varbytes(src: &mut impl Buf, name: &'static str) -> AuthResult<Vec<u8>> {
     let len = usize::try_from(varint::decode(src)?).map_err(|_| ProtocolError::InvalidVarint)?;
+    if len > MAX_AUTH_CAPABILITIES_LEN {
+        return Err(AuthError::InvalidPayload(
+            "payload length exceeds maximum allowed",
+        ));
+    }
     if src.remaining() < len {
         return Err(AuthError::InvalidPayload(name));
     }
@@ -1252,6 +1262,68 @@ mod tests {
         assert_eq!(
             AuthResponse::decode(&mut src),
             Err(AuthError::InvalidKeyIdLength)
+        );
+    }
+
+    #[test]
+    fn rejects_non_minimal_varint_in_auth_response() {
+        // Non-minimal encoding of key_id_len = 1 as 2 bytes (0x40, 0x01)
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&[0x40, 0x01]);
+        buf.put_u8(b'k');
+        let mut src = buf.freeze();
+        assert_eq!(
+            AuthResponse::decode(&mut src),
+            Err(AuthError::Protocol(ProtocolError::InvalidVarint))
+        );
+
+        // Minimal key_id_len = 1, but non-minimal client_capabilities length = 0 as 2 bytes (0x40, 0x00)
+        let mut buf = BytesMut::new();
+        varint::encode(1, &mut buf).unwrap();
+        buf.put_u8(b'k');
+        // 32-byte nonce
+        buf.extend_from_slice(&[0x11; 32]);
+        // 8-byte client time
+        buf.put_u64(1_700_000_000);
+        // Non-minimal capabilities len = 0 (0x40, 0x00)
+        buf.extend_from_slice(&[0x40, 0x00]);
+        // 32-byte tag
+        buf.extend_from_slice(&[0x22; 32]);
+        let mut src = buf.freeze();
+        assert_eq!(
+            AuthResponse::decode(&mut src),
+            Err(AuthError::Protocol(ProtocolError::InvalidVarint))
+        );
+    }
+
+    #[test]
+    fn rejects_decoding_oversized_capabilities_payload() {
+        let mut buf = BytesMut::new();
+        // Valid nonce (32 bytes)
+        buf.extend_from_slice(&[0x11; 32]);
+        // Server time (8 bytes)
+        buf.put_u64(1_700_000_000);
+        // Oversized capabilities length (> MAX_AUTH_CAPABILITIES_LEN)
+        varint::encode((MAX_AUTH_CAPABILITIES_LEN + 1) as u64, &mut buf).unwrap();
+        let mut src = buf.freeze();
+        assert_eq!(
+            AuthChallenge::decode(&mut src),
+            Err(AuthError::InvalidPayload(
+                "payload length exceeds maximum allowed"
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_capabilities_exceeding_max_len() {
+        let mut buf = BytesMut::new();
+        varint::encode((MAX_AUTH_CAPABILITIES_LEN + 1) as u64, &mut buf).unwrap();
+        let mut src = buf.freeze();
+        assert_eq!(
+            read_varbytes(&mut src, "client capabilities"),
+            Err(AuthError::InvalidPayload(
+                "payload length exceeds maximum allowed"
+            ))
         );
     }
 

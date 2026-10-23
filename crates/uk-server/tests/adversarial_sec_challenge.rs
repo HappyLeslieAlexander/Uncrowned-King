@@ -23,9 +23,14 @@ use std::{
 };
 
 use bytes::Bytes;
-use uk_auth::{AuthChallenge, AuthError, AuthResponse, Credential, verify_auth_response_stateless};
+use uk_auth::{
+    AuthChallenge, AuthError, AuthResponse, Credential, MAX_AUTH_CAPABILITIES_LEN,
+    verify_auth_response_stateless,
+};
 use uk_policy::{PolicyContext, PolicyDecision, PolicyRule, PolicySet};
-use uk_proto::{ProtocolError, Target};
+use uk_proto::{
+    ErrorPayload, FrameHeader, FrameLimits, ProtocolError, Settings, Target, datagram, varint,
+};
 
 // =========================================================================
 // Helper constructors
@@ -900,5 +905,530 @@ fn sec04_adversarial_policy_parser_rejects_ip_literals_in_domain_predicates() {
     assert!(
         PolicySet::from_toml(toml_suffix_ip).is_err(),
         "PolicySet must reject IP literal in domain_suffix predicate"
+    );
+}
+
+// =========================================================================
+// Round 2 Adversarial Suite: Protocol Framing, Varints, Target Bounds, Auth
+// =========================================================================
+
+#[test]
+fn sec05_adversarial_target_decode_early_bounds_and_type_validation() {
+    // 1. Invalid address types (0x00, 0x04, 0x05, 0x10, 0x7f, 0xfe, 0xff)
+    // with large declared lengths or truncated buffers MUST immediately return
+    // InvalidTarget("unknown address type") without reading varint or returning Truncated.
+    let invalid_types = [0x00, 0x04, 0x05, 0x10, 0x7f, 0xfe, 0xff];
+    for &addr_type in &invalid_types {
+        // Just the invalid byte alone
+        let mut buf = Bytes::copy_from_slice(&[addr_type]);
+        assert_eq!(
+            Target::decode(&mut buf),
+            Err(ProtocolError::InvalidTarget("unknown address type")),
+            "Type {addr_type:#04x} alone must return InvalidTarget"
+        );
+
+        // Invalid byte with incomplete varint (e.g. 0xc0 with no trailing bytes)
+        let mut buf = Bytes::copy_from_slice(&[addr_type, 0xc0]);
+        assert_eq!(
+            Target::decode(&mut buf),
+            Err(ProtocolError::InvalidTarget("unknown address type")),
+            "Type {addr_type:#04x} with partial varint must return InvalidTarget immediately"
+        );
+
+        // Invalid byte with huge declared length (e.g. 1000 = 0x80, 0x00, 0x03, 0xe8)
+        let mut buf = Bytes::copy_from_slice(&[addr_type, 0x80, 0x00, 0x03, 0xe8]);
+        assert_eq!(
+            Target::decode(&mut buf),
+            Err(ProtocolError::InvalidTarget("unknown address type")),
+            "Type {addr_type:#04x} with large declared length must return InvalidTarget immediately"
+        );
+    }
+
+    // 2. Domain bounds:
+    // host_len == 0 -> InvalidTarget("invalid domain length")
+    let mut buf = Bytes::from_static(&[0x01, 0x00]); // ADDR_DOMAIN, length 0
+    assert_eq!(
+        Target::decode(&mut buf),
+        Err(ProtocolError::InvalidTarget("invalid domain length"))
+    );
+
+    // host_len > 255 (e.g. 256 = 0x41, 0x00) with only 2 bytes buffer
+    let mut buf = Bytes::from_static(&[0x01, 0x41, 0x00]); // ADDR_DOMAIN, length 256
+    assert_eq!(
+        Target::decode(&mut buf),
+        Err(ProtocolError::InvalidTarget("invalid domain length")),
+        "Domain > 255 bytes must be rejected immediately without waiting for buffer"
+    );
+
+    // host_len = 1_000_000 (0x80, 0x0f, 0x42, 0x40)
+    let mut buf = Bytes::from_static(&[0x01, 0x80, 0x0f, 0x42, 0x40]);
+    assert_eq!(
+        Target::decode(&mut buf),
+        Err(ProtocolError::InvalidTarget("invalid domain length"))
+    );
+
+    // 3. IPv4 bounds: host_len != 4
+    for bad_len in [0u64, 1, 2, 3, 5, 6, 16, 255, 1000] {
+        let mut out = Vec::new();
+        out.push(0x02); // ADDR_IPV4
+        varint::encode(bad_len, &mut out).unwrap();
+        // Do not provide host or port bytes - must fail early on length validation!
+        let mut buf = Bytes::from(out);
+        assert_eq!(
+            Target::decode(&mut buf),
+            Err(ProtocolError::InvalidTarget("invalid ipv4 length")),
+            "IPv4 with length {bad_len} must return InvalidTarget immediately"
+        );
+    }
+
+    // 4. IPv6 bounds: host_len != 16
+    for bad_len in [0u64, 1, 4, 15, 17, 32, 255, 1000] {
+        let mut out = Vec::new();
+        out.push(0x03); // ADDR_IPV6
+        varint::encode(bad_len, &mut out).unwrap();
+        let mut buf = Bytes::from(out);
+        assert_eq!(
+            Target::decode(&mut buf),
+            Err(ProtocolError::InvalidTarget("invalid ipv6 length")),
+            "IPv6 with length {bad_len} must return InvalidTarget immediately"
+        );
+    }
+
+    // 5. IP literals in domain strings are rejected
+    let ip_literal_domains = [
+        "127.0.0.1",
+        "0.0.0.0",
+        "10.0.0.1",
+        "169.254.169.254",
+        "192.168.1.1",
+        "::1",
+        "::",
+        "fe80::1",
+        "::ffff:127.0.0.1",
+        "::ffff:169.254.169.254",
+    ];
+    for ip_str in ip_literal_domains {
+        let mut out = Vec::new();
+        out.push(0x01); // ADDR_DOMAIN
+        varint::encode(ip_str.len() as u64, &mut out).unwrap();
+        out.extend_from_slice(ip_str.as_bytes());
+        out.extend_from_slice(&80u16.to_be_bytes());
+        let mut buf = Bytes::from(out);
+        assert_eq!(
+            Target::decode(&mut buf),
+            Err(ProtocolError::InvalidTarget(
+                "domain must not be an IP literal"
+            )),
+            "IP literal '{ip_str}' in domain string must be rejected"
+        );
+    }
+
+    // 6. Port 0 is rejected
+    let mut out = Vec::new();
+    out.push(0x01); // ADDR_DOMAIN
+    varint::encode(b"example.com".len() as u64, &mut out).unwrap();
+    out.extend_from_slice(b"example.com");
+    out.extend_from_slice(&0u16.to_be_bytes()); // port 0
+    let mut buf = Bytes::from(out);
+    assert_eq!(
+        Target::decode(&mut buf),
+        Err(ProtocolError::InvalidTarget("port must be 1..=65535"))
+    );
+}
+
+#[test]
+fn sec06_adversarial_rfc9000_non_minimal_varint_rejection() {
+    let non_minimal_samples: Vec<&'static [u8]> = vec![
+        &[0x40, 0x00],                                     // 0 in 2 bytes
+        &[0x40, 0x01],                                     // 1 in 2 bytes
+        &[0x40, 0x3f],                                     // 63 in 2 bytes
+        &[0x80, 0x00, 0x00, 0x00],                         // 0 in 4 bytes
+        &[0x80, 0x00, 0x00, 0x01],                         // 1 in 4 bytes
+        &[0x80, 0x00, 0x3f, 0xff],                         // 16383 in 4 bytes
+        &[0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 0 in 8 bytes
+        &[0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01], // 1 in 8 bytes
+        &[0xc0, 0x00, 0x00, 0x00, 0x3f, 0xff, 0xff, 0xff], // 1073741823 in 8 bytes
+    ];
+
+    // A. FrameHeader::decode
+    for sample in &non_minimal_samples {
+        // Test non-minimal in `id` position
+        let mut wire = Vec::new();
+        wire.push(0x01); // version
+        wire.push(0x11); // TCP_DATA frame type
+        wire.extend_from_slice(&[0x00, 0x00]); // flags
+        wire.extend_from_slice(sample); // non-minimal id
+        wire.push(0x00); // length = 0
+        let mut buf = Bytes::from(wire);
+        assert_eq!(
+            FrameHeader::decode(&mut buf, FrameLimits::default()),
+            Err(ProtocolError::InvalidVarint),
+            "FrameHeader must reject non-minimal varint id: {:?}",
+            sample
+        );
+
+        // Test non-minimal in `length` position
+        let mut wire = Vec::new();
+        wire.push(0x01); // version
+        wire.push(0x11); // TCP_DATA frame type
+        wire.extend_from_slice(&[0x00, 0x00]); // flags
+        wire.push(0x01); // id = 1
+        wire.extend_from_slice(sample); // non-minimal length
+        let mut buf = Bytes::from(wire);
+        assert_eq!(
+            FrameHeader::decode(&mut buf, FrameLimits::default()),
+            Err(ProtocolError::InvalidVarint),
+            "FrameHeader must reject non-minimal varint length: {:?}",
+            sample
+        );
+    }
+
+    // B. Settings::decode
+    for sample in &non_minimal_samples {
+        // Non-minimal in `count`
+        let mut wire = Vec::new();
+        wire.extend_from_slice(sample); // non-minimal count
+        let mut buf = Bytes::from(wire);
+        assert_eq!(
+            Settings::decode(&mut buf),
+            Err(ProtocolError::InvalidVarint),
+            "Settings must reject non-minimal varint count: {:?}",
+            sample
+        );
+
+        // Non-minimal in `key` (count = 1)
+        let mut wire = Vec::new();
+        wire.push(0x01); // count = 1
+        wire.extend_from_slice(sample); // non-minimal key
+        wire.push(0x01); // value = 1
+        let mut buf = Bytes::from(wire);
+        assert_eq!(
+            Settings::decode(&mut buf),
+            Err(ProtocolError::InvalidVarint),
+            "Settings must reject non-minimal varint key: {:?}",
+            sample
+        );
+
+        // Non-minimal in `value` (count = 1, key = 1)
+        let mut wire = Vec::new();
+        wire.push(0x01); // count = 1
+        wire.push(0x01); // key = 1
+        wire.extend_from_slice(sample); // non-minimal value
+        let mut buf = Bytes::from(wire);
+        assert_eq!(
+            Settings::decode(&mut buf),
+            Err(ProtocolError::InvalidVarint),
+            "Settings must reject non-minimal varint value: {:?}",
+            sample
+        );
+    }
+
+    // C. ErrorPayload::decode
+    for sample in &non_minimal_samples {
+        let mut buf = Bytes::copy_from_slice(sample);
+        assert_eq!(
+            ErrorPayload::decode(&mut buf),
+            Err(ProtocolError::InvalidVarint),
+            "ErrorPayload must reject non-minimal varint code: {:?}",
+            sample
+        );
+    }
+
+    // D. datagram::decode
+    for sample in &non_minimal_samples {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(sample);
+        wire.extend_from_slice(b"payload");
+        let buf = Bytes::from(wire);
+        assert_eq!(
+            datagram::decode(buf),
+            Err(ProtocolError::InvalidVarint),
+            "datagram must reject non-minimal varint flow_id: {:?}",
+            sample
+        );
+    }
+
+    // E. AuthResponse::decode
+    for sample in &non_minimal_samples {
+        // Non-minimal key_id_len
+        let mut wire = Vec::new();
+        wire.extend_from_slice(sample);
+        wire.push(b'k');
+        let mut buf = Bytes::from(wire);
+        assert_eq!(
+            AuthResponse::decode(&mut buf),
+            Err(AuthError::Protocol(ProtocolError::InvalidVarint)),
+            "AuthResponse must reject non-minimal varint key_id_len: {:?}",
+            sample
+        );
+
+        // Non-minimal client_capabilities length
+        let mut wire = Vec::new();
+        varint::encode(1, &mut wire).unwrap(); // key_id_len = 1
+        wire.push(b'k'); // key_id
+        wire.extend_from_slice(&[0x11; 32]); // nonce
+        wire.extend_from_slice(&1_700_000_000u64.to_be_bytes()); // time
+        wire.extend_from_slice(sample); // non-minimal capabilities len
+        wire.extend_from_slice(&[0x22; 32]); // tag
+        let mut buf = Bytes::from(wire);
+        assert_eq!(
+            AuthResponse::decode(&mut buf),
+            Err(AuthError::Protocol(ProtocolError::InvalidVarint)),
+            "AuthResponse must reject non-minimal varint capabilities length: {:?}",
+            sample
+        );
+
+        // F. AuthChallenge::decode
+        // Non-minimal server_capabilities length
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&[0x11; 32]); // nonce
+        wire.extend_from_slice(&1_700_000_000u64.to_be_bytes()); // time
+        wire.extend_from_slice(sample); // non-minimal capabilities len
+        let mut buf = Bytes::from(wire);
+        assert_eq!(
+            AuthChallenge::decode(&mut buf),
+            Err(AuthError::Protocol(ProtocolError::InvalidVarint)),
+            "AuthChallenge must reject non-minimal varint server_capabilities length: {:?}",
+            sample
+        );
+
+        // Non-minimal limits length
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&[0x11; 32]); // nonce
+        wire.extend_from_slice(&1_700_000_000u64.to_be_bytes()); // time
+        wire.push(0x00); // capabilities len = 0
+        wire.extend_from_slice(sample); // non-minimal limits len
+        let mut buf = Bytes::from(wire);
+        assert_eq!(
+            AuthChallenge::decode(&mut buf),
+            Err(AuthError::Protocol(ProtocolError::InvalidVarint)),
+            "AuthChallenge must reject non-minimal varint limits length: {:?}",
+            sample
+        );
+    }
+}
+
+#[test]
+fn sec07_adversarial_read_varbytes_capacity_limits() {
+    assert_eq!(MAX_AUTH_CAPABILITIES_LEN, 1024);
+
+    // Test with AuthChallenge:
+    // Nonce (32 bytes) + Server Time (8 bytes) + server_capabilities length varint + ...
+    for declared_len in [1025u64, 2048, 65536, 1_000_000, 10_000_000] {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&[0xaa; 32]); // server nonce
+        wire.extend_from_slice(&1_700_000_000u64.to_be_bytes()); // server time
+        varint::encode(declared_len, &mut wire).unwrap(); // oversized capabilities length
+        // Buffer has NO payload bytes after length varint
+        let mut buf = Bytes::from(wire);
+        assert_eq!(
+            AuthChallenge::decode(&mut buf),
+            Err(AuthError::InvalidPayload(
+                "payload length exceeds maximum allowed"
+            )),
+            "AuthChallenge must reject declared length {declared_len} exceeding 1024 immediately"
+        );
+    }
+
+    // Exact limit 1024:
+    // With 1024 bytes present in buffer, capabilities length 1024 passes this check
+    let mut wire = Vec::new();
+    wire.extend_from_slice(&[0xaa; 32]);
+    wire.extend_from_slice(&1_700_000_000u64.to_be_bytes());
+    varint::encode(1024, &mut wire).unwrap();
+    wire.extend_from_slice(&vec![0xbb; 1024]); // exactly 1024 bytes
+    varint::encode(0, &mut wire).unwrap(); // limits len = 0
+    let mut buf = Bytes::from(wire);
+    let challenge = AuthChallenge::decode(&mut buf);
+    assert!(challenge.is_ok(), "1024 bytes payload should be accepted");
+    assert_eq!(challenge.unwrap().server_capabilities.len(), 1024);
+
+    // Limits payload > 1024
+    let mut wire = Vec::new();
+    wire.extend_from_slice(&[0xaa; 32]);
+    wire.extend_from_slice(&1_700_000_000u64.to_be_bytes());
+    varint::encode(0, &mut wire).unwrap(); // capabilities len = 0
+    varint::encode(1025, &mut wire).unwrap(); // limits len = 1025 > 1024
+    let mut buf = Bytes::from(wire);
+    assert_eq!(
+        AuthChallenge::decode(&mut buf),
+        Err(AuthError::InvalidPayload(
+            "payload length exceeds maximum allowed"
+        )),
+        "AuthChallenge must reject limits length 1025"
+    );
+
+    // Test with AuthResponse:
+    for declared_len in [1025u64, 2048, 100_000] {
+        let mut wire = Vec::new();
+        varint::encode(1, &mut wire).unwrap(); // key_id_len = 1
+        wire.push(b'k');
+        wire.extend_from_slice(&[0x11; 32]); // nonce
+        wire.extend_from_slice(&1_700_000_000u64.to_be_bytes()); // time
+        varint::encode(declared_len, &mut wire).unwrap(); // client capabilities len > 1024
+        wire.extend_from_slice(&[0x22; 32]); // 32-byte response tag (satisfies MIN_RESPONSE_TAIL_LEN)
+        let mut buf = Bytes::from(wire);
+        assert_eq!(
+            AuthResponse::decode(&mut buf),
+            Err(AuthError::InvalidPayload(
+                "payload length exceeds maximum allowed"
+            )),
+            "AuthResponse must reject client capabilities length {declared_len}"
+        );
+    }
+}
+
+#[test]
+fn sec08_adversarial_auth_dummy_hmac_constant_time_execution() {
+    let key_id = b"authenticated-user".to_vec();
+    let secret = b"0123456789abcdef0123456789abcdef".to_vec();
+    let credential = Credential::active(key_id.clone(), secret.clone()).unwrap();
+    let credentials = vec![credential];
+
+    let exporter = [0x55u8; 32];
+    let challenge = AuthChallenge {
+        server_nonce: [0x33u8; 32],
+        server_time: 1_700_000_000,
+        server_capabilities: vec![],
+        limits: vec![],
+    };
+    let allowed_skew = Duration::from_secs(30);
+    let now = 1_700_000_000;
+
+    // 1. Unknown Key ID with invalid tag and extreme clock skew:
+    // It MUST return UnknownKey, NOT ClockSkew, NOT InvalidTag.
+    // This confirms HMAC was computed with dummy secret and constant-time path executed.
+    let response_unknown = AuthResponse {
+        key_id: b"completely-unknown-key".to_vec(),
+        client_nonce: [0x44u8; 32],
+        client_time: now + 1_000_000, // extreme future skew
+        client_capabilities: vec![],
+        tag: [0x99u8; 32], // invalid tag
+    };
+
+    let res = verify_auth_response_stateless(
+        &credentials,
+        &exporter,
+        &challenge,
+        &response_unknown,
+        now,
+        allowed_skew,
+    );
+    assert_eq!(
+        res,
+        Err(AuthError::UnknownKey),
+        "Unknown key must return UnknownKey even with skewed clock and invalid tag"
+    );
+
+    // 2. Known Key ID with invalid tag:
+    // Returns InvalidTag (after computing HMAC).
+    let response_bad_tag = AuthResponse {
+        key_id: key_id.clone(),
+        client_nonce: [0x44u8; 32],
+        client_time: now,
+        client_capabilities: vec![],
+        tag: [0x99u8; 32], // bad tag
+    };
+
+    let res_bad_tag = verify_auth_response_stateless(
+        &credentials,
+        &exporter,
+        &challenge,
+        &response_bad_tag,
+        now,
+        allowed_skew,
+    );
+    assert_eq!(
+        res_bad_tag,
+        Err(AuthError::InvalidTag),
+        "Known key with invalid tag must return InvalidTag"
+    );
+
+    // 3. Known Key ID with valid tag but skewed clock:
+    // Returns ClockSkew.
+    let valid_response = AuthResponse::for_challenge(
+        key_id.clone(),
+        &secret,
+        &exporter,
+        &challenge,
+        now + 100, // skewed
+        vec![],
+    )
+    .unwrap();
+
+    let res_skew = verify_auth_response_stateless(
+        &credentials,
+        &exporter,
+        &challenge,
+        &valid_response,
+        now,
+        allowed_skew,
+    );
+    assert_eq!(
+        res_skew,
+        Err(AuthError::ClockSkew),
+        "Known key with valid tag but skewed clock must return ClockSkew"
+    );
+
+    // 4. Prefix-matching key IDs:
+    // An unknown key that shares prefix with a known key ("authenticated-user-suffix")
+    // must return UnknownKey without short-circuiting.
+    let response_prefix = AuthResponse {
+        key_id: b"authenticated-user-suffix".to_vec(),
+        client_nonce: [0x44u8; 32],
+        client_time: now,
+        client_capabilities: vec![],
+        tag: [0x99u8; 32],
+    };
+    assert_eq!(
+        verify_auth_response_stateless(
+            &credentials,
+            &exporter,
+            &challenge,
+            &response_prefix,
+            now,
+            allowed_skew,
+        ),
+        Err(AuthError::UnknownKey)
+    );
+
+    // 5. Empirical timing check: verify unknown key HMAC calculation takes comparable
+    // time to known key with bad tag (both execute HMAC), proving HMAC is not skipped.
+    let iterations = 500;
+    let t_start_unknown = std::time::Instant::now();
+    for _ in 0..iterations {
+        let _ = verify_auth_response_stateless(
+            &credentials,
+            &exporter,
+            &challenge,
+            &response_unknown,
+            now,
+            allowed_skew,
+        );
+    }
+    let elapsed_unknown = t_start_unknown.elapsed();
+
+    let t_start_bad_tag = std::time::Instant::now();
+    for _ in 0..iterations {
+        let _ = verify_auth_response_stateless(
+            &credentials,
+            &exporter,
+            &challenge,
+            &response_bad_tag,
+            now,
+            allowed_skew,
+        );
+    }
+    let elapsed_bad_tag = t_start_bad_tag.elapsed();
+
+    // If dummy HMAC were skipped, elapsed_unknown would be 50x-100x faster than elapsed_bad_tag.
+    // Both compute HMAC over identical payload lengths, so ratio should be close to 1.0 (within 0.2..=5.0).
+    let ratio = elapsed_unknown.as_secs_f64() / elapsed_bad_tag.as_secs_f64();
+    assert!(
+        ratio > 0.2 && ratio < 5.0,
+        "Unknown key HMAC timing ({:?}) deviates significantly from known key HMAC timing ({:?}), ratio = {}",
+        elapsed_unknown,
+        elapsed_bad_tag,
+        ratio
     );
 }

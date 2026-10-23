@@ -545,4 +545,28 @@ mod tests {
             MAX_NEGOTIATED_IDLE_TIMEOUT_SECONDS
         );
     }
+
+    #[test]
+    fn rejects_non_minimal_varint_in_settings() {
+        // Non-minimal encoding of count = 1 as 2 bytes (0x40, 0x01)
+        let mut bytes = Bytes::from_static(&[0x40, 0x01, 0x01, 0x01]);
+        assert_eq!(
+            Settings::decode(&mut bytes),
+            Err(ProtocolError::InvalidVarint)
+        );
+
+        // Minimal count = 1, but non-minimal encoding of key = 1 as 2 bytes (0x40, 0x01)
+        let mut bytes = Bytes::from_static(&[0x01, 0x40, 0x01, 0x01]);
+        assert_eq!(
+            Settings::decode(&mut bytes),
+            Err(ProtocolError::InvalidVarint)
+        );
+
+        // Minimal count = 1, minimal key = 1, but non-minimal value = 1 as 2 bytes (0x40, 0x01)
+        let mut bytes = Bytes::from_static(&[0x01, 0x01, 0x40, 0x01]);
+        assert_eq!(
+            Settings::decode(&mut bytes),
+            Err(ProtocolError::InvalidVarint)
+        );
+    }
 }

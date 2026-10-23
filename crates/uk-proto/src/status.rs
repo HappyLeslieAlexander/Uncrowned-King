@@ -201,4 +201,14 @@ mod tests {
             ))
         );
     }
+
+    #[test]
+    fn rejects_non_minimal_varint_in_error_payload() {
+        // Non-minimal encoding of error code 1 (Protocol) as 2 bytes (0x40, 0x01)
+        let mut bytes = Bytes::from_static(&[0x40, 0x01]);
+        assert_eq!(
+            ErrorPayload::decode(&mut bytes),
+            Err(ProtocolError::InvalidVarint)
+        );
+    }
 }

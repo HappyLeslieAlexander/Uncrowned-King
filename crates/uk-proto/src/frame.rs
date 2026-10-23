@@ -369,4 +369,21 @@ mod tests {
             ))
         );
     }
+
+    #[test]
+    fn rejects_non_minimal_varint_in_frame_header() {
+        // Non-minimal encoding of id = 1 as 2 bytes (0x40, 0x01)
+        let mut bytes = Bytes::from_static(&[0x01, 0x11, 0x00, 0x00, 0x40, 0x01, 0x00]);
+        assert_eq!(
+            FrameHeader::decode(&mut bytes, FrameLimits::default()),
+            Err(ProtocolError::InvalidVarint)
+        );
+
+        // Non-minimal encoding of length = 1 as 2 bytes (0x40, 0x01)
+        let mut bytes = Bytes::from_static(&[0x01, 0x11, 0x00, 0x00, 0x01, 0x40, 0x01]);
+        assert_eq!(
+            FrameHeader::decode(&mut bytes, FrameLimits::default()),
+            Err(ProtocolError::InvalidVarint)
+        );
+    }
 }

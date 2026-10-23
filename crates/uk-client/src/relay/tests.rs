@@ -1128,7 +1128,10 @@ async fn carrier_write_in_flight_is_not_truncated_by_shutdown() {
         tokio::spawn(
             async move { write_frame_or_shutdown(&mut writer, &frame, &shutdown, None).await },
         );
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Read the first byte to deterministically ensure write_task has started writing
+    // and is stalled on the 1-byte duplex pipe without any wall-clock sleep.
+    let mut received = vec![0_u8; encoded_len];
+    reader.read_exact(&mut received[..1]).await.unwrap();
     assert!(
         !write_task.is_finished(),
         "the 1-byte duplex should stall it"
@@ -1136,12 +1139,14 @@ async fn carrier_write_in_flight_is_not_truncated_by_shutdown() {
 
     shutdown_handle.close();
 
-    // Drain the peer: the whole frame must still arrive.
-    let mut received = vec![0_u8; encoded_len];
-    tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut received))
-        .await
-        .expect("the in-flight frame must complete")
-        .unwrap();
+    // Drain the peer: the remainder of the frame must still arrive.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        reader.read_exact(&mut received[1..]),
+    )
+    .await
+    .expect("the in-flight frame must complete")
+    .unwrap();
     assert_eq!(&received[received.len() - payload.len()..], &payload[..]);
 
     tokio::time::timeout(Duration::from_secs(5), write_task)
