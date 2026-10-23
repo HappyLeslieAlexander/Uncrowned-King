@@ -17,6 +17,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 cargo deny check
 cargo audit
 helm lint deploy/helm/uncrowned-king
+# Assert Helm fail-closed behavior on placeholder credentials
+helm template test deploy/helm/uncrowned-king \
+  --set server.existingTlsSecret=dummy 2>&1 | grep -q "placeholder or empty credential secret found"
+helm template test deploy/helm/uncrowned-king \
+  --set server.existingTlsSecret=my-tls \
+  --set "server.credentials[0].id=server-id" \
+  --set "server.credentials[0].secret=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+  --set client.enabled=true \
+  --set client.existingCaSecret=my-ca 2>&1 | grep -q "placeholder or empty credential secret found in client.config.secret"
+./scripts/interop-curl.sh
 ```
 
 ## 2. Multi-File Version Synchronization
@@ -53,7 +63,7 @@ Update `CHANGELOG.md` following [Keep a Changelog](https://keepachangelog.com/en
 ## 4. GPG-Signed Commit & Tag
 All release commits and tags must be cryptographically signed with the project GPG key:
 ```bash
-git add Cargo.toml Cargo.lock deploy/ CHANGELOG.md
+git add -u
 git commit -S -m "release: bump version to X.Y.Z"
 git tag -s vX.Y.Z -m "Release vX.Y.Z: <brief description>"
 ```
