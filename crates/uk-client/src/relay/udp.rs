@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
@@ -22,21 +22,43 @@ use uk_proto::{
 use super::carrier::validate_flow_status;
 use super::context::{
     AnyError, BufferedFlowFrame, ClientFlow, ClientFlowRoute, ClientSessionBufferControl,
-    FlowProtocol, OpenOutcome, UDP_ASSOCIATION_BUFFER_SIZE, UDP_ASSOCIATION_EVENT_QUEUE_CAPACITY,
-    UDP_SEND_ATTEMPTS, UdpAssociationFlowEvent, UdpAssociationFlowLookup,
+    FlowProtocol, OpenOutcome, UDP_ASSOCIATION_BUFFER_SIZE, UDP_SEND_ATTEMPTS,
 };
 use super::session_manager::{ClientSession, ClientSessionManager};
 use crate::{
-    observability::{RelayDirection, RelayProtocol},
+    observability::{ClientMetrics, RelayDirection, RelayProtocol},
     socks5,
 };
+
+/// Per-target outbound queue depth.
+///
+/// One worker per target owns the flow to that target, so a datagram to a
+/// healthy target is never queued behind a target whose open or carrier
+/// write is stalled. The queue is bounded: UDP is best-effort, and overflow
+/// drops (counted by `uncrowned_king_client_udp_association_queue_full_total`)
+/// rather than growing memory.
+pub(crate) const UDP_TARGET_QUEUE_CAPACITY: usize = 8;
+
+/// Upper bound on how long association teardown waits for workers to close
+/// their flows cleanly before aborting stragglers. Worker waits are already
+/// internally bounded (open timeout, carrier write timeout); this is the
+/// belt-and-braces bound for the control-EOF path, which has no outer
+/// shutdown budget.
+const UDP_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub(crate) struct UdpAssociation {
     pub(crate) socket: Arc<UdpSocket>,
     pub(crate) idle_timeout: Option<Duration>,
-    pub(crate) flow_event_tx: mpsc::Sender<UdpAssociationFlowEvent>,
     pub(crate) client_endpoint: UdpClientEndpoint,
-    pub(crate) flows_by_target: HashMap<Target, UdpAssociationFlow>,
-    pub(crate) flow_tasks: JoinSet<UdpFlowTaskResult>,
+    /// Feed side of each target's bounded outbound queue.
+    pub(crate) senders: HashMap<Target, mpsc::Sender<Bytes>>,
+    /// One worker per seen target; each worker owns that target's UK flow and
+    /// its inbound relay task.
+    workers: JoinSet<()>,
+    /// Fires when the association ends (listener shutdown or SOCKS control
+    /// disconnect): cancels in-flight opens and stops every worker.
+    closed_tx: watch::Sender<bool>,
+    pub(crate) metrics: Arc<ClientMetrics>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,14 +80,9 @@ pub(crate) struct UdpClientEndpoint {
 pub(crate) struct UdpAssociationFlow {
     pub(crate) id: u64,
     pub(crate) session: Arc<ClientSession>,
-    pub(crate) last_activity: time::Instant,
-}
-
-pub(crate) struct UdpFlowTaskResult {
-    pub(crate) session_id: u64,
-    pub(crate) flow_id: u64,
-    pub(crate) target: Target,
-    pub(crate) outcome: Result<(), AnyError>,
+    /// Shared with the inbound relay task so datagrams from the server keep
+    /// the flow's idle deadline fresh without a cross-task event channel.
+    pub(crate) activity: Arc<StdMutex<time::Instant>>,
 }
 
 pub(crate) async fn deliver_inbound_udp_datagram(
@@ -161,15 +178,14 @@ pub(crate) async fn relay_udp_association(
     let bound_endpoint = socks5::SocksEndpoint::from(socket.local_addr()?);
     socks5::send_reply_with_endpoint(&mut local, socks5::Reply::Succeeded, &bound_endpoint).await?;
 
-    let (flow_event_tx, mut flow_event_rx) = mpsc::channel(UDP_ASSOCIATION_EVENT_QUEUE_CAPACITY);
+    let metrics = Arc::clone(&sessions.metrics);
     let mut association = UdpAssociation::new(
         socket,
         sessions.udp_flow_idle_timeout(),
-        flow_event_tx,
         client_endpoint,
         control_peer_ip,
+        metrics,
     );
-    let mut idle_interval = udp_idle_interval(association.idle_timeout);
     let mut udp_buf = vec![0_u8; UDP_ASSOCIATION_BUFFER_SIZE].into_boxed_slice();
     let mut tcp_buf = [0_u8; 1];
     let mut termination_error = None;
@@ -196,19 +212,14 @@ pub(crate) async fn relay_udp_association(
             received = association.socket.recv_from(udp_buf.as_mut()) => {
                 match received {
                     Ok((read, peer)) => {
+                        // Never awaits worker progress: the per-target queues
+                        // accept or drop, so one slow target cannot stall the
+                        // association's receive loop.
                         match association
-                            .handle_local_udp_datagram(
-                                peer,
-                                &udp_buf[..read],
-                                &mut local,
-                                &mut tcp_buf,
-                                &sessions,
-                                &mut shutdown_rx,
-                            )
+                            .handle_local_udp_datagram(peer, &udp_buf[..read], &sessions)
                             .await
                         {
-                            Ok(true) => {}
-                            Ok(false) => break,
+                            Ok(()) => {}
                             Err(err) => {
                                 termination_error = Some(err);
                                 break;
@@ -220,14 +231,8 @@ pub(crate) async fn relay_udp_association(
                     }
                 }
             }
-            joined = association.flow_tasks.join_next(), if !association.flow_tasks.is_empty() => {
-                association.handle_flow_task_result(joined);
-            }
-            event = flow_event_rx.recv() => {
-                association.handle_flow_event(event);
-            }
-            () = tick_udp_idle_interval(&mut idle_interval), if idle_interval.is_some() => {
-                association.close_idle_flows().await;
+            joined = association.workers.join_next(), if !association.workers.is_empty() => {
+                let _ = joined;
             }
         }
     }
@@ -244,322 +249,375 @@ impl UdpAssociation {
     pub(crate) fn new(
         socket: Arc<UdpSocket>,
         idle_timeout: Option<Duration>,
-        flow_event_tx: mpsc::Sender<UdpAssociationFlowEvent>,
         client_endpoint: socks5::SocksEndpoint,
         control_peer_ip: IpAddr,
+        metrics: Arc<ClientMetrics>,
     ) -> Self {
+        let (closed_tx, _) = watch::channel(false);
         Self {
             socket,
             idle_timeout,
-            flow_event_tx,
             client_endpoint: UdpClientEndpoint::new(client_endpoint, control_peer_ip),
-            flows_by_target: HashMap::new(),
-            flow_tasks: JoinSet::new(),
+            senders: HashMap::new(),
+            workers: JoinSet::new(),
+            closed_tx,
+            metrics,
         }
     }
 
+    /// Validates, screens and enqueues one datagram from the SOCKS client.
+    ///
+    /// Every await here is bounded and never touches a target's flow: the
+    /// only suspension point is the (pool-only, non-dialling) live-session
+    /// lookup used for the size screen, so datagram handling cannot be held
+    /// up by a slow open or carrier write elsewhere.
     pub(crate) async fn handle_local_udp_datagram(
         &mut self,
         peer: SocketAddr,
         packet: &[u8],
-        local: &mut TcpStream,
-        tcp_buf: &mut [u8; 1],
         sessions: &Arc<ClientSessionManager>,
-        shutdown_rx: &mut watch::Receiver<bool>,
-    ) -> Result<bool, AnyError> {
+    ) -> Result<(), AnyError> {
         if !self.accept_client_endpoint(peer) {
             debug!(event = "socks5.udp_associate.peer_ignored", peer = %peer);
-            return Ok(true);
+            return Ok(());
         }
 
         let datagram = match socks5::decode_udp_datagram(packet) {
             Ok(datagram) => datagram,
             Err(err) => {
                 debug!(event = "socks5.udp.datagram.invalid", error = %err);
-                return Ok(true);
+                return Ok(());
             }
         };
 
-        // Size the datagram *before* touching a flow: `flow_for_target` opens a
-        // UK UDP flow on demand, so checking afterwards would leave an idle
-        // flow holding a `max_udp_flows` slot for the whole idle timeout every
-        // time a client's first datagram to a target is oversized.
-        // Sizing a first datagram may have to wait for a session, so keep the
-        // wait cancellable: shutdown must not be held up by a pending dial.
-        let max_payload_len = tokio::select! {
-            result = self.max_udp_payload_len(&datagram.target, sessions) => result?,
-            changed = shutdown_rx.changed() => {
-                let _ = changed;
-                return Ok(false);
-            }
-        };
-        if udp_payload_exceeds_frame_limit(datagram.payload.len(), max_payload_len) {
-            warn_oversized_udp_datagram(&datagram.target, datagram.payload.len(), max_payload_len);
-            return Ok(true);
-        }
-
-        let mut last_error = None;
-        for attempt in 0..UDP_SEND_ATTEMPTS {
-            let flow = match self
-                .flow_for_target(
-                    datagram.target.clone(),
-                    local,
-                    tcp_buf,
-                    sessions,
-                    shutdown_rx,
-                )
-                .await?
-            {
-                UdpAssociationFlowLookup::Open(flow) => flow,
-                UdpAssociationFlowLookup::NoFlow => return Ok(true),
-                UdpAssociationFlowLookup::Cancelled => return Ok(false),
-            };
-            match flow
-                .session
-                .send_udp_data(flow.id, datagram.payload.clone())
-                .await
-            {
-                Ok(()) => return Ok(true),
-                Err(err) => {
-                    warn!(
-                        event = "client.udp_flow.send.error",
-                        flow_id = flow.id,
-                        target = %datagram.target.log_safe(),
-                        attempt,
-                        error = %err
-                    );
-                    self.remove_flow_if_matches(
-                        &datagram.target,
-                        flow.session.correlation_id,
-                        flow.id,
-                    );
-                    flow.session.remove_flow(flow.id).await;
-                    last_error = Some(err);
-                }
+        // Size screen against any live session (pool-only lookup, no dial).
+        // With no live carrier the screen is skipped rather than the datagram
+        // dropped: the worker re-dials on demand and re-checks the size
+        // precisely against the session it actually opens, which is also what
+        // recovers an association whose carrier died.
+        if let Some(session) = sessions.first_live_session().await {
+            let max_payload_len = session.max_udp_payload_len_for(FIRST_CLIENT_FLOW_ID);
+            if udp_payload_exceeds_frame_limit(datagram.payload.len(), max_payload_len) {
+                warn_oversized_udp_datagram(
+                    &datagram.target,
+                    datagram.payload.len(),
+                    max_payload_len,
+                );
+                return Ok(());
             }
         }
 
-        // Drop this datagram rather than failing the association. Returning an
-        // error here propagates out of `relay_udp_association` and tears down
-        // the SOCKS control connection along with every other target's flow —
-        // so one unreachable target would take out an application's entire UDP
-        // relay. UDP is best-effort and the failed flow has already been
-        // removed, so the next datagram to this target opens a fresh one. This
-        // matches the reliable path, where a per-flow failure closes only that
-        // flow.
-        warn!(
-            event = "socks5.udp_associate.datagram_dropped",
-            target = %datagram.target.log_safe(),
-            attempts = UDP_SEND_ATTEMPTS,
-            error = %last_error
-                .map_or_else(|| "no send attempt succeeded".to_owned(), |err| err.to_string())
-        );
-        Ok(true)
+        self.enqueue_datagram(&datagram.target, datagram.payload, sessions);
+        Ok(())
+    }
+
+    /// Hands the datagram to its target's worker, spawning the worker (and
+    /// its bounded queue) on first sight of the target.
+    pub(crate) fn enqueue_datagram(
+        &mut self,
+        target: &Target,
+        payload: Bytes,
+        sessions: &Arc<ClientSessionManager>,
+    ) {
+        if !self.senders.contains_key(target) {
+            if let Some(sender) = self.spawn_target_worker(target, sessions) {
+                self.senders.insert(target.clone(), sender);
+            }
+        }
+        if let Some(sender) = self.senders.get(target) {
+            let _ = try_enqueue_datagram(sender, target, payload, &self.metrics);
+        }
+        // No worker could be spawned (no learned client endpoint yet): drop.
+    }
+
+    fn spawn_target_worker(
+        &mut self,
+        target: &Target,
+        sessions: &Arc<ClientSessionManager>,
+    ) -> Option<mpsc::Sender<Bytes>> {
+        // The learned endpoint is fixed by the first accepted datagram, which
+        // is what spawned this worker, so it is always known here in practice.
+        let client_endpoint = self.client_endpoint.learned()?;
+        let (tx, rx) = mpsc::channel(UDP_TARGET_QUEUE_CAPACITY);
+        self.workers.spawn(udp_target_worker(
+            target.clone(),
+            rx,
+            Arc::clone(sessions),
+            Arc::clone(&self.socket),
+            client_endpoint,
+            self.idle_timeout,
+            self.closed_tx.subscribe(),
+        ));
+        Some(tx)
     }
 
     pub(crate) fn accept_client_endpoint(&mut self, peer: SocketAddr) -> bool {
         self.client_endpoint.accepts(peer)
     }
 
-    /// Largest UDP payload this association can relay to `target`: the data
-    /// frame size of the target's existing flow, or — for a target with no flow
-    /// yet — of a session that could carry one. Queried without opening a flow
-    /// so an oversized datagram cannot strand UDP flow capacity.
-    pub(crate) async fn max_udp_payload_len(
-        &self,
-        target: &Target,
-        sessions: &ClientSessionManager,
-    ) -> Result<usize, AnyError> {
-        if let Some(flow) = self.flows_by_target.get(target) {
-            return Ok(flow.session.max_udp_payload_len_for(flow.id));
+    /// Stops every worker, letting each close its own flow, and drops the
+    /// queue feeds. Bounded: stragglers are aborted rather than awaited
+    /// forever, and the listener's drain budget still applies above this.
+    pub(crate) async fn close(&mut self) {
+        let _ = self.closed_tx.send(true);
+        self.senders.clear();
+        let drained = time::timeout(UDP_WORKER_JOIN_TIMEOUT, async {
+            while self.workers.join_next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            self.workers.abort_all();
+            while self.workers.join_next().await.is_some() {}
         }
-        let session = sessions.current_session().await?;
-        // No flow yet, so no flow id: size against the first id this session
-        // would allocate, which bounds the varint overhead.
-        Ok(session.max_udp_payload_len_for(FIRST_CLIENT_FLOW_ID))
     }
+}
 
-    pub(crate) async fn flow_for_target(
-        &mut self,
-        target: Target,
-        local: &mut TcpStream,
-        tcp_buf: &mut [u8; 1],
-        sessions: &Arc<ClientSessionManager>,
-        shutdown_rx: &mut watch::Receiver<bool>,
-    ) -> Result<UdpAssociationFlowLookup, AnyError> {
-        if let Some(flow) = self.flows_by_target.get_mut(&target) {
-            flow.record_activity();
-            return Ok(UdpAssociationFlowLookup::Open(flow.clone()));
-        }
+/// Enqueues one datagram into a target's bounded queue, counting a drop when
+/// the queue is full.
+///
+/// Returns whether the datagram was accepted.
+pub(crate) fn try_enqueue_datagram(
+    sender: &mpsc::Sender<Bytes>,
+    target: &Target,
+    payload: Bytes,
+    metrics: &ClientMetrics,
+) -> bool {
+    if sender.try_send(payload).is_ok() {
+        return true;
+    }
+    metrics.record_udp_association_queue_full();
+    warn!(event = "socks5.udp_associate.queue_full", target = %target.log_safe());
+    false
+}
 
-        let flow = match sessions
-            .open_udp_flow(target.clone(), local, tcp_buf, shutdown_rx)
-            .await?
-        {
-            OpenOutcome::Open(flow) => flow,
-            OpenOutcome::Rejected(reply) => {
-                debug!(
-                    event = "client.udp_flow.open.rejected",
-                    target = %target.log_safe(),
-                    reply = ?reply
-                );
-                return Ok(UdpAssociationFlowLookup::NoFlow);
+/// What happened to a datagram inside a target worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UdpWorkerSend {
+    Sent,
+    Dropped,
+    Cancelled,
+}
+
+/// Owns one target's UK flow: opens it on demand, sends every queued
+/// datagram, keeps the inbound relay task, and closes the flow on idle,
+/// inbound termination or association shutdown.
+#[allow(clippy::too_many_lines)]
+async fn udp_target_worker(
+    target: Target,
+    mut queue: mpsc::Receiver<Bytes>,
+    sessions: Arc<ClientSessionManager>,
+    socket: Arc<UdpSocket>,
+    client_endpoint: SocketAddr,
+    idle_timeout: Option<Duration>,
+    mut cancel: watch::Receiver<bool>,
+) {
+    let mut current: Option<UdpAssociationFlow> = None;
+    let mut inbound = JoinSet::new();
+    let mut idle_interval = udp_idle_interval(idle_timeout);
+    loop {
+        tokio::select! {
+            changed = cancel.changed() => {
+                let _ = changed;
+                break;
             }
-            OpenOutcome::Cancelled => return Ok(UdpAssociationFlowLookup::Cancelled),
-        };
-        let association_flow = UdpAssociationFlow {
-            id: flow.id,
-            session: Arc::clone(&flow.session),
-            last_activity: time::Instant::now(),
-        };
-        self.flows_by_target
-            .insert(target.clone(), association_flow.clone());
-        self.spawn_flow_task(flow, target, shutdown_rx.clone());
-        Ok(UdpAssociationFlowLookup::Open(association_flow))
-    }
-
-    pub(crate) fn spawn_flow_task(
-        &mut self,
-        flow: ClientFlow,
-        target: Target,
-        shutdown_rx: watch::Receiver<bool>,
-    ) {
-        let socket = Arc::clone(&self.socket);
-        let flow_event_tx = self.flow_event_tx.clone();
-        let Some(client_endpoint) = self.client_endpoint.learned() else {
-            warn!(
-                event = "client.udp_flow.missing_client_endpoint",
-                flow_id = flow.id,
-                target = %target.log_safe()
-            );
-            self.spawn_udp_flow_cleanup(&flow, target);
-            return;
-        };
-        self.flow_tasks.spawn(async move {
-            relay_udp_flow_to_client(
-                flow,
-                target,
-                socket,
-                client_endpoint,
-                shutdown_rx,
-                flow_event_tx,
-            )
-            .await
-        });
-    }
-
-    pub(crate) fn spawn_udp_flow_cleanup(&mut self, flow: &ClientFlow, target: Target) {
-        let session_id = flow.session.correlation_id;
-        let flow_id = flow.id;
-        let session = Arc::clone(&flow.session);
-        self.flow_tasks.spawn(async move {
-            let outcome = async {
-                session.send_udp_close(flow_id, UDP_CLOSE_ERROR).await?;
-                session.remove_flow(flow_id).await;
-                Ok(())
-            }
-            .await;
-            UdpFlowTaskResult {
-                session_id,
-                flow_id,
-                target,
-                outcome,
-            }
-        });
-    }
-
-    pub(crate) fn handle_flow_task_result(
-        &mut self,
-        joined: Option<Result<UdpFlowTaskResult, tokio::task::JoinError>>,
-    ) {
-        let Some(joined) = joined else {
-            return;
-        };
-        match joined {
-            Ok(result) => {
-                self.remove_flow_if_matches(&result.target, result.session_id, result.flow_id);
-                if let Err(err) = result.outcome {
-                    warn!(
-                        event = "client.udp_flow.task_error",
-                        session_id = result.session_id,
-                        flow_id = result.flow_id,
-                        target = %result.target.log_safe(),
-                        error = %err
-                    );
+            payload = queue.recv() => {
+                let Some(payload) = payload else {
+                    // Association dropped the feed: nothing can arrive again.
+                    break;
+                };
+                let mut worker = UdpTargetWorker {
+                    target: &target,
+                    current: &mut current,
+                    inbound: &mut inbound,
+                    sessions: &sessions,
+                    socket: &socket,
+                    client_endpoint,
+                    cancel: &mut cancel,
+                };
+                match send_datagram_with_attempts(&mut worker, payload).await {
+                    UdpWorkerSend::Cancelled => break,
+                    UdpWorkerSend::Sent | UdpWorkerSend::Dropped => {}
                 }
             }
+            () = tick_udp_idle_interval(&mut idle_interval), if idle_interval.is_some() => {
+                let Some(timeout) = idle_timeout else {
+                    continue;
+                };
+                // With no flow there is nothing to keep alive; exiting frees
+                // the task, and the association respawns it on demand.
+                let Some(flow) = current.as_ref() else {
+                    break;
+                };
+                if flow.idle_for() >= timeout {
+                    debug!(
+                        event = "client.udp_flow.idle_timeout",
+                        flow_id = flow.id,
+                        target = %target.log_safe()
+                    );
+                    break;
+                }
+            }
+            joined = inbound.join_next(), if !inbound.is_empty() => {
+                // The inbound relay ended (server closed the flow, the session
+                // died, or shutdown): mirror the close on our side. The worker
+                // itself stays alive for the next datagram to this target.
+                let _ = joined;
+                close_worker_flow(&mut current).await;
+            }
+        }
+    }
+    close_worker_flow(&mut current).await;
+    inbound.abort_all();
+    while inbound.join_next().await.is_some() {}
+}
+
+/// Everything a target worker needs besides the datagram at hand; bundling
+/// these keeps the send/open helpers under clippy's argument budget.
+struct UdpTargetWorker<'a> {
+    target: &'a Target,
+    current: &'a mut Option<UdpAssociationFlow>,
+    inbound: &'a mut JoinSet<()>,
+    sessions: &'a Arc<ClientSessionManager>,
+    socket: &'a Arc<UdpSocket>,
+    client_endpoint: SocketAddr,
+    cancel: &'a mut watch::Receiver<bool>,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn send_datagram_with_attempts(
+    worker: &mut UdpTargetWorker<'_>,
+    payload: Bytes,
+) -> UdpWorkerSend {
+    let mut last_error = None;
+    for attempt in 0..UDP_SEND_ATTEMPTS {
+        if *worker.cancel.borrow() {
+            return UdpWorkerSend::Cancelled;
+        }
+        let Some(flow) = ensure_worker_flow(worker, &payload).await else {
+            if *worker.cancel.borrow() {
+                return UdpWorkerSend::Cancelled;
+            }
+            // Rejected, no capacity, or oversized: drop this datagram rather
+            // than failing the whole association (one unreachable target must
+            // not take out an application's entire UDP relay).
+            return UdpWorkerSend::Dropped;
+        };
+        match flow.session.send_udp_data(flow.id, payload.clone()).await {
+            Ok(()) => {
+                flow.record_activity();
+                return UdpWorkerSend::Sent;
+            }
             Err(err) => {
-                warn!(event = "client.udp_flow.join_error", error = %err);
-            }
-        }
-    }
-
-    pub(crate) fn remove_flow_if_matches(
-        &mut self,
-        target: &Target,
-        session_id: u64,
-        flow_id: u64,
-    ) -> bool {
-        if let Some(flow) = self.flows_by_target.get(target) {
-            if flow.session.correlation_id == session_id && flow.id == flow_id {
-                self.flows_by_target.remove(target);
-                return true;
-            }
-        }
-        false
-    }
-
-    pub(crate) fn handle_flow_event(&mut self, event: Option<UdpAssociationFlowEvent>) {
-        let Some(UdpAssociationFlowEvent::Activity {
-            session_id,
-            flow_id,
-            target,
-        }) = event
-        else {
-            return;
-        };
-        let Some(flow) = self.flows_by_target.get_mut(&target) else {
-            return;
-        };
-        if flow.session.correlation_id == session_id && flow.id == flow_id {
-            flow.record_activity();
-        }
-    }
-
-    pub(crate) async fn close(&mut self) {
-        for flow in self.flows_by_target.values().cloned().collect::<Vec<_>>() {
-            let _ = flow.session.send_udp_close(flow.id, UDP_CLOSE_NORMAL).await;
-            flow.session.remove_flow(flow.id).await;
-        }
-        self.flows_by_target.clear();
-        self.flow_tasks.abort_all();
-        while self.flow_tasks.join_next().await.is_some() {}
-    }
-
-    pub(crate) async fn close_idle_flows(&mut self) {
-        let Some(idle_timeout) = self.idle_timeout else {
-            return;
-        };
-        let now = time::Instant::now();
-        let expired = self
-            .flows_by_target
-            .iter()
-            .filter(|(_, flow)| now.duration_since(flow.last_activity) >= idle_timeout)
-            .map(|(target, flow)| (target.clone(), flow.clone()))
-            .collect::<Vec<_>>();
-
-        for (target, flow) in expired {
-            if self.flows_by_target.remove(&target).is_some() {
-                debug!(
-                    event = "client.udp_flow.idle_timeout",
+                warn!(
+                    event = "client.udp_flow.send.error",
                     flow_id = flow.id,
-                    target = %target.log_safe()
+                    target = %worker.target.log_safe(),
+                    attempt,
+                    error = %err
                 );
-                let _ = flow.session.send_udp_close(flow.id, UDP_CLOSE_NORMAL).await;
+                // The flow is dead; the inbound relay task notices its route
+                // disappearing and ends by itself.
                 flow.session.remove_flow(flow.id).await;
+                *worker.current = None;
+                last_error = Some(err);
             }
         }
     }
+
+    warn!(
+        event = "socks5.udp_associate.datagram_dropped",
+        target = %worker.target.log_safe(),
+        attempts = UDP_SEND_ATTEMPTS,
+        error = %last_error
+            .map_or_else(|| "no send attempt succeeded".to_owned(), |err| err.to_string())
+    );
+    UdpWorkerSend::Dropped
+}
+
+/// Returns the target's live flow, opening one on demand.
+///
+/// Opening goes through [`ClientSessionManager::open_udp_flow`], whose
+/// admission path prefers an already-pooled live session and only dials under
+/// the connect lock after rechecking the pool — so a datagram racing the
+/// health-maintainer's re-dial reuses that session instead of piling a second
+/// carrier onto the server.
+///
+/// The precise payload size is checked against the flow's own session right
+/// after the open, closing the flow immediately on an oversized datagram so
+/// no `max_udp_flows` slot is stranded for the idle timeout.
+#[allow(clippy::too_many_lines)]
+async fn ensure_worker_flow(
+    worker: &mut UdpTargetWorker<'_>,
+    payload: &Bytes,
+) -> Option<UdpAssociationFlow> {
+    let target = worker.target;
+    if let Some(flow) = worker.current {
+        flow.record_activity();
+        return Some(flow.clone());
+    }
+
+    let flow = match worker
+        .sessions
+        .open_udp_flow(target.clone(), worker.cancel)
+        .await
+    {
+        Ok(OpenOutcome::Open(flow)) => flow,
+        Ok(OpenOutcome::Rejected(reply)) => {
+            debug!(
+                event = "client.udp_flow.open.rejected",
+                target = %target.log_safe(),
+                reply = ?reply
+            );
+            return None;
+        }
+        Ok(OpenOutcome::Cancelled) => return None,
+        Err(err) => {
+            warn!(
+                event = "client.udp_flow.open.error",
+                target = %target.log_safe(),
+                error = %err
+            );
+            return None;
+        }
+    };
+
+    // Precise size screen against the session that actually carries the flow.
+    // The association's receive loop already screens opportunistically, so
+    // reaching here oversized means no session existed at enqueue time.
+    let max_payload_len = flow.session.max_udp_payload_len_for(flow.id);
+    if udp_payload_exceeds_frame_limit(payload.len(), max_payload_len) {
+        warn_oversized_udp_datagram(target, payload.len(), max_payload_len);
+        let _ = flow.session.send_udp_close(flow.id, UDP_CLOSE_ERROR).await;
+        flow.session.remove_flow(flow.id).await;
+        return None;
+    }
+
+    let activity = Arc::new(StdMutex::new(time::Instant::now()));
+    let association_flow = UdpAssociationFlow {
+        id: flow.id,
+        session: Arc::clone(&flow.session),
+        activity: Arc::clone(&activity),
+    };
+    worker.inbound.spawn(relay_udp_flow_to_client(
+        flow,
+        target.clone(),
+        Arc::clone(worker.socket),
+        worker.client_endpoint,
+        worker.cancel.clone(),
+        Arc::clone(&activity),
+    ));
+    *worker.current = Some(association_flow.clone());
+    Some(association_flow)
+}
+
+/// Closes the worker's flow (if any) and leaves the inbound relay to end on
+/// its own: removing the route drops its frame channel.
+async fn close_worker_flow(current: &mut Option<UdpAssociationFlow>) {
+    let Some(flow) = current.take() else {
+        return;
+    };
+    let _ = flow.session.send_udp_close(flow.id, UDP_CLOSE_NORMAL).await;
+    flow.session.remove_flow(flow.id).await;
 }
 
 #[cfg(test)]
@@ -663,41 +721,49 @@ pub(crate) fn warn_oversized_udp_datagram(
 }
 
 impl UdpAssociationFlow {
-    pub(crate) fn record_activity(&mut self) {
-        self.last_activity = time::Instant::now();
+    pub(crate) fn record_activity(&self) {
+        record_udp_activity(&self.activity);
+    }
+
+    /// How long since either direction last moved on this flow.
+    pub(crate) fn idle_for(&self) -> Duration {
+        let last = match self.activity.lock() {
+            Ok(last) => *last,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
+        time::Instant::now().saturating_duration_since(last)
     }
 }
 
+fn record_udp_activity(activity: &StdMutex<time::Instant>) {
+    let mut last = match activity.lock() {
+        Ok(last) => last,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *last = time::Instant::now();
+}
+
+/// Relays one flow's server-to-client datagrams back to the SOCKS client.
+///
+/// Pure relay: the owning worker is the sole closer of the flow, so this task
+/// has no teardown side effects of its own.
 pub(crate) async fn relay_udp_flow_to_client(
     flow: ClientFlow,
     target: Target,
     socket: Arc<UdpSocket>,
     client_endpoint: SocketAddr,
-    shutdown_rx: watch::Receiver<bool>,
-    flow_event_tx: mpsc::Sender<UdpAssociationFlowEvent>,
-) -> UdpFlowTaskResult {
-    let session_id = flow.session.correlation_id;
-    let flow_id = flow.id;
-    let session = Arc::clone(&flow.session);
-    let outcome = relay_udp_flow_to_client_inner(
+    mut cancel: watch::Receiver<bool>,
+    activity: Arc<StdMutex<time::Instant>>,
+) {
+    let _ = relay_udp_flow_to_client_inner(
         flow,
-        target.clone(),
+        target,
         socket,
         client_endpoint,
-        shutdown_rx,
-        flow_event_tx,
+        &mut cancel,
+        &activity,
     )
     .await;
-    if outcome.is_err() {
-        let _ = session.send_udp_close(flow_id, UDP_CLOSE_NORMAL).await;
-    }
-    session.remove_flow(flow_id).await;
-    UdpFlowTaskResult {
-        session_id,
-        flow_id,
-        target,
-        outcome,
-    }
 }
 
 pub(crate) async fn relay_udp_flow_to_client_inner(
@@ -705,13 +771,12 @@ pub(crate) async fn relay_udp_flow_to_client_inner(
     target: Target,
     socket: Arc<UdpSocket>,
     client_endpoint: SocketAddr,
-    mut shutdown_rx: watch::Receiver<bool>,
-    flow_event_tx: mpsc::Sender<UdpAssociationFlowEvent>,
+    cancel: &mut watch::Receiver<bool>,
+    activity: &StdMutex<time::Instant>,
 ) -> Result<(), AnyError> {
-    let flow_id = flow.id;
     loop {
         tokio::select! {
-            changed = shutdown_rx.changed() => {
+            changed = cancel.changed() => {
                 let _ = changed;
                 return Ok(());
             }
@@ -730,12 +795,7 @@ pub(crate) async fn relay_udp_flow_to_client_inner(
                             RelayDirection::ServerToLocal,
                             payload_len,
                         );
-                        try_record_udp_association_activity(
-                            &flow_event_tx,
-                            flow.session.correlation_id,
-                            flow_id,
-                            &target,
-                        );
+                        record_udp_activity(activity);
                     }
                     FrameType::UdpClose => {
                         let mut payload = frame.payload;
@@ -758,19 +818,6 @@ pub(crate) fn udp_association_bind_addr(tcp_local_addr: SocketAddr) -> SocketAdd
         IpAddr::V4(ip) => SocketAddr::new(IpAddr::V4(ip), 0),
         IpAddr::V6(ip) => SocketAddr::new(IpAddr::V6(ip), 0),
     }
-}
-
-pub(crate) fn try_record_udp_association_activity(
-    flow_event_tx: &mpsc::Sender<UdpAssociationFlowEvent>,
-    session_id: u64,
-    flow_id: u64,
-    target: &Target,
-) {
-    let _ = flow_event_tx.try_send(UdpAssociationFlowEvent::Activity {
-        session_id,
-        flow_id,
-        target: target.clone(),
-    });
 }
 
 pub(crate) fn udp_idle_interval(idle_timeout: Option<Duration>) -> Option<time::Interval> {

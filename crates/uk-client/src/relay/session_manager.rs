@@ -12,7 +12,7 @@ use rand::Rng;
 
 use bytes::{Bytes, BytesMut};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     net::TcpStream,
     sync::{Mutex, Notify, Semaphore, mpsc, watch},
     task::JoinSet,
@@ -71,6 +71,12 @@ pub(crate) struct ClientSession {
     pub(crate) tasks: Mutex<ClientSessionTasks>,
     pub(crate) shutdown: ClientSessionShutdown,
     pub(crate) draining: AtomicBool,
+    /// Whether this session is the manager's designated health session.
+    ///
+    /// A health session keeps sending keepalive PINGs even when it has no open
+    /// flows, so pooled readiness does not depend on application traffic and
+    /// the server's idle timeout does not close the only session a Service has.
+    pub(crate) health_session: AtomicBool,
     pub(crate) metrics: Arc<ClientMetrics>,
     pub(crate) metric_state: StdMutex<ClientSessionMetricState>,
     pub(crate) next_flow_id: AtomicU64,
@@ -183,20 +189,40 @@ impl ClientSessionManager {
             // filesystem (an NFS or automount CA path) would otherwise stall
             // the loop and stop the client accepting SOCKS connections.
             let validated = candidate.clone();
-            tokio::task::spawn_blocking(move || crate::check_config(&validated))
-                .await
-                .map_err(|err| -> AnyError {
-                    format!("config validation task failed: {err}").into()
-                })??;
+            tokio::time::timeout(
+                crate::tls::CA_LOAD_TIMEOUT,
+                tokio::task::spawn_blocking(move || crate::check_config(&validated)),
+            )
+            .await
+            .map_err(|_| -> AnyError {
+                format!(
+                    "config validation timed out after {:?} (stalled filesystem?)",
+                    crate::tls::CA_LOAD_TIMEOUT
+                )
+                .into()
+            })?
+            .map_err(|err| -> AnyError {
+                format!("config validation task failed: {err}").into()
+            })??;
             let _publish_guard = self.config_publish_lock.lock().await;
             let current = self.config.snapshot();
             ensure_reload_compatible(&current.config, &candidate)?;
             let ca_path = candidate.ca_cert_path.clone();
-            tokio::task::spawn_blocking(move || crate::tls::refresh_client_config(&ca_path))
-                .await
-                .map_err(|err| -> AnyError {
-                    format!("failed to refresh TLS CA cache: {err}").into()
-                })??;
+            tokio::time::timeout(
+                crate::tls::CA_LOAD_TIMEOUT,
+                tokio::task::spawn_blocking(move || crate::tls::refresh_client_config(&ca_path)),
+            )
+            .await
+            .map_err(|_| -> AnyError {
+                format!(
+                    "CA cache refresh timed out after {:?} (stalled filesystem?)",
+                    crate::tls::CA_LOAD_TIMEOUT
+                )
+                .into()
+            })?
+            .map_err(|err| -> AnyError {
+                format!("failed to refresh TLS CA cache: {err}").into()
+            })??;
             let generation = self.config.replace(candidate);
             self.clear_connect_failure().await;
             // Degraded-endpoint penalties were recorded under the old config;
@@ -280,19 +306,17 @@ impl ClientSessionManager {
     pub(crate) async fn open_udp_flow(
         &self,
         target: Target,
-        local: &mut TcpStream,
-        tcp_buf: &mut [u8; 1],
-        shutdown_rx: &mut watch::Receiver<bool>,
+        cancel_rx: &mut watch::Receiver<bool>,
     ) -> Result<OpenOutcome, AnyError> {
         self.metrics.record_flow_open_request(RelayProtocol::Udp);
         let mut last_error = None;
         for attempt in 0..2 {
-            if *shutdown_rx.borrow() {
+            if *cancel_rx.borrow() {
                 return Ok(OpenOutcome::Cancelled);
             }
             let admission = tokio::select! {
                 result = self.admission_for_new_flow(FlowProtocol::Udp) => result?,
-                changed = shutdown_rx.changed() => {
+                changed = cancel_rx.changed() => {
                     let _ = changed;
                     return Ok(OpenOutcome::Cancelled);
                 }
@@ -307,7 +331,7 @@ impl ClientSessionManager {
             };
             let session = Arc::clone(&admission.session);
             match session
-                .open_udp_flow(target.clone(), admission, local, tcp_buf, shutdown_rx)
+                .open_udp_flow(target.clone(), admission, cancel_rx)
                 .await
             {
                 Ok(outcome) => return Ok(outcome),
@@ -423,10 +447,22 @@ impl ClientSessionManager {
     /// Returns `Ok(None)` when the connect should be retried (transient connect
     /// failure with retry disabled, or the config generation changed underneath).
     pub(crate) async fn connect_and_pool(&self) -> Result<Option<Arc<ClientSession>>, AnyError> {
+        self.connect_and_pool_with_health(false).await
+    }
+
+    /// Connects a new carrier session and optionally marks it as the manager's
+    /// health session before publishing it.
+    ///
+    /// Must be called while holding `connect_lock` so dials are serialized.
+    pub(crate) async fn connect_and_pool_with_health(
+        &self,
+        health_session: bool,
+    ) -> Result<Option<Arc<ClientSession>>, AnyError> {
         let snapshot = self.config.snapshot();
         info!(
             event = "client.session.connect",
-            config_generation = snapshot.generation
+            config_generation = snapshot.generation,
+            health_session
         );
         self.metrics.record_session_connect_attempt();
         let pending = match ClientSession::connect(&snapshot, Arc::clone(&self.metrics)).await {
@@ -465,8 +501,103 @@ impl ClientSessionManager {
         // between here and the push, so the guard covers every cancellation
         // point on the way in.
         let session = pending.into_session();
+        if health_session {
+            session.mark_health_session();
+        }
         pool.push(Arc::clone(&session));
         Ok(Some(session))
+    }
+
+    /// Ensures the pool contains a designated health session.
+    ///
+    /// If a live session already exists, it is adopted as the health session
+    /// rather than dialling another carrier. Otherwise this establishes one
+    /// under `connect_lock`, using the same config-generation and connect
+    /// failure rules as ordinary flow admission.
+    pub(crate) async fn ensure_health_session(&self) -> Result<Arc<ClientSession>, AnyError> {
+        if let Some(session) = self.first_live_session().await {
+            session.mark_health_session();
+            return Ok(session);
+        }
+
+        let _connect_guard = self.connect_lock.lock().await;
+        if self.is_closed() {
+            return Err("client session manager is shutting down".into());
+        }
+        if let Some(session) = self.first_live_session().await {
+            session.mark_health_session();
+            return Ok(session);
+        }
+        if let Some(failure) = self.recent_connect_failure_if_active().await {
+            return Err(cached_connect_failure_error(failure));
+        }
+
+        match self.connect_and_pool_with_health(true).await? {
+            Some(session) => Ok(session),
+            None => Err("client config changed while establishing health session".into()),
+        }
+    }
+
+    /// Keeps a health session alive independently of application traffic.
+    ///
+    /// This is what makes `/readyz` meaningful behind a Kubernetes Service: a
+    /// fresh pod establishes a carrier without waiting for the first SOCKS
+    /// request, and a session closed by the server's idle timeout is
+    /// re-established without requiring external traffic.
+    pub(crate) async fn maintain_health_session(
+        self: Arc<Self>,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) {
+        loop {
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            match self.ensure_health_session().await {
+                Ok(session) => {
+                    debug!(
+                        event = "client.session.health.established",
+                        correlation_id = session.correlation_id
+                    );
+                    tokio::select! {
+                        () = session.shutdown.closed() => {}
+                        changed = shutdown_rx.changed() => {
+                            let _ = changed;
+                            return;
+                        }
+                    }
+                }
+                Err(err) => {
+                    if self.is_closed() {
+                        return;
+                    }
+                    warn!(event = "client.session.health.error", error = %err);
+                    self.wait_before_maintainer_retry(&mut shutdown_rx).await;
+                }
+            }
+        }
+    }
+
+    async fn wait_before_maintainer_retry(&self, shutdown_rx: &mut watch::Receiver<bool>) {
+        let now = time::Instant::now();
+        let cached_delay = self
+            .recent_connect_failure_if_active()
+            .await
+            .and_then(|failure| failure.expires_at)
+            .map(|expires_at| expires_at.saturating_duration_since(now));
+        let delay = cached_delay.unwrap_or_else(|| {
+            let millis = self
+                .config
+                .snapshot()
+                .config
+                .server_connect_retry_delay_millis();
+            Duration::from_millis(millis.max(1_000))
+        });
+        tokio::select! {
+            () = time::sleep(delay.max(Duration::from_millis(100))) => {}
+            changed = shutdown_rx.changed() => {
+                let _ = changed;
+            }
+        }
     }
 
     /// Maximum number of pooled sessions for the current config generation.
@@ -739,6 +870,7 @@ impl ClientSession {
             tasks: Mutex::new(ClientSessionTasks::default()),
             shutdown: ClientSessionShutdown::default(),
             draining: AtomicBool::new(false),
+            health_session: AtomicBool::new(false),
             metrics: Arc::clone(&metrics),
             metric_state: StdMutex::new(ClientSessionMetricState::Active),
             next_flow_id: AtomicU64::new(FIRST_CLIENT_FLOW_ID),
@@ -767,6 +899,14 @@ impl ClientSession {
 
     pub(crate) fn is_draining(&self) -> bool {
         self.draining.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_health_session(&self) {
+        self.health_session.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_health_session(&self) -> bool {
+        self.health_session.load(Ordering::Acquire)
     }
 
     pub(crate) async fn begin_drain(&self) {
@@ -985,9 +1125,7 @@ impl ClientSession {
         self: &Arc<Self>,
         target: Target,
         admission: FlowAdmission,
-        local: &mut TcpStream,
-        tcp_buf: &mut [u8; 1],
-        shutdown_rx: &mut watch::Receiver<bool>,
+        cancel_rx: &mut watch::Receiver<bool>,
     ) -> Result<OpenOutcome, AnyError> {
         debug_assert!(
             Arc::ptr_eq(self, &admission.session),
@@ -1025,7 +1163,7 @@ impl ClientSession {
             _slot: admission.slot,
         };
         let frame = match self
-            .wait_for_udp_open_frame(flow_id, &mut flow.frames, local, tcp_buf, shutdown_rx)
+            .wait_for_udp_open_frame(flow_id, &mut flow.frames, cancel_rx)
             .await?
         {
             UdpOpenWaitOutcome::Frame(frame) => frame,
@@ -1089,14 +1227,12 @@ impl ClientSession {
         &self,
         flow_id: u64,
         frames: &mut mpsc::Receiver<BufferedFlowFrame>,
-        local: &mut TcpStream,
-        tcp_buf: &mut [u8; 1],
-        shutdown_rx: &mut watch::Receiver<bool>,
+        cancel_rx: &mut watch::Receiver<bool>,
     ) -> Result<UdpOpenWaitOutcome, AnyError> {
         if let Some(timeout) = self.open_timeout {
             if let Ok(result) = time::timeout(
                 timeout,
-                self.wait_for_udp_open_frame_inner(flow_id, frames, local, tcp_buf, shutdown_rx),
+                self.wait_for_udp_open_frame_inner(flow_id, frames, cancel_rx),
             )
             .await
             {
@@ -1107,53 +1243,34 @@ impl ClientSession {
                 Ok(UdpOpenWaitOutcome::TimedOut)
             }
         } else {
-            self.wait_for_udp_open_frame_inner(flow_id, frames, local, tcp_buf, shutdown_rx)
+            self.wait_for_udp_open_frame_inner(flow_id, frames, cancel_rx)
                 .await
         }
     }
 
+    /// Waits for the UDP_OPEN response.
+    ///
+    /// The open runs inside a per-target association worker, so the control
+    /// connection is no longer readable here: the association loop watches
+    /// the SOCKS control TCP connection and flips `cancel_rx` when it ends,
+    /// which cancels any in-flight open through the same branch the listener
+    /// shutdown uses.
     pub(crate) async fn wait_for_udp_open_frame_inner(
         &self,
         flow_id: u64,
         frames: &mut mpsc::Receiver<BufferedFlowFrame>,
-        local: &mut TcpStream,
-        tcp_buf: &mut [u8; 1],
-        shutdown_rx: &mut watch::Receiver<bool>,
+        cancel_rx: &mut watch::Receiver<bool>,
     ) -> Result<UdpOpenWaitOutcome, AnyError> {
-        loop {
-            tokio::select! {
-                frame = frames.recv() => {
-                    let Some(frame) = frame else {
-                        return Err("uk session closed while opening udp flow".into());
-                    };
-                    return Ok(UdpOpenWaitOutcome::Frame(frame.into_frame()?));
-                }
-                read = local.read(tcp_buf) => {
-                    match read {
-                        Ok(0) => {
-                            debug!(event = "client.udp_flow.open.cancelled", flow_id);
-                            self.cancel_pending_udp_open(flow_id).await;
-                            return Ok(UdpOpenWaitOutcome::Cancelled);
-                        }
-                        Ok(_) => {
-                            debug!(event = "socks5.udp_associate.control_data_ignored");
-                        }
-                        Err(err) => {
-                            debug!(
-                                event = "client.udp_flow.open.control_read_error",
-                                flow_id,
-                                error = %err
-                            );
-                            self.cancel_pending_udp_open(flow_id).await;
-                            return Ok(UdpOpenWaitOutcome::Cancelled);
-                        }
-                    }
-                }
-                changed = shutdown_rx.changed() => {
-                    let _ = changed;
-                    self.cancel_pending_udp_open(flow_id).await;
-                    return Ok(UdpOpenWaitOutcome::Cancelled);
-                }
+        tokio::select! {
+            frame = frames.recv() => match frame {
+                Some(frame) => Ok(UdpOpenWaitOutcome::Frame(frame.into_frame()?)),
+                None => Err("uk session closed while opening udp flow".into()),
+            },
+            changed = cancel_rx.changed() => {
+                let _ = changed;
+                debug!(event = "client.udp_flow.open.cancelled", flow_id);
+                self.cancel_pending_udp_open(flow_id).await;
+                Ok(UdpOpenWaitOutcome::Cancelled)
             }
         }
     }

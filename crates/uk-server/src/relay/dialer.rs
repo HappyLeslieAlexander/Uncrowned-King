@@ -14,7 +14,7 @@ use tokio::{
 };
 use tracing::debug;
 use uk_auth::AuthenticatedIdentity;
-use uk_policy::{PolicyContext, PolicyDecision, PolicySet};
+use uk_policy::{PolicyContext, PolicyDecision, PolicySet, PreResolveDecision};
 use uk_proto::Target;
 
 use super::context::{
@@ -34,6 +34,28 @@ pub(crate) async fn connect_allowed_target(
     connect_allowed_target_inner(target, identity, policy_set, open_dial_limiter, deadline).await
 }
 
+/// Evaluates the policy with pre-resolution knowledge only.
+///
+/// A denial here is final: the caller must reject the target *before* any DNS
+/// lookup, so an authenticated client cannot use the relay as a DNS oracle
+/// (resolution failure vs policy denial) against otherwise deny-all rules.
+pub(crate) fn pre_resolve_policy_check(
+    target: &Target,
+    identity: &AuthenticatedIdentity,
+    policy_set: &PolicySet,
+) -> Result<(), OpenFailure> {
+    let context = PolicyContext {
+        key_id: &identity.key_id,
+        policy_group: identity.policy_group.as_deref(),
+        target,
+        resolved_ips: &[],
+    };
+    match policy_set.evaluate_pre_resolve(&context) {
+        PreResolveDecision::DeniedWithoutResolution => Err(OpenFailure::PolicyDenied),
+        PreResolveDecision::NeedsResolution => Ok(()),
+    }
+}
+
 pub(crate) async fn connect_allowed_target_inner(
     target: &Target,
     identity: &AuthenticatedIdentity,
@@ -41,6 +63,7 @@ pub(crate) async fn connect_allowed_target_inner(
     open_dial_limiter: &OpenDialLimiter,
     target_connect_deadline: Option<time::Instant>,
 ) -> Result<TcpStream, OpenFailure> {
+    pre_resolve_policy_check(target, identity, policy_set)?;
     let addrs: Vec<SocketAddr> =
         with_target_connect_deadline(target_connect_deadline, resolve_target(target)).await?;
     let resolved_ips = resolved_ips(target, &addrs);
@@ -75,6 +98,7 @@ pub(crate) async fn connect_allowed_udp_target_inner(
     open_dial_limiter: &OpenDialLimiter,
     target_connect_deadline: Option<time::Instant>,
 ) -> Result<UdpSocket, OpenFailure> {
+    pre_resolve_policy_check(target, identity, policy_set)?;
     let addrs: Vec<SocketAddr> =
         with_target_connect_deadline(target_connect_deadline, resolve_target(target)).await?;
     let resolved_ips = resolved_ips(target, &addrs);

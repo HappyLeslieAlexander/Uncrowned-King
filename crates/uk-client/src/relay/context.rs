@@ -19,12 +19,11 @@ use tokio::{
     time,
 };
 use tracing::{debug, warn};
-use uk_proto::{BoxedCarrierWriter, Frame, FrameLimits, NegotiatedSettings, Target};
+use uk_proto::{BoxedCarrierWriter, Frame, FrameLimits, NegotiatedSettings};
 
 use super::carrier::peek_when_pending_buffer_full;
 use super::listener::log_client_session_task_error;
 use super::session_manager::ClientSession;
-use super::udp::UdpAssociationFlow;
 use crate::{
     observability::{ActiveFlowGuard, RelayProtocol},
     socks5,
@@ -35,7 +34,6 @@ pub(crate) const FLOW_ID_ALLOCATION_ATTEMPTS: usize = 1024;
 pub(crate) const FLOW_FRAME_QUEUE_MIN_CAPACITY: usize = 64;
 pub(crate) const FLOW_FRAME_QUEUE_MAX_CAPACITY: usize = 8192;
 pub(crate) const FLOW_FRAME_QUEUE_NOMINAL_FRAME_BYTES: usize = 1024;
-pub(crate) const UDP_ASSOCIATION_EVENT_QUEUE_CAPACITY: usize = 128;
 
 /// Depth of a flow's inbound frame queue, derived from its per-flow byte limit
 /// so the configured byte budget — not a small fixed frame count — governs when
@@ -377,20 +375,6 @@ pub(crate) fn semaphore_permits(limit: u64) -> usize {
     usize::try_from(limit)
         .unwrap_or(Semaphore::MAX_PERMITS)
         .min(Semaphore::MAX_PERMITS)
-}
-
-pub(crate) enum UdpAssociationFlowEvent {
-    Activity {
-        session_id: u64,
-        flow_id: u64,
-        target: Target,
-    },
-}
-
-pub(crate) enum UdpAssociationFlowLookup {
-    Open(UdpAssociationFlow),
-    NoFlow,
-    Cancelled,
 }
 
 pub(crate) enum OpenOutcome {

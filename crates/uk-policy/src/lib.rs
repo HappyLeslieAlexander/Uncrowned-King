@@ -51,6 +51,16 @@ pub enum PolicyDecision {
     Deny,
 }
 
+/// Outcome of a pre-resolution policy check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreResolveDecision {
+    /// The final decision is `Deny` regardless of DNS resolution; the caller
+    /// must reject the target without resolving it.
+    DeniedWithoutResolution,
+    /// The decision (or the dial itself) needs the resolved addresses first.
+    NeedsResolution,
+}
+
 /// Context known when evaluating a policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyContext<'a> {
@@ -102,6 +112,55 @@ impl PolicySet {
         }
 
         PolicyDecision::Deny
+    }
+
+    /// Decides the request using only pre-resolution knowledge.
+    ///
+    /// [`PreResolveDecision::DeniedWithoutResolution`] means the final
+    /// decision is `Deny` whatever DNS returns, so the caller must reject
+    /// the target *without resolving it*. This keeps "denied by policy" and
+    /// "would not have resolved" indistinguishable to the requester, which
+    /// closes the DNS enumeration oracle against an otherwise deny-all
+    /// policy, and stops authenticated clients from making the relay
+    /// resolve arbitrary internal names.
+    ///
+    /// Literal IP targets are fully decidable here; the normal
+    /// [`PolicySet::evaluate`] still runs after resolution for everything
+    /// else, so hard metadata denial on the resolved addresses is unchanged.
+    pub fn evaluate_pre_resolve(&self, context: &PolicyContext<'_>) -> PreResolveDecision {
+        match context.target {
+            Target::Ipv4(_, _) | Target::Ipv6(_, _) => match self.evaluate(context) {
+                PolicyDecision::Allow => PreResolveDecision::NeedsResolution,
+                PolicyDecision::Deny => PreResolveDecision::DeniedWithoutResolution,
+            },
+            Target::Domain(_, _) => {
+                // If no Allow rule can ever match, the decision is Deny
+                // regardless of what resolution would say.
+                if !self.rules.iter().any(|rule| {
+                    rule.action == PolicyDecision::Allow && rule.matches_fixed_predicates(context)
+                }) {
+                    return PreResolveDecision::DeniedWithoutResolution;
+                }
+                // First-match-wins over the rules that could still match: a
+                // definite deny settles the outcome without resolution, a
+                // definite allow (or anything resolution-dependent) does not.
+                for rule in &self.rules {
+                    if !rule.matches_fixed_predicates(context) {
+                        continue;
+                    }
+                    if rule.resolution_dependent(context.target) {
+                        return PreResolveDecision::NeedsResolution;
+                    }
+                    match rule.action {
+                        PolicyDecision::Deny => {
+                            return PreResolveDecision::DeniedWithoutResolution;
+                        }
+                        PolicyDecision::Allow => return PreResolveDecision::NeedsResolution,
+                    }
+                }
+                PreResolveDecision::DeniedWithoutResolution
+            }
+        }
     }
 
     /// Checks if the policy set contains any `Allow` rule that explicitly
@@ -181,6 +240,27 @@ impl PolicyRule {
     }
 
     fn matches(&self, context: &PolicyContext<'_>) -> bool {
+        if !self.matches_fixed_predicates(context) {
+            return false;
+        }
+        if self.cidr.as_ref().is_some_and(|cidr| {
+            !cidr_matches(self.action, cidr, context.target, context.resolved_ips)
+        }) {
+            return false;
+        }
+        if self
+            .private
+            .is_some_and(|want_private| !private_matches(context, want_private))
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Predicates that are decidable before DNS resolution: identity and
+    /// host/port predicates only. Resolution can only refine the `cidr` and
+    /// `private` predicates, so a rule failing here can never match later.
+    fn matches_fixed_predicates(&self, context: &PolicyContext<'_>) -> bool {
         if self
             .key_id
             .as_ref()
@@ -213,18 +293,32 @@ impl PolicyRule {
         {
             return false;
         }
-        if self.cidr.as_ref().is_some_and(|cidr| {
-            !cidr_matches(self.action, cidr, context.target, context.resolved_ips)
-        }) {
-            return false;
-        }
-        if self
-            .private
-            .is_some_and(|want_private| !private_matches(context, want_private))
-        {
-            return false;
-        }
         true
+    }
+
+    /// Whether this rule's remaining predicates need the target's resolved
+    /// addresses before the final decision is knowable.
+    fn resolution_dependent(&self, target: &Target) -> bool {
+        match target {
+            Target::Ipv4(_, _) | Target::Ipv6(_, _) => false,
+            Target::Domain(_, _) => {
+                if self.cidr.is_some() {
+                    return true;
+                }
+                match (self.action, self.private) {
+                    // Nothing about this rule depends on the resolved
+                    // addresses: a deny with no private predicate matches on
+                    // its fixed predicates alone, and an allow with an
+                    // explicit private opt-in skips the private-destination
+                    // rejection entirely.
+                    (PolicyDecision::Deny, None) | (PolicyDecision::Allow, Some(true)) => false,
+                    // Every other combination compares against the resolved
+                    // addresses (or, for Allow rules, the private rejection
+                    // verdict on them).
+                    _ => true,
+                }
+            }
+        }
     }
 }
 
@@ -402,11 +496,9 @@ fn validate_policy_group_match(group: String) -> PolicyResult<String> {
 
 fn validate_domain_match(domain: String) -> PolicyResult<String> {
     let normalized = normalize_domain(&domain);
-    if normalized.is_empty()
-        || normalized.starts_with('.')
-        || domain.bytes().any(|byte| byte.is_ascii_control())
-        || is_unmatchable_domain_pattern(&normalized)
-    {
+    // An exact-match predicate must stay exact: a leading dot is suffix
+    // syntax and would silently widen the rule to every subdomain.
+    if normalized.starts_with('.') || uk_proto::validate_domain_name(&normalized).is_err() {
         Err(PolicyError::InvalidDomain(domain))
     } else {
         Ok(domain)
@@ -415,37 +507,11 @@ fn validate_domain_match(domain: String) -> PolicyResult<String> {
 
 fn validate_domain_suffix_match(suffix: String) -> PolicyResult<String> {
     let normalized = normalize_domain(&suffix);
-    if normalized.is_empty()
-        || suffix.bytes().any(|byte| byte.is_ascii_control())
-        || is_unmatchable_domain_pattern(&normalized)
-    {
+    if uk_proto::validate_domain_pattern(&normalized).is_err() {
         Err(PolicyError::InvalidDomain(suffix))
     } else {
         Ok(suffix)
     }
-}
-
-/// Characters that can never appear in the hostname of a `Target::Domain`.
-///
-/// A pattern containing one of them is dead: it parses, passes `config-check`
-/// and then silently never matches, which turns a deny rule into a no-op. The
-/// common mistakes are glob syntax (`*.internal.corp`), a URL instead of a host
-/// (`http://x.com`, `x.com:443`) and a mail-style address (`user@x.com`).
-const UNMATCHABLE_DOMAIN_CHARS: [char; 4] = ['*', '/', ':', '@'];
-
-/// Returns true when `normalized` can never match a domain target.
-///
-/// IP literals are rejected as well: an IP target decodes to `Target::Ipv4` or
-/// `Target::Ipv6`, so `target_domain` returns `None` and a `domain` predicate
-/// holding an address is likewise dead. Use a `cidr` predicate instead.
-fn is_unmatchable_domain_pattern(normalized: &str) -> bool {
-    normalized
-        .chars()
-        .any(|character| character.is_whitespace() || UNMATCHABLE_DOMAIN_CHARS.contains(&character))
-        || normalized.parse::<IpAddr>().is_ok()
-        || normalized
-            .strip_prefix('.')
-            .is_some_and(|stripped| stripped.parse::<IpAddr>().is_ok())
 }
 
 fn domain_matches_exact(domain: &str, want: &str) -> bool {
@@ -525,6 +591,7 @@ fn is_metadata_service_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             ip == Ipv4Addr::new(169, 254, 169, 254)
+                || ip == Ipv4Addr::new(169, 254, 170, 2)
                 || ip == Ipv4Addr::new(100, 100, 100, 200)
                 || ip == Ipv4Addr::new(168, 63, 129, 16)
         }
@@ -742,6 +809,122 @@ mod tests {
         assert_eq!(
             policy.evaluate(&context(&target, Some("default"), &resolved)),
             PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn pre_resolve_denies_domains_without_any_reachable_allow() {
+        // Deny-all: nothing can ever be allowed, so no resolution is needed.
+        let policy = PolicySet::new(vec![]);
+        let target = Target::Domain("secret.internal.corp".to_owned(), 443);
+        assert_eq!(
+            policy.evaluate_pre_resolve(&context(&target, None, &[])),
+            PreResolveDecision::DeniedWithoutResolution
+        );
+
+        // An allow rule scoped to a different suffix is equally unreachable.
+        let mut allow = PolicyRule::new(PolicyDecision::Allow);
+        allow.domain_suffix = Some(".example.com".to_owned());
+        let policy = PolicySet::new(vec![allow]);
+        assert_eq!(
+            policy.evaluate_pre_resolve(&context(&target, None, &[])),
+            PreResolveDecision::DeniedWithoutResolution
+        );
+
+        // A port mismatch keeps the only allow rule unreachable too.
+        let mut allow = PolicyRule::new(PolicyDecision::Allow);
+        allow.domain_suffix = Some(".internal.corp".to_owned());
+        allow.ports = Some(8443..=8443);
+        let policy = PolicySet::new(vec![allow]);
+        assert_eq!(
+            policy.evaluate_pre_resolve(&context(&target, None, &[])),
+            PreResolveDecision::DeniedWithoutResolution
+        );
+    }
+
+    #[test]
+    fn pre_resolve_needs_resolution_when_allow_is_reachable() {
+        let mut allow = PolicyRule::new(PolicyDecision::Allow);
+        allow.domain_suffix = Some(".example.com".to_owned());
+        let policy = PolicySet::new(vec![allow]);
+        let target = Target::Domain("api.example.com".to_owned(), 443);
+        assert_eq!(
+            policy.evaluate_pre_resolve(&context(&target, None, &[])),
+            PreResolveDecision::NeedsResolution
+        );
+    }
+
+    #[test]
+    fn pre_resolve_settles_definite_deny_before_dns() {
+        // A matching deny rule with no resolution-dependent predicates wins
+        // first-match-wins without any DNS lookup.
+        let mut deny = PolicyRule::new(PolicyDecision::Deny);
+        deny.domain = Some("forbidden.example.com".to_owned());
+        let mut allow = PolicyRule::new(PolicyDecision::Allow);
+        allow.domain_suffix = Some(".example.com".to_owned());
+        let policy = PolicySet::new(vec![deny, allow]);
+        let target = Target::Domain("forbidden.example.com".to_owned(), 443);
+        assert_eq!(
+            policy.evaluate_pre_resolve(&context(&target, None, &[])),
+            PreResolveDecision::DeniedWithoutResolution
+        );
+
+        // Sibling domains still need resolution before the allow applies.
+        let sibling = Target::Domain("ok.example.com".to_owned(), 443);
+        assert_eq!(
+            policy.evaluate_pre_resolve(&context(&sibling, None, &[])),
+            PreResolveDecision::NeedsResolution
+        );
+    }
+
+    #[test]
+    fn pre_resolve_needs_resolution_for_cidr_or_private_predicates() {
+        let mut deny_private = PolicyRule::new(PolicyDecision::Deny);
+        deny_private.private = Some(true);
+        let mut allow = PolicyRule::new(PolicyDecision::Allow);
+        allow.domain_suffix = Some(".example.com".to_owned());
+        let policy = PolicySet::new(vec![deny_private, allow]);
+        let target = Target::Domain("api.example.com".to_owned(), 443);
+        assert_eq!(
+            policy.evaluate_pre_resolve(&context(&target, None, &[])),
+            PreResolveDecision::NeedsResolution
+        );
+
+        let mut allow_cidr = PolicyRule::new(PolicyDecision::Allow);
+        allow_cidr.private = Some(true);
+        allow_cidr.cidr = Some(Cidr::new_v4(Ipv4Addr::new(93, 184, 216, 0), 24).unwrap());
+        let policy = PolicySet::new(vec![allow_cidr]);
+        assert_eq!(
+            policy.evaluate_pre_resolve(&context(&target, None, &[])),
+            PreResolveDecision::NeedsResolution
+        );
+    }
+
+    #[test]
+    fn pre_resolve_is_exact_for_ip_targets() {
+        let mut allow = PolicyRule::new(PolicyDecision::Allow);
+        allow.private = Some(true);
+        let policy = PolicySet::new(vec![allow]);
+
+        let allowed = Target::Ipv4(Ipv4Addr::new(10, 1, 2, 3), 443);
+        assert_eq!(
+            policy.evaluate_pre_resolve(&context(&allowed, None, &[])),
+            PreResolveDecision::NeedsResolution
+        );
+
+        // Allow without private opt-in still rejects a private IP, decidable
+        // without any resolution.
+        let allow = PolicyRule::new(PolicyDecision::Allow);
+        let policy = PolicySet::new(vec![allow]);
+        assert_eq!(
+            policy.evaluate_pre_resolve(&context(&allowed, None, &[])),
+            PreResolveDecision::DeniedWithoutResolution
+        );
+
+        let metadata = Target::Ipv4(Ipv4Addr::new(169, 254, 170, 2), 80);
+        assert_eq!(
+            policy.evaluate_pre_resolve(&context(&metadata, None, &[])),
+            PreResolveDecision::DeniedWithoutResolution
         );
     }
 
@@ -1041,6 +1224,34 @@ mod tests {
         let target = Target::Ipv4(Ipv4Addr::new(169, 254, 169, 254), 80);
         assert_eq!(
             policy.evaluate(&context(&target, Some("default"), &[])),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn denies_ecs_task_metadata_ip_even_when_allow_rule_matches() {
+        // AWS ECS task metadata endpoint (169.254.170.2) v2/v3 API. The rule
+        // opts into private targets, so only the hard metadata denial can
+        // reject this.
+        let mut rule = PolicyRule::new(PolicyDecision::Allow);
+        rule.private = Some(true);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Ipv4(Ipv4Addr::new(169, 254, 170, 2), 80);
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &[])),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn denies_domain_resolving_to_ecs_task_metadata_ip() {
+        let mut rule = PolicyRule::new(PolicyDecision::Allow);
+        rule.private = Some(true);
+        let policy = PolicySet::new(vec![rule]);
+        let target = Target::Domain("ecs-metadata.example".to_owned(), 80);
+        let resolved = [IpAddr::V4(Ipv4Addr::new(169, 254, 170, 2))];
+        assert_eq!(
+            policy.evaluate(&context(&target, Some("default"), &resolved)),
             PolicyDecision::Deny
         );
     }
@@ -1601,6 +1812,109 @@ mod tests {
         .unwrap();
 
         assert_eq!(policy.rules.len(), 3);
+    }
+
+    #[test]
+    fn rejects_domain_patterns_outside_target_charset() {
+        // These pass a loose "no glob/URL chars" check but a Target::Domain
+        // hostname only ever holds [A-Za-z0-9.-] with RFC 1123 label rules,
+        // so a rule using one of them can never match anything.
+        let dead_patterns = [
+            "foo_bar.example.com",
+            "foo+bar.example.com",
+            "foo~bar.example.com",
+            "-leading.example.com",
+            "trailing-.example.com",
+            "double..dot.example.com",
+            "a b.example.com",
+        ];
+        for pattern in dead_patterns {
+            let err = PolicySet::from_toml(&format!(
+                r#"
+                [[rules]]
+                action = "deny"
+                domain = "{pattern}"
+                "#
+            ))
+            .unwrap_err();
+            assert_eq!(
+                err,
+                PolicyError::InvalidDomain(pattern.to_owned()),
+                "domain = {pattern} was accepted"
+            );
+
+            let err = PolicySet::from_toml(&format!(
+                r#"
+                [[rules]]
+                action = "deny"
+                domain_suffix = "{pattern}"
+                "#
+            ))
+            .unwrap_err();
+            assert_eq!(
+                err,
+                PolicyError::InvalidDomain(pattern.to_owned()),
+                "domain_suffix = {pattern} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_domain_pattern_labels() {
+        let long_label = "a".repeat(64);
+        for field in ["domain", "domain_suffix"] {
+            let err = PolicySet::from_toml(&format!(
+                r#"
+                [[rules]]
+                action = "allow"
+                {field} = "{long_label}.example.com"
+                "#
+            ))
+            .unwrap_err();
+            assert_eq!(
+                err,
+                PolicyError::InvalidDomain(format!("{long_label}.example.com"))
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_suffix_syntax_in_exact_domain_match() {
+        let err = PolicySet::from_toml(
+            r#"
+            [[rules]]
+            action = "allow"
+            domain = ".example.com"
+            "#,
+        )
+        .unwrap_err();
+        assert_eq!(err, PolicyError::InvalidDomain(".example.com".to_owned()));
+    }
+
+    #[test]
+    fn accepts_case_and_fqdn_normalized_domain_patterns() {
+        let policy = PolicySet::from_toml(
+            r#"
+            [[rules]]
+            action = "deny"
+            domain = "Example.COM."
+
+            [[rules]]
+            action = "allow"
+            domain_suffix = ".Internal.Corp"
+            "#,
+        )
+        .unwrap();
+
+        let exact = &policy.rules[0];
+        let target = Target::Domain("example.com".to_owned(), 443);
+        let context = PolicyContext {
+            key_id: b"key",
+            policy_group: None,
+            target: &target,
+            resolved_ips: &[],
+        };
+        assert!(exact.matches(&context));
     }
 
     #[test]

@@ -19,21 +19,27 @@ spec:
           port: {{ .Values.server.service.ports.tls.targetPort | default 8443 }}
         - protocol: UDP
           port: {{ .Values.server.service.ports.quic.targetPort | default 8443 }}
-    # Allow metrics scraping from Prometheus
+    # Allow metrics scraping from Prometheus. Default: any pod in this
+    # namespace; set networkPolicy.prometheusNamespace to open it for a
+    # dedicated monitoring namespace instead of every namespace.
     - from:
         {{- if .Values.networkPolicy.prometheusNamespace }}
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: {{ .Values.networkPolicy.prometheusNamespace }}
         {{- else }}
-        - namespaceSelector: {}
+        - podSelector: {}
         {{- end }}
       ports:
         - protocol: TCP
           port: {{ .Values.server.metricsService.targetPort | default 9090 }}
   egress:
-    # Allow DNS resolution
-    - ports:
+    # Allow DNS resolution only in the cluster DNS namespace.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.dnsNamespace | default "kube-system" }}
+      ports:
         - protocol: UDP
           port: 53
         - protocol: TCP
@@ -77,33 +83,66 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # Allow incoming SOCKS5 connections from within the cluster
+    {{- if eq (.Values.client.socks5.exposure | default "local") "cluster" }}
+    # The SOCKS listener is unauthenticated. Only the explicitly configured
+    # namespaces/pods may reach it; an empty allow-list means this namespace.
     - from:
-        - namespaceSelector: {}
+        {{- if .Values.client.socks5.allowedNamespaces }}
+        {{- range .Values.client.socks5.allowedNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+        {{- else }}
+        - podSelector:
+            {{- with .Values.client.socks5.allowedPods }}
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+            {{- else }}
+            {}
+            {{- end }}
+        {{- end }}
       ports:
         - protocol: TCP
           port: {{ .Values.client.socks5.port }}
-    # Allow metrics scraping from Prometheus
+    {{- end }}
+    # Allow metrics scraping from Prometheus. Default: any pod in this
+    # namespace; set networkPolicy.prometheusNamespace to open it for a
+    # dedicated monitoring namespace instead of every namespace.
     - from:
         {{- if .Values.networkPolicy.prometheusNamespace }}
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: {{ .Values.networkPolicy.prometheusNamespace }}
         {{- else }}
-        - namespaceSelector: {}
+        - podSelector: {}
         {{- end }}
       ports:
         - protocol: TCP
           port: {{ .Values.client.metrics.port }}
   egress:
-    # Allow DNS resolution
-    - ports:
+    # Allow DNS resolution, restricted to the cluster DNS namespace.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.dnsNamespace | default "kube-system" }}
+      ports:
         - protocol: UDP
           port: 53
         - protocol: TCP
           port: 53
-    # Allow outbound carrier connections to UK server
-    - ports:
+    # Allow outbound carrier connections only to this release's UK server.
+    {{- if .Values.server.enabled }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "uncrowned-king.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: server
+      ports:
         - protocol: TCP
           port: {{ .Values.server.service.ports.tls.port | default 443 }}
         - protocol: UDP
@@ -112,4 +151,5 @@ spec:
           port: {{ .Values.server.service.ports.tls.targetPort | default 8443 }}
         - protocol: UDP
           port: {{ .Values.server.service.ports.quic.targetPort | default 8443 }}
+    {{- end }}
 {{- end }}

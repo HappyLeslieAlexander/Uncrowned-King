@@ -64,16 +64,34 @@ server:
     log_format: "json"
     limits:
       max_frame_size: 65536
-      max_sessions: 10000
+      # Sizing formula (keep under resources.limits.memory, 2GiB here):
+      #   max_sessions * max_buffered_bytes_per_session + session overhead
+      #     < memory limit
+      # 200 sessions x 8MiB = 1.6GiB worst-case queued bytes, and
+      # max_total_buffered_bytes below hard-caps the sum at 1GiB regardless.
+      # Each authenticated session also costs TLS/QUIC state and sockets, so
+      # do not raise max_sessions without raising the memory limit.
+      max_sessions: 200
       max_handshakes: 1000
       max_streams: 1024
       max_udp_flows: 512
-      max_buffered_bytes_per_session: 16777216 # 16MB
+      max_buffered_bytes_per_session: 8388608  # 8MB
       max_buffered_bytes_per_flow: 4194304     # 4MB
-      relay_buffer_size: 16384                 # 16KB
+      # Global budgets across all sessions. Keep max_total_buffered_bytes
+      # below the pod memory limit: 1GiB here for a 2GiB pod.
+      max_total_streams: 65536
+      max_total_buffered_bytes: 1073741824     # 1GiB
+      relay_buffer_size: 16384                 # 16KB; also caps UDP datagram
+                                               # payloads (raise on BOTH server
+                                               # and client for large UDP)
       auth_rate_limit_failures: 5
       auth_rate_limit_window_seconds: 60
       auth_rate_limit_ban_seconds: 300
+      # Failure accounting aggregates IPv6 sources by /64 and every client
+      # behind one NAT egress into a single bucket: 5 failures from ANY of
+      # them bans them ALL for ban_seconds. List trusted sources here (CIDR
+      # or bare IP) to exempt them from both counting and banning.
+      auth_rate_limit_allowlist: []
 
   # Credentials for authenticating clients.
   # WARNING: You MUST replace the placeholder secret with a secure 64-character hex secret!
@@ -116,6 +134,22 @@ client:
   socks5:
     port: 1080
     hostPort: null # Disabled by default to prevent exposing unauthenticated SOCKS5 to cluster nodes
+    # "local" binds 127.0.0.1 inside the pod. "cluster" binds 0.0.0.0 and is
+    # reachable only through the explicit ingress allow-list below.
+    exposure: "local"
+    # Used only when exposure=cluster. Empty means "pods in this release
+    # namespace"; add namespace names to widen the allow-list deliberately.
+    allowedNamespaces: []
+    # Optional pod label selector within the allowed namespaces. Empty means
+    # all pods in those namespaces.
+    allowedPods: {}
+
+  # Optional stable endpoint for the SOCKS listener. Enable together with
+  # exposure=cluster when workloads need a Service DNS name.
+  service:
+    enabled: false
+    type: ClusterIP
+    annotations: {}
 
   metrics:
     port: 9091
@@ -146,9 +180,17 @@ serviceMonitor:
   enabled: false
   interval: 15s
   labels: {}
+  client:
+    # Requires client.service.enabled (and therefore socks5.exposure=cluster).
+    # A loopback-only client sidecar has no scrapable endpoint and keeps
+    # this disabled.
+    enabled: false
 
 # NetworkPolicy restricting ingress and egress traffic
 networkPolicy:
   enabled: false
   prometheusNamespace: ""
+  # Namespace containing cluster DNS. Egress to port 53 is restricted to
+  # this namespace instead of allowing every destination on port 53.
+  dnsNamespace: "kube-system"
 

@@ -191,6 +191,8 @@ struct ConnectionRuntime {
     auth_rate_limiter: Arc<rate_limit::AuthRateLimiter>,
     max_sessions: usize,
     max_handshakes: usize,
+    global_buffer: relay::GlobalBufferControl,
+    global_flows: relay::GlobalFlowBudget,
     metrics: Arc<ServerMetrics>,
 }
 
@@ -415,6 +417,13 @@ where
     let shutdown_timeout = listener_shutdown_timeout(config.shutdown_timeout_seconds());
     let metrics = Arc::new(ServerMetrics::default());
     metrics.set_security_generation(security.generation());
+    let global_buffer_limit = usize_limit(
+        "max_total_buffered_bytes",
+        config.max_total_buffered_bytes(),
+    )?;
+    let global_flow_limit = usize_limit("max_total_streams", config.max_total_streams())?;
+    let (global_buffered_bytes, global_active_flows) = metrics.global_budget_counters();
+    metrics.set_global_budget_limits(global_buffer_limit, global_flow_limit);
     let connection_runtime = ConnectionRuntime {
         security: security.clone(),
         replay_cache: Arc::clone(&replay_cache),
@@ -424,6 +433,8 @@ where
         auth_rate_limiter,
         max_sessions,
         max_handshakes,
+        global_buffer: relay::GlobalBufferControl::new(global_buffer_limit, global_buffered_bytes),
+        global_flows: relay::GlobalFlowBudget::new(global_flow_limit, global_active_flows),
         metrics: Arc::clone(&metrics),
     };
 
@@ -672,8 +683,9 @@ fn prepare_server_runtime(mut config: ServerConfig) -> Result<ServerRuntime, Any
             config.replay_cache_max_entries(),
         )?,
     )));
-    let auth_rate_limiter = Arc::new(rate_limit::AuthRateLimiter::new(
+    let auth_rate_limiter = Arc::new(rate_limit::AuthRateLimiter::with_allowlist(
         config.auth_rate_limit_config(),
+        config.auth_rate_limit_allowlist_cidrs(),
     ));
     let max_sessions = usize_limit("max_sessions", config.max_sessions())?;
     let max_handshakes = usize_limit("max_handshakes", config.max_handshakes())?;
@@ -749,6 +761,9 @@ fn ensure_reload_compatible(
     if let Some(field) = changed_static_config_field(current, candidate) {
         return Err(reload_requires_restart(field));
     }
+    if current.auth_rate_limit_allowlist() != candidate.auth_rate_limit_allowlist() {
+        return Err(reload_requires_restart("auth_rate_limit_allowlist"));
+    }
     for ((name, current), (_, candidate)) in reload_static_limits(current)
         .into_iter()
         .zip(reload_static_limits(candidate))
@@ -775,7 +790,7 @@ fn changed_static_config_field(
     }
 }
 
-fn reload_static_limits(config: &ServerConfig) -> [(&'static str, u64); 25] {
+fn reload_static_limits(config: &ServerConfig) -> [(&'static str, u64); 27] {
     [
         ("max_pre_auth_bytes", config.max_pre_auth_bytes()),
         ("max_frame_size", config.max_frame_size()),
@@ -795,6 +810,11 @@ fn reload_static_limits(config: &ServerConfig) -> [(&'static str, u64); 25] {
         (
             "max_buffered_bytes_per_flow",
             config.max_buffered_bytes_per_flow(),
+        ),
+        ("max_total_streams", config.max_total_streams()),
+        (
+            "max_total_buffered_bytes",
+            config.max_total_buffered_bytes(),
         ),
         (
             "handshake_timeout_seconds",
@@ -1045,6 +1065,8 @@ where
         &runtime.config,
         runtime.session_permits,
         runtime.max_sessions,
+        runtime.global_buffer,
+        runtime.global_flows,
         peer,
         shutdown_rx,
         runtime.metrics,
@@ -1064,6 +1086,8 @@ async fn run_authenticated_session(
     config: &ServerConfig,
     session_permits: Arc<Semaphore>,
     max_sessions: usize,
+    global_buffer: relay::GlobalBufferControl,
+    global_flows: relay::GlobalFlowBudget,
     peer: SocketAddr,
     shutdown_rx: watch::Receiver<bool>,
     metrics: Arc<ServerMetrics>,
@@ -1157,6 +1181,8 @@ async fn run_authenticated_session(
             ),
             relay_buffer_size: Some(config.relay_buffer_size()),
         }),
+        global_buffer,
+        global_flows,
         idle_timeout(config.idle_timeout_seconds()),
         shutdown_rx,
         metrics,
@@ -1692,6 +1718,29 @@ mod tests {
     }
 
     #[test]
+    fn server_settings_are_negotiable_by_clients() {
+        let mut config = minimal_config();
+        config.limits = None;
+        assert!(server_settings(&config, false).negotiated_v1_0().is_ok());
+
+        config.limits = Some(LimitConfig {
+            max_streams: Some(uk_proto::MAX_NEGOTIATED_FLOWS),
+            max_udp_flows: Some(uk_proto::MAX_NEGOTIATED_FLOWS),
+            idle_timeout_seconds: Some(uk_proto::MAX_NEGOTIATED_IDLE_TIMEOUT_SECONDS),
+            ..LimitConfig::default()
+        });
+        assert!(server_settings(&config, true).negotiated_v1_0().is_ok());
+
+        config.limits = Some(LimitConfig {
+            max_streams: Some(1),
+            max_udp_flows: Some(0),
+            idle_timeout_seconds: Some(0),
+            ..LimitConfig::default()
+        });
+        assert!(server_settings(&config, false).negotiated_v1_0().is_ok());
+    }
+
+    #[test]
     fn server_settings_include_protocol_and_limits() {
         let mut config = minimal_config();
         config.limits = Some(LimitConfig {
@@ -2144,6 +2193,8 @@ mod tests {
             auth_rate_limiter,
             max_sessions: 0,
             max_handshakes: 10,
+            global_buffer: relay::GlobalBufferControl::default(),
+            global_flows: relay::GlobalFlowBudget::default(),
             metrics: Arc::clone(&metrics),
         };
 
@@ -2368,6 +2419,8 @@ mod settings_write_tests {
                 &config,
                 task_permits,
                 1,
+                relay::GlobalBufferControl::default(),
+                relay::GlobalFlowBudget::default(),
                 "127.0.0.1:1000".parse().unwrap(),
                 rx,
                 Arc::new(ServerMetrics::default()),
@@ -2428,6 +2481,8 @@ mod settings_write_tests {
                 &config,
                 task_permits,
                 1,
+                relay::GlobalBufferControl::default(),
+                relay::GlobalFlowBudget::default(),
                 "127.0.0.1:1000".parse().unwrap(),
                 rx,
                 Arc::new(ServerMetrics::default()),
@@ -2487,6 +2542,8 @@ mod settings_write_tests {
             &config,
             task_permits,
             1,
+            relay::GlobalBufferControl::default(),
+            relay::GlobalFlowBudget::default(),
             "127.0.0.1:1000".parse().unwrap(),
             rx,
             Arc::new(ServerMetrics::default()),

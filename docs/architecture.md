@@ -16,8 +16,8 @@ graph TB
     end
 
     subgraph Transit ["安全传输层 (Carrier)"]
-        UKClient == "TLS/TCP (ALPN: uncrowned-king/1)" ==> UKServer
-        UKClient == "QUIC + DATAGRAM (ALPN: uncrowned-king/1)" ==> UKServer
+        UKClient == "TLS/TCP (ALPN: uk/1)" ==> UKServer
+        UKClient == "QUIC + DATAGRAM (ALPN: uk/1)" ==> UKServer
     end
 
     subgraph ServerHost ["服务端主机 / 集群"]
@@ -76,7 +76,7 @@ sequenceDiagram
     participant Server as uk-server
 
     Note over Client,Server: 1. 传输层与 TLS / QUIC 握手
-    Client->>Server: TLS ClientHello (ALPN: "uncrowned-king/1")
+    Client->>Server: TLS ClientHello (ALPN: "uk/1")
     Server-->>Client: TLS ServerHello + Certificate
     Note over Client,Server: TLS 握手成功，提取 TLS Exporter Keying Material
 
@@ -85,7 +85,9 @@ sequenceDiagram
     Note over Client: 验证 ServerTimestamp 时钟漂移<br/>计算 HMAC-SHA256(KeyID, Secret, ExporterContext, ChallengeNonce)
     Client->>Server: AUTH_RESPONSE (KeyID, ClientNonce, HMAC-Tag)
     Note over Server: 检查 AuthRateLimiter 防爆破限制<br/>验证 HMAC 与 ReplayCache (防重放攻击)
-    Server-->>Client: SETTINGS (FrameLimits, Streams, UDP Fallback, BufferSize)
+    Server-->>Client: SETTINGS (FrameLimits, Streams, UDP Fallback, IdleTimeout)
+    Client->>Server: SETTINGS (ProtocolRevision=2, 自身接收上限)
+    Note over Server: 校验客户端 SETTINGS（重复/迟到/超限即断开）
 
     Note over Client,Server: 3. 会话建立完成，进入多路复用中继状态
 ```

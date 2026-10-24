@@ -105,6 +105,13 @@ where
     info!(event = "socks5.listen", listen = %listen);
 
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+    let maintainer = {
+        let sessions = Arc::clone(&sessions);
+        let shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            sessions.maintain_health_session(shutdown_rx).await;
+        })
+    };
     metrics.set_ready(true);
     let mut connections = JoinSet::new();
     let mut accept_backoff = ListenerAcceptBackoff::default();
@@ -160,6 +167,11 @@ where
 
     drain_socks_tasks(&mut connections, shutdown_timeout).await;
     sessions.shutdown().await;
+    // The maintainer may be inside a handshake when shutdown starts. The pool
+    // is already closed, so aborting it here only avoids waiting for the
+    // connect timeout; it owns no state that outlives this listener.
+    maintainer.abort();
+    let _ = maintainer.await;
     stop_observability(observability_shutdown_tx, observability_task).await;
 
     Ok(())

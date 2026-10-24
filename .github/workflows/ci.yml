@@ -108,3 +108,28 @@ jobs:
             --set client.config.max_socks_connections=500 \
             --set networkPolicy.enabled=true > /dev/null
 
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup default 1.85.0
+
+      - name: Rendered Config Passes Binary Config-Check
+        run: |
+          cargo build --locked --bin uk-server --bin uk-client
+          ./scripts/helm-config-check.sh target/debug
+
+  docker-smoke:
+    name: Docker Image Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Build Images
+        run: |
+          docker build --target server -t uncrowned-king-server:ci .
+          docker build --target client -t uncrowned-king-client:ci .
+
+      - name: Smoke Test (config-check + SOCKS request over Docker network)
+        run: ./scripts/docker-smoke.sh
+

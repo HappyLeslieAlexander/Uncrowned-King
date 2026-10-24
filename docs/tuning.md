@@ -35,6 +35,17 @@ max_buffered_bytes_per_session = 16777216 # 16MB
 max_buffered_bytes_per_flow = 8388608      # 8MB
 ```
 
+### 1.1.1 UDP 报文尺寸（默认 16 KiB）
+
+UDP 数据报的有效载荷上限是 `data_frame_size = min(max_frame_size, relay_buffer_size)`，
+默认 `relay_buffer_size = 16384`（16 KiB）：超过该尺寸的 UDP 数据报会被**丢弃并记录
+`client.udp.datagram.too_large`**（计数的还有
+`uncrowned_king_client_udp_association_queue_full_total`，即目标队列溢出丢包），不会静默截断。
+DNS 等典型小报文不受影响；需要承载大 UDP 载荷（如 WireGuard/QUIC 隧道内再封装）的部署需
+在**服务端与客户端同时**调大 `relay_buffer_size`（两端 `data_frame_size` 取小者生效），并
+相应调高 `max_buffered_bytes_per_flow` / `max_buffered_bytes_per_session`，因为每个在途
+报文都会占用流/会话缓冲预算。`max_frame_size` 只放宽帧的上限，不足以单独提升 UDP 尺寸。
+
 ### 1.2 高并发网关场景（微服务集群 / 爬虫 / IoT 设备接入）
 适用于海量并发短连接、活跃流数量极多的场景：
 

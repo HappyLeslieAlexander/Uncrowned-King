@@ -61,7 +61,7 @@ This document establishes the non-negotiable architectural invariants, security 
 ## 4. Operational Readiness & Deployment Standards
 
 - **Strict File Permissions (`mode & 0o077 == 0`)**:
-  - Server strictly enforces that configuration files and certificates have no group or other permissions (e.g. `0600` or `0400`).
+  - Server strictly enforces that configuration files and private keys have no group or other permissions (e.g. `0600` or `0400`). Certificates are public handshake material and are intentionally exempt from this check.
   - **Kubernetes / Helm Manifests**: ConfigMaps are mounted with `0644` by default; deployment templates must use an `initContainer` to copy and `chmod 0600` configuration files into a shared emptyDir volume before the main container starts.
   - **Zero Plaintext & Fail-Closed Secrets**: Authentication keys and private keys must never be placed in plain `ConfigMap` templates. Always use Kubernetes `Secret` resources, and fail closed in Helm templates if secret values are missing, empty, or placeholders. Credential generation templates must strictly enforce non-empty `key_id` (or `id`) alongside secrets to prevent silent generation of invalid empty identifiers that crash services at startup. CI assertion tests validating template rejection must verify both server and client fail-closed paths and maintain synchronized error pattern substrings.
   - **Downward API IP Binding**: In containerized deployments, unauthenticated metrics and health endpoints must bind to `status.podIP` via Downward API, never wildcards.

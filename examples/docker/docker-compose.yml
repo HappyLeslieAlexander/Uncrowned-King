@@ -1,0 +1,37 @@
+# Local Docker Compose demo. Generate the certificate/key in this directory
+# first (see README.md), then:
+#
+#   docker compose -f examples/docker/docker-compose.yml up --build
+#
+# The host UID/GID is used so the 0600 config/key files remain readable by the
+# non-root process inside the container on Linux.
+services:
+  server:
+    build:
+      context: ../..
+      target: server
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - ./:/etc/uncrowned-king:ro
+    ports:
+      - "9443:9443/tcp"
+      - "9443:9443/udp"
+    restart: unless-stopped
+
+  client:
+    build:
+      context: ../..
+      target: client
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - ./:/etc/uncrowned-king:ro
+    # The image binds 127.0.0.1 by default; this compose network is trusted,
+    # so bind the container-wide address explicitly to make the published
+    # host port work. The publish itself stays on host loopback.
+    command:
+      ["--config", "/etc/uncrowned-king/client.toml", "socks5", "--listen", "0.0.0.0:1080", "--allow-non-loopback"]
+    ports:
+      - "127.0.0.1:1080:1080"
+    depends_on:
+      - server
+    restart: unless-stopped

@@ -10,5 +10,7 @@ pub(crate) mod udp;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use context::{RelayLimitConfig, RelayLimits, ServerCarrier};
+pub(crate) use context::{
+    GlobalBufferControl, GlobalFlowBudget, RelayLimitConfig, RelayLimits, ServerCarrier,
+};
 pub(crate) use session::relay_session;

@@ -3,7 +3,7 @@ use std::{
     io,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -176,6 +176,15 @@ pub(super) struct ServerMetrics {
     opened_flows_total: [AtomicU64; PROTOCOL_COUNT],
     active_flows: [AtomicU64; PROTOCOL_COUNT],
     relay_bytes_total: [[AtomicU64; DIRECTION_COUNT]; PROTOCOL_COUNT],
+    /// Live counter shared with the server-wide buffer budget
+    /// (`relay::GlobalBufferControl`), so the gauge observes reservations as
+    /// they happen rather than sampling a copy.
+    global_buffered_bytes: Arc<AtomicUsize>,
+    global_buffered_bytes_limit: AtomicUsize,
+    /// Live counter shared with the server-wide flow budget
+    /// (`relay::GlobalFlowBudget`).
+    global_active_flows: Arc<AtomicUsize>,
+    global_active_flows_limit: AtomicUsize,
 }
 
 impl ServerMetrics {
@@ -190,6 +199,23 @@ impl ServerMetrics {
     pub(super) fn set_security_generation(&self, generation: u64) {
         self.security_generation
             .store(generation, Ordering::Release);
+    }
+
+    /// Returns the live counters backing the server-wide buffer and flow
+    /// budgets. Hand the same arcs to `relay::GlobalBufferControl` /
+    /// `relay::GlobalFlowBudget` so the gauges track real reservations.
+    pub(super) fn global_budget_counters(&self) -> (Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        (
+            Arc::clone(&self.global_buffered_bytes),
+            Arc::clone(&self.global_active_flows),
+        )
+    }
+
+    pub(super) fn set_global_budget_limits(&self, buffered_bytes: usize, flows: usize) {
+        self.global_buffered_bytes_limit
+            .store(buffered_bytes, Ordering::Release);
+        self.global_active_flows_limit
+            .store(flows, Ordering::Release);
     }
 
     pub(super) fn record_config_reload_success(&self, generation: u64) {
@@ -299,7 +325,7 @@ impl ServerMetrics {
                 "# HELP uncrowned_king_server_config_reload_failures_total Security config reloads rejected.\n",
                 "# TYPE uncrowned_king_server_config_reload_failures_total counter\n",
                 "uncrowned_king_server_config_reload_failures_total {config_reload_failures_total}\n",
-                "# HELP uncrowned_king_server_accepted_connections_total Accepted TCP carrier connections.\n",
+                "# HELP uncrowned_king_server_accepted_connections_total Accepted TCP and QUIC carrier connections.\n",
                 "# TYPE uncrowned_king_server_accepted_connections_total counter\n",
                 "uncrowned_king_server_accepted_connections_total {accepted_connections_total}\n",
                 "# HELP uncrowned_king_server_rate_limited_connections_total Carrier connections rejected by authentication rate limiting.\n",
@@ -326,6 +352,18 @@ impl ServerMetrics {
                 "# HELP uncrowned_king_server_active_sessions Authenticated relay sessions currently active.\n",
                 "# TYPE uncrowned_king_server_active_sessions gauge\n",
                 "uncrowned_king_server_active_sessions {active_sessions}\n",
+                "# HELP uncrowned_king_server_global_buffered_bytes Client-to-target bytes currently buffered across all sessions.\n",
+                "# TYPE uncrowned_king_server_global_buffered_bytes gauge\n",
+                "uncrowned_king_server_global_buffered_bytes {global_buffered_bytes}\n",
+                "# HELP uncrowned_king_server_global_buffered_bytes_limit Configured server-wide buffered-byte budget (max_total_buffered_bytes).\n",
+                "# TYPE uncrowned_king_server_global_buffered_bytes_limit gauge\n",
+                "uncrowned_king_server_global_buffered_bytes_limit {global_buffered_bytes_limit}\n",
+                "# HELP uncrowned_king_server_global_active_flows UK flows currently reserved across all sessions.\n",
+                "# TYPE uncrowned_king_server_global_active_flows gauge\n",
+                "uncrowned_king_server_global_active_flows {global_active_flows}\n",
+                "# HELP uncrowned_king_server_global_active_flows_limit Configured server-wide concurrent flow budget (max_total_streams).\n",
+                "# TYPE uncrowned_king_server_global_active_flows_limit gauge\n",
+                "uncrowned_king_server_global_active_flows_limit {global_active_flows_limit}\n",
             ),
             ready = ready,
             security_generation = self.security_generation.load(Ordering::Acquire),
@@ -346,6 +384,10 @@ impl ServerMetrics {
                 self.authenticated_sessions_total.load(Ordering::Relaxed),
             rejected_sessions_total = self.rejected_sessions_total.load(Ordering::Relaxed),
             active_sessions = self.active_sessions.load(Ordering::Relaxed),
+            global_buffered_bytes = self.global_buffered_bytes.load(Ordering::Acquire),
+            global_buffered_bytes_limit = self.global_buffered_bytes_limit.load(Ordering::Acquire),
+            global_active_flows = self.global_active_flows.load(Ordering::Acquire),
+            global_active_flows_limit = self.global_active_flows_limit.load(Ordering::Acquire),
         );
         self.render_handshake_failure_metrics(&mut output);
         self.render_flow_metrics(&mut output);
@@ -616,6 +658,10 @@ mod tests {
         metrics.record_flow_open_failure(RelayProtocol::Tcp, FlowOpenFailure::TargetUnavailable);
         metrics.record_relay_bytes(RelayProtocol::Tcp, RelayDirection::ClientToTarget, 123);
         let flow = metrics.begin_flow(RelayProtocol::Tcp);
+        let (global_buffered, global_flows) = metrics.global_budget_counters();
+        metrics.set_global_budget_limits(1024, 16);
+        global_buffered.store(300, Ordering::Release);
+        global_flows.store(4, Ordering::Release);
 
         let response = request(
             Arc::clone(&metrics),
@@ -636,6 +682,10 @@ mod tests {
                 .contains("uncrowned_king_server_handshake_failures_total{reason=\"auth\"} 1\n")
         );
         assert!(response.contains("uncrowned_king_server_active_sessions 1\n"));
+        assert!(response.contains("uncrowned_king_server_global_buffered_bytes 300\n"));
+        assert!(response.contains("uncrowned_king_server_global_buffered_bytes_limit 1024\n"));
+        assert!(response.contains("uncrowned_king_server_global_active_flows 4\n"));
+        assert!(response.contains("uncrowned_king_server_global_active_flows_limit 16\n"));
         assert!(
             response
                 .contains("uncrowned_king_server_flow_open_requests_total{protocol=\"tcp\"} 1\n")

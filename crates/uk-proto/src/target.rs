@@ -202,6 +202,31 @@ fn validate_domain(domain: &str) -> ProtocolResult<()> {
     Ok(())
 }
 
+/// Validates a bare DNS hostname exactly as `Target::Domain` requires.
+///
+/// This is the shared authority for anything that must remain matchable
+/// against a domain target: policy domain predicates call it so that a
+/// pattern which can never match any legal `Target::Domain` is rejected at
+/// configuration time instead of silently becoming a no-op rule (a denied
+/// nothing is worse than a denied something).
+pub fn validate_domain_name(name: &str) -> ProtocolResult<()> {
+    validate_domain(name)
+}
+
+/// Validates a domain *pattern*: a bare hostname, optionally preceded by a
+/// single `.` (suffix semantics) and/or followed by a single `.` (FQDN
+/// normalization).
+///
+/// The remainder must satisfy [`validate_domain_name`]; in particular IP
+/// literals — with or without the leading dot — are rejected, because an
+/// address target decodes to `Target::Ipv4`/`Target::Ipv6` and can therefore
+/// never match a domain predicate.
+pub fn validate_domain_pattern(pattern: &str) -> ProtocolResult<()> {
+    let stripped = pattern.strip_prefix('.').unwrap_or(pattern);
+    let stripped = stripped.strip_suffix('.').unwrap_or(stripped);
+    validate_domain(stripped)
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -467,5 +492,65 @@ mod tests {
             let target = Target::Domain(domain.to_owned(), 443);
             assert!(target.encode(&mut out).is_ok());
         }
+    }
+
+    #[test]
+    fn validate_domain_name_matches_target_domain_rules() {
+        for name in ["example.com", "host-1.example.org", "a-b.c-d.e"] {
+            assert!(validate_domain_name(name).is_ok(), "rejected {name}");
+        }
+        for name in [
+            "",
+            ".example.com",
+            "example.com.",
+            "a..b",
+            "foo_bar.com",
+            "-a.example.com",
+            "a-.example.com",
+            "10.0.0.1",
+        ] {
+            assert!(
+                validate_domain_name(name).is_err(),
+                "accepted {name}, which no Target::Domain can equal"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_domain_pattern_allows_suffix_and_fqdn_dots() {
+        for pattern in [
+            "example.com",
+            ".example.com",
+            "example.com.",
+            ".example.com.",
+            ".internal-1.corp",
+        ] {
+            assert!(
+                validate_domain_pattern(pattern).is_ok(),
+                "rejected matchable pattern {pattern}"
+            );
+        }
+        for pattern in [
+            "",
+            ".",
+            "..",
+            ".a..b",
+            "foo_bar.example.com",
+            ".10.0.0.1",
+            "10.0.0.1",
+            ".-bad.example.com",
+        ] {
+            assert!(
+                validate_domain_pattern(pattern).is_err(),
+                "accepted {pattern}, which no Target::Domain can ever match"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_domain_pattern_rejects_oversized_labels() {
+        let long_label = "a".repeat(64);
+        assert!(validate_domain_pattern(&long_label).is_err());
+        assert!(validate_domain_name(&long_label).is_err());
     }
 }

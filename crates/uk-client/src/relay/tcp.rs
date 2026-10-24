@@ -7,7 +7,7 @@ use tokio::{
     sync::{mpsc, watch},
     time,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 use uk_proto::{FrameType, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TcpClose};
 
 use super::carrier::validate_flow_status;
@@ -126,6 +126,19 @@ pub(crate) async fn relay_tcp(
         tokio::select! {
             changed = shutdown_rx.changed() => {
                 let _ = changed;
+                // SIGTERM must not throw away the upload side on the floor:
+                // the local application may have bytes buffered (or still be
+                // producing) that the target has not received yet. Relay them
+                // until the app half-closes or the shutdown budget passes,
+                // then tell the server the upload is finished.
+                if local_to_remote_open {
+                    drain_upload_before_shutdown(&mut local, &mut flow, local_buf.as_mut()).await?;
+                    let _ = flow
+                        .session
+                        .send_tcp_close(flow.id, TCP_CLOSE_NORMAL)
+                        .await;
+                    local_to_remote_open = false;
+                }
                 // Hand over what the server already delivered before the FIN:
                 // dropping it would turn up to `max_buffered_bytes_per_flow` of
                 // received data into a clean EOF for the local application.
@@ -136,7 +149,6 @@ pub(crate) async fn relay_tcp(
                 )
                 .await?;
                 local.shutdown().await?;
-                local_to_remote_open = false;
                 remote_to_local_open = false;
             }
             read = local.read(local_buf.as_mut()), if local_to_remote_open => {
@@ -266,6 +278,45 @@ where
         return Ok(false);
     }
     Ok(true)
+}
+
+pub(crate) async fn drain_upload_before_shutdown(
+    local: &mut TcpStream,
+    flow: &mut ClientFlow,
+    local_buf: &mut [u8],
+) -> Result<(), AnyError> {
+    let deadline = flow
+        .session
+        .task_shutdown_timeout
+        .and_then(|timeout| time::Instant::now().checked_add(timeout));
+    let data_frame_size = flow.session.data_frame_size.max(1);
+    loop {
+        let read = match deadline {
+            Some(deadline) => tokio::select! {
+                read = local.read(local_buf) => read?,
+                () = time::sleep_until(deadline) => {
+                    // The budget expired with the upload still open: whatever
+                    // the local app buffers next is lost, so make that
+                    // observable instead of a silent truncation.
+                    flow.session.metrics.record_shutdown_upload_truncated();
+                    warn!(event = "socks5.shutdown.upload_truncated", flow_id = flow.id);
+                    return Ok(());
+                }
+            },
+            // No shutdown timeout configured: mirror `drain_socks_tasks` and
+            // wait for the local application's EOF without a deadline.
+            None => local.read(local_buf).await?,
+        };
+        if read == 0 {
+            debug!(event = "socks5.shutdown.upload_drained", flow_id = flow.id);
+            return Ok(());
+        }
+        for chunk in local_buf[..read].chunks(data_frame_size) {
+            flow.session
+                .send_tcp_data(flow.id, Bytes::copy_from_slice(chunk))
+                .await?;
+        }
+    }
 }
 
 /// Drains the frames a flow has *already* received into the local socket, so a

@@ -11,8 +11,8 @@ use uk_proto::{
 };
 
 use super::context::{
-    AnyError, CarrierWriter, FlowSlot, FlowTable, FlowToken, OpenFailure, OpenFlowCancel,
-    OpenSlotRejection, RelaySessionContext, TargetFlowControl, UdpDataDisposition,
+    AnyError, CarrierWriter, FlowPermit, FlowSlot, FlowTable, FlowToken, OpenFailure,
+    OpenFlowCancel, OpenSlotRejection, RelaySessionContext, TargetFlowControl, UdpDataDisposition,
     UdpOpenSlotRejection, UdpTargetFlow, remove_flow_slot, udp_target_flow_mut,
 };
 use super::session::{
@@ -88,7 +88,15 @@ pub(crate) async fn handle_udp_open_frame(
             flow_id,
             security_generation = policy.generation
         );
-        let cancel = OpenFlowCancel::new(context.flow_tokens.next());
+        let Some(flow_permit) = context.global_flows.try_acquire() else {
+            context
+                .metrics
+                .record_flow_open_failure(RelayProtocol::Udp, FlowOpenFailure::ResourceLimit);
+            send_resource_limit(context.carrier_writer, flow_id).await?;
+            send_udp_close(context.carrier_writer, flow_id, UDP_CLOSE_ERROR).await?;
+            return Ok(());
+        };
+        let cancel = OpenFlowCancel::with_permit(context.flow_tokens.next(), Some(flow_permit));
         target_writers.insert(flow_id, FlowSlot::OpeningUdp(cancel.clone()));
         spawn_udp_open(
             session_tasks,
@@ -367,18 +375,22 @@ pub(crate) async fn handle_udp_open_completed(
     target_writers: &mut FlowTable,
     session_tasks: &mut SessionTasks,
 ) -> Result<(), AnyError> {
-    if !matches!(
-        target_writers.get(&flow_id),
-        Some(FlowSlot::OpeningUdp(cancel)) if cancel.token == token
-    ) {
-        return Ok(());
-    }
+    let flow_permit = match target_writers.get(&flow_id) {
+        Some(FlowSlot::OpeningUdp(cancel)) if cancel.token == token => cancel.permit.clone(),
+        _ => return Ok(()),
+    };
 
     match result {
         Ok(target_socket) => {
-            let target_flow =
-                accept_open_udp_target(flow_id, target, target_socket, context, session_tasks)
-                    .await?;
+            let target_flow = accept_open_udp_target(
+                flow_id,
+                target,
+                target_socket,
+                context,
+                session_tasks,
+                flow_permit,
+            )
+            .await?;
             target_writers.insert(flow_id, FlowSlot::Udp(target_flow));
         }
         Err(err) => {
@@ -400,13 +412,18 @@ pub(crate) async fn accept_open_udp_target(
     target_socket: UdpSocket,
     context: &RelaySessionContext<'_>,
     session_tasks: &mut SessionTasks,
+    flow_permit: Option<Arc<FlowPermit>>,
 ) -> Result<UdpTargetFlow, AnyError> {
     let target_socket = Arc::new(target_socket);
-    let flow_control = TargetFlowControl::new(context.session_buffer.clone());
+    let flow_control = TargetFlowControl::with_global_buffer(
+        context.session_buffer.clone(),
+        context.global_buffer.clone(),
+    );
     let token = context.flow_tokens.next();
     send_udp_data(context.carrier_writer, flow_id, Bytes::new(), &flow_control).await?;
     let target_flow = UdpTargetFlow::new(token, Arc::clone(&target_socket), flow_control.clone())
-        .track_metrics(context.metrics.begin_flow(RelayProtocol::Udp));
+        .track_metrics(context.metrics.begin_flow(RelayProtocol::Udp))
+        .with_flow_permit(flow_permit);
     spawn_udp_reader(
         session_tasks,
         UdpReaderTask {

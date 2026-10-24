@@ -5,7 +5,10 @@ use std::{
     error::Error,
     fmt,
     pin::Pin,
-    sync::{Arc, LazyLock, Mutex as StdMutex},
+    sync::{
+        Arc, LazyLock, Mutex as StdMutex,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -22,7 +25,8 @@ use tracing::{info, warn};
 use uk_auth::{AuthChallenge, AuthResponse, unix_now};
 use uk_proto::{
     BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, ErrorCode, ErrorPayload, Frame,
-    FrameLimits, FrameType, Settings, read_frame, validate_connection_frame, write_frame,
+    FrameLimits, FrameType, MAX_FRAME_PAYLOAD_SIZE, MAX_NEGOTIATED_FLOWS, PROTOCOL_REVISION_V1_0,
+    SettingKey, Settings, read_frame, validate_connection_frame, write_frame,
 };
 
 use crate::{
@@ -277,22 +281,37 @@ where
     .await
 }
 
-static DEGRADED_ENDPOINTS: LazyLock<StdMutex<HashMap<String, Instant>>> =
+/// `(cooldown deadline, config epoch that recorded the penalty)`.
+type DegradedEndpointEntry = (Instant, u64);
+
+static DEGRADED_ENDPOINTS: LazyLock<StdMutex<HashMap<String, DegradedEndpointEntry>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
+static DEGRADED_EPOCH: AtomicU64 = AtomicU64::new(0);
 const DEGRADED_COOLDOWN: Duration = Duration::from_secs(180);
 
-fn is_endpoint_degraded(endpoint: &str) -> bool {
+fn degraded_epoch() -> u64 {
+    DEGRADED_EPOCH.load(Ordering::Acquire)
+}
+
+fn is_endpoint_degraded(endpoint: &str, epoch: u64) -> bool {
     let Ok(mut map) = DEGRADED_ENDPOINTS.lock() else {
         return false;
     };
     let now = Instant::now();
-    map.retain(|_, until| *until > now);
-    map.contains_key(endpoint)
+    map.retain(|_, (until, _)| *until > now);
+    // Penalties belong to the config generation that observed the failure:
+    // after a reload, an old-generation connect still in flight must not
+    // impose its 180s cooldown on the new configuration's endpoints.
+    map.get(endpoint)
+        .is_some_and(|(_, marked_epoch)| *marked_epoch == epoch)
 }
 
-fn mark_endpoint_degraded(endpoint: &str) {
+fn mark_endpoint_degraded(endpoint: &str, epoch: u64) {
     if let Ok(mut map) = DEGRADED_ENDPOINTS.lock() {
-        map.insert(endpoint.to_owned(), Instant::now() + DEGRADED_COOLDOWN);
+        map.insert(
+            endpoint.to_owned(),
+            (Instant::now() + DEGRADED_COOLDOWN, epoch),
+        );
     }
 }
 
@@ -302,15 +321,17 @@ fn clear_endpoint_degraded(endpoint: &str) {
     }
 }
 
-/// Clears all degraded-endpoint cooldowns.
+/// Clears all degraded-endpoint cooldowns and starts a new degradation epoch.
 ///
 /// Called when a config reload is applied: the operator just changed the
 /// network posture (possibly fixing whatever degraded the endpoint), so
 /// penalties recorded under the old config must not linger for up to
-/// `DEGRADED_COOLDOWN` on reused endpoints.
+/// `DEGRADED_COOLDOWN` on reused endpoints — including penalties that an
+/// old-generation connect writes *after* this clear.
 pub(crate) fn clear_degraded_endpoints() {
     if let Ok(mut map) = DEGRADED_ENDPOINTS.lock() {
         map.clear();
+        DEGRADED_EPOCH.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -341,12 +362,13 @@ where
     let server_name = tls::server_name(config.server_name.clone())?;
     let mut attempts = Vec::new();
     let mut credential_rejection = false;
+    let epoch = degraded_epoch();
 
     let raw_endpoints = config.server_endpoints();
     let mut healthy = Vec::new();
     let mut degraded = Vec::new();
     for ep in raw_endpoints {
-        if is_endpoint_degraded(ep) {
+        if is_endpoint_degraded(ep, epoch) {
             degraded.push(ep);
         } else {
             healthy.push(ep);
@@ -390,7 +412,7 @@ where
                 if (failure_phase == EndpointFailurePhase::Timeout || is_quic_transport_failure)
                     && !credential_rejection
                 {
-                    mark_endpoint_degraded(endpoint);
+                    mark_endpoint_degraded(endpoint, epoch);
                 }
                 observe(EndpointAttemptOutcome::Failed(failure_phase));
                 warn!(
@@ -581,11 +603,54 @@ async fn authenticate_over_carrier(
             err,
         )
     })?;
+    // The 1.0 contract says peers exchange SETTINGS. The server has already
+    // advertised its receive limits; announce ours before entering relay so a
+    // conforming peer does not wait for this frame.
+    let client_settings = client_settings(config, datagrams.is_some());
+    let mut client_settings_payload = BytesMut::new();
+    client_settings
+        .encode(&mut client_settings_payload)
+        .map_err(|err| {
+            phase_error(
+                "encode client settings",
+                EndpointFailurePhase::Settings,
+                err,
+            )
+        })?;
+    let client_settings_frame =
+        Frame::new(FrameType::Settings, 0, 0, client_settings_payload.freeze()).map_err(|err| {
+            phase_error(
+                "build client settings frame",
+                EndpointFailurePhase::Settings,
+                err,
+            )
+        })?;
+    write_frame(&mut writer, &client_settings_frame)
+        .await
+        .map_err(|err| phase_error("write client settings", EndpointFailurePhase::Settings, err))?;
+
     info!(
         event = "auth.success",
         max_frame_size = negotiated.max_frame_size
     );
     Ok((ClientCarrier::new(reader, writer, datagrams), settings))
+}
+
+fn client_settings(config: &ClientConfig, supports_udp_datagram: bool) -> Settings {
+    let mut settings = Settings::default();
+    settings.set(SettingKey::ProtocolRevision, PROTOCOL_REVISION_V1_0);
+    settings.set(SettingKey::MaxFrameSize, MAX_FRAME_PAYLOAD_SIZE);
+    let streams = config.max_socks_connections().min(MAX_NEGOTIATED_FLOWS);
+    settings.set(SettingKey::MaxStreams, streams);
+    settings.set(SettingKey::MaxUdpFlows, streams);
+    settings.set(
+        SettingKey::SupportsUdpDatagram,
+        u64::from(supports_udp_datagram),
+    );
+    settings.set(SettingKey::SupportsUdpStreamFallback, 1);
+    // The client does not impose a protocol idle timeout on the server.
+    settings.set(SettingKey::IdleTimeoutSeconds, 0);
+    settings
 }
 
 fn decode_server_settings_frame(frame: Frame) -> Result<Settings, AnyError> {
@@ -1005,15 +1070,40 @@ mod tests {
     #[test]
     fn tracks_and_clears_degraded_endpoints() {
         clear_degraded_endpoints();
+        let epoch = degraded_epoch();
         let ep = "quic://127.0.0.1:9443";
-        assert!(!is_endpoint_degraded(ep));
-        mark_endpoint_degraded(ep);
-        assert!(is_endpoint_degraded(ep));
+        assert!(!is_endpoint_degraded(ep, epoch));
+        mark_endpoint_degraded(ep, epoch);
+        assert!(is_endpoint_degraded(ep, epoch));
         clear_endpoint_degraded(ep);
-        assert!(!is_endpoint_degraded(ep));
-        mark_endpoint_degraded(ep);
+        assert!(!is_endpoint_degraded(ep, epoch));
+        mark_endpoint_degraded(ep, epoch);
         clear_degraded_endpoints();
-        assert!(!is_endpoint_degraded(ep));
+        assert!(!is_endpoint_degraded(ep, epoch));
+    }
+
+    #[test]
+    fn degraded_endpoints_do_not_leak_across_reload_epochs() {
+        clear_degraded_endpoints();
+        let old_epoch = degraded_epoch();
+        let ep = "quic://127.0.0.1:9443";
+
+        // A reload lands while an old-generation connect is still in flight...
+        clear_degraded_endpoints();
+        let new_epoch = degraded_epoch();
+        assert_ne!(old_epoch, new_epoch);
+
+        // ...and the old connect only reports its failure afterwards.
+        mark_endpoint_degraded(ep, old_epoch);
+        assert!(
+            !is_endpoint_degraded(ep, new_epoch),
+            "a late old-generation penalty must not degrade the new config"
+        );
+        // Same-epoch penalties still apply.
+        mark_endpoint_degraded(ep, new_epoch);
+        assert!(is_endpoint_degraded(ep, new_epoch));
+        assert!(!is_endpoint_degraded(ep, new_epoch + 1));
+        clear_degraded_endpoints();
     }
 
     #[tokio::test]
@@ -1048,12 +1138,15 @@ mod tests {
             max_carrier_sessions: None,
             relay_buffer_size: None,
         };
-        assert!(!is_endpoint_degraded(quic_ep));
+        // Capture the epoch the connect will run under: parallel tests bump
+        // it via clear_degraded_endpoints(), which must not mask this mark.
+        let connect_epoch = degraded_epoch();
+        assert!(!is_endpoint_degraded(quic_ep, connect_epoch));
         let res = connect_authenticated(&config).await;
         std::fs::remove_file(&path).ok();
         assert!(res.is_err());
         assert!(
-            is_endpoint_degraded(quic_ep),
+            is_endpoint_degraded(quic_ep, connect_epoch),
             "failed QUIC connection attempt must mark endpoint as degraded"
         );
         clear_degraded_endpoints();

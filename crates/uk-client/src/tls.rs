@@ -4,13 +4,14 @@ use std::{
     collections::HashMap,
     fs,
     sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError},
+    time::Duration,
 };
 
 use rustls::{
     ClientConfig, RootCertStore,
     pki_types::{CertificateDer, ServerName, pem::PemObject},
 };
-use tokio::{net::TcpStream, task};
+use tokio::{net::TcpStream, task, time};
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use uk_auth::EXPORTER_LABEL;
 use uk_proto::ALPN_PROTOCOL;
@@ -33,17 +34,39 @@ type TlsError = Box<dyn std::error::Error + Send + Sync>;
 static CLIENT_CONFIGS: LazyLock<Mutex<HashMap<String, Arc<ClientConfig>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Upper bound for reading and parsing a CA bundle off the runtime.
+///
+/// A stalled CA path (automount, NFS) must fail the dial or reload within a
+/// bounded time instead of parking the caller forever. The bound is
+/// deliberately generous: it only needs to catch a wedged filesystem, not
+/// slow-but-progressing reads.
+pub const CA_LOAD_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Returns the shared client config for `ca_cert_path`, reading and parsing
 /// the CA bundle on a blocking thread only when it is not cached yet.
+///
+/// The blocking read is bounded by [`CA_LOAD_TIMEOUT`]. On timeout the caller
+/// keeps the previously cached config (nothing is published); if the orphaned
+/// read later completes, it publishes a config freshly read from disk — the
+/// same value any subsequent load would produce — so no torn state can leak.
 pub async fn shared_client_config(ca_cert_path: &str) -> Result<Arc<ClientConfig>, TlsError> {
     if let Some(config) = cached_client_config(ca_cert_path) {
         return Ok(config);
     }
 
     let path = ca_cert_path.to_owned();
-    match task::spawn_blocking(move || refresh_client_config(&path)).await {
-        Ok(result) => result,
-        Err(err) => Err(format!("failed to load CA certificate {ca_cert_path}: {err}").into()),
+    match time::timeout(
+        CA_LOAD_TIMEOUT,
+        task::spawn_blocking(move || refresh_client_config(&path)),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(err)) => Err(format!("failed to load CA certificate {ca_cert_path}: {err}").into()),
+        Err(_) => Err(format!(
+            "timed out after {CA_LOAD_TIMEOUT:?} loading CA certificate {ca_cert_path}"
+        )
+        .into()),
     }
 }
 

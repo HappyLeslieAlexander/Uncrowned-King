@@ -48,7 +48,7 @@ pub use settings::{
     NegotiatedSettings, PROTOCOL_REVISION_V1_0, SettingKey, Settings,
 };
 pub use status::{ErrorCode, ErrorPayload};
-pub use target::Target;
+pub use target::{Target, validate_domain_name, validate_domain_pattern};
 pub use tcp::{
     MIN_TCP_RELAY_FRAME_SIZE, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, TcpClose,
     TcpOpen,

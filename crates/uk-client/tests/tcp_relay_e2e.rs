@@ -555,6 +555,20 @@ async fn client_exposes_health_readiness_and_relay_metrics() -> Result<(), TestE
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_health_session_keeps_readiness_without_traffic() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(20), run_client_health_readiness_e2e()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_shutdown_drains_in_flight_upload() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        run_client_shutdown_upload_drain_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_atomically_reloads_access_control() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -763,8 +777,8 @@ async fn reconnects_after_server_idle_timeout() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn expires_idle_session_without_open_flows_despite_ping() -> Result<(), TestError> {
-    tokio::time::timeout(Duration::from_secs(10), run_no_flow_ping_idle_expiry_e2e()).await?
+async fn keeps_flowless_session_alive_with_ping() -> Result<(), TestError> {
+    tokio::time::timeout(Duration::from_secs(10), run_no_flow_ping_keepalive_e2e()).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1508,29 +1522,39 @@ async fn run_idle_reconnect_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
-async fn run_no_flow_ping_idle_expiry_e2e() -> Result<(), TestError> {
+async fn run_no_flow_ping_keepalive_e2e() -> Result<(), TestError> {
     init_tracing();
 
     let harness = ServerHarness::start(test_limits_with_idle_timeout(1)).await?;
     let (mut carrier, _settings) =
         connect_authenticated_carrier(harness.client_config(SECRET)).await?;
 
+    // Connection-scoped PINGs count as activity even with no relay flow open:
+    // this is the contract the client's designated health session relies on
+    // to keep a Service's only carrier alive while idle.
     write_ping_expect_pong(&mut carrier, Bytes::from_static(b"no-flow-ping-1")).await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
     write_ping_expect_pong(&mut carrier, Bytes::from_static(b"no-flow-ping-2")).await?;
     tokio::time::sleep(Duration::from_millis(650)).await;
 
+    // Past the 1s idle timeout the session must still be alive and answering.
     match tokio::time::timeout(
         Duration::from_millis(200),
         read_frame(&mut carrier, FrameLimits::default()),
     )
     .await
     {
-        Ok(Err(FrameIoError::Closed)) => Ok(()),
-        Ok(Err(err)) => Err(err.into()),
-        Ok(Ok(frame)) => Err(format!("unexpected frame after idle expiry: {frame:?}").into()),
-        Err(_) => Err("no-flow ping extended the idle session".into()),
+        Err(_) => {}
+        Ok(Err(FrameIoError::Closed)) => {
+            return Err("pinging health session was closed by the idle timeout".into());
+        }
+        Ok(Err(err)) => return Err(err.into()),
+        Ok(Ok(frame)) => {
+            return Err(format!("unexpected frame while idle: {frame:?}").into());
+        }
     }
+    write_ping_expect_pong(&mut carrier, Bytes::from_static(b"no-flow-ping-3")).await?;
+    Ok(())
 }
 
 async fn run_idle_flow_keepalive_e2e() -> Result<(), TestError> {
@@ -3340,7 +3364,7 @@ async fn run_unexpected_session_frame_error_e2e() -> Result<(), TestError> {
     let (mut carrier, _settings) =
         connect_authenticated_carrier(harness.client_config(SECRET)).await?;
 
-    let frame = Frame::new(FrameType::Settings, 0, 0, Bytes::new())?;
+    let frame = Frame::new(FrameType::AuthChallenge, 0, 0, Bytes::new())?;
     write_frame(&mut carrier, &frame).await?;
 
     let response = tokio::time::timeout(
@@ -4410,6 +4434,7 @@ async fn run_quic_multiple_udp_associations_e2e() -> Result<(), TestError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_client_observability_e2e() -> Result<(), TestError> {
     init_tracing();
 
@@ -4451,10 +4476,17 @@ async fn run_client_observability_e2e() -> Result<(), TestError> {
     } = start_reloadable_socks5_listener(initial_config.clone()).await?;
     wait_for_listener("uk-client observability", observability_addr, &mut task).await?;
 
+    // A health session is established without waiting for SOCKS traffic, so a
+    // fresh pod becomes Ready before the first application request.
+    wait_for_client_metric(
+        observability_addr,
+        "uncrowned_king_client_active_sessions 1\n",
+    )
+    .await?;
     let health = http_get(observability_addr, "/healthz").await?;
     let ready = http_get(observability_addr, "/readyz").await?;
     assert!(health.starts_with("HTTP/1.1 200 OK\r\n"));
-    assert!(ready.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+    assert!(ready.starts_with("HTTP/1.1 200 OK\r\n"));
 
     let (udp_target_addr, udp_target_task) = spawn_udp_echo_target().await?;
     let (udp_control, udp_relay_addr) = open_socks_udp_associate(socks_addr).await?;
@@ -4516,6 +4548,177 @@ async fn run_client_observability_e2e() -> Result<(), TestError> {
         .send(())
         .map_err(|()| "server shutdown receiver dropped")?;
     tokio::time::timeout(Duration::from_secs(3), server_task).await???;
+    let _ = fs::remove_dir_all(temp_dir);
+    Ok(())
+}
+
+async fn run_client_health_readiness_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    let policy_path = temp_dir.join("policy.toml");
+    fs::write(&cert_path, CERT_PEM)?;
+    write_private_key(&key_path)?;
+    write_policy_file(&policy_path, allow_loopback_any_port_policy())?;
+
+    let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
+    let (server_addr, server_task) = start_uk_server_until_shutdown(
+        test_server_config(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            &cert_path,
+            &key_path,
+            test_limits_with_idle_timeout(2),
+            Some(&policy_path),
+            30,
+        ),
+        async {
+            let _ = server_shutdown_rx.await;
+        },
+    )
+    .await?;
+
+    let observability_addr = unused_loopback_addr().await?;
+    let mut config = test_client_config(server_addr, &cert_path, SECRET);
+    config.observability_listen = Some(observability_addr.to_string());
+    let (client_shutdown_tx, client_shutdown_rx) = oneshot::channel();
+    let (_socks_addr, mut client_task) = start_socks5_listener_until_shutdown(config, async {
+        let _ = client_shutdown_rx.await;
+    })
+    .await?;
+    wait_for_listener("uk-client health", observability_addr, &mut client_task).await?;
+
+    // No SOCKS request is made: the background maintainer must establish the
+    // session, and readiness must therefore be 200 on a fresh pod.
+    wait_for_client_metric(
+        observability_addr,
+        "uncrowned_king_client_active_sessions 1\n",
+    )
+    .await?;
+    let ready = http_get(observability_addr, "/readyz").await?;
+    assert!(ready.starts_with("HTTP/1.1 200 OK\r\n"));
+
+    // Server idle timeout is 2s. The designated health session sends PINGs
+    // even without application flows, so across a window longer than the
+    // idle timeout readiness must stay green and the session must never be
+    // reclaimed. Poll the invariant instead of sleeping past it blindly.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    while tokio::time::Instant::now() < deadline {
+        let ready = http_get(observability_addr, "/readyz").await?;
+        assert!(
+            ready.starts_with("HTTP/1.1 200 OK\r\n"),
+            "readiness flapped while idle: {ready}"
+        );
+        wait_for_client_metric(
+            observability_addr,
+            "uncrowned_king_client_active_sessions 1\n",
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    client_shutdown_tx
+        .send(())
+        .map_err(|()| "client shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(3), client_task).await???;
+    server_shutdown_tx
+        .send(())
+        .map_err(|()| "server shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(3), server_task).await???;
+    let _ = fs::remove_dir_all(temp_dir);
+    Ok(())
+}
+
+async fn run_client_shutdown_upload_drain_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let temp_dir = create_temp_dir()?;
+    let cert_path = temp_dir.join("server-cert.pem");
+    let key_path = temp_dir.join("server-key.pem");
+    let policy_path = temp_dir.join("policy.toml");
+    fs::write(&cert_path, CERT_PEM)?;
+    write_private_key(&key_path)?;
+    write_policy_file(&policy_path, allow_loopback_any_port_policy())?;
+
+    // A deliberately slow target that counts every byte until EOF.
+    let target_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let target_addr = target_listener.local_addr()?;
+    let received = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let received_counter = Arc::clone(&received);
+    let target_task = tokio::spawn(async move {
+        let (mut stream, _) = target_listener.accept().await.unwrap();
+        let mut buf = [0_u8; 16_384];
+        let mut total = 0_u64;
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    total += n as u64;
+                    received_counter.store(total, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        }
+        received_counter.store(total, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
+    let (server_addr, server_task) = start_uk_server_until_shutdown(
+        test_server_config(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            &cert_path,
+            &key_path,
+            test_limits(),
+            Some(&policy_path),
+            30,
+        ),
+        async {
+            let _ = server_shutdown_rx.await;
+        },
+    )
+    .await?;
+
+    let mut config = test_client_config(server_addr, &cert_path, SECRET);
+    config.shutdown_timeout_seconds = Some(5);
+    let (client_shutdown_tx, client_shutdown_rx) = oneshot::channel();
+    let (socks_addr, client_task) = start_socks5_listener_until_shutdown(config, async {
+        let _ = client_shutdown_rx.await;
+    })
+    .await?;
+
+    let (mut socks, reply) = open_socks_connect(socks_addr, target_addr).await?;
+    assert_eq!(reply[1], 0, "SOCKS CONNECT must succeed");
+
+    // Start uploading, trigger the client shutdown mid-upload, finish the
+    // tail, then half-close: whatever interleaving wins, the drain phase must
+    // deliver every byte before the FIN.
+    let payload: Vec<u8> = (0..256 * 1024u32).map(|i| (i % 251) as u8).collect();
+    socks.write_all(&payload[..65_536]).await?;
+    client_shutdown_tx
+        .send(())
+        .map_err(|()| "client shutdown receiver dropped")?;
+    socks.write_all(&payload[65_536..]).await?;
+    socks.shutdown().await?;
+
+    tokio::time::timeout(Duration::from_secs(15), client_task).await???;
+
+    // The target only sees EOF after the relayed TCP_CLOSE(normal) reaches
+    // the server and it half-closes the target leg.
+    tokio::time::timeout(Duration::from_secs(15), target_task)
+        .await
+        .map_err(|_| "target reader did not finish")?
+        .map_err(|_| "target reader task panicked")?;
+    assert_eq!(
+        received.load(std::sync::atomic::Ordering::SeqCst),
+        payload.len() as u64,
+        "shutdown must not truncate the in-flight upload"
+    );
+
+    server_shutdown_tx
+        .send(())
+        .map_err(|()| "server shutdown receiver dropped")?;
+    tokio::time::timeout(Duration::from_secs(5), server_task).await???;
     let _ = fs::remove_dir_all(temp_dir);
     Ok(())
 }
@@ -5004,8 +5207,11 @@ async fn run_client_reload_during_handshake_e2e() -> Result<(), TestError> {
     client_shutdown_tx
         .send(())
         .map_err(|()| "client shutdown receiver dropped")?;
-    tokio::time::timeout(Duration::from_secs(3), server_task).await???;
-    tokio::time::timeout(Duration::from_secs(3), client_task).await???;
+    // The relayed flow is half-closed at both ends when shutdown starts, so
+    // the server's drain runs until the 3s half-close timer expires; wait
+    // past that budget (same for the client's upload drain below).
+    tokio::time::timeout(Duration::from_secs(10), server_task).await???;
+    tokio::time::timeout(Duration::from_secs(10), client_task).await???;
     let _ = fs::remove_dir_all(temp_dir);
     Ok(())
 }
@@ -6664,8 +6870,22 @@ async fn run_udp_reconnect_server(
 async fn accept_fake_udp_flow(
     stream: &mut ServerTlsStream<TcpStream>,
 ) -> Result<(u64, Target), TestError> {
-    let open = read_frame(stream, FrameLimits::default()).await?;
-    assert_eq!(open.header.frame_type, FrameType::UdpOpen);
+    // A real server answers connection-scoped PINGs at any time; a health
+    // session that keeps itself alive while the association waits to open
+    // its first flow must not break the peer.
+    let open = loop {
+        let frame = read_frame(stream, FrameLimits::default()).await?;
+        match frame.header.frame_type {
+            FrameType::UdpOpen => break frame,
+            FrameType::Ping => {
+                let pong = Frame::new(FrameType::Pong, 0, 0, frame.payload)?;
+                write_frame(stream, &pong).await?;
+            }
+            other => {
+                return Err(format!("unexpected frame waiting for udp open: {other:?}").into());
+            }
+        }
+    };
     let flow_id = open.header.id;
     let mut payload = open.payload;
     let target = UdpOpen::decode(&mut payload)?.target;
@@ -6757,6 +6977,13 @@ async fn accept_fake_server_session_from_listener(
     settings.encode(&mut settings_payload)?;
     let settings_frame = Frame::new(FrameType::Settings, 0, 0, settings_payload.freeze())?;
     write_frame(&mut stream, &settings_frame).await?;
+
+    // A 1.0 client announces its own receive limits before relay traffic.
+    let client_settings_frame = read_frame(&mut stream, FrameLimits::default()).await?;
+    validate_connection_frame(&client_settings_frame, FrameType::Settings)?;
+    let mut client_settings_payload = client_settings_frame.payload;
+    let client_settings = Settings::decode(&mut client_settings_payload)?;
+    client_settings.negotiated_v1_0()?;
     Ok(stream)
 }
 
@@ -8114,6 +8341,8 @@ fn test_limits() -> LimitConfig {
         max_buffered_bytes_per_session: Some(4 * 1024 * 1024),
         idle_timeout_seconds: Some(30),
         max_buffered_bytes_per_flow: Some(1024 * 1024),
+        max_total_streams: None,
+        max_total_buffered_bytes: None,
         handshake_timeout_seconds: Some(3),
         target_connect_timeout_seconds: Some(3),
         tcp_half_close_timeout_seconds: Some(3),
@@ -8127,6 +8356,7 @@ fn test_limits() -> LimitConfig {
         auth_rate_limit_failures: None,
         auth_rate_limit_window_seconds: None,
         auth_rate_limit_ban_seconds: None,
+        auth_rate_limit_allowlist: None,
         quic_stream_receive_window: None,
         quic_connection_receive_window: None,
     }

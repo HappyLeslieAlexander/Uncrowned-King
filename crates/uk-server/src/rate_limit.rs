@@ -97,14 +97,25 @@ struct RateLimitState {
 #[derive(Debug)]
 pub struct AuthRateLimiter {
     config: AuthRateLimitConfig,
+    /// Peers exempt from failure accounting: a shared NAT egress used by many
+    /// clients, or a monitoring prober, would otherwise aggregate every
+    /// constituent's failures into one ban. Failures from allowlisted peers
+    /// are neither counted nor banned.
+    allowlist: Vec<uk_policy::Cidr>,
     records: Mutex<RateLimitState>,
 }
 
 impl AuthRateLimiter {
     /// Creates a new `AuthRateLimiter` with the given configuration.
     pub fn new(config: AuthRateLimitConfig) -> Self {
+        Self::with_allowlist(config, Vec::new())
+    }
+
+    /// Creates a new `AuthRateLimiter` that never limits the given networks.
+    pub fn with_allowlist(config: AuthRateLimitConfig, allowlist: Vec<uk_policy::Cidr>) -> Self {
         Self {
             config,
+            allowlist,
             records: Mutex::new(RateLimitState {
                 entries: HashMap::new(),
                 last_prune: Instant::now(),
@@ -112,9 +123,16 @@ impl AuthRateLimiter {
         }
     }
 
+    fn is_allowlisted(&self, ip: IpAddr) -> bool {
+        self.allowlist.iter().any(|cidr| cidr.contains(ip))
+    }
+
     /// Checks whether an IP address is currently allowed to attempt authentication.
     /// Returns `true` if allowed, `false` if currently banned.
     pub fn check(&self, ip: IpAddr) -> bool {
+        if self.is_allowlisted(ip) {
+            return true;
+        }
         if self.config.max_failures == 0 {
             return true;
         }
@@ -141,6 +159,9 @@ impl AuthRateLimiter {
     /// Records an authentication failure for `ip`.
     /// Returns `true` if the IP is now banned as a result of this failure.
     pub fn record_failure(&self, ip: IpAddr) -> bool {
+        if self.is_allowlisted(ip) {
+            return false;
+        }
         if self.config.max_failures == 0 {
             return false;
         }
@@ -452,5 +473,54 @@ mod tests {
 
         // Active ban for banned_ip must still be enforced!
         assert!(!limiter.check(banned_ip));
+    }
+
+    #[test]
+    fn allowlisted_peers_are_never_limited() {
+        let config = AuthRateLimitConfig {
+            max_failures: 3,
+            window_secs: 60,
+            ban_secs: 300,
+        };
+        let allowlist = vec!["198.51.100.0/24".parse().unwrap()];
+        let limiter = AuthRateLimiter::with_allowlist(config, allowlist);
+
+        let shared_nat = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let unrelated = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+
+        for _ in 0..10 {
+            assert!(!limiter.record_failure(shared_nat));
+            assert!(limiter.check(shared_nat));
+        }
+
+        // Exhausting the allowlisted network must not touch anyone else.
+        for _ in 0..2 {
+            assert!(!limiter.record_failure(unrelated));
+        }
+        assert!(limiter.check(unrelated));
+        assert!(limiter.record_failure(unrelated));
+        assert!(
+            !limiter.check(unrelated),
+            "non-allowlisted peer must be banned"
+        );
+    }
+
+    #[test]
+    fn bare_ip_allowlist_entry_matches_only_that_host() {
+        let config = AuthRateLimitConfig {
+            max_failures: 1,
+            window_secs: 60,
+            ban_secs: 300,
+        };
+        let limiter = AuthRateLimiter::with_allowlist(
+            config,
+            vec![uk_policy::Cidr::new_v4(std::net::Ipv4Addr::new(198, 51, 100, 7), 32).unwrap()],
+        );
+        let exempt = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let sibling = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8));
+        limiter.record_failure(sibling);
+        assert!(!limiter.check(sibling));
+        limiter.record_failure(exempt);
+        assert!(limiter.check(exempt));
     }
 }

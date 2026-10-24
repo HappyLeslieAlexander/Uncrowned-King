@@ -6,7 +6,7 @@ being developed in small, testable increments.
 
 ## Current Milestone
 
-The repository currently focuses on the first runnable v0.1 TLS/TCP carrier:
+The repository ships the 1.0 TLS/TCP and QUIC carriers (SOCKS5 client, multiplexed TCP/UDP relay):
 
 - binary frame and QUIC-style varint encoding in `uk-proto`
 - strict target encoding in `uk-proto`
@@ -116,6 +116,8 @@ max_streams = 64
 max_udp_flows = 64
 max_outbound_dials_per_session = 16
 max_buffered_bytes_per_session = 16777216
+max_total_streams = 65536
+max_total_buffered_bytes = 536870912
 idle_timeout_seconds = 300
 max_buffered_bytes_per_flow = 2097152
 handshake_timeout_seconds = 10
@@ -359,19 +361,28 @@ images for the server and client:
 docker build --target server -t uncrowned-king-server .
 docker build --target client -t uncrowned-king-client .
 
-# server (mount a config)
-docker run --rm -v "$PWD/server.toml:/etc/uncrowned-king/server.toml:ro" \
+# server (mount the whole config directory: TOML + cert + key + policy)
+# Run as the host file owner so the 0600 files are readable inside the
+# container; the image itself runs as UID 65532.
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD/examples/docker:/etc/uncrowned-king:ro" \
   -p 9443:9443/tcp -p 9443:9443/udp uncrowned-king-server
 
 # client SOCKS5 inside the container (the image CMD binds 0.0.0.0:1080 and
 # passes --allow-non-loopback; 0.0.0.0 is the container's own namespace)
-docker run --rm -v "$PWD/client.toml:/etc/uncrowned-king/client.toml:ro" \
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD/examples/docker:/etc/uncrowned-king:ro" \
   -p 127.0.0.1:1080:1080 uncrowned-king-client
 ```
 
-The mounted `client.toml`/`server.toml` (and the server private key) must be
-mode `0600` on the host — any group or other permission bit makes the process
-refuse to start.
+See `examples/docker/README.md` for certificate generation and Compose. Mount
+the **entire** directory, not just the TOML: the config references the
+certificate, private key, policy and CA. On Linux a bind mount preserves the
+host UID, so `--user` (or `chown 65532:65532`) is required for the 0600 files;
+do not chmod them to 0644, because the process will refuse to start. The mounted
+`client.toml`/`server.toml` (and the server private key) must be mode `0600`.
 
 > **Warning:** the SOCKS5 listener is unauthenticated. Publishing it as
 > `-p 1080:1080` binds every host interface and hands an open proxy to anyone

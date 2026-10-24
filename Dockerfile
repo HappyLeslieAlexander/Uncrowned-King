@@ -34,11 +34,13 @@ USER nonroot:nonroot
 # The client needs a config; mount one at /etc/uncrowned-king/client.toml. It
 # must not be group/other accessible (mode 0600), or startup is refused.
 #
-# `--allow-non-loopback` is required because the listener binds 0.0.0.0. Inside
-# the container's own network namespace that is the only address other
-# containers/`-p` can reach, so it is not itself an exposure: the real exposure
-# control is whether you publish the port (`-p 1080:1080`). The SOCKS5 listener
-# is UNAUTHENTICATED — publish it only to a trusted network, or bind the publish
+# The listener defaults to loopback: safe even if the port is accidentally
+# published. To let other containers or `-p` reach it, override the arguments
+# (e.g. `docker run ... image --config /etc/uncrowned-king/client.toml socks5
+# --listen 0.0.0.0:1080 --allow-non-loopback`). Inside the container's own
+# network namespace 0.0.0.0 is not itself an exposure: the real exposure
+# control is whether you publish the port. The SOCKS5 listener is
+# UNAUTHENTICATED — publish it only to a trusted network, or bind the publish
 # to loopback (`-p 127.0.0.1:1080:1080`).
 ENTRYPOINT ["/usr/local/bin/uk-client"]
-CMD ["--config", "/etc/uncrowned-king/client.toml", "socks5", "--listen", "0.0.0.0:1080", "--allow-non-loopback"]
+CMD ["--config", "/etc/uncrowned-king/client.toml", "socks5", "--listen", "127.0.0.1:1080"]

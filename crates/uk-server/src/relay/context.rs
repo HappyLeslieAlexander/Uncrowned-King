@@ -267,6 +267,95 @@ pub(crate) enum UdpDataDisposition {
     ForwardPayload,
 }
 
+/// Server-wide client-to-target buffered-byte budget.
+///
+/// The per-flow and per-session budgets bound one flow/session; this one keeps
+/// the sum across every authenticated session within the host's memory
+/// envelope.
+#[derive(Debug, Clone)]
+pub(crate) struct GlobalBufferControl {
+    pub(crate) buffered_bytes: Arc<AtomicUsize>,
+    pub(crate) limit: usize,
+}
+
+impl GlobalBufferControl {
+    pub(crate) fn new(limit: usize, buffered_bytes: Arc<AtomicUsize>) -> Self {
+        Self {
+            buffered_bytes,
+            limit,
+        }
+    }
+
+    pub(crate) fn reserve_bytes(&self, amount: usize) -> bool {
+        reserve_bytes(&self.buffered_bytes, amount, self.limit)
+    }
+
+    pub(crate) fn release_bytes(&self, amount: usize) {
+        release_bytes(&self.buffered_bytes, amount);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        self.buffered_bytes.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for GlobalBufferControl {
+    fn default() -> Self {
+        Self {
+            buffered_bytes: Arc::new(AtomicUsize::new(0)),
+            limit: usize::MAX,
+        }
+    }
+}
+
+/// Server-wide flow budget, shared by every authenticated session.
+#[derive(Debug, Clone)]
+pub(crate) struct GlobalFlowBudget {
+    current: Arc<AtomicUsize>,
+    limit: usize,
+}
+
+impl GlobalFlowBudget {
+    pub(crate) fn new(limit: usize, current: Arc<AtomicUsize>) -> Self {
+        Self { current, limit }
+    }
+
+    pub(crate) fn try_acquire(&self) -> Option<Arc<FlowPermit>> {
+        if !reserve_bytes(&self.current, 1, self.limit) {
+            return None;
+        }
+        Some(Arc::new(FlowPermit {
+            budget: self.clone(),
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current(&self) -> usize {
+        self.current.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for GlobalFlowBudget {
+    fn default() -> Self {
+        Self {
+            current: Arc::new(AtomicUsize::new(0)),
+            limit: usize::MAX,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct FlowPermit {
+    budget: GlobalFlowBudget,
+}
+
+impl Drop for FlowPermit {
+    fn drop(&mut self) {
+        release_bytes(&self.budget.current, 1);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SessionBufferControl {
     pub(crate) buffered_bytes: Arc<AtomicUsize>,
@@ -283,6 +372,7 @@ pub(crate) struct BufferedTargetData {
 pub(crate) struct TargetFlowControl {
     pub(crate) buffered_bytes: Arc<AtomicUsize>,
     pub(crate) session_buffer: SessionBufferControl,
+    pub(crate) global_buffer: GlobalBufferControl,
     pub(crate) closed: Arc<AtomicBool>,
     pub(crate) aborted: Arc<AtomicBool>,
     pub(crate) abort_notify: Arc<Notify>,
@@ -326,6 +416,10 @@ pub(crate) struct OpenFlowCancel {
     /// flow id was closed and re-opened must not have its result attached to
     /// the new flow, so completion events carry this back for comparison.
     pub(crate) token: FlowToken,
+    /// Server-wide flow reservation for this attempt. It is moved into the
+    /// established `TargetFlow`/`UdpTargetFlow`, or released when the open is
+    /// cancelled or rejected.
+    pub(crate) permit: Option<Arc<FlowPermit>>,
     pub(crate) cancelled: Arc<AtomicBool>,
     pub(crate) notify: Arc<Notify>,
 }
@@ -360,6 +454,7 @@ pub(crate) struct TargetFlow {
     pub(crate) target_write_open: bool,
     pub(crate) half_close_timer: Option<SessionTaskHandle>,
     pub(crate) metrics_guard: Option<ActiveFlowGuard>,
+    pub(crate) flow_permit: Option<Arc<FlowPermit>>,
 }
 
 #[derive(Debug)]
@@ -372,6 +467,7 @@ pub(crate) struct UdpTargetFlow {
     pub(crate) control: TargetFlowControl,
     pub(crate) last_activity: time::Instant,
     pub(crate) metrics_guard: Option<ActiveFlowGuard>,
+    pub(crate) flow_permit: Option<Arc<FlowPermit>>,
 }
 
 #[derive(Debug, Clone)]
@@ -388,6 +484,8 @@ pub(crate) struct RelaySessionContext<'a> {
     pub(crate) limits: RelayLimits,
     pub(crate) shutdown: SessionShutdown,
     pub(crate) session_buffer: SessionBufferControl,
+    pub(crate) global_buffer: GlobalBufferControl,
+    pub(crate) global_flows: GlobalFlowBudget,
     pub(crate) open_dial_limiter: OpenDialLimiter,
     pub(crate) flow_tokens: FlowTokenAllocator,
     pub(crate) metrics: Arc<ServerMetrics>,
@@ -497,9 +595,15 @@ impl fmt::Debug for OpenDialPermit {
 }
 
 impl OpenFlowCancel {
+    #[cfg(test)]
     pub(crate) fn new(token: FlowToken) -> Self {
+        Self::with_permit(token, None)
+    }
+
+    pub(crate) fn with_permit(token: FlowToken, permit: Option<Arc<FlowPermit>>) -> Self {
         Self {
             token,
+            permit,
             cancelled: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
         }
@@ -568,9 +672,17 @@ impl Default for TargetFlowControl {
 
 impl TargetFlowControl {
     pub(crate) fn new(session_buffer: SessionBufferControl) -> Self {
+        Self::with_global_buffer(session_buffer, GlobalBufferControl::default())
+    }
+
+    pub(crate) fn with_global_buffer(
+        session_buffer: SessionBufferControl,
+        global_buffer: GlobalBufferControl,
+    ) -> Self {
         Self {
             buffered_bytes: Arc::new(AtomicUsize::new(0)),
             session_buffer,
+            global_buffer,
             closed: Arc::new(AtomicBool::new(false)),
             aborted: Arc::new(AtomicBool::new(false)),
             abort_notify: Arc::new(Notify::new()),
@@ -592,12 +704,18 @@ impl TargetFlowControl {
             release_bytes(&self.buffered_bytes, amount);
             return false;
         }
+        if !self.global_buffer.reserve_bytes(amount) {
+            self.session_buffer.release_bytes(amount);
+            release_bytes(&self.buffered_bytes, amount);
+            return false;
+        }
         true
     }
 
     pub(crate) fn release_bytes(&self, amount: usize) {
         release_bytes(&self.buffered_bytes, amount);
         self.session_buffer.release_bytes(amount);
+        self.global_buffer.release_bytes(amount);
     }
 
     #[cfg(test)]
@@ -707,11 +825,17 @@ impl TargetFlow {
             target_write_open: true,
             half_close_timer: None,
             metrics_guard: None,
+            flow_permit: None,
         }
     }
 
     pub(crate) fn track_metrics(mut self, guard: ActiveFlowGuard) -> Self {
         self.metrics_guard = Some(guard);
+        self
+    }
+
+    pub(crate) fn with_flow_permit(mut self, permit: Option<Arc<FlowPermit>>) -> Self {
+        self.flow_permit = permit;
         self
     }
 
@@ -843,11 +967,17 @@ impl UdpTargetFlow {
             control,
             last_activity: time::Instant::now(),
             metrics_guard: None,
+            flow_permit: None,
         }
     }
 
     pub(crate) fn track_metrics(mut self, guard: ActiveFlowGuard) -> Self {
         self.metrics_guard = Some(guard);
+        self
+    }
+
+    pub(crate) fn with_flow_permit(mut self, permit: Option<Arc<FlowPermit>>) -> Self {
+        self.flow_permit = permit;
         self
     }
 

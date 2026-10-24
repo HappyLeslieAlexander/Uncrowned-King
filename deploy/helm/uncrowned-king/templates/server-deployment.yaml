@@ -28,6 +28,13 @@ spec:
         checksum/config: {{ include (print $.Template.BasePath "/server-configmap.yaml") . | sha256sum }}
         {{- if not .Values.server.existingSecret }}
         checksum/secret: {{ include (print $.Template.BasePath "/server-secret.yaml") . | sha256sum }}
+        {{- else }}
+        # Best-effort: a helm upgrade that sees changed Secret content rolls the
+        # pod. A Secret edited outside Helm still needs an explicit rollout.
+        checksum/existing-secret: {{ (lookup "v1" "Secret" .Release.Namespace .Values.server.existingSecret).data | toYaml | sha256sum }}
+        {{- end }}
+        {{- if .Values.server.existingTlsSecret }}
+        checksum/tls-secret: {{ (lookup "v1" "Secret" .Release.Namespace .Values.server.existingTlsSecret).data | toYaml | sha256sum }}
         {{- end }}
       labels:
         {{- include "uncrowned-king.server.selectorLabels" . | nindent 8 }}

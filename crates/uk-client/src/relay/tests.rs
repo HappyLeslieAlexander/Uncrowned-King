@@ -97,6 +97,7 @@ fn test_session(max_streams: u64, max_udp_flows: u64) -> Arc<ClientSession> {
         tasks: Mutex::new(ClientSessionTasks::default()),
         shutdown: ClientSessionShutdown::default(),
         draining: AtomicBool::new(false),
+        health_session: AtomicBool::new(false),
         metrics: Arc::new(ClientMetrics::default()),
         metric_state: StdMutex::new(ClientSessionMetricState::Active),
         next_flow_id: AtomicU64::new(FIRST_CLIENT_FLOW_ID),
@@ -1228,27 +1229,77 @@ async fn socks_shutdown_drain_waits_for_completed_connection_tasks() {
 }
 
 #[tokio::test]
-async fn udp_association_activity_events_are_lossy_when_queue_is_full() {
-    let (event_tx, mut event_rx) = mpsc::channel(1);
-    let first_target = Target::Domain("first.example".to_owned(), 53);
-    let second_target = Target::Domain("second.example".to_owned(), 53);
+async fn udp_target_queue_drops_datagrams_and_counts_metric_when_full() {
+    let metrics = Arc::new(ClientMetrics::default());
+    // A receiver that never drains models a stalled open or carrier write.
+    let (tx, rx) = mpsc::channel(1);
+    let stalled = tokio::spawn(async move {
+        drop(rx);
+        std::future::pending::<()>().await;
+    });
+    let target = Target::Domain("slow.example".to_owned(), 53);
 
-    try_record_udp_association_activity(&event_tx, 100, 1, &first_target);
-    try_record_udp_association_activity(&event_tx, 100, 3, &second_target);
+    assert!(try_enqueue_datagram(
+        &tx,
+        &target,
+        Bytes::from_static(b"first"),
+        &metrics
+    ));
+    assert!(
+        !try_enqueue_datagram(&tx, &target, Bytes::from_static(b"second"), &metrics),
+        "queue of depth 1 must refuse the second datagram"
+    );
+    assert!(
+        metrics
+            .render()
+            .contains("uncrowned_king_client_udp_association_queue_full_total 1\n")
+    );
+    drop(tx);
+    stalled.abort();
+}
 
-    match event_rx.recv().await {
-        Some(UdpAssociationFlowEvent::Activity {
-            session_id,
-            flow_id,
-            target,
-        }) => {
-            assert_eq!(session_id, 100);
-            assert_eq!(flow_id, 1);
-            assert_eq!(target, first_target);
-        }
-        None => panic!("activity event should be queued"),
-    }
-    assert!(event_rx.try_recv().is_err());
+#[tokio::test]
+async fn udp_association_enqueue_returns_without_awaiting_stalled_workers() {
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let metrics = Arc::new(ClientMetrics::default());
+    let mut association = UdpAssociation::new(
+        socket,
+        None,
+        socks5::SocksEndpoint::Ipv4(Ipv4Addr::UNSPECIFIED, 0),
+        CONTROL_PEER_IP,
+        metrics,
+    );
+    // Pretend a worker for one target exists but never drains its queue.
+    let (stalled_tx, stalled_rx) = mpsc::channel(1);
+    let stalled = tokio::spawn(async move {
+        drop(stalled_rx);
+        std::future::pending::<()>().await;
+    });
+    let slow_target = Target::Domain("slow.example".to_owned(), 53);
+    association.senders.insert(slow_target.clone(), stalled_tx);
+
+    // Enqueue to the stalled target must complete immediately: the queue
+    // accepts or drops synchronously, so the association's receive loop can
+    // never be held up by worker progress.
+    association.enqueue_datagram(
+        &slow_target,
+        Bytes::from_static(b"first"),
+        &Arc::new(test_session_manager(minimal_config())),
+    );
+    association.enqueue_datagram(
+        &slow_target,
+        Bytes::from_static(b"second"),
+        &Arc::new(test_session_manager(minimal_config())),
+    );
+    assert!(
+        association
+            .metrics
+            .render()
+            .contains("uncrowned_king_client_udp_association_queue_full_total 1\n"),
+        "the overflowing datagram must be counted as dropped"
+    );
+
+    stalled.abort();
 }
 
 #[test]
@@ -2192,53 +2243,6 @@ async fn audit_udp_control_reset_leaves_orphan_route() {
 }
 
 #[tokio::test]
-async fn audit_udp_old_session_completion_must_not_remove_new_session_flow() {
-    let old_session = test_session(8, 8);
-    let new_session = test_session(8, 8);
-    let target = Target::Ipv4(Ipv4Addr::LOCALHOST, 12345);
-    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let (event_tx, _event_rx) = mpsc::channel(8);
-    let mut association = UdpAssociation::new(
-        socket,
-        None,
-        event_tx,
-        socks5::SocksEndpoint::Ipv4(Ipv4Addr::UNSPECIFIED, 0),
-        CONTROL_PEER_IP,
-    );
-    let old_id = old_session
-        .reserve_flow(FlowProtocol::Udp)
-        .await
-        .unwrap()
-        .unwrap()
-        .0;
-    let new_id = new_session
-        .reserve_flow(FlowProtocol::Udp)
-        .await
-        .unwrap()
-        .unwrap()
-        .0;
-    assert_eq!(old_id, new_id, "ids restart per carrier");
-    association.flows_by_target.insert(
-        target.clone(),
-        UdpAssociationFlow {
-            id: new_id,
-            session: new_session.clone(),
-            last_activity: time::Instant::now(),
-        },
-    );
-    association.handle_flow_task_result(Some(Ok(UdpFlowTaskResult {
-        session_id: old_session.correlation_id,
-        flow_id: old_id,
-        target: target.clone(),
-        outcome: Ok(()),
-    })));
-    assert!(
-        association.flows_by_target.contains_key(&target),
-        "old carrier completion removed new carrier flow with the same id"
-    );
-}
-
-#[tokio::test]
 async fn audit_rejected_reload_must_preserve_active_ca_cache() {
     let path = std::env::temp_dir().join(format!(
         "audit-ca-rejected-reload-{}.pem",
@@ -2340,4 +2344,217 @@ async fn client_handle_reload_request_load_failure_increments_metric() {
         "metrics should report reload failure, got:\n{metrics}"
     );
     assert_eq!(manager.config.generation(), 1);
+}
+
+fn shutdown_drain_session(
+    carrier_writer: BoxedCarrierWriter,
+    metrics: Arc<ClientMetrics>,
+    shutdown_timeout: Option<Duration>,
+) -> Arc<ClientSession> {
+    let limits = FrameLimits::default();
+    Arc::new(ClientSession {
+        correlation_id: NEXT_TEST_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+        config_generation: 1,
+        writer: Arc::new(Mutex::new(carrier_writer)),
+        flows: Arc::new(Mutex::new(HashMap::new())),
+        limits,
+        data_frame_size: tcp_data_frame_size(limits, None),
+        max_streams: 64,
+        max_udp_flows: 64,
+        admission: FlowAdmissionControl::new(64, 64),
+        supports_udp_stream_fallback: true,
+        supports_udp_datagram: false,
+        datagrams: None,
+        max_pending_open_bytes: 1024,
+        max_buffered_bytes_per_session: 1024,
+        max_buffered_bytes_per_flow: 1024,
+        session_buffer: ClientSessionBufferControl::default(),
+        open_timeout: None,
+        task_shutdown_timeout: shutdown_timeout,
+        tasks: Mutex::new(ClientSessionTasks::default()),
+        shutdown: ClientSessionShutdown::default(),
+        draining: AtomicBool::new(false),
+        health_session: AtomicBool::new(false),
+        metrics,
+        metric_state: StdMutex::new(ClientSessionMetricState::Active),
+        next_flow_id: AtomicU64::new(FIRST_CLIENT_FLOW_ID),
+        next_ping_nonce: AtomicU64::new(0),
+        outstanding_ping_nonce: AtomicU64::new(0),
+        last_pong_nonce: AtomicU64::new(0),
+        pong_notify: Notify::new(),
+    })
+}
+
+fn test_flow(session: Arc<ClientSession>, frames: mpsc::Receiver<BufferedFlowFrame>) -> ClientFlow {
+    ClientFlow {
+        id: FLOW_ID,
+        frames,
+        session,
+        pending_local_data: Vec::new(),
+        metric_guard: None,
+        _slot: FlowSlot {
+            _stream: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            _udp_flow: None,
+        },
+    }
+}
+
+fn buffered_data_frame(payload: Bytes) -> BufferedFlowFrame {
+    BufferedFlowFrame {
+        frame: Some(Frame::new(FrameType::TcpData, 0, FLOW_ID, payload).unwrap()),
+        payload_len: 8,
+        flow_control: ClientFlowBufferControl::default(),
+        session_control: ClientSessionBufferControl::default(),
+    }
+}
+
+#[tokio::test]
+async fn shutdown_drains_upload_then_sends_single_close_and_flushes_downlink() {
+    let (carrier_writer, mut carrier_reader) = tokio::io::duplex(4096);
+    let metrics = Arc::new(ClientMetrics::default());
+    let session = shutdown_drain_session(
+        Box::new(carrier_writer),
+        Arc::clone(&metrics),
+        Some(Duration::from_millis(300)),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (mut app, _) = listener.accept().await.unwrap();
+
+    // One downlink frame already queued when shutdown fires: it must still be
+    // handed to the local application behind the upload drain.
+    let (frames_tx, frames_rx) = mpsc::channel(16);
+    frames_tx
+        .send(buffered_data_frame(Bytes::from_static(b"downlink")))
+        .await
+        .unwrap();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let relay = tokio::spawn(relay_tcp(
+        local,
+        test_flow(Arc::clone(&session), frames_rx),
+        shutdown_rx,
+    ));
+
+    // The application pushes an upload tail and keeps its socket open, so
+    // only the drain deadline can end the upload phase.
+    app.write_all(b"upload-tail").await.unwrap();
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), relay)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    // The upload tail must have been relayed before the FIN...
+    let data = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_frame(&mut carrier_reader, FrameLimits::default()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(data.header.frame_type, FrameType::TcpData);
+    assert_eq!(&data.payload[..], b"upload-tail");
+
+    // ...followed by exactly one TCP_CLOSE(NORMAL), and nothing after it.
+    let close = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_frame(&mut carrier_reader, FrameLimits::default()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(close.header.frame_type, FrameType::TcpClose);
+    let mut close_payload = close.payload;
+    assert_eq!(
+        TcpClose::decode(&mut close_payload).unwrap().close_code,
+        TCP_CLOSE_NORMAL
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            read_frame(&mut carrier_reader, FrameLimits::default())
+        )
+        .await
+        .is_err(),
+        "the close frame must be the last frame on the carrier"
+    );
+
+    // The deadline ended an upload that never EOF'd: the loss must be visible.
+    assert!(
+        metrics
+            .render()
+            .contains("uncrowned_king_client_shutdown_upload_truncated_total 1\n")
+    );
+
+    // The queued downlink bytes reached the application before its FIN.
+    let mut app_buf = [0_u8; 8];
+    tokio::time::timeout(Duration::from_secs(2), app.read_exact(&mut app_buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&app_buf, b"downlink");
+}
+
+#[tokio::test]
+async fn shutdown_upload_drain_completes_cleanly_on_local_eof() {
+    let (carrier_writer, mut carrier_reader) = tokio::io::duplex(4096);
+    let metrics = Arc::new(ClientMetrics::default());
+    let session = shutdown_drain_session(
+        Box::new(carrier_writer),
+        Arc::clone(&metrics),
+        Some(Duration::from_secs(5)),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (mut app, _) = listener.accept().await.unwrap();
+    let (_frames_tx, frames_rx) = mpsc::channel(16);
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let relay = tokio::spawn(relay_tcp(
+        local,
+        test_flow(Arc::clone(&session), frames_rx),
+        shutdown_rx,
+    ));
+
+    app.write_all(b"tail").await.unwrap();
+    app.shutdown().await.unwrap();
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), relay)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    let data = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_frame(&mut carrier_reader, FrameLimits::default()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(&data.payload[..], b"tail");
+
+    let close = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_frame(&mut carrier_reader, FrameLimits::default()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(close.header.frame_type, FrameType::TcpClose);
+
+    // A clean EOF drains within the deadline: no truncation is recorded.
+    assert!(
+        metrics
+            .render()
+            .contains("uncrowned_king_client_shutdown_upload_truncated_total 0\n")
+    );
 }

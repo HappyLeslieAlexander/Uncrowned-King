@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use tokio::{net::TcpStream, sync::mpsc};
@@ -10,8 +10,8 @@ use uk_proto::{
 };
 
 use super::context::{
-    AnyError, CarrierWriter, EnqueueError, FlowEventSender, FlowSlot, FlowTable, FlowToken,
-    HalfCloseSide, OpenFailure, OpenFlowCancel, OpenSlotRejection, RelaySessionContext,
+    AnyError, CarrierWriter, EnqueueError, FlowEventSender, FlowPermit, FlowSlot, FlowTable,
+    FlowToken, HalfCloseSide, OpenFailure, OpenFlowCancel, OpenSlotRejection, RelaySessionContext,
     SessionShutdown, TargetFlow, TargetFlowControl, TargetFlowIdentity, TcpDataDisposition,
     open_target_flow_mut, remove_flow_slot,
 };
@@ -96,6 +96,15 @@ pub(crate) async fn handle_half_close_drain_expired(
             }
         }
         HalfCloseDrainDecision::Abort { remove } => {
+            // The target half-closed and the client never finished its
+            // upload, so pending client-to-target bytes are gone. Tell the
+            // client the flow ended with an error instead of letting it
+            // discover the silence; a failed tell must not keep the dead
+            // flow pinned in the table.
+            if let Err(err) = send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await
+            {
+                warn!(event = "tcp.half_close_timeout.close_send_failed", flow_id, error = %err);
+            }
             if remove {
                 remove_flow_slot(target_writers, flow_id);
                 info!(event = "tcp.half_close_timeout", flow_id, side = ?closed_side);
@@ -463,7 +472,15 @@ pub(crate) async fn handle_tcp_open_frame(
             flow_id,
             security_generation = policy.generation
         );
-        let cancel = OpenFlowCancel::new(context.flow_tokens.next());
+        let Some(flow_permit) = context.global_flows.try_acquire() else {
+            context
+                .metrics
+                .record_flow_open_failure(RelayProtocol::Tcp, FlowOpenFailure::ResourceLimit);
+            send_resource_limit(context.carrier_writer, flow_id).await?;
+            send_tcp_close(context.carrier_writer, flow_id, TCP_CLOSE_ERROR).await?;
+            return Ok(());
+        };
+        let cancel = OpenFlowCancel::with_permit(context.flow_tokens.next(), Some(flow_permit));
         target_writers.insert(flow_id, FlowSlot::OpeningTcp(cancel.clone()));
         spawn_target_open(
             session_tasks,
@@ -549,17 +566,22 @@ pub(crate) async fn handle_tcp_open_completed(
     // so a close plus re-open can slip in between and would otherwise get the
     // previous attempt's stream wired in, under a target the client never
     // requested for that flow.
-    if !matches!(
-        target_writers.get(&flow_id),
-        Some(FlowSlot::OpeningTcp(cancel)) if cancel.token == token
-    ) {
-        return Ok(());
-    }
+    let flow_permit = match target_writers.get(&flow_id) {
+        Some(FlowSlot::OpeningTcp(cancel)) if cancel.token == token => cancel.permit.clone(),
+        _ => return Ok(()),
+    };
 
     match result {
         Ok(target_stream) => {
-            let target_flow =
-                accept_open_target(flow_id, target, target_stream, context, session_tasks).await?;
+            let target_flow = accept_open_target(
+                flow_id,
+                target,
+                target_stream,
+                context,
+                session_tasks,
+                flow_permit,
+            )
+            .await?;
             target_writers.insert(flow_id, FlowSlot::Tcp(target_flow));
         }
         Err(err) => {
@@ -576,17 +598,22 @@ pub(crate) async fn accept_open_target(
     target_stream: TcpStream,
     context: &RelaySessionContext<'_>,
     session_tasks: &mut SessionTasks,
+    flow_permit: Option<Arc<FlowPermit>>,
 ) -> Result<TargetFlow, AnyError> {
     let (target_reader, target_writer) = target_stream.into_split();
     let (target_writer_tx, target_writer_rx) = mpsc::channel(target_write_queue_capacity(
         context.limits.max_buffered_bytes_per_flow,
     ));
-    let flow_control = TargetFlowControl::new(context.session_buffer.clone());
+    let flow_control = TargetFlowControl::with_global_buffer(
+        context.session_buffer.clone(),
+        context.global_buffer.clone(),
+    );
     let token = context.flow_tokens.next();
     let identity = TargetFlowIdentity { flow_id, token };
     send_tcp_data(context.carrier_writer, flow_id, Bytes::new(), &flow_control).await?;
     let target_flow = TargetFlow::new(token, target_writer_tx, flow_control.clone())
-        .track_metrics(context.metrics.begin_flow(RelayProtocol::Tcp));
+        .track_metrics(context.metrics.begin_flow(RelayProtocol::Tcp))
+        .with_flow_permit(flow_permit);
     spawn_target_reader(
         session_tasks,
         TargetReaderTask {

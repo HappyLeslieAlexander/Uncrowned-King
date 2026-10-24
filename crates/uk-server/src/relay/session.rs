@@ -11,17 +11,18 @@ use tracing::{debug, info, warn};
 use uk_auth::AuthenticatedIdentity;
 use uk_proto::{
     BoxedCarrierReader, ErrorCode, ErrorPayload, Frame, FrameIoError, FrameReader, FrameType,
-    TCP_CLOSE_ERROR, UDP_CLOSE_ERROR, is_client_initiated_flow_id, validate_connection_frame,
-    write_frame,
+    Settings, TCP_CLOSE_ERROR, UDP_CLOSE_ERROR, is_client_initiated_flow_id,
+    validate_connection_frame, write_frame,
 };
 
 use super::context::{
     AnyError, CarrierWriter, FlowEvent, FlowEventReceiver, FlowEventSender, FlowIdRejection,
-    FlowSlot, FlowTable, FlowTokenAllocator, OpenDialLimiter, RelayLimits, RelaySessionContext,
-    SESSION_EVENT_QUEUE_BASE_CAPACITY, SESSION_EVENT_QUEUE_MAX_CAPACITY,
-    SESSION_EVENT_QUEUE_PER_FLOW_CAPACITY, ServerCarrier, SessionBufferControl, SessionShutdown,
-    SessionTaskKind, TARGET_WRITE_QUEUE_MAX_CAPACITY, TARGET_WRITE_QUEUE_MIN_CAPACITY,
-    TARGET_WRITE_QUEUE_NOMINAL_FRAME_BYTES, TargetFlowControl, transition, udp_target_flow_mut,
+    FlowSlot, FlowTable, FlowTokenAllocator, GlobalBufferControl, GlobalFlowBudget,
+    OpenDialLimiter, RelayLimits, RelaySessionContext, SESSION_EVENT_QUEUE_BASE_CAPACITY,
+    SESSION_EVENT_QUEUE_MAX_CAPACITY, SESSION_EVENT_QUEUE_PER_FLOW_CAPACITY, ServerCarrier,
+    SessionBufferControl, SessionShutdown, SessionTaskKind, TARGET_WRITE_QUEUE_MAX_CAPACITY,
+    TARGET_WRITE_QUEUE_MIN_CAPACITY, TARGET_WRITE_QUEUE_NOMINAL_FRAME_BYTES, TargetFlowControl,
+    transition, udp_target_flow_mut,
 };
 use super::tasks::{SessionTasks, maybe_spawn_datagram_reader};
 use super::tcp::{
@@ -38,11 +39,17 @@ pub(crate) use super::context::{ServerSessionState, SessionEvent};
 use crate::observability::{FlowOpenFailure, RelayProtocol, ServerMetrics};
 use crate::security::SecurityState;
 
+// The session entry point intentionally takes one parameter per orthogonal
+// concern (transport, identity, security, limits, global budgets, timers,
+// shutdown); bundling them would obscure which test constructs what.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn relay_session(
     carrier: ServerCarrier,
     identity: AuthenticatedIdentity,
     security: SecurityState,
     limits: RelayLimits,
+    global_buffer: GlobalBufferControl,
+    global_flows: GlobalFlowBudget,
     idle_timeout: Option<Duration>,
     mut shutdown_rx: watch::Receiver<bool>,
     metrics: Arc<ServerMetrics>,
@@ -78,6 +85,8 @@ pub(crate) async fn relay_session(
         limits,
         shutdown: shutdown.clone(),
         session_buffer,
+        global_buffer,
+        global_flows,
         open_dial_limiter,
         flow_tokens,
         metrics,
@@ -87,6 +96,7 @@ pub(crate) async fn relay_session(
     let mut udp_idle_interval = udp_idle_interval(limits.udp_flow_idle_timeout);
     let mut drain_deadline_set = false;
     let mut drain_deadline: Option<time::Instant> = None;
+    let mut client_settings_received = false;
 
     let result = loop {
         let is_draining = state == ServerSessionState::Draining;
@@ -112,6 +122,7 @@ pub(crate) async fn relay_session(
             &mut target_writers,
             &mut session_tasks,
             &mut state,
+            &mut client_settings_received,
         )
         .await
         {
@@ -171,6 +182,7 @@ pub(crate) async fn handle_session_event(
     target_writers: &mut FlowTable,
     session_tasks: &mut SessionTasks,
     state: &mut ServerSessionState,
+    client_settings_received: &mut bool,
 ) -> SessionStep {
     let counts_as_activity = match event {
         SessionEvent::Flow(event) => {
@@ -183,12 +195,26 @@ pub(crate) async fn handle_session_event(
             counts_as_activity
         }
         SessionEvent::Frame(frame) => {
-            if let Err(err) =
-                handle_session_frame(frame, context, target_writers, session_tasks, *state).await
+            // PING/PONG are connection-scoped liveness frames: they must
+            // refresh the idle deadline even when no relay flow is open,
+            // otherwise a health session is closed exactly while it is being
+            // kept alive.
+            let counts_as_activity =
+                matches!(frame.header.frame_type, FrameType::Ping | FrameType::Pong)
+                    || session_has_activity_flows(target_writers);
+            if let Err(err) = handle_session_frame(
+                frame,
+                context,
+                target_writers,
+                session_tasks,
+                *state,
+                client_settings_received,
+            )
+            .await
             {
                 return SessionStep::Stop(Err(err));
             }
-            session_has_activity_flows(target_writers)
+            counts_as_activity
         }
         SessionEvent::SessionTaskCompleted => false,
         SessionEvent::UdpIdleMaintenance => {
@@ -488,11 +514,10 @@ pub(crate) fn session_has_activity_flows(target_writers: &FlowTable) -> bool {
 }
 
 pub(crate) fn next_idle_deadline(idle_timeout: Option<Duration>) -> Option<time::Instant> {
-    idle_timeout.map(|timeout| {
-        time::Instant::now()
-            .checked_add(timeout)
-            .unwrap_or_else(time::Instant::now)
-    })
+    // Config validation bounds this to the protocol maximum, but a bad value
+    // must never turn into an immediate idle timeout: `None` disables the
+    // deadline rather than firing it on the next select iteration.
+    idle_timeout.and_then(|timeout| time::Instant::now().checked_add(timeout))
 }
 
 pub(crate) fn udp_idle_interval(idle_timeout: Option<Duration>) -> Option<time::Interval> {
@@ -522,6 +547,7 @@ pub(crate) async fn handle_session_frame(
     target_writers: &mut FlowTable,
     session_tasks: &mut SessionTasks,
     state: ServerSessionState,
+    client_settings_received: &mut bool,
 ) -> Result<(), AnyError> {
     if state == ServerSessionState::Draining {
         match frame.header.frame_type {
@@ -566,6 +592,32 @@ pub(crate) async fn handle_session_frame(
         }
         FrameType::UdpData => handle_udp_data_frame(frame, context, target_writers).await,
         FrameType::UdpClose => handle_udp_close_frame(frame, context, target_writers).await,
+        FrameType::Settings => {
+            validate_or_report_session_control_frame(&frame, context, FrameType::Settings).await?;
+            if *client_settings_received {
+                send_error(context.carrier_writer, 0, ErrorCode::Protocol).await?;
+                return Err("duplicate client settings frame".into());
+            }
+            if !target_writers.is_empty() {
+                send_error(context.carrier_writer, 0, ErrorCode::Protocol).await?;
+                return Err("client settings arrived after relay flows started".into());
+            }
+            let mut payload = frame.payload;
+            let settings = match Settings::decode(&mut payload) {
+                Ok(settings) => settings,
+                Err(err) => {
+                    send_error(context.carrier_writer, 0, ErrorCode::Protocol).await?;
+                    return Err(err.into());
+                }
+            };
+            if let Err(err) = settings.negotiated_v1_0() {
+                send_error(context.carrier_writer, 0, ErrorCode::Protocol).await?;
+                return Err(err.into());
+            }
+            *client_settings_received = true;
+            debug!(event = "server.session.client_settings");
+            Ok(())
+        }
         FrameType::Error | FrameType::PolicyDenied | FrameType::ResourceLimit => {
             handle_client_flow_status_frame(frame, context, target_writers).await
         }

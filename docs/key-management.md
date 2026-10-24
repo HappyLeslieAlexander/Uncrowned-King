@@ -127,11 +127,18 @@ the security-generation / reload-success metrics before retiring old material.
 
 **Kubernetes caveat**: the shipped manifest
 ([`deploy/kubernetes/uncrowned-king-server.yaml`](../deploy/kubernetes/uncrowned-king-server.yaml))
-stages the Secret and policy ConfigMap into an `emptyDir` via an initContainer,
-because a directly mounted Secret can never satisfy the `0600` permission check.
-Copies are made at pod start, so an edited Secret/ConfigMap does **not** reach a
-running pod and SIGHUP cannot pick it up. Roll the Deployment instead:
+and the Helm chart stage the Secret and policy ConfigMap into an `emptyDir` via
+an initContainer, because a directly mounted Secret can never satisfy the
+`0600` permission check. Copies are made at pod start, so an edited
+Secret/ConfigMap does **not** reach a running pod and SIGHUP cannot pick it up.
+Roll the Deployment instead:
 `kubectl rollout restart deployment/uncrowned-king-server`.
+
+The Helm chart adds checksums for chart-managed config/credentials and a
+best-effort `lookup` checksum for `existingTlsSecret`/`existingSecret` (and the
+client's `existingCaSecret`), so a `helm upgrade` that observes changed Secret
+content rolls the pod. A Secret edited directly with `kubectl` does not change
+the Helm release; still run `kubectl rollout restart` after rotating it.
 
 ## 4. Checklist
 

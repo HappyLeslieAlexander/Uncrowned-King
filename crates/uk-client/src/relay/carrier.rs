@@ -177,7 +177,11 @@ pub(crate) async fn spawn_keepalive(session: Arc<ClientSession>, interval: Durat
                 () = time::sleep(interval) => {}
                 () = task_session.shutdown.closed() => return,
             }
-            if !task_session.has_open_flows().await {
+            // A designated health session is the client's readiness carrier,
+            // so it must stay alive even while no application flow is open.
+            // Ordinary sessions still avoid keeping otherwise idle carriers
+            // alive, matching the protocol guidance.
+            if !task_session.has_open_flows().await && !task_session.is_health_session() {
                 continue;
             }
             let nonce = match task_session.write_ping().await {

@@ -95,6 +95,8 @@ pub(crate) struct ClientMetrics {
     opened_flows_total: [AtomicU64; PROTOCOL_COUNT],
     active_flows: [AtomicU64; PROTOCOL_COUNT],
     relay_bytes_total: [[AtomicU64; DIRECTION_COUNT]; PROTOCOL_COUNT],
+    shutdown_upload_truncated_total: AtomicU64,
+    udp_association_queue_full_total: AtomicU64,
 }
 
 impl ClientMetrics {
@@ -207,6 +209,16 @@ impl ClientMetrics {
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_shutdown_upload_truncated(&self) {
+        self.shutdown_upload_truncated_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_udp_association_queue_full(&self) {
+        self.udp_association_queue_full_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn render(&self) -> String {
         let ready = u8::from(self.is_ready());
         let mut output = format!(
@@ -250,6 +262,12 @@ impl ClientMetrics {
                 "# HELP uncrowned_king_client_draining_sessions Superseded UK carrier sessions draining flows.\n",
                 "# TYPE uncrowned_king_client_draining_sessions gauge\n",
                 "uncrowned_king_client_draining_sessions {draining_sessions}\n",
+                "# HELP uncrowned_king_client_shutdown_upload_truncated_total TCP flows whose upload tail was cut by the shutdown drain deadline.\n",
+                "# TYPE uncrowned_king_client_shutdown_upload_truncated_total counter\n",
+                "uncrowned_king_client_shutdown_upload_truncated_total {shutdown_upload_truncated}\n",
+                "# HELP uncrowned_king_client_udp_association_queue_full_total UDP datagrams dropped because their target's outbound queue was full.\n",
+                "# TYPE uncrowned_king_client_udp_association_queue_full_total counter\n",
+                "uncrowned_king_client_udp_association_queue_full_total {udp_association_queue_full}\n",
             ),
             ready = ready,
             config_generation = self.config_generation.load(Ordering::Acquire),
@@ -268,6 +286,11 @@ impl ClientMetrics {
             established_sessions = self.established_sessions_total.load(Ordering::Relaxed),
             active_sessions = self.active_sessions.load(Ordering::Relaxed),
             draining_sessions = self.draining_sessions.load(Ordering::Relaxed),
+            shutdown_upload_truncated =
+                self.shutdown_upload_truncated_total.load(Ordering::Relaxed),
+            udp_association_queue_full = self
+                .udp_association_queue_full_total
+                .load(Ordering::Relaxed),
         );
         self.render_endpoint_metrics(&mut output);
         self.render_flow_metrics(&mut output);

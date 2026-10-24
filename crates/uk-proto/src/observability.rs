@@ -153,16 +153,16 @@ where
             "text/plain",
             "not ready\n".to_string(),
         ),
-        "/metrics" => (
-            200,
-            "OK",
-            "text/plain; version=0.0.4; charset=utf-8",
-            if is_head {
-                String::new()
-            } else {
-                render_metrics()
-            },
-        ),
+        "/metrics" => {
+            // HEAD must advertise the same Content-Length as GET, so the
+            // body is rendered to measure it and dropped right after.
+            (
+                200,
+                "OK",
+                "text/plain; version=0.0.4; charset=utf-8",
+                render_metrics(),
+            )
+        }
         _ => (404, "Not Found", "text/plain", "not found\n".to_string()),
     };
 
@@ -212,6 +212,39 @@ mod tests {
             response.ends_with("\r\n\r\n"),
             "HEAD request should have no body content"
         );
+    }
+
+    #[tokio::test]
+    async fn head_metrics_matches_get_content_length() {
+        for method in ["GET", "HEAD"] {
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            let task = tokio::spawn(async move {
+                serve_probe_connection(
+                    &mut server,
+                    || true,
+                    || "# HELP demo A demo metric\n# TYPE demo gauge\ndemo 42\n".to_string(),
+                )
+                .await
+            });
+            client
+                .write_all(format!("{method} /metrics HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            task.await.unwrap().unwrap();
+            let response = String::from_utf8(response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{method}");
+            assert!(
+                response.contains("Content-Length: 52\r\n"),
+                "{method} must report the rendered metrics length"
+            );
+            if method == "HEAD" {
+                assert!(response.ends_with("\r\n\r\n"), "HEAD must omit the body");
+            } else {
+                assert!(response.ends_with("demo 42\n"));
+            }
+        }
     }
 
     #[test]

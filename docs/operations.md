@@ -27,13 +27,31 @@ The server enforces bounded resources; size them to the host and expected load:
 | `max_handshakes` | in-flight unauthenticated handshakes | connection arrival burst |
 | `max_streams` / `max_udp_flows` | flows per session | per-client concurrency |
 | `max_outbound_dials_per_session` | concurrent target dials | target fan-out |
-| `max_buffered_bytes_per_session` / `_per_flow` | queued server→client bytes (also sizes the per-flow queue) | bandwidth-delay product |
+| `max_buffered_bytes_per_session` / `_per_flow` | queued client→target bytes for one session/flow | bandwidth-delay product |
+| `max_total_buffered_bytes` / `max_total_streams` | global server-wide buffered bytes and concurrent flows | host memory and file-descriptor budget |
 | `LimitNOFILE` (systemd) | file descriptors | ~2 per flow + sockets |
 
 Rules of thumb: each active flow uses ~2 sockets and up to
 `max_buffered_bytes_per_flow` of memory; a soak of 16 sustained flows held RSS
-around 70 MiB (see `docs/performance.md`). Set `LimitNOFILE` well above
-`2 × max_sessions × max_streams`.
+around 70 MiB (see `docs/performance.md`). Size `max_total_buffered_bytes` below
+the process memory limit and set `LimitNOFILE` above the global flow budget
+(roughly `2 × max_total_streams`).
+
+## Authentication rate limiting
+
+Failures are aggregated per IPv4 source address, per IPv6 `/64` prefix, and
+therefore per NAT egress: with the default `5 failures / 60s -> 300s ban`,
+five failed handshakes from *any* client behind one shared NAT (or inside one
+IPv6 `/64`) ban *all* of them for five minutes. If your clients egress
+through a known NAT or a prober triggers handshakes from a fixed address,
+exempt those sources in `[limits]`:
+
+```toml
+auth_rate_limit_allowlist = ["198.51.100.0/24", "203.0.113.7"]
+```
+
+Allowlisted sources skip failure counting and banning entirely; everyone else
+keeps full brute-force protection. Changing the list requires a restart.
 
 ## Tuning
 

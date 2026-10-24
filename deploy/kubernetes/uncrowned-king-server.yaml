@@ -287,8 +287,12 @@ spec:
         - protocol: TCP
           port: 9090
   egress:
-    # Allow DNS resolution
-    - ports:
+    # Allow DNS resolution only in the cluster DNS namespace.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
         - protocol: UDP
           port: 53
         - protocol: TCP

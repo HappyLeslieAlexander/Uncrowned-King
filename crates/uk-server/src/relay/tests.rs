@@ -10,9 +10,9 @@ use std::{
 
 use super::context::{
     BoxedConnectFuture, BufferedTargetData, CarrierWriter, FlowEvent, FlowIdRejection, FlowSlot,
-    FlowTable, FlowToken, FlowTokenAllocator, HalfCloseSide, OpenDialLimiter, OpenFailure,
-    OpenFlowCancel, OpenSlotRejection, RELAY_BUFFER_SIZE, RelayLimits,
-    SESSION_EVENT_QUEUE_BASE_CAPACITY, SESSION_EVENT_QUEUE_MAX_CAPACITY,
+    FlowTable, FlowToken, FlowTokenAllocator, GlobalBufferControl, GlobalFlowBudget, HalfCloseSide,
+    OpenDialLimiter, OpenFailure, OpenFlowCancel, OpenSlotRejection, RELAY_BUFFER_SIZE,
+    RelayLimits, SESSION_EVENT_QUEUE_BASE_CAPACITY, SESSION_EVENT_QUEUE_MAX_CAPACITY,
     SESSION_EVENT_QUEUE_PER_FLOW_CAPACITY, ServerCarrier, ServerSessionState, SessionBufferControl,
     SessionEvent, SessionShutdown, SessionTaskKind, TARGET_RESOLUTION_ADDR_LIMIT,
     TARGET_WRITE_QUEUE_MAX_CAPACITY, TARGET_WRITE_QUEUE_MIN_CAPACITY, TargetCommand,
@@ -21,8 +21,8 @@ use super::context::{
     open_target_flow_mut, remove_flow_slot, tcp_data_frame_size,
 };
 use super::dialer::{
-    collect_resolved_addrs, connect_first_successful, connect_udp_socket_addr,
-    target_connect_deadline, with_target_connect_deadline,
+    collect_resolved_addrs, connect_allowed_target_inner, connect_first_successful,
+    connect_udp_socket_addr, target_connect_deadline, with_target_connect_deadline,
 };
 use super::session::{
     close_session, close_target_flows, drain_session_tasks, flow_event_counts_as_session_activity,
@@ -518,6 +518,43 @@ fn target_flow_control_release_saturates_at_zero() {
     control.release_bytes(8);
     assert_eq!(control.buffered_bytes(), 0);
     assert_eq!(session.buffered_bytes(), 0);
+}
+
+#[test]
+fn global_buffer_budget_is_shared_across_sessions() {
+    let global = GlobalBufferControl::new(3, Arc::new(AtomicUsize::new(0)));
+    let first_session = SessionBufferControl::default();
+    let second_session = SessionBufferControl::default();
+    let first = TargetFlowControl::with_global_buffer(first_session, global.clone());
+    let second = TargetFlowControl::with_global_buffer(second_session, global.clone());
+
+    assert!(first.reserve_bytes(2, 10, 10));
+    assert!(second.reserve_bytes(1, 10, 10));
+    assert_eq!(global.buffered_bytes(), 3);
+    assert!(!second.reserve_bytes(1, 10, 10));
+    assert_eq!(global.buffered_bytes(), 3);
+
+    first.release_bytes(2);
+    assert_eq!(global.buffered_bytes(), 1);
+    assert!(second.reserve_bytes(1, 10, 10));
+    assert_eq!(global.buffered_bytes(), 2);
+}
+
+#[test]
+fn global_flow_budget_releases_permits_on_drop() {
+    let global = GlobalFlowBudget::new(2, Arc::new(AtomicUsize::new(0)));
+    let first = global.try_acquire().expect("first flow permit");
+    let second = global.try_acquire().expect("second flow permit");
+    assert_eq!(global.current(), 2);
+    assert!(global.try_acquire().is_none());
+
+    drop(first);
+    assert_eq!(global.current(), 1);
+    let replacement = global.try_acquire().expect("permit after release");
+    assert_eq!(global.current(), 2);
+    drop(second);
+    drop(replacement);
+    assert_eq!(global.current(), 0);
 }
 
 #[tokio::test]
@@ -1828,6 +1865,134 @@ fn rejects_server_session_state_regression() {
 }
 
 #[tokio::test]
+async fn policy_denied_domains_skip_dns_resolution() {
+    let cred = uk_auth::Credential::active(
+        b"user".to_vec(),
+        b"0123456789abcdef0123456789abcdef".to_vec(),
+    )
+    .unwrap();
+    let identity = AuthenticatedIdentity::from(&cred);
+    let limiter = OpenDialLimiter::new(4);
+    let deny_all = uk_policy::PolicySet::new(vec![]);
+
+    // `.invalid` is reserved (RFC 6761) and can never resolve: had the dialer
+    // resolved first, it would surface as TargetUnavailable instead of
+    // PolicyDenied. Denied-but-resolvable and denied-and-unresolvable names
+    // must stay indistinguishable to the client.
+    for domain in ["secret.internal.corp.invalid", "localhost"] {
+        let target = Target::Domain(domain.to_owned(), 443);
+        let err = connect_allowed_target_inner(&target, &identity, &deny_all, &limiter, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OpenFailure::PolicyDenied),
+            "domain {domain} leaked resolution status: {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn half_close_timeout_notifies_client_with_error_close() {
+    let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target_listener.local_addr().unwrap();
+
+    let (client_transport, server_transport) = tokio::io::duplex(65536);
+    let (server_reader, server_writer) = tokio::io::split(server_transport);
+    let carrier = ServerCarrier::new(Box::new(server_reader), Box::new(server_writer), None);
+
+    let cred = uk_auth::Credential::active(
+        b"user".to_vec(),
+        b"0123456789abcdef0123456789abcdef".to_vec(),
+    )
+    .unwrap();
+    let identity = AuthenticatedIdentity::from(&cred);
+    let mut policy = uk_policy::PolicyRule::new(uk_policy::PolicyDecision::Allow);
+    policy.ports = Some(1..=65535);
+    policy.private = Some(true);
+    let security = SecurityState::new(
+        crate::security::test_tls_acceptor(),
+        vec![cred],
+        uk_policy::PolicySet::new(vec![policy]),
+        Duration::from_secs(30),
+    );
+    let mut limits = test_relay_limits(10);
+    limits.tcp_half_close_timeout = Some(Duration::from_millis(100));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let metrics = Arc::new(ServerMetrics::default());
+
+    let session_handle = tokio::spawn(async move {
+        relay_session(
+            carrier,
+            identity,
+            security,
+            limits,
+            GlobalBufferControl::default(),
+            GlobalFlowBudget::default(),
+            None,
+            shutdown_rx,
+            metrics,
+        )
+        .await
+    });
+
+    let (client_reader, mut client_writer) = tokio::io::split(client_transport);
+    let mut client_frame_reader = FrameReader::new(Box::pin(client_reader), FrameLimits::default());
+
+    let target = Target::Ipv4(Ipv4Addr::LOCALHOST, target_addr.port());
+    let mut payload = BytesMut::new();
+    TcpOpen::new(target, TCP_OPEN_FLAGS_NONE)
+        .encode(&mut payload)
+        .unwrap();
+    let frame = Frame::new(FrameType::TcpOpen, 0, 1, payload.freeze()).unwrap();
+    write_frame(&mut client_writer, &frame).await.unwrap();
+
+    let (mut target_stream, _) = target_listener.accept().await.unwrap();
+    let open_ack = client_frame_reader.read_frame().await.unwrap();
+    assert_eq!(open_ack.header.frame_type, FrameType::TcpData);
+    assert_eq!(open_ack.header.id, 1);
+
+    // The target half-closes; the client never uploads its TCP_CLOSE, so the
+    // TargetToClient drain timer is the only thing that can end this flow.
+    target_stream.shutdown().await.unwrap();
+
+    // First the reader task propagates the target EOF as a half-close...
+    let target_close =
+        tokio::time::timeout(Duration::from_secs(2), client_frame_reader.read_frame())
+            .await
+            .expect("target EOF must reach the client")
+            .unwrap();
+    assert_eq!(target_close.header.frame_type, FrameType::TcpClose);
+    assert_eq!(target_close.header.id, 1);
+    let mut target_close_payload = target_close.payload;
+    assert_eq!(
+        TcpClose::decode(&mut target_close_payload)
+            .unwrap()
+            .close_code,
+        TCP_CLOSE_NORMAL
+    );
+
+    // ...then, when the client still has not finished its upload by the drain
+    // deadline, the flow is aborted and the client must be told instead of
+    // being left with a half-closed flow that can never complete.
+    let close_frame =
+        tokio::time::timeout(Duration::from_secs(2), client_frame_reader.read_frame())
+            .await
+            .expect("half-close timeout must notify the client")
+            .unwrap();
+    assert_eq!(close_frame.header.frame_type, FrameType::TcpClose);
+    assert_eq!(close_frame.header.id, 1);
+    let mut close_payload = close_frame.payload;
+    let close = TcpClose::decode(&mut close_payload).unwrap();
+    assert_eq!(
+        close.close_code, TCP_CLOSE_ERROR,
+        "aborted half-close drain must surface as an error close, not silence"
+    );
+
+    shutdown_tx.send(true).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), session_handle).await;
+}
+
+#[tokio::test]
 async fn server_session_graceful_drain_completes_active_flows_and_rejects_new() {
     let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target_listener.local_addr().unwrap();
@@ -1862,6 +2027,8 @@ async fn server_session_graceful_drain_completes_active_flows_and_rejects_new() 
             identity,
             security,
             limits,
+            GlobalBufferControl::default(),
+            GlobalFlowBudget::default(),
             None,
             shutdown_rx,
             metrics,
@@ -1976,6 +2143,8 @@ async fn server_session_drain_timeout_aborts_hung_flows() {
             identity,
             security,
             limits,
+            GlobalBufferControl::default(),
+            GlobalFlowBudget::default(),
             None,
             shutdown_rx,
             metrics,
@@ -2038,6 +2207,8 @@ async fn server_session_zero_flows_instant_shutdown() {
             identity,
             security,
             limits,
+            GlobalBufferControl::default(),
+            GlobalFlowBudget::default(),
             None,
             shutdown_rx,
             metrics,
@@ -2441,6 +2612,8 @@ async fn review_real_relay_drain_loses_tail_of_upload() {
         identity,
         security,
         limits,
+        GlobalBufferControl::default(),
+        GlobalFlowBudget::default(),
         None,
         shutdown_rx,
         metrics,
@@ -2554,6 +2727,8 @@ async fn carrier_disconnect_without_client_close_flushes_pending_writes() {
         identity,
         security,
         limits,
+        GlobalBufferControl::default(),
+        GlobalFlowBudget::default(),
         None,
         shutdown_rx,
         metrics,

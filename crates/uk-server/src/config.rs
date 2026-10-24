@@ -16,13 +16,24 @@ use uk_auth::{
 };
 use uk_policy::PolicySet;
 use uk_proto::{
-    BindExposure, MAX_FRAME_PAYLOAD_SIZE, MIN_TCP_RELAY_FRAME_SIZE, validate_host_port_endpoint,
+    BindExposure, MAX_FRAME_PAYLOAD_SIZE, MAX_NEGOTIATED_FLOWS,
+    MAX_NEGOTIATED_IDLE_TIMEOUT_SECONDS, MIN_TCP_RELAY_FRAME_SIZE, validate_host_port_endpoint,
     validate_observability_bind,
 };
 use zeroize::{Zeroize, Zeroizing};
 
 /// Default accepted authentication timestamp skew in seconds.
 pub const DEFAULT_AUTH_SKEW_SECONDS: u64 = 30;
+
+/// Default global concurrent stream budget across all authenticated sessions.
+pub const DEFAULT_MAX_TOTAL_STREAMS: u64 = 65_536;
+
+/// Default global client-to-target buffered-byte budget across all sessions.
+pub const DEFAULT_MAX_TOTAL_BUFFERED_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Largest accepted global limit. One TiB is far above any realistic host and
+/// only prevents absurd values from overflowing platform conversions.
+const MAX_TOTAL_LIMIT: u64 = 1024 * 1024 * 1024 * 1024;
 
 /// Largest accepted authentication timestamp skew in seconds.
 ///
@@ -143,7 +154,23 @@ impl ServerConfig {
         reject_zero_limit("max_handshakes", self.max_handshakes())?;
         reject_semaphore_permit_limit("max_handshakes", self.max_handshakes())?;
         reject_zero_limit("max_streams", self.max_streams())?;
+        reject_large_limit("max_streams", self.max_streams(), MAX_NEGOTIATED_FLOWS)?;
         reject_large_limit("max_udp_flows", self.max_udp_flows(), self.max_streams())?;
+        reject_large_limit("max_udp_flows", self.max_udp_flows(), MAX_NEGOTIATED_FLOWS)?;
+        reject_zero_limit("max_total_streams", self.max_total_streams())?;
+        reject_large_limit(
+            "max_total_streams",
+            self.max_total_streams(),
+            MAX_TOTAL_LIMIT,
+        )?;
+        reject_usize_limit("max_total_streams", self.max_total_streams())?;
+        reject_zero_limit("max_total_buffered_bytes", self.max_total_buffered_bytes())?;
+        reject_large_limit(
+            "max_total_buffered_bytes",
+            self.max_total_buffered_bytes(),
+            MAX_TOTAL_LIMIT,
+        )?;
+        reject_usize_limit("max_total_buffered_bytes", self.max_total_buffered_bytes())?;
         reject_zero_limit(
             "max_outbound_dials_per_session",
             self.max_outbound_dials_per_session(),
@@ -181,6 +208,11 @@ impl ServerConfig {
             "auth_skew_seconds",
             self.auth_skew_seconds(),
             MAX_AUTH_SKEW_SECONDS,
+        )?;
+        reject_large_limit(
+            "idle_timeout_seconds",
+            self.idle_timeout_seconds(),
+            MAX_NEGOTIATED_IDLE_TIMEOUT_SECONDS,
         )?;
         self.validate_replay_cache_covers_auth_skew()?;
         if let Some(buf_size) = self.limits.as_ref().and_then(|l| l.relay_buffer_size) {
@@ -255,7 +287,38 @@ impl ServerConfig {
             rate_limit.ban_secs,
             2_592_000,
         )?;
+        // Each allowlist entry must parse as a CIDR (or bare IP) now, so a
+        // typo cannot silently limit nothing.
+        for entry in self.auth_rate_limit_allowlist() {
+            if parse_allowlist_entry(&entry).is_none() {
+                return Err(format!(
+                    "auth_rate_limit_allowlist entry {entry:?} is not a valid CIDR or IP"
+                )
+                .into());
+            }
+        }
         Ok(())
+    }
+
+    /// Networks exempt from authentication failure rate limiting.
+    ///
+    /// Failures from these peers (a shared NAT egress, a monitoring prober)
+    /// are neither counted nor banned; every other source keeps the default
+    /// `5 failures / 60s -> 300s ban` protection. Changing the list requires
+    /// a restart (it is part of the static admission path).
+    pub fn auth_rate_limit_allowlist(&self) -> Vec<String> {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.auth_rate_limit_allowlist.clone())
+            .unwrap_or_default()
+    }
+
+    /// The allowlist parsed into CIDRs; only valid after `validate_limits`.
+    pub fn auth_rate_limit_allowlist_cidrs(&self) -> Vec<uk_policy::Cidr> {
+        self.auth_rate_limit_allowlist()
+            .iter()
+            .filter_map(|entry| parse_allowlist_entry(entry))
+            .collect()
     }
 
     /// Ensures the replay cache outlives the whole accepted timestamp window.
@@ -359,6 +422,22 @@ impl ServerConfig {
             .as_ref()
             .and_then(|limits| limits.max_streams)
             .unwrap_or(64)
+    }
+
+    /// Maximum concurrent streams across all authenticated sessions.
+    pub fn max_total_streams(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.max_total_streams)
+            .unwrap_or(DEFAULT_MAX_TOTAL_STREAMS)
+    }
+
+    /// Maximum client-to-target bytes buffered across all authenticated sessions.
+    pub fn max_total_buffered_bytes(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.max_total_buffered_bytes)
+            .unwrap_or(DEFAULT_MAX_TOTAL_BUFFERED_BYTES)
     }
 
     /// Configured maximum concurrent UDP flows per authenticated session.
@@ -535,6 +614,17 @@ impl ServerConfig {
     }
 }
 
+fn parse_allowlist_entry(entry: &str) -> Option<uk_policy::Cidr> {
+    if let Ok(cidr) = entry.parse::<uk_policy::Cidr>() {
+        return Some(cidr);
+    }
+    match entry.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => uk_policy::Cidr::new_v4(ip, 32).ok(),
+        Ok(std::net::IpAddr::V6(ip)) => uk_policy::Cidr::new_v6(ip, 128).ok(),
+        Err(_) => None,
+    }
+}
+
 fn reject_zero_limit(name: &str, value: u64) -> Result<(), Box<dyn Error + Send + Sync>> {
     if value == 0 {
         Err(format!("{name} must be greater than zero").into())
@@ -605,6 +695,10 @@ pub struct LimitConfig {
     pub idle_timeout_seconds: Option<u64>,
     /// Maximum queued client-to-target bytes per TCP flow.
     pub max_buffered_bytes_per_flow: Option<u64>,
+    /// Maximum concurrent streams across all authenticated sessions.
+    pub max_total_streams: Option<u64>,
+    /// Maximum queued client-to-target bytes across all authenticated sessions.
+    pub max_total_buffered_bytes: Option<u64>,
     /// TLS and authentication handshake timeout in seconds.
     pub handshake_timeout_seconds: Option<u64>,
     /// DNS resolution and TCP dial timeout for target opens.
@@ -631,6 +725,10 @@ pub struct LimitConfig {
     pub auth_rate_limit_window_seconds: Option<u64>,
     /// Ban duration in seconds when auth_rate_limit_failures is exceeded.
     pub auth_rate_limit_ban_seconds: Option<u64>,
+    /// Networks (CIDR or bare IP strings) exempt from authentication failure
+    /// rate limiting, e.g. a shared NAT egress. Empty by default; changing it
+    /// requires a restart.
+    pub auth_rate_limit_allowlist: Option<Vec<String>>,
     /// QUIC stream receive window in bytes. Default: 1 MiB (1048576). Range: 64 KiB .. 16 MiB.
     pub quic_stream_receive_window: Option<u64>,
     /// QUIC connection receive window in bytes. Default: 1 MiB (1048576). Range: 64 KiB .. 16 MiB.
@@ -1203,6 +1301,104 @@ max_udp_flows = 3
     #[test]
     fn accepts_default_limits() {
         assert!(minimal_config().validate_limits().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_auth_rate_limit_allowlist_entries() {
+        let mut config = minimal_config();
+        config.limits = Some(LimitConfig {
+            auth_rate_limit_allowlist: Some(vec![
+                "198.51.100.0/24".to_owned(),
+                "not-a-cidr".to_owned(),
+            ]),
+            ..LimitConfig::default()
+        });
+        let err = config.validate_limits().unwrap_err();
+        assert!(err.to_string().contains("not-a-cidr"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_valid_auth_rate_limit_allowlist() {
+        let mut config = minimal_config();
+        config.limits = Some(LimitConfig {
+            auth_rate_limit_allowlist: Some(vec![
+                "198.51.100.0/24".to_owned(),
+                "2001:db8::/32".to_owned(),
+                "203.0.113.7".to_owned(),
+            ]),
+            ..LimitConfig::default()
+        });
+        assert!(config.validate_limits().is_ok());
+        assert_eq!(config.auth_rate_limit_allowlist_cidrs().len(), 3);
+    }
+
+    #[test]
+    fn rejects_protocol_limit_above_wire_cap() {
+        let mut config = minimal_config();
+        config.limits = Some(LimitConfig {
+            max_streams: Some(MAX_NEGOTIATED_FLOWS + 1),
+            ..LimitConfig::default()
+        });
+        assert!(config.validate_limits().is_err());
+
+        let mut config = minimal_config();
+        config.limits = Some(LimitConfig {
+            max_streams: Some(MAX_NEGOTIATED_FLOWS),
+            max_udp_flows: Some(MAX_NEGOTIATED_FLOWS + 1),
+            ..LimitConfig::default()
+        });
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_idle_timeout_above_wire_cap() {
+        let mut config = minimal_config();
+        config.limits = Some(LimitConfig {
+            idle_timeout_seconds: Some(MAX_NEGOTIATED_IDLE_TIMEOUT_SECONDS + 1),
+            ..LimitConfig::default()
+        });
+        assert!(config.validate_limits().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_global_limits() {
+        for limits in [
+            LimitConfig {
+                max_total_streams: Some(0),
+                ..LimitConfig::default()
+            },
+            LimitConfig {
+                max_total_buffered_bytes: Some(0),
+                ..LimitConfig::default()
+            },
+        ] {
+            let mut config = minimal_config();
+            config.limits = Some(limits);
+            assert!(config.validate_limits().is_err());
+        }
+    }
+
+    #[test]
+    fn defaults_global_limits() {
+        let config = minimal_config();
+        assert_eq!(config.max_total_streams(), DEFAULT_MAX_TOTAL_STREAMS);
+        assert_eq!(
+            config.max_total_buffered_bytes(),
+            DEFAULT_MAX_TOTAL_BUFFERED_BYTES
+        );
+        assert!(config.validate_limits().is_ok());
+    }
+
+    #[test]
+    fn accepts_protocol_limits_at_wire_cap() {
+        let mut config = minimal_config();
+        config.limits = Some(LimitConfig {
+            max_streams: Some(MAX_NEGOTIATED_FLOWS),
+            max_udp_flows: Some(MAX_NEGOTIATED_FLOWS),
+            idle_timeout_seconds: Some(MAX_NEGOTIATED_IDLE_TIMEOUT_SECONDS),
+            ..LimitConfig::default()
+        });
+        assert!(config.validate_limits().is_ok());
     }
 
     #[test]

@@ -121,6 +121,11 @@ spec:
       containers:
         - name: uk-client
           image: ghcr.io/happylesliealexander/uncrowned-king-client:v1.0.2
+          # This manifest is the cluster-proxy form: the SOCKS listener binds
+          # the pod address so the Service below can route to it, and the
+          # NetworkPolicy restricts ingress to this namespace. For a local
+          # sidecar instead, switch to 127.0.0.1:1080 (drop --allow-non-loopback)
+          # and remove the Service.
           command:
             - "uk-client"
             - "socks5"
@@ -225,9 +230,10 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # Allow incoming SOCKS5 connections from within the cluster
+    # The SOCKS listener is unauthenticated. Allow only pods in this
+    # namespace; add namespaceSelectors only after an explicit risk review.
     - from:
-        - namespaceSelector: {}
+        - podSelector: {}
       ports:
         - protocol: TCP
           port: 1080
@@ -243,14 +249,25 @@ spec:
         - protocol: TCP
           port: 9091
   egress:
-    # Allow DNS resolution
-    - ports:
+    # Allow DNS resolution only in the cluster DNS namespace.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
         - protocol: UDP
           port: 53
         - protocol: TCP
           port: 53
-    # Allow outbound carrier connections to UK server
-    - ports:
+    # Allow outbound carrier connections only to the UK server in this namespace.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: uncrowned-king
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: uncrowned-king-server
+      ports:
         - protocol: TCP
           port: 9443
         - protocol: UDP

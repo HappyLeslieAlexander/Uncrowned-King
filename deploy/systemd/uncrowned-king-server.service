@@ -76,8 +76,11 @@ AmbientCapabilities=
 # reads them (ProtectSystem=strict already makes the filesystem read-only).
 
 # --- Resource limits ---------------------------------------------------------
-LimitNOFILE=65536
-TasksMax=1024
+# Each relayed flow holds ~2 sockets, so size this above the flow budget:
+# roughly 2 x max_total_streams (server) or 2 x max_sessions x max_streams.
+# 1,048,576 covers the default 65,536 global flow budget with headroom.
+LimitNOFILE=1048576
+TasksMax=infinity
 
 [Install]
 WantedBy=multi-user.target

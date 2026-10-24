@@ -68,8 +68,11 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 
 # --- Resource limits ---------------------------------------------------------
-LimitNOFILE=65536
-TasksMax=1024
+# Every SOCKS connection and every carrier flow holds a socket, so size this
+# above roughly (max_socks_connections + max_carrier_sessions x max_streams).
+# 1,048,576 covers the defaults with ample headroom.
+LimitNOFILE=1048576
+TasksMax=infinity
 
 [Install]
 WantedBy=multi-user.target

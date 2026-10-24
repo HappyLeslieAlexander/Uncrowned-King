@@ -1,4 +1,13 @@
 {{- if .Values.server.enabled }}
+{{- /* Unknown top-level keys in server.config are rejected: a typo like
+     `quic_lisen` would otherwise be silently ignored and the deployment
+     would run with defaults instead of the intended value. */}}
+{{- $knownServerFields := list "listen" "quic_listen" "observability_listen" "auth_skew_seconds" "limits" "log_format" }}
+{{- range $key, $val := .Values.server.config }}
+{{- if not (has $key $knownServerFields) }}
+{{- fail (printf "Unknown server.config field %q (known fields: %s); refusing to silently ignore it" $key (join ", " $knownServerFields)) }}
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -22,14 +31,18 @@ data:
     {{- end }}
 
     {{- if .Values.server.config.limits }}
-    {{- $knownLimits := list "max_pre_auth_bytes" "max_frame_size" "max_sessions" "max_handshakes" "max_streams" "max_udp_flows" "max_outbound_dials_per_session" "max_buffered_bytes_per_session" "max_buffered_bytes_per_flow" "relay_buffer_size" "idle_timeout_seconds" "handshake_timeout_seconds" "target_connect_timeout_seconds" "tcp_half_close_timeout_seconds" "carrier_write_timeout_seconds" "tcp_keepalive_seconds" "udp_flow_idle_timeout_seconds" "shutdown_timeout_seconds" "auth_rate_limit_failures" "auth_rate_limit_window_seconds" "auth_rate_limit_ban_seconds" "replay_cache_window_seconds" "replay_cache_max_entries" "quic_stream_receive_window" "quic_connection_receive_window" }}
+    {{- $knownLimits := list "max_pre_auth_bytes" "max_frame_size" "max_sessions" "max_handshakes" "max_streams" "max_udp_flows" "max_outbound_dials_per_session" "max_buffered_bytes_per_session" "max_buffered_bytes_per_flow" "max_total_streams" "max_total_buffered_bytes" "relay_buffer_size" "idle_timeout_seconds" "handshake_timeout_seconds" "target_connect_timeout_seconds" "tcp_half_close_timeout_seconds" "carrier_write_timeout_seconds" "tcp_keepalive_seconds" "udp_flow_idle_timeout_seconds" "shutdown_timeout_seconds" "auth_rate_limit_failures" "auth_rate_limit_window_seconds" "auth_rate_limit_ban_seconds" "auth_rate_limit_allowlist" "replay_cache_window_seconds" "replay_cache_max_entries" "quic_stream_receive_window" "quic_connection_receive_window" }}
     [limits]
     {{- range $key, $val := .Values.server.config.limits }}
     {{- if not (has $key $knownLimits) }}
     {{- fail (printf "Unknown server limit %q in server.config.limits" $key) }}
     {{- end }}
     {{- if not (kindIs "invalid" $val) }}
+    {{- if eq $key "auth_rate_limit_allowlist" }}
+    {{ $key }} = [{{ range $item := $val }}"{{ $item }}", {{ end }}]
+    {{- else }}
     {{ $key }} = {{ int64 $val }}
+    {{- end }}
     {{- end }}
     {{- end }}
     {{- end }}
