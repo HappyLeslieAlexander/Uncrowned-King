@@ -48,8 +48,9 @@ rm -f "$WORK/server.csr" "$WORK/ca-key.pem"
 mkdir "$WORK/server" "$WORK/client"
 # The server config points at /etc/uncrowned-king/server-{cert,key}.pem, and
 # only "$WORK/server" is mounted there, so the TLS material must live in it.
+# The client trusts the CA (not the leaf) and verifies the uk-server SAN.
 cp "$WORK/server-cert.pem" "$WORK/server-key.pem" "$WORK/server/"
-cp "$WORK/server-cert.pem" "$WORK/client/ca.crt"
+cp "$WORK/ca-cert.pem" "$WORK/client/ca.crt"
 
 cat > "$WORK/server/server.toml" <<EOF
 listen = "0.0.0.0:9443"
