@@ -5781,10 +5781,11 @@ async fn run_udp_carrier_recovery_e2e() -> Result<(), TestError> {
     let mut recovered = None;
     // A reconnect re-does the whole carrier chain (TCP + TLS + auth + SETTINGS
     // + UDP_OPEN + ack) before the datagram can flow. That is milliseconds on
-    // an idle machine but can stretch well past two seconds on a loaded CI
-    // runner, so keep retrying well beyond that: UDP datagrams are cheap and
-    // the outer test timeout still bounds the wait.
-    for _ in 0..60 {
+    // an idle machine but can stretch far beyond two seconds on a loaded CI
+    // runner — including one doomed open against the dying carrier before the
+    // client observes its death — so keep retrying well beyond that: UDP
+    // datagrams are cheap and the outer test timeout still bounds the wait.
+    for _ in 0..150 {
         udp_client
             .send_to(
                 &socks_udp_datagram(target, recovered_payload),

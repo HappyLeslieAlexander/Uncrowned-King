@@ -581,8 +581,18 @@ async fn ensure_worker_flow(
 ) -> Option<UdpAssociationFlow> {
     let target = worker.target;
     if let Some(flow) = worker.current {
-        flow.record_activity();
-        return Some(flow.clone());
+        if flow.session.is_closed() {
+            // The carrier died. The session close already cleared the flow
+            // table, so a reuse here would hand the datagram to a dead
+            // carrier's write buffer — where it disappears without an error
+            // (TCP half-open) — instead of triggering the fresh open that
+            // actually recovers the association.
+            flow.session.remove_flow(flow.id).await;
+            *worker.current = None;
+        } else {
+            flow.record_activity();
+            return Some(flow.clone());
+        }
     }
 
     let flow = match worker
