@@ -1067,8 +1067,22 @@ mod tests {
         assert!(settings.negotiated_v1_0().is_err());
     }
 
+    /// Serializes the tests that mutate the process-global degraded-endpoint
+    /// state: the map and its epoch are shared across parallel tests, and a
+    /// concurrent `clear_degraded_endpoints()` between one test's epoch
+    /// capture and its assertion would mask the recorded penalty and fail
+    /// the test spuriously.
+    static DEGRADED_STATE_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+
+    fn lock_degraded_state() -> std::sync::MutexGuard<'static, ()> {
+        DEGRADED_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn tracks_and_clears_degraded_endpoints() {
+        let _degraded_state = lock_degraded_state();
         clear_degraded_endpoints();
         let epoch = degraded_epoch();
         let ep = "quic://127.0.0.1:9443";
@@ -1084,6 +1098,7 @@ mod tests {
 
     #[test]
     fn degraded_endpoints_do_not_leak_across_reload_epochs() {
+        let _degraded_state = lock_degraded_state();
         clear_degraded_endpoints();
         let old_epoch = degraded_epoch();
         let ep = "quic://127.0.0.1:9443";
@@ -1107,7 +1122,13 @@ mod tests {
     }
 
     #[tokio::test]
+    // The guard must span the whole connect, including its awaits, to keep
+    // parallel tests out of the global degraded-endpoint map. `#[tokio::test]`
+    // runs on a single-threaded runtime and no other task in it contends on
+    // this lock, so holding it across the await is safe here.
+    #[allow(clippy::await_holding_lock)]
     async fn quic_transport_failure_marks_endpoint_degraded() {
+        let _degraded_state = lock_degraded_state();
         clear_degraded_endpoints();
         let path =
             std::env::temp_dir().join(format!("quic-degraded-test-ca-{}.pem", std::process::id()));

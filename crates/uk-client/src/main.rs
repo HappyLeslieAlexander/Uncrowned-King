@@ -72,15 +72,22 @@ async fn main() -> Result<(), AnyError> {
         } => {
             check_config(&config)?;
             validate_host_port_endpoint("socks listen", &listen)?;
-            // Reject a forbidden bind *before* the socket exists: binding
-            // first and validating after would briefly expose an
-            // unauthenticated SOCKS5 listener the operator did not approve.
-            // Hostnames cannot be classified without DNS, so the post-bind
-            // check below stays as the second layer for those.
-            if let Ok(requested) = listen.parse::<SocketAddr>() {
-                validate_socks_listener_scope(requested, allow_non_loopback)?;
+            // Resolve before the socket exists and validate every address the
+            // name maps to: binding first and validating after would briefly
+            // expose an unauthenticated SOCKS5 listener the operator did not
+            // approve. Binding the resolved address (not the name) also
+            // removes the resolution gap between this check and the bind.
+            let resolved: Vec<SocketAddr> = tokio::net::lookup_host(&listen)
+                .await
+                .map_err(|err| format!("failed to resolve socks listen {listen}: {err}"))?
+                .collect();
+            if resolved.is_empty() {
+                return Err(format!("socks listen {listen} resolved to no addresses").into());
             }
-            let listener = TcpListener::bind(&listen).await?;
+            for addr in &resolved {
+                validate_socks_listener_scope(*addr, allow_non_loopback)?;
+            }
+            let listener = TcpListener::bind(resolved[0]).await?;
             let listen = listener.local_addr()?;
             validate_socks_listener_scope(listen, allow_non_loopback)?;
             if allow_non_loopback && !listen.ip().is_loopback() {
