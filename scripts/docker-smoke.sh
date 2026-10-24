@@ -33,6 +33,9 @@ openssl req -x509 -newkey rsa:2048 -nodes \
     -subj "/CN=uk-server" -addext "subjectAltName=DNS:uk-server" >/dev/null 2>&1
 
 mkdir "$WORK/server" "$WORK/client"
+# The server config points at /etc/uncrowned-king/server-{cert,key}.pem, and
+# only "$WORK/server" is mounted there, so the TLS material must live in it.
+cp "$WORK/server-cert.pem" "$WORK/server-key.pem" "$WORK/server/"
 cp "$WORK/server-cert.pem" "$WORK/client/ca.crt"
 
 cat > "$WORK/server/server.toml" <<EOF

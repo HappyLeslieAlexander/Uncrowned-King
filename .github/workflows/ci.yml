@@ -69,7 +69,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install Helm
-        uses: azure/setup-helm@b7246b12e77f713476503ba86817b96053f3e1b1 # v4.3.0
+        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
 
       - name: Helm Lint
         run: helm lint deploy/helm/uncrowned-king

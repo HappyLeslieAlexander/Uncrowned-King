@@ -458,11 +458,40 @@ async fn udp_target_worker(
                 }
             }
             joined = inbound.join_next(), if !inbound.is_empty() => {
-                // The inbound relay ended (server closed the flow, the session
-                // died, or shutdown): mirror the close on our side. The worker
-                // itself stays alive for the next datagram to this target.
-                let _ = joined;
-                close_worker_flow(&mut current).await;
+                // Mirror the close only for the flow whose inbound relay
+                // *actually* ended. The JoinSet can still hold the previous
+                // flow's finished relay task — for example one ended by the
+                // old carrier's death — and closing `current` for it would
+                // tear down a healthy flow on the new carrier right after
+                // its first datagram, silently dropping the reply that is
+                // already in flight. The worker itself stays alive for the
+                // next datagram to this target either way.
+                match joined {
+                    Some(Ok(ended)) => {
+                        let matches_current = current.as_ref().is_some_and(|flow| {
+                            flow.id == ended.flow_id
+                                && flow.session.correlation_id == ended.session_correlation
+                        });
+                        if matches_current {
+                            close_worker_flow(&mut current).await;
+                        } else {
+                            debug!(
+                                event = "client.udp_flow.inbound.stale_relay_reaped",
+                                flow_id = ended.flow_id,
+                                session_correlation = ended.session_correlation,
+                                target = %target.log_safe()
+                            );
+                        }
+                    }
+                    Some(Err(err)) => {
+                        warn!(
+                            event = "client.udp_flow.inbound.join_error",
+                            target = %target.log_safe(),
+                            error = %err
+                        );
+                    }
+                    None => {}
+                }
             }
         }
     }
@@ -476,7 +505,7 @@ async fn udp_target_worker(
 struct UdpTargetWorker<'a> {
     target: &'a Target,
     current: &'a mut Option<UdpAssociationFlow>,
-    inbound: &'a mut JoinSet<()>,
+    inbound: &'a mut JoinSet<EndedUdpRelay>,
     sessions: &'a Arc<ClientSessionManager>,
     socket: &'a Arc<UdpSocket>,
     client_endpoint: SocketAddr,
@@ -598,16 +627,42 @@ async fn ensure_worker_flow(
         session: Arc::clone(&flow.session),
         activity: Arc::clone(&activity),
     };
-    worker.inbound.spawn(relay_udp_flow_to_client(
-        flow,
-        target.clone(),
-        Arc::clone(worker.socket),
-        worker.client_endpoint,
-        worker.cancel.clone(),
-        Arc::clone(&activity),
-    ));
+    // The relay task reports which flow it belonged to when it ends, so the
+    // worker can mirror a close onto the matching flow instead of onto
+    // whichever flow happens to be current when it gets around to joining
+    // (see the `inbound.join_next` branch in `udp_target_worker`).
+    let relay_session_correlation = flow.session.correlation_id;
+    let relay_flow_id = flow.id;
+    let relay_socket = Arc::clone(worker.socket);
+    let relay_cancel = worker.cancel.clone();
+    let relay_client_endpoint = worker.client_endpoint;
+    let relay_target = target.clone();
+    worker.inbound.spawn(async move {
+        relay_udp_flow_to_client(
+            flow,
+            relay_target,
+            relay_socket,
+            relay_client_endpoint,
+            relay_cancel,
+            Arc::clone(&activity),
+        )
+        .await;
+        EndedUdpRelay {
+            session_correlation: relay_session_correlation,
+            flow_id: relay_flow_id,
+        }
+    });
     *worker.current = Some(association_flow.clone());
     Some(association_flow)
+}
+
+/// Identity of an inbound relay task that has finished, letting the worker
+/// tell a stale task (one that belonged to a flow it already replaced) apart
+/// from the end of the flow it currently owns.
+#[derive(Debug)]
+struct EndedUdpRelay {
+    session_correlation: u64,
+    flow_id: u64,
 }
 
 /// Closes the worker's flow (if any) and leaves the inbound relay to end on
