@@ -665,8 +665,11 @@ async fn socks_udp_associate_stops_while_server_connect_is_pending() -> Result<(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn socks_udp_datagram_stops_while_server_reconnect_is_pending() -> Result<(), TestError> {
+    // The healthy path finishes in well under a second; the budgets only
+    // bound a hang, so they are generous enough for a loaded CI runner
+    // (four worker-thread runtimes per test on a four-core machine).
     tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(30),
         run_socks_udp_datagram_shutdown_during_reconnect_e2e(),
     )
     .await?
@@ -5676,12 +5679,12 @@ async fn run_socks_udp_datagram_shutdown_during_reconnect_e2e() -> Result<(), Te
             udp_relay_addr,
         )
         .await?;
-    tokio::time::timeout(Duration::from_secs(3), reconnect_rx).await??;
+    tokio::time::timeout(Duration::from_secs(10), reconnect_rx).await??;
 
     shutdown_tx
         .send(())
         .map_err(|()| "client shutdown receiver dropped")?;
-    tokio::time::timeout(Duration::from_secs(3), client_task).await???;
+    tokio::time::timeout(Duration::from_secs(10), client_task).await???;
     silent_reconnect_server.abort();
     let _ = fs::remove_dir_all(&temp_dir);
     Ok(())

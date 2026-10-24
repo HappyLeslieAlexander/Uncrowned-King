@@ -28,9 +28,22 @@ docker run -d --name uk-target --network "$NET" \
     -v "$WORK/www:/www:ro" "$BUSYBOX" httpd -f -p 8080 -h /www >/dev/null
 
 # --- TLS material + configs ---------------------------------------------------
+# A minimal two-certificate chain: a self-signed CA (basicConstraints CA:TRUE)
+# and a server leaf signed by it. rustls/webpki rejects a CA certificate used
+# directly as an end-entity certificate (CaUsedAsEndEntity), so the smoke
+# cannot present one self-signed certificate as both trust anchor and leaf.
 openssl req -x509 -newkey rsa:2048 -nodes \
-    -keyout "$WORK/server-key.pem" -out "$WORK/server-cert.pem" -days 2 \
-    -subj "/CN=uk-server" -addext "subjectAltName=DNS:uk-server" >/dev/null 2>&1
+    -keyout "$WORK/ca-key.pem" -out "$WORK/ca-cert.pem" -days 2 \
+    -subj "/CN=uk-smoke-ca" >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes \
+    -keyout "$WORK/server-key.pem" -out "$WORK/server.csr" \
+    -subj "/CN=uk-server" >/dev/null 2>&1
+openssl x509 -req -in "$WORK/server.csr" \
+    -CA "$WORK/ca-cert.pem" -CAkey "$WORK/ca-key.pem" -CAcreateserial \
+    -out "$WORK/server-cert.pem" -days 2 \
+    -extfile <(printf 'subjectAltName=DNS:uk-server\nbasicConstraints=critical,CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n') \
+    >/dev/null 2>&1
+rm -f "$WORK/server.csr" "$WORK/ca-key.pem"
 
 mkdir "$WORK/server" "$WORK/client"
 # The server config points at /etc/uncrowned-king/server-{cert,key}.pem, and
