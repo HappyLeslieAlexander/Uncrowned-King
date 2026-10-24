@@ -5622,6 +5622,8 @@ async fn run_socks_udp_datagram_shutdown_during_reconnect_e2e() -> Result<(), Te
     let server_addr = carrier_listener.local_addr()?;
     let server_cert_path = cert_path.clone();
     let server_key_path = key_path.clone();
+    let (first_ready_tx, first_ready_rx) = oneshot::channel();
+    let (first_drop_tx, first_drop_rx) = oneshot::channel();
     let (reconnect_tx, reconnect_rx) = oneshot::channel();
     let silent_reconnect_server = tokio::spawn(async move {
         let first = accept_fake_server_session_from_listener(
@@ -5631,8 +5633,14 @@ async fn run_socks_udp_datagram_shutdown_during_reconnect_e2e() -> Result<(), Te
             fake_server_settings(),
         )
         .await?;
+        let _ = first_ready_tx.send(());
+        // Hold the first carrier until the SOCKS UDP association exists.
+        // Dropping it earlier races the associate: its `current_session`
+        // blocks on a re-dial, and a re-dial to the silent server never
+        // completes its TLS handshake, hanging the associate for the whole
+        // handshake timeout.
+        let _ = first_drop_rx.await;
         drop(first);
-
         let (_tcp, _) = carrier_listener.accept().await?;
         let _ = reconnect_tx.send(());
         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -5668,7 +5676,31 @@ async fn run_socks_udp_datagram_shutdown_during_reconnect_e2e() -> Result<(), Te
     )
     .await?;
 
-    let (_socks_control, udp_relay_addr) = open_socks_udp_associate(socks_addr).await?;
+    // Wait for the harness to finish authenticating the first carrier, then
+    // establish the association against it. A retry bounds the tiny window
+    // where the harness has authenticated the session but the client has not
+    // published it yet (a retry that raced would dial the silent server, so
+    // each attempt is bounded too).
+    tokio::time::timeout(Duration::from_secs(10), first_ready_rx).await??;
+    let mut associate = None;
+    let mut last_associate_error = None;
+    for _ in 0..10 {
+        match tokio::time::timeout(Duration::from_secs(2), open_socks_udp_associate(socks_addr))
+            .await
+        {
+            Ok(Ok(pair)) => {
+                associate = Some(pair);
+                break;
+            }
+            Ok(Err(err)) => last_associate_error = Some(err),
+            Err(_) => last_associate_error = Some("socks udp associate attempt timed out".into()),
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let (_socks_control, udp_relay_addr) = associate.ok_or_else(|| {
+        last_associate_error.unwrap_or_else(|| "socks udp associate never succeeded".into())
+    })?;
+
     let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     udp_client
         .send_to(
@@ -5679,6 +5711,9 @@ async fn run_socks_udp_datagram_shutdown_during_reconnect_e2e() -> Result<(), Te
             udp_relay_addr,
         )
         .await?;
+
+    // Dropping the first carrier is what starts the reconnect dance.
+    let _ = first_drop_tx.send(());
     tokio::time::timeout(Duration::from_secs(10), reconnect_rx).await??;
 
     shutdown_tx
