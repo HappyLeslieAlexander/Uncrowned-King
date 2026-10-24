@@ -101,7 +101,8 @@ docker run -d --name uk-server --network "$NET" --user "$RUN_UID" \
 docker run -d --name uk-client --network "$NET" --user "$RUN_UID" \
     -v "$WORK/client:/etc/uncrowned-king:ro" \
     -p 127.0.0.1:11080:1080 \
-    "$CLIENT_IMAGE" >/dev/null
+    "$CLIENT_IMAGE" --config /etc/uncrowned-king/client.toml socks5 \
+    --listen 0.0.0.0:1080 --allow-non-loopback >/dev/null
 
 # Poll until a SOCKS request round-trips (server TLS accept + carrier auth +
 # flow open all happen on the first request).
