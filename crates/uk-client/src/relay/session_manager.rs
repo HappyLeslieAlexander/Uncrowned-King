@@ -762,8 +762,32 @@ impl ClientSessionManager {
     pub(crate) async fn shutdown(&self) {
         self.closed.store(true, Ordering::SeqCst);
         let sessions: Vec<Arc<ClientSession>> = { self.pool.lock().await.drain(..).collect() };
-        for session in sessions {
-            session.close_and_wait().await;
+        let budget = timeout(self.config.snapshot().config.shutdown_timeout_seconds());
+        match budget {
+            None => {
+                for session in sessions {
+                    session.close_and_wait().await;
+                }
+            }
+            Some(budget) => {
+                // One shared deadline for the whole pool, mirroring the
+                // server's drain: `close_and_wait` is individually bounded,
+                // but several blackholed carriers must not stretch process
+                // shutdown to a multiple of that bound.
+                let deadline = time::Instant::now() + budget;
+                for session in sessions {
+                    let remaining = deadline.saturating_duration_since(time::Instant::now());
+                    if time::timeout(remaining, session.close_and_wait())
+                        .await
+                        .is_err()
+                    {
+                        warn!(
+                            event = "client.session.shutdown.deadline_exceeded",
+                            correlation_id = session.correlation_id
+                        );
+                    }
+                }
+            }
         }
         let mut reapers = self.reapers.lock().await;
         while reapers.join_next().await.is_some() {}

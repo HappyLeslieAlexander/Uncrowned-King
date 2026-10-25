@@ -586,16 +586,29 @@ async fn handle_reload_request(
     metrics: &ServerMetrics,
     request: ServerReloadRequest,
 ) {
+    // Reload runs inline in the accept loop, so a wedged filesystem (certs on
+    // a hung NFS mount) would otherwise stall accepting new connections for
+    // as long as the blocking read takes. Bounded like the client's CA load.
+    const RELOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
     let current = config.clone();
     let security = security.clone();
     let quic_endpoint = quic_endpoint.cloned();
 
     let result: Result<u64, AnyError> = match request.config {
-        Ok(candidate) => tokio::task::spawn_blocking(move || {
-            apply_security_reload(&current, &security, quic_endpoint.as_ref(), candidate)
-        })
-        .await
-        .unwrap_or_else(|err| Err(Box::new(err))),
+        Ok(candidate) => {
+            let reload = tokio::task::spawn_blocking(move || {
+                apply_security_reload(&current, &security, quic_endpoint.as_ref(), candidate)
+            });
+            match tokio::time::timeout(RELOAD_TIMEOUT, reload).await {
+                Ok(joined) => joined.unwrap_or_else(|err| Err(Box::new(err))),
+                Err(_) => Err(format!(
+                    "security reload exceeded {}s; keeping the previous generation",
+                    RELOAD_TIMEOUT.as_secs()
+                )
+                .into()),
+            }
+        }
         Err(reason) => Err(Box::<dyn std::error::Error + Send + Sync>::from(reason)),
     };
 
