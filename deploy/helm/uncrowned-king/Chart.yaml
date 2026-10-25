@@ -1,0 +1,17 @@
+apiVersion: v2
+name: uncrowned-king
+description: A Helm chart for Uncrowned King high-performance multiplexed secure proxy (Server & Client DaemonSet)
+type: application
+version: 1.0.2
+appVersion: "v1.0.2"
+keywords:
+  - proxy
+  - secure-tunnel
+  - socks5
+  - quic
+  - multiplexing
+home: https://github.com/HappyLeslieAlexander/Uncrowned-King
+sources:
+  - https://github.com/HappyLeslieAlexander/Uncrowned-King
+maintainers:
+  - name: Uncrowned King Team

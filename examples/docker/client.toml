@@ -1,0 +1,22 @@
+# Docker-oriented client example. Mount the whole directory and run as the
+# file owner (see README.md); the config holds the shared secret and must be
+# mode 0600.
+
+server_addr = "quic://server:9443"
+server_addrs = ["tls://server:9443"]
+server_name = "localhost"
+# Probe listener stays on loopback inside the container; not published.
+observability_listen = "127.0.0.1:9091"
+ca_cert_path = "/etc/uncrowned-king/server-cert.pem"
+key_id = "docker-demo"
+secret = "replace-with-a-long-random-shared-secret-0000000000000000"
+handshake_timeout_seconds = 10
+server_connect_retry_delay_millis = 250
+socks_handshake_timeout_seconds = 10
+tcp_open_timeout_seconds = 10
+udp_flow_idle_timeout_seconds = 120
+shutdown_timeout_seconds = 30
+max_socks_connections = 1024
+max_buffered_bytes_per_session = 16777216
+max_buffered_bytes_per_flow = 2097152
+max_carrier_sessions = 4

@@ -1,0 +1,328 @@
+# Uncrowned King Protocol Specification v1.0
+
+This document is the frozen 1.0 wire contract (`protocol_revision = 2`).
+It supersedes the v0.1 experimental specification: the only wire changes are
+the removal of `AuthChallenge.session_id` and the revision bump from 1 to 2.
+It intentionally covers only the pieces required by the initial Rust crates.
+
+## 0. Carrier Requirements
+
+The v0.1 TLS/TCP carrier must negotiate ALPN `uk/1`. Both endpoints must treat
+missing or different ALPN as a connection error before accepting UK frames.
+
+UK frames must only be processed after the transport handshake completes. TLS
+0-RTT data must not be accepted as UK application data.
+
+Implementations may additionally wrap the carrier in the optional transport
+masking extension ([`masking-spec.md`](masking-spec.md)). Masking sits below
+TLS/QUIC and does not modify any frame, encoding, or requirement in this
+specification; with masking enabled the carrier connection additionally begins
+with the masking prelude/nonce (TCP) or masked datagrams (QUIC) defined there.
+The masking layer is out of scope for this frozen wire contract.
+
+## 1. Common Encoding
+
+All fixed-width integers are unsigned and encoded in network byte order
+(big-endian). All length-prefixed byte fields use UK varint unless this
+document says otherwise.
+
+### 1.1 UK Varint
+
+UK varint uses the QUIC variable-length integer layout:
+
+| Prefix bits | Total bytes | Payload bits | Maximum value |
+| --- | ---: | ---: | ---: |
+| `00` | 1 | 6 | `63` |
+| `01` | 2 | 14 | `16383` |
+| `10` | 4 | 30 | `1073741823` |
+| `11` | 8 | 62 | `4611686018427387903` |
+
+Decoders must reject truncated inputs. Encoders must use the shortest legal
+encoding.
+
+## 2. Frame Header
+
+Every UK frame begins with:
+
+```text
+u8      version
+u8      type
+u16     flags
+varint  id
+varint  length
+bytes   payload
+```
+
+- `version` is `1`.
+- `flags` are split into optional bits `0x0001..0x00ff` and required bits
+  `0x0100..0xffff`.
+- v0.1 defines no known flags. Any required flag must be rejected.
+- `length` is the number of payload bytes and must not exceed the configured
+  frame limit.
+- `AUTH_CHALLENGE`, `AUTH_RESPONSE`, `SETTINGS`, `PING`, and `PONG` are
+  connection-scoped and must use `id = 0`.
+- Flow-scoped frame ids must be non-zero UK varints. Client-initiated flow ids
+  are odd; server-initiated flow ids are even.
+
+Frame types:
+
+| Value | Name |
+| ---: | --- |
+| `0x01` | `AUTH_CHALLENGE` |
+| `0x02` | `AUTH_RESPONSE` |
+| `0x03` | `SETTINGS` |
+| `0x04` | `PING` |
+| `0x05` | `PONG` |
+| `0x10` | `TCP_OPEN` |
+| `0x11` | `TCP_DATA` |
+| `0x12` | `TCP_CLOSE` |
+| `0x20` | `UDP_OPEN` |
+| `0x21` | `UDP_DATA` |
+| `0x22` | `UDP_CLOSE` |
+| `0x30` | `ERROR` |
+| `0x31` | `POLICY_DENIED` |
+| `0x32` | `RESOURCE_LIMIT` |
+
+Frame types that are not valid in the current protocol phase are protocol
+errors. Receivers should send `ERROR(Protocol)` before closing the session when
+the carrier is still writable.
+
+## 3. Target Encoding
+
+```text
+u8      addr_type
+varint  host_len
+bytes   host
+u16     port
+```
+
+`addr_type` values:
+
+- `0x01`: domain
+- `0x02`: IPv4
+- `0x03`: IPv6
+
+Validation:
+
+- `port` must be `1..=65535`.
+- domain bytes must be valid UTF-8.
+- domain byte length must be `1..=255`.
+- domain must not contain ASCII control characters.
+- domain must not be an IPv4/IPv6 address literal, including the
+  non-canonical numeric forms that POSIX resolvers still interpret as IPv4
+  addresses (octal `0177.0.0.1`, hex `0x7f.0.0.1`, short `127.1`, bare
+  integer `2130706433`): every label all-numeric or `0x`-hex is rejected.
+- IPv4 host length must be exactly 4.
+- IPv6 host length must be exactly 16.
+
+## 4. TCP Relay Payloads
+
+TCP relay flow IDs are non-zero. v0.1 requires client-initiated proxy flows to
+use odd IDs. Even non-zero IDs are reserved for future server-initiated flows.
+Connection-scoped frames such as authentication and settings use ID `0`.
+
+`TCP_OPEN` payload:
+
+```text
+Target target
+u16    open_flags
+```
+
+v0.1 defines no non-zero `open_flags`. Encoders and decoders must reject
+non-zero `open_flags`.
+
+`TCP_DATA` payload is uninterpreted TCP byte data.
+
+When a `TCP_OPEN` is accepted, the server sends a zero-length `TCP_DATA` on the
+same `id` as the open acknowledgement before forwarding target bytes. Rejection
+uses `POLICY_DENIED`, `RESOURCE_LIMIT`, or `ERROR`, followed by `TCP_CLOSE`.
+Implementations may keep processing other connection frames while target
+resolution or connection for a `TCP_OPEN` is pending. A peer must not send
+`TCP_DATA` on a flow before receiving the zero-length acknowledgement; doing so
+is a protocol error. A `TCP_CLOSE` before acknowledgement cancels the pending
+open for that flow.
+
+`TCP_CLOSE` payload:
+
+```text
+u16 close_code
+```
+
+`TCP_CLOSE` closes the sending direction for that flow. A peer that receives a
+normal `TCP_CLOSE` may continue sending data until it also sends `TCP_CLOSE` or
+the receiver's configured half-close drain window expires.
+When a receiver cannot buffer more data for an established flow, it should send
+`RESOURCE_LIMIT(ResourceLimit)` followed by `TCP_CLOSE(error)` for that flow.
+Malformed relay payloads are protocol errors; receivers should send
+`ERROR(Protocol)` before closing the session when the carrier is still writable.
+
+Known close codes:
+
+| Code | Name |
+| ---: | --- |
+| `0` | normal close |
+| `1` | generic error |
+
+Decoders must reject unknown close codes.
+
+## 5. UDP Relay Payloads
+
+UDP relay flow IDs are non-zero. v0.1 requires client-initiated UDP flows to
+use odd IDs. Even non-zero IDs are reserved for future server-initiated flows.
+
+`UDP_OPEN` payload:
+
+```text
+Target target
+```
+
+`UDP_DATA` payload is one uninterpreted UDP datagram byte string.
+
+When a `UDP_OPEN` is accepted, the server sends a zero-length `UDP_DATA` on the
+same `id` as the open acknowledgement before forwarding target datagrams. A peer
+must not send `UDP_DATA` on a flow before receiving the zero-length
+acknowledgement; doing so is a protocol error. After acknowledgement,
+zero-length `UDP_DATA` frames are valid zero-length UDP datagrams.
+
+`UDP_CLOSE` payload:
+
+```text
+u16 close_code
+```
+
+Known UDP close codes match TCP close codes:
+
+| Code | Name |
+| ---: | --- |
+| `0` | normal close |
+| `1` | generic error |
+
+Decoders must reject unknown UDP close codes.
+
+Implementations may close idle UDP relay flows to release target sockets and
+flow capacity. A UDP flow counts as active when either direction relays a
+`UDP_DATA` datagram for that flow; idle cleanup must not be based only on
+client-to-target traffic.
+
+## 6. Authentication Payloads
+
+The carrier supplies a 32-byte TLS/QUIC exporter binding. Until carriers are
+implemented, tests pass this value explicitly.
+
+`AUTH_CHALLENGE` payload:
+
+```text
+bytes[32] server_nonce
+u64       server_time
+varint    server_capabilities_len
+bytes     server_capabilities
+varint    limits_len
+bytes     limits
+```
+
+`AUTH_RESPONSE` payload:
+
+```text
+varint    key_id_len
+bytes     key_id
+bytes[32] client_nonce
+u64       client_time
+varint    client_capabilities_len
+bytes     client_capabilities
+bytes[32] tag
+```
+
+`key_id_len` must be `1..=64`. Shared secrets are local configuration, never
+sent on the wire, and must contain at least 32 bytes of secret material.
+Implementations with a pre-authentication frame limit must allow at least 75
+payload bytes so a minimum `AUTH_RESPONSE` can be received.
+
+`tag` is:
+
+```text
+HMAC-SHA256(
+  secret,
+  "UK-AUTH-v1" ||
+  exporter_32 ||
+  auth_challenge_payload ||
+  varint(key_id_len) ||
+  key_id ||
+  client_nonce ||
+  client_time_be ||
+  varint(client_capabilities_len) ||
+  client_capabilities
+)
+```
+
+`auth_challenge_payload` is the canonical `AUTH_CHALLENGE` payload exactly as
+encoded above, including `server_time`, `server_capabilities_len`, and
+`limits_len`. Servers must reject responses when either `server_time` or
+`client_time` is outside the configured authentication skew window.
+
+## 7. SETTINGS Payload
+
+v1.0 settings use repeated key/value pairs:
+
+```text
+varint setting_count
+repeat setting_count:
+  varint key
+  varint value
+```
+
+Known keys:
+
+| Key | Name |
+| ---: | --- |
+| `1` | `max_frame_size` |
+| `2` | `max_streams` |
+| `3` | `max_udp_flows` |
+| `4` | `supports_udp_datagram` |
+| `5` | `supports_udp_stream_fallback` |
+| `6` | `idle_timeout_seconds` |
+| `7` | `protocol_revision` |
+
+Unknown optional settings may be ignored. Required setting semantics will be
+added after v0.1. Decoders must reject duplicate known setting keys and
+trailing bytes after the declared setting pairs.
+
+Peers must send `protocol_revision = 2` in v1.0 SETTINGS. A peer that receives a
+missing or unsupported protocol revision must fail the session.
+If `max_frame_size` or `max_streams` is present, the value must be greater than
+zero. TCP relay implementations must reject `max_frame_size < 262`, the minimum
+needed to carry every valid v1.0 `TCP_OPEN` payload. Implementations must reject
+`max_frame_size > 16777216`.
+If `max_udp_flows` is absent, peers should treat it as equal to `max_streams`.
+`max_udp_flows = 0` disables new UDP relay flows; otherwise the value limits the
+number of concurrent UDP relay flows, including pending UDP opens. Non-zero
+`max_udp_flows` values must not exceed `max_streams`.
+
+When `idle_timeout_seconds` is non-zero, a peer may send `PING` frames before
+the deadline to keep active relay flows alive. Implementations should avoid
+keeping otherwise idle sessions alive when no flow is open.
+`PING` payload bytes are opaque to the receiver. A `PONG` response must echo the
+request `PING` payload exactly. Implementations that use `PING` for liveness
+should include an unpredictable or monotonically unique nonce and treat only the
+matching `PONG` as the liveness response for that probe.
+
+## 8. Error Codes
+
+`ERROR`, `POLICY_DENIED`, and `RESOURCE_LIMIT` payloads carry one coarse code:
+
+```text
+varint error_code
+```
+
+| Code | Name |
+| ---: | --- |
+| `1` | `ERROR_UNSUPPORTED_VERSION` |
+| `2` | `ERROR_UNSUPPORTED_FLAG` |
+| `3` | `ERROR_OVERSIZED_FRAME` |
+| `4` | `ERROR_TRUNCATED_FRAME` |
+| `5` | `ERROR_INVALID_TARGET` |
+| `6` | `ERROR_AUTH_FAILED` |
+| `7` | `ERROR_POLICY_DENIED` |
+| `8` | `ERROR_RESOURCE_LIMIT` |
+| `9` | `ERROR_PROTOCOL` |
+| `10` | `ERROR_TARGET_UNAVAILABLE` |
+| `11` | `ERROR_TARGET_TIMEOUT` |

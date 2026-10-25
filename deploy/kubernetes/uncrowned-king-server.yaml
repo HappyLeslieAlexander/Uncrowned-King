@@ -1,0 +1,325 @@
+# Uncrowned King server on Kubernetes.
+#
+# Before applying, replace every REPLACE_ME below with real values (base a
+# secret on `kubectl create secret generic ... --dry-run=client -o yaml` in
+# practice; never commit real secrets). Then:
+#
+#   kubectl apply -f deploy/kubernetes/uncrowned-king-server.yaml
+#
+# The image is built and pushed by .github/workflows/release.yml.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: uncrowned-king
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: uncrowned-king-policy
+  namespace: uncrowned-king
+data:
+  # Deny private/reserved ranges first, then allow your real targets.
+  policy.toml: |
+    [[rules]]
+    action = "deny"
+    private = true
+
+    [[rules]]
+    action = "allow"
+    domain_suffix = ".example.com"
+    port_start = 443
+    port_end = 443
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: uncrowned-king-server
+  namespace: uncrowned-king
+type: Opaque
+stringData:
+  # Observability binds to the pod's IP via Downward API so the kubelet can
+  # reach the probes; it is NOT exposed by the Service. The listeners bind all
+  # interfaces inside the pod.
+  server.toml: |
+    listen = "0.0.0.0:9443"
+    quic_listen = "0.0.0.0:9443"
+    observability_listen = "__POD_IP__:9090"
+    cert_path = "/etc/uncrowned-king/server-cert.pem"
+    key_path = "/etc/uncrowned-king/server-key.pem"
+    policy_path = "/etc/uncrowned-king/policy.toml"
+
+    [[credentials]]
+    key_id = "REPLACE_ME"
+    secret = "REPLACE_ME_WITH_A_LONG_RANDOM_SECRET"
+    status = "active"
+    policy_group = "default"
+  server-cert.pem: |
+    REPLACE_ME_WITH_PEM_CERTIFICATE_CHAIN
+  server-key.pem: |
+    REPLACE_ME_WITH_PEM_PRIVATE_KEY
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: uncrowned-king-server
+  namespace: uncrowned-king
+  labels:
+    app.kubernetes.io/name: uncrowned-king-server
+spec:
+  replicas: 2
+  # Never drop below full capacity during a rollout, and admit a new pod only
+  # after it passes readiness (/readyz). Combined with the PodDisruptionBudget
+  # below, this gives a safe canary/gradual rollout.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  minReadySeconds: 10
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: uncrowned-king-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: uncrowned-king-server
+    spec:
+      # Nothing in this pod talks to the Kubernetes API server.
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        # fsGroup makes the projected Secret group-readable by uid 65532 so the
+        # initContainer below can read it. Do NOT mount the Secret straight into
+        # the server: uk-server rejects a config or private key with any bit of
+        # 0o077 set, and a projected Secret is at best root:65532 mode 0440
+        # (kubelet ORs in group-read under fsGroup) — which is rejected. Without
+        # fsGroup it is root:root 0400, unreadable by uid 65532. Neither works.
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      # Stage the Secret/ConfigMap into an emptyDir owned by uid 65532 at mode
+      # 0600, which is the only layout uk-server accepts. Do not "simplify" this
+      # away by mounting the Secret directly — the pod will CrashLoopBackOff with
+      # "must not be accessible by group or other users".
+      initContainers:
+        - name: stage-config
+          image: busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              cp /staging/secret/server.toml \
+                 /staging/secret/server-cert.pem \
+                 /staging/secret/server-key.pem \
+                 /etc/uncrowned-king/
+              cp /staging/policy/policy.toml /etc/uncrowned-king/
+              case "${POD_IP}" in *:*) POD_HOST="[${POD_IP}]" ;; *) POD_HOST="${POD_IP}" ;; esac
+              sed -i "s/__POD_IP__/${POD_HOST}/g" /etc/uncrowned-king/server.toml
+              chmod 0600 /etc/uncrowned-king/server.toml \
+                         /etc/uncrowned-king/server-cert.pem \
+                         /etc/uncrowned-king/server-key.pem \
+                         /etc/uncrowned-king/policy.toml
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "32Mi"
+          volumeMounts:
+            - name: config
+              mountPath: /staging/secret
+              readOnly: true
+            - name: policy
+              mountPath: /staging/policy
+              readOnly: true
+            - name: runtime-config
+              mountPath: /etc/uncrowned-king
+      containers:
+        - name: uk-server
+          image: ghcr.io/happylesliealexander/uncrowned-king-server:v1.0.2
+          args:
+            - "--config"
+            - "/etc/uncrowned-king/server.toml"
+            - "serve"
+          ports:
+            - name: uk-tcp
+              containerPort: 9443
+              protocol: TCP
+            - name: uk-quic
+              containerPort: 9443
+              protocol: UDP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "1"
+              memory: "256Mi"
+          volumeMounts:
+            # The staged copy, not the Secret itself. NOTE: because the files are
+            # copied at pod start, editing the Secret or ConfigMap does NOT reach
+            # a running pod, so SIGHUP hot-reload of credentials/policy/TLS
+            # cannot pick up new content here — roll the Deployment
+            # (`kubectl rollout restart`) to apply changed secrets or policy.
+            - name: runtime-config
+              mountPath: /etc/uncrowned-king
+              readOnly: true
+      volumes:
+        # Source material, mounted only into the initContainer. defaultMode 0400
+        # plus fsGroup lands as root:65532 0440, which uid 65532 can read.
+        - name: config
+          secret:
+            secretName: uncrowned-king-server
+            defaultMode: 0400
+        - name: policy
+          configMap:
+            name: uncrowned-king-policy
+        # The mode-0600 copy the server actually reads. Memory-backed so the key
+        # never touches node disk.
+        - name: runtime-config
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: uncrowned-king-server
+  namespace: uncrowned-king
+  labels:
+    app.kubernetes.io/name: uncrowned-king-server
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: uncrowned-king-server
+  ports:
+    - name: uk-tcp
+      port: 9443
+      targetPort: uk-tcp
+      protocol: TCP
+    - name: uk-quic
+      port: 9443
+      targetPort: uk-quic
+      protocol: UDP
+---
+# Keep at least one server reachable during voluntary disruptions (node drains,
+# rollouts). With replicas: 2 this permits exactly one pod down at a time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: uncrowned-king-server
+  namespace: uncrowned-king
+  labels:
+    app.kubernetes.io/name: uncrowned-king-server
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: uncrowned-king-server
+---
+# Dual-stack hardened NetworkPolicy restricting ingress and egress traffic.
+# Egress is restricted to cluster DNS and external target destinations, strictly
+# excluding private RFC 1918 networks, loopback, and cloud provider metadata addresses.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: uncrowned-king-server
+  namespace: uncrowned-king
+  labels:
+    app.kubernetes.io/name: uncrowned-king-server
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: uncrowned-king-server
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow incoming client carrier connections on TLS and QUIC ports
+    - ports:
+        - protocol: TCP
+          port: 9443
+        - protocol: UDP
+          port: 9443
+    # Allow metrics scraping and health probes on internal management port.
+    # Both selectors sit in ONE from entry so they AND together: separate
+    # entries are OR'd, which would admit every pod in the monitoring
+    # namespace plus any prometheus-labelled pod in this namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 9090
+  egress:
+    # Allow DNS resolution only in the cluster DNS namespace.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow outbound traffic to target destinations, strictly excluding
+    # private RFC 1918 networks, loopback, and cloud provider metadata addresses.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 169.254.169.254/32
+              - 100.100.100.200/32
+              - 168.63.129.16/32
+        - ipBlock:
+            cidr: "::/0"
+            except:
+              - "::1/128"
+              - "fc00::/7"
+              - "fe80::/10"
+              - "fd00:ec2::254/128"
+              - "::ffff:0:0/96"
+

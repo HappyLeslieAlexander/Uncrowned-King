@@ -1,0 +1,19 @@
+# Values used by CI to lint and render the chart with valid production-like
+# material. Default values intentionally fail closed (placeholder secrets,
+# missing TLS secret), so lint/template jobs render with these instead.
+server:
+  existingTlsSecret: ci-tls-secret
+  credentials:
+    - id: ci-client
+      secret: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      policy_group: default
+
+client:
+  enabled: true
+  existingCaSecret: ci-ca-secret
+  config:
+    key_id: ci-client
+    secret: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+networkPolicy:
+  enabled: true

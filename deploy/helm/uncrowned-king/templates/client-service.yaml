@@ -1,0 +1,26 @@
+{{- if and .Values.client.enabled .Values.client.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "uncrowned-king.client.fullname" . }}
+  labels:
+    {{- include "uncrowned-king.labels" . | nindent 4 }}
+    app.kubernetes.io/component: client
+  {{- with .Values.client.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.client.service.type | default "ClusterIP" }}
+  selector:
+    {{- include "uncrowned-king.client.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: socks5
+      port: {{ .Values.client.socks5.port }}
+      targetPort: socks5
+      protocol: TCP
+    - name: metrics
+      port: {{ .Values.client.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+{{- end }}

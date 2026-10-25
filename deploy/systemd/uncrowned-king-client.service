@@ -1,0 +1,78 @@
+# Hardened systemd unit for the Uncrowned King client (local SOCKS5 front end).
+#
+# Install:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin uncrowned-king
+#   sudo install -m 0755 target/release/uk-client /usr/local/bin/uk-client
+#   sudo install -d -m 0750 -o uncrowned-king -g uncrowned-king /etc/uncrowned-king
+#   sudo install -m 0600 -o uncrowned-king -g uncrowned-king \
+#       client.toml server-cert.pem /etc/uncrowned-king/
+#
+# The mode MUST be 0600: the client config holds the shared secret, and uk-client
+# rejects a config accessible by group or other users (any bit in 0o077) and
+# exits at startup. 0640 does NOT work. The CA/server certificate is not secret,
+# but installing both at 0600 keeps one rule to remember.
+#   sudo cp deploy/systemd/uncrowned-king-client.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now uncrowned-king-client
+#
+# The SOCKS5 listener defaults to loopback. Exposing it beyond loopback requires
+# `--allow-non-loopback` AND your own network access control — edit ExecStart.
+
+[Unit]
+Description=Uncrowned King client (SOCKS5)
+Documentation=https://github.com/HappyLeslieAlexander/Uncrowned-King
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/uk-client --config /etc/uncrowned-king/client.toml socks5 --listen 127.0.0.1:1080
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+
+User=uncrowned-king
+Group=uncrowned-king
+
+# --- Sandboxing / hardening --------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+# AF_INET/AF_INET6 carry the SOCKS5 and carrier traffic. AF_UNIX and AF_NETLINK
+# are needed by the glibc resolver when resolving the server hostname:
+# nsswitch.conf backends such as systemd-resolved/nscd are reached over an
+# AF_UNIX socket, and glibc uses AF_NETLINK to enumerate local addresses for
+# source-address selection. The published Linux release binaries are static musl
+# (UDP-only resolver) and do not need them, but a locally built glibc binary —
+# what the install steps above produce — loses DNS without them.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# --- Resource limits ---------------------------------------------------------
+# Every SOCKS connection and every carrier flow holds a socket, so size this
+# above roughly (max_socks_connections + max_carrier_sessions x max_streams).
+# 1,048,576 covers the defaults with ample headroom.
+LimitNOFILE=1048576
+TasksMax=infinity
+
+[Install]
+WantedBy=multi-user.target

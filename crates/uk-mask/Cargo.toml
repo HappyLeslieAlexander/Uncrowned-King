@@ -1,0 +1,33 @@
+[package]
+name = "uk-mask"
+description = "Opt-in transport masking for Uncrowned King carriers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+chacha20.workspace = true
+quinn.workspace = true
+quinn-proto.workspace = true
+hmac.workspace = true
+rand.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+tokio = { workspace = true, features = ["full"] }
+
+[[bench]]
+name = "mask"
+harness = false
+
+[lints]
+workspace = true

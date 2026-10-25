@@ -1,0 +1,221 @@
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
+use tokio::sync::watch;
+use tokio_rustls::TlsAcceptor;
+use uk_auth::{AuthenticatedIdentity, Credential};
+use uk_mask::MaskKeys;
+use uk_policy::PolicySet;
+
+const INITIAL_GENERATION: u64 = 1;
+
+#[derive(Clone)]
+pub(crate) struct SecurityState {
+    current: watch::Sender<Arc<SecurityGeneration>>,
+    next_generation: Arc<AtomicU64>,
+}
+
+struct SecurityGeneration {
+    generation: u64,
+    tls_acceptor: TlsAcceptor,
+    credentials: Arc<Vec<Credential>>,
+    /// Per-credential masking keys derived from the same generation's
+    /// credentials; empty when masking is disabled. New connections derive
+    /// their keystreams from this snapshot, so a reload swaps mask keys only
+    /// for connections admitted afterwards.
+    mask_keys: Arc<Vec<MaskKeys>>,
+    policy_set: Arc<PolicySet>,
+    auth_skew: Duration,
+}
+
+pub(crate) struct AuthenticationSnapshot {
+    pub(crate) generation: u64,
+    pub(crate) tls_acceptor: TlsAcceptor,
+    pub(crate) credentials: Arc<Vec<Credential>>,
+    pub(crate) mask_keys: Arc<Vec<MaskKeys>>,
+    pub(crate) auth_skew: Duration,
+}
+
+pub(crate) struct PolicySnapshot {
+    pub(crate) generation: u64,
+    pub(crate) policy_set: Arc<PolicySet>,
+}
+
+impl SecurityState {
+    pub(crate) fn new(
+        tls_acceptor: TlsAcceptor,
+        credentials: Vec<Credential>,
+        mask_keys: Vec<MaskKeys>,
+        policy_set: PolicySet,
+        auth_skew: Duration,
+    ) -> Self {
+        let state = Arc::new(SecurityGeneration {
+            generation: INITIAL_GENERATION,
+            tls_acceptor,
+            credentials: Arc::new(credentials),
+            mask_keys: Arc::new(mask_keys),
+            policy_set: Arc::new(policy_set),
+            auth_skew,
+        });
+        let (current, _) = watch::channel(state);
+        Self {
+            current,
+            next_generation: Arc::new(AtomicU64::new(INITIAL_GENERATION + 1)),
+        }
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.current.borrow().generation
+    }
+
+    pub(crate) fn authentication_snapshot(&self) -> AuthenticationSnapshot {
+        let state = self.current.borrow();
+        AuthenticationSnapshot {
+            generation: state.generation,
+            tls_acceptor: state.tls_acceptor.clone(),
+            credentials: Arc::clone(&state.credentials),
+            mask_keys: Arc::clone(&state.mask_keys),
+            auth_skew: state.auth_skew,
+        }
+    }
+
+    pub(crate) fn policy_snapshot(
+        &self,
+        identity: &AuthenticatedIdentity,
+        now: u64,
+    ) -> Option<PolicySnapshot> {
+        let state = self.current.borrow();
+        state.credentials.iter().find(|credential| {
+            credential.key_id == identity.key_id
+                && credential.policy_group == identity.policy_group
+                && credential.is_active_at(now)
+        })?;
+        Some(PolicySnapshot {
+            generation: state.generation,
+            policy_set: Arc::clone(&state.policy_set),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn replace(
+        &self,
+        tls_acceptor: TlsAcceptor,
+        credentials: Vec<Credential>,
+        mask_keys: Vec<MaskKeys>,
+        policy_set: PolicySet,
+        auth_skew: Duration,
+    ) -> u64 {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        self.current.send_replace(Arc::new(SecurityGeneration {
+            generation,
+            tls_acceptor,
+            credentials: Arc::new(credentials),
+            mask_keys: Arc::new(mask_keys),
+            policy_set: Arc::new(policy_set),
+            auth_skew,
+        }));
+        generation
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_tls_acceptor() -> TlsAcceptor {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
+    config.alpn_protocols = vec![uk_proto::ALPN_PROTOCOL.to_vec()];
+    TlsAcceptor::from(Arc::new(config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn credential(key_id: &[u8], secret: &[u8]) -> Credential {
+        Credential::active(key_id.to_vec(), secret.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn replacement_is_visible_only_to_new_snapshots() {
+        let security = SecurityState::new(
+            test_tls_acceptor(),
+            vec![credential(b"old", b"0123456789abcdef0123456789abcdef")],
+            Vec::new(),
+            PolicySet::default(),
+            Duration::from_secs(30),
+        );
+        let old_authentication = security.authentication_snapshot();
+        let old_identity = AuthenticatedIdentity::from(&old_authentication.credentials[0]);
+        let old_policy = security.policy_snapshot(&old_identity, 1).unwrap();
+
+        let generation = security.replace(
+            test_tls_acceptor(),
+            vec![credential(b"new", b"fedcba9876543210fedcba9876543210")],
+            Vec::new(),
+            PolicySet::default(),
+            Duration::from_secs(60),
+        );
+        let new_authentication = security.authentication_snapshot();
+        let new_identity = AuthenticatedIdentity::from(&new_authentication.credentials[0]);
+        let new_policy = security.policy_snapshot(&new_identity, 1).unwrap();
+
+        assert_eq!(generation, 2);
+        assert_eq!(security.generation(), 2);
+        assert_eq!(old_authentication.generation, 1);
+        assert_eq!(old_authentication.credentials[0].key_id, b"old");
+        assert_eq!(old_authentication.auth_skew, Duration::from_secs(30));
+        assert_eq!(old_policy.generation, 1);
+        assert_eq!(new_authentication.generation, 2);
+        assert_eq!(new_authentication.credentials[0].key_id, b"new");
+        assert_eq!(new_authentication.auth_skew, Duration::from_secs(60));
+        assert_eq!(new_policy.generation, 2);
+        assert!(!Arc::ptr_eq(&old_policy.policy_set, &new_policy.policy_set));
+        assert!(security.policy_snapshot(&old_identity, 1).is_none());
+    }
+
+    #[test]
+    fn disabled_or_reassigned_credentials_cannot_open_new_flows() {
+        let mut active = credential(b"client", b"0123456789abcdef0123456789abcdef");
+        active.policy_group = Some("default".to_owned());
+        let identity = AuthenticatedIdentity::from(&active);
+        let security = SecurityState::new(
+            test_tls_acceptor(),
+            vec![active],
+            Vec::new(),
+            PolicySet::default(),
+            Duration::from_secs(30),
+        );
+        assert!(security.policy_snapshot(&identity, 1).is_some());
+
+        let mut disabled = credential(b"client", b"fedcba9876543210fedcba9876543210");
+        disabled.status = uk_auth::CredentialStatus::Disabled;
+        disabled.policy_group = Some("default".to_owned());
+        security.replace(
+            test_tls_acceptor(),
+            vec![disabled],
+            Vec::new(),
+            PolicySet::default(),
+            Duration::from_secs(30),
+        );
+        assert!(security.policy_snapshot(&identity, 1).is_none());
+
+        let mut reassigned = credential(b"client", b"abcdef0123456789abcdef0123456789");
+        reassigned.policy_group = Some("admins".to_owned());
+        security.replace(
+            test_tls_acceptor(),
+            vec![reassigned],
+            Vec::new(),
+            PolicySet::default(),
+            Duration::from_secs(30),
+        );
+        assert!(security.policy_snapshot(&identity, 1).is_none());
+    }
+}
