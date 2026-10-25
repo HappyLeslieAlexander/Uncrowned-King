@@ -4,7 +4,11 @@
 #   docker compose -f examples/docker/docker-compose.yml up --build
 #
 # The host UID/GID is used so the 0600 config/key files remain readable by the
-# non-root process inside the container on Linux.
+# non-root process inside the container on Linux. Note UID/GID are read-only,
+# non-exported shell variables: compose always sees the 1000 fallback unless
+# you export them explicitly (`export UID GID` does not work; copy the values,
+# e.g. `UID=$(id -u) GID=$(id -g) docker compose ...`). If your account is not
+# UID 1000, the 0600 mounts become unreadable and the container crash-loops.
 services:
   server:
     build:

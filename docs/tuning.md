@@ -74,6 +74,7 @@ udp_flow_idle_timeout_seconds = 30
 - **传输载体建议**：优先选用 **QUIC 载体**。QUIC 基于 UDP，具备抗丢包能力、多路复用无队头阻塞（HOL Blocking）以及 0-RTT/1-RTT 极速连接特性。
 - **QUIC 接收窗口调优**：对于高丢包但有较大带宽延时积（BDP）的跨国链路，建议将 `limits.quic_stream_receive_window` 调至 `4194304` (4MB)，并将 `limits.quic_connection_receive_window` 调至 `8388608` (8MB)，避免传输层过早触发 QUIC 流控窗口等待。
 - **UDP 流量优化**：利用 QUIC 原生 `DATAGRAM` 扩展转发 UDP，不引入流控与重传开销。
+- **已知限制：半开 TLS/TCP 载体上的 UDP 丢包窗口**：客户端只复用未被标记关闭的会话；一个"半开"载体（对端已不可达但尚未收到 RST/FIN，`is_closed()` 仍为 false）在检测落地前会把 UDP 报文写入已死的内核缓冲区并静默丢失。检测延迟有上界：QUIC 载体为 keep-alive 15s + idle timeout 60s；TLS/TCP 载体为 `idle_timeout_seconds / 2` 的 keepalive PING（服务端默认 300s 时最长约 150s）。对 UDP 可用性敏感的部署，优先使用 QUIC 载体，或调低服务端 `idle_timeout_seconds` 以缩短半开窗口。
 
 ---
 
