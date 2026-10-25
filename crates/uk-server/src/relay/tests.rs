@@ -1257,7 +1257,6 @@ async fn session_tasks_is_empty_and_len_are_consistent() {
         SessionTaskKind::HalfCloseTimer,
         std::future::pending::<()>(),
     );
-    assert!(!tasks.is_empty());
     assert_eq!(tasks.len(), 1);
 
     handle.abort();

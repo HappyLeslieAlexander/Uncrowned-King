@@ -348,7 +348,11 @@ mod tests {
     fn resolve_bind_accepts_specific_loopback() {
         let addrs = resolve_observability_bind("observability_listen", "127.0.0.1:9090")
             .expect("loopback literal resolves");
-        assert!(!addrs.is_empty());
+        assert_ne!(
+            addrs.len(),
+            0,
+            "loopback literal must resolve to at least one address"
+        );
         assert!(
             addrs
                 .iter()
