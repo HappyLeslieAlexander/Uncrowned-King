@@ -1,4 +1,10 @@
-{{- if and .Values.server.enabled .Values.server.podDisruptionBudget.enabled }}
+{{- /* A PDB with minAvailable >= 1 and a single replica blocks every
+voluntary disruption (node drains hang), so it is only rendered when the
+effective floor is at least two pods: HPA enabled, or replicaCount >= 2 for
+Deployments. DaemonSet clients always render: their pod count follows the
+node count. */}}
+{{- $serverEffectiveFloor := or .Values.server.autoscaling.enabled (ge (int (.Values.server.replicaCount | default 1)) 2) }}
+{{- if and .Values.server.enabled .Values.server.podDisruptionBudget.enabled $serverEffectiveFloor }}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
@@ -10,4 +16,20 @@ spec:
   selector:
     matchLabels:
       {{- include "uncrowned-king.server.selectorLabels" . | nindent 6 }}
+{{- end }}
+{{- if and .Values.client.enabled .Values.client.podDisruptionBudget.enabled (or (eq (.Values.client.kind | default "DaemonSet") "DaemonSet") (ge (int (.Values.client.replicaCount | default 1)) 2)) }}
+{{- if and .Values.server.enabled .Values.server.podDisruptionBudget.enabled $serverEffectiveFloor }}
+---
+{{- end }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "uncrowned-king.client.fullname" . }}
+  labels:
+    {{- include "uncrowned-king.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.client.podDisruptionBudget.minAvailable | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "uncrowned-king.client.selectorLabels" . | nindent 6 }}
 {{- end }}

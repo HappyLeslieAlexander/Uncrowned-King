@@ -44,6 +44,17 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+    {{- range .Values.networkPolicy.dnsIpBlocks }}
+    # Extra DNS endpoint (e.g. NodeLocal DNSCache link-local IP), port 53 only.
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
     # Allow outbound traffic to target destinations, strictly excluding
     # private RFC1918 networks, loopback, and cloud provider metadata addresses.
     - to:
@@ -131,6 +142,17 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+    {{- range .Values.networkPolicy.dnsIpBlocks }}
+    # Extra DNS endpoint (e.g. NodeLocal DNSCache link-local IP), port 53 only.
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
     # Allow outbound carrier connections only to this release's UK server.
     {{- if .Values.server.enabled }}
     - to:

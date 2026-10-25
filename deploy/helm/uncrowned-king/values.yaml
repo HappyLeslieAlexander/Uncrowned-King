@@ -154,6 +154,13 @@ client:
   metrics:
     port: 9091
 
+  # PodDisruptionBudget for the client pods. Rendered for DaemonSet clients
+  # and for Deployment clients with replicaCount >= 2 (a PDB on a single
+  # replica would block every voluntary disruption).
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
   resources:
     limits:
       cpu: "1"
@@ -193,4 +200,11 @@ networkPolicy:
   # Namespace containing cluster DNS. Egress to port 53 is restricted to
   # this namespace instead of allowing every destination on port 53.
   dnsNamespace: "kube-system"
+  # Extra CIDRs allowed for DNS egress (port 53 only). Clusters running
+  # NodeLocal DNSCache answer from a link-local IP (e.g. 169.254.20.25/32 on
+  # GKE) that is neither in the DNS namespace nor covered by the namespace
+  # selector — without an entry here those clusters cannot resolve at all
+  # while probes stay green. Keep empty unless the cluster uses such a DNS
+  # topology.
+  dnsIpBlocks: []
 

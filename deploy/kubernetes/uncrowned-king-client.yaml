@@ -237,12 +237,15 @@ spec:
       ports:
         - protocol: TCP
           port: 1080
-    # Allow metrics scraping from Prometheus / monitoring namespace
+    # Allow metrics scraping from Prometheus pods in the monitoring
+    # namespace. Both selectors sit in ONE from entry so they AND together:
+    # separate entries are OR'd, which would admit every pod in the
+    # monitoring namespace plus any prometheus-labelled pod here.
     - from:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: monitoring
-        - podSelector:
+          podSelector:
             matchLabels:
               app.kubernetes.io/name: prometheus
       ports:

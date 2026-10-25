@@ -8,7 +8,11 @@ metadata:
     {{- include "uncrowned-king.labels" . | nindent 4 }}
 data:
   client.toml: |
-    server_addr = "{{ .Values.client.config.server_addr | default (printf "%s.%s.svc.cluster.local:443" (include "uncrowned-king.server.fullname" .) .Release.Namespace) }}"
+    {{- /* The default server address follows the configured Service port so a
+non-default server.service.ports.tls.port cannot silently desynchronize the
+dial address from the NetworkPolicy egress rules. */}}
+    {{- $serverPort := .Values.server.service.ports.tls.port | default 443 }}
+    server_addr = "{{ .Values.client.config.server_addr | default (printf "%s.%s.svc.cluster.local:%v" (include "uncrowned-king.server.fullname" .) .Release.Namespace $serverPort) }}"
     server_name = "{{ .Values.client.config.server_name }}"
     ca_cert_path = "/etc/uncrowned-king/ca/ca.crt"
     {{- if .Values.client.config.observability_listen }}
