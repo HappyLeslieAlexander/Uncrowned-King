@@ -11,7 +11,7 @@ use bytes::{Buf, BufMut, BytesMut};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
-use subtle::ConstantTimeEq;
+use subtle::{Choice, ConstantTimeEq};
 use thiserror::Error;
 use uk_proto::{ProtocolError, varint};
 use zeroize::Zeroizing;
@@ -145,12 +145,17 @@ impl From<&Credential> for AuthenticatedIdentity {
 /// Compares two credentials without a byte-wise compare of secret material.
 ///
 /// This is hand written rather than derived so that no call site can turn `==`
-/// into a short-circuiting oracle on `secret`. Key id and secret are compared in
-/// constant time and their results combined before any branch; the remaining
-/// fields hold no secrets.
+/// into a short-circuiting oracle on `secret`. Key id and secret are compared
+/// without an early content exit and their results combined before any
+/// branch; the remaining fields hold no secrets. Key ids are padded to a
+/// fixed-length buffer first, since `ct_eq` on slices short-circuits on a
+/// length mismatch (see `pad_key_id_for_ct`). Secret lengths are config
+/// material, not secret, so they are compared directly.
 impl PartialEq for Credential {
     fn eq(&self, other: &Self) -> bool {
-        let material_matches = self.key_id.ct_eq(&other.key_id)
+        let material_matches = pad_key_id_for_ct(&self.key_id)
+            .ct_eq(&pad_key_id_for_ct(&other.key_id))
+            & Choice::from(u8::from(self.secret.len() == other.secret.len()))
             & self.secret.as_slice().ct_eq(other.secret.as_slice());
         bool::from(material_matches)
             && self.status == other.status
@@ -254,6 +259,8 @@ impl AuthChallenge {
 
     /// Encodes this challenge as an `AUTH_CHALLENGE` payload.
     pub fn encode(&self, dst: &mut impl BufMut) -> AuthResult<()> {
+        validate_capabilities_len(self.server_capabilities.len())?;
+        validate_capabilities_len(self.limits.len())?;
         dst.put_slice(&self.server_nonce);
         dst.put_u64(self.server_time);
         varint::encode(self.server_capabilities.len() as u64, dst)?;
@@ -384,6 +391,7 @@ impl AuthResponse {
     /// Encodes this response as an `AUTH_RESPONSE` payload.
     pub fn encode(&self, dst: &mut impl BufMut) -> AuthResult<()> {
         validate_key_id(&self.key_id)?;
+        validate_capabilities_len(self.client_capabilities.len())?;
         varint::encode(self.key_id.len() as u64, dst)?;
         dst.put_slice(&self.key_id);
         dst.put_slice(&self.client_nonce);
@@ -551,6 +559,11 @@ impl Default for ReplayCache {
     }
 }
 
+/// Both nonces are transmitted in cleartext on the wire, so retention here is
+/// not secret material; they are not zeroized on eviction because the keys
+/// must stay `Hash`/`Copy` for the O(1) queue discipline. MAC input buffers,
+/// which combine the nonces with secret material, are zeroized via
+/// [`ZeroOnDrop`] instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ReplayKey {
     server_nonce: [u8; 32],
@@ -783,7 +796,11 @@ fn auth_mac(
     client_capabilities: &[u8],
 ) -> AuthResult<HmacSha256> {
     validate_shared_secret(secret)?;
-    validate_key_id(key_id)?;
+    // A malformed key id still pays for the full MAC before the cheap length
+    // error surfaces, mirroring the unknown-key-id dummy path: the wire
+    // decoder can never produce such a key id, so this only removes a
+    // behavioral divergence for hand-constructed responses.
+    let key_id_len_error = validate_key_id(key_id).err();
     let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| AuthError::SecretTooShort)?;
     mac.update(AUTH_LABEL);
     mac.update(exporter_32);
@@ -794,7 +811,10 @@ fn auth_mac(
         client_time,
         client_capabilities,
     )?);
-    Ok(mac)
+    match key_id_len_error {
+        Some(err) => Err(err),
+        None => Ok(mac),
+    }
 }
 
 fn timestamp_within_skew(timestamp: u64, now: u64, allowed_skew: Duration) -> bool {
@@ -804,7 +824,27 @@ fn timestamp_within_skew(timestamp: u64, now: u64, allowed_skew: Duration) -> bo
     now.abs_diff(timestamp) <= allowed_skew.as_secs()
 }
 
-fn encoded_challenge_payload(challenge: &AuthChallenge) -> AuthResult<BytesMut> {
+/// Clears secret-adjacent buffer contents (the nonces MAC'd here) when it
+/// goes out of scope, on every path including `?` early returns. The nonces
+/// travel in cleartext on the wire, so this is defense in depth — but it
+/// matches the crate's own posture of redacting them everywhere else.
+struct ZeroOnDrop(BytesMut);
+
+impl std::ops::Deref for ZeroOnDrop {
+    type Target = BytesMut;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for ZeroOnDrop {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+fn encoded_challenge_payload(challenge: &AuthChallenge) -> AuthResult<ZeroOnDrop> {
     // Size the buffer exactly: nonce (32) + time (8) +
     // varint-prefixed capabilities and limits. This runs once per handshake;
     // exact sizing avoids any reallocation.
@@ -816,7 +856,7 @@ fn encoded_challenge_payload(challenge: &AuthChallenge) -> AuthResult<BytesMut> 
         + challenge.limits.len();
     let mut payload = BytesMut::with_capacity(capacity);
     challenge.encode(&mut payload)?;
-    Ok(payload)
+    Ok(ZeroOnDrop(payload))
 }
 
 fn encoded_response_prefix(
@@ -824,7 +864,7 @@ fn encoded_response_prefix(
     client_nonce: &[u8; 32],
     client_time: u64,
     client_capabilities: &[u8],
-) -> AuthResult<BytesMut> {
+) -> AuthResult<ZeroOnDrop> {
     // Size the buffer exactly: varint-prefixed key id + nonce (32) +
     // time (8) + varint-prefixed capabilities.
     let capacity = varint::encoded_len(key_id.len() as u64)?
@@ -840,7 +880,7 @@ fn encoded_response_prefix(
     payload.put_u64(client_time);
     varint::encode(client_capabilities.len() as u64, &mut payload)?;
     payload.put_slice(client_capabilities);
-    Ok(payload)
+    Ok(ZeroOnDrop(payload))
 }
 
 /// Validates that a key id can be represented on the wire.
@@ -931,6 +971,19 @@ fn read_varbytes(src: &mut impl Buf, name: &'static str) -> AuthResult<Vec<u8>> 
         return Err(AuthError::InvalidPayload(name));
     }
     Ok(src.copy_to_bytes(len).to_vec())
+}
+
+/// Mirrors the decoder-side [`MAX_AUTH_CAPABILITIES_LEN`] bound for encoders,
+/// so a locally built payload can never exceed what the peer's decoder
+/// categorically refuses. Fail-closed either way, but catching it at encode
+/// time keeps the error at the misconfiguration instead of on the wire.
+fn validate_capabilities_len(len: usize) -> AuthResult<()> {
+    if len > MAX_AUTH_CAPABILITIES_LEN {
+        return Err(AuthError::InvalidPayload(
+            "payload length exceeds maximum allowed",
+        ));
+    }
+    Ok(())
 }
 
 /// Timestamp substituted by [`unix_now`] when the host clock is unreadable.
@@ -1928,6 +1981,41 @@ mod tests {
     }
 
     #[test]
+    fn encode_rejects_capability_fields_over_the_wire_limit() {
+        let (_, _, challenge, mut response) = fixture();
+        response.client_capabilities = vec![0_u8; MAX_AUTH_CAPABILITIES_LEN + 1];
+        let mut dst = BytesMut::new();
+        assert!(response.encode(&mut dst).is_err());
+
+        let mut oversized_challenge = challenge.clone();
+        oversized_challenge.limits = vec![0_u8; MAX_AUTH_CAPABILITIES_LEN + 1];
+        assert!(oversized_challenge.encode(&mut dst).is_err());
+    }
+
+    #[test]
+    fn hand_built_response_with_malformed_key_id_is_rejected() {
+        let (credential, exporter, challenge, mut response) = fixture();
+        response.key_id = Vec::new();
+        let mut replay_cache = ReplayCache::default();
+
+        // The wire decoder can never produce this, but a hand-constructed
+        // response must still pay for the dummy MAC before the cheap length
+        // error surfaces.
+        assert_eq!(
+            verify_auth_response(
+                &[credential],
+                &exporter,
+                &challenge,
+                &response,
+                1_700_000_001,
+                Duration::from_secs(30),
+                &mut replay_cache
+            ),
+            Err(AuthError::InvalidKeyIdLength)
+        );
+    }
+
+    #[test]
     fn finds_credentials_by_exact_key_id_only() {
         let secret = b"0123456789abcdef0123456789abcdef".to_vec();
         let credentials = [
@@ -1962,6 +2050,12 @@ mod tests {
         let mut other_key_id = credential.clone();
         other_key_id.key_id = b"client-b".to_vec();
         assert_ne!(credential, other_key_id);
+
+        // Different-length key ids are unequal through the padded constant
+        // time comparison, including a prefix of the other's bytes.
+        let mut shorter_key_id = credential.clone();
+        shorter_key_id.key_id = b"client".to_vec();
+        assert_ne!(credential, shorter_key_id);
 
         let mut other_status = credential.clone();
         other_status.status = CredentialStatus::Retired;
