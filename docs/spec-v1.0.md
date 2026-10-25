@@ -101,6 +101,10 @@ Validation:
 - domain bytes must be valid UTF-8.
 - domain byte length must be `1..=255`.
 - domain must not contain ASCII control characters.
+- domain must not be an IPv4/IPv6 address literal, including the
+  non-canonical numeric forms that POSIX resolvers still interpret as IPv4
+  addresses (octal `0177.0.0.1`, hex `0x7f.0.0.1`, short `127.1`, bare
+  integer `2130706433`): every label all-numeric or `0x`-hex is rejected.
 - IPv4 host length must be exactly 4.
 - IPv6 host length must be exactly 16.
 

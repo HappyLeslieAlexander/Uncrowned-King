@@ -162,6 +162,25 @@ fn validate_port(port: u16) -> ProtocolResult<()> {
     }
 }
 
+/// Detects hostname-shaped strings a POSIX resolver would still read as IPv4
+/// addresses. `inet_aton` accepts numeric forms Rust's strict `IpAddr`
+/// parser rejects: octal (`0177.0.0.1`), hex (`0x7f.0.0.1`), short (`127.1`)
+/// and bare-integer (`2130706433`) forms, all resolving to loopback-range or
+/// attacker-chosen addresses without a DNS query. Every label of such a form
+/// is either all digits or a `0x` hex literal — which no real DNS name can
+/// be, since TLDs cannot be all numeric — so the whole shape is rejected
+/// instead of relying on post-resolution policy checks alone.
+fn is_resolver_ip_shaped(domain: &str) -> bool {
+    domain.split('.').all(|label| {
+        let all_digits = !label.is_empty() && label.bytes().all(|byte| byte.is_ascii_digit());
+        let hex_literal = label
+            .strip_prefix("0x")
+            .or_else(|| label.strip_prefix("0X"))
+            .is_some_and(|rest| rest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        all_digits || hex_literal
+    })
+}
+
 fn validate_domain(domain: &str) -> ProtocolResult<()> {
     if domain.is_empty() || domain.len() > 255 {
         return Err(ProtocolError::InvalidTarget("invalid domain length"));
@@ -172,6 +191,11 @@ fn validate_domain(domain: &str) -> ProtocolResult<()> {
         ));
     }
     if domain.parse::<IpAddr>().is_ok() {
+        return Err(ProtocolError::InvalidTarget(
+            "domain must not be an IP literal",
+        ));
+    }
+    if is_resolver_ip_shaped(domain) {
         return Err(ProtocolError::InvalidTarget(
             "domain must not be an IP literal",
         ));
@@ -422,6 +446,41 @@ mod tests {
                 "domain must not be an IP literal"
             ))
         );
+    }
+
+    #[test]
+    fn rejects_resolver_numeric_forms_as_domain() {
+        // POSIX `inet_aton` reads all of these as IPv4 addresses even though
+        // the strict `IpAddr` parser rejects them.
+        let numeric_forms = [
+            "2130706433", // bare integer -> 127.0.0.1
+            "127.1",      // short form -> 127.0.0.1
+            "0177.0.0.1", // octal -> 127.0.0.1
+            "0x7f.0.0.1", // hex -> 127.0.0.1
+            "0X7F.1",     // upper-case hex, short form
+            "0.1.2.3",    // "this network" block
+        ];
+        let mut out = Vec::new();
+        for domain in numeric_forms {
+            let target = Target::Domain(domain.to_owned(), 80);
+            assert_eq!(
+                target.encode(&mut out),
+                Err(ProtocolError::InvalidTarget(
+                    "domain must not be an IP literal"
+                )),
+                "numeric form {domain} must not be accepted as a domain"
+            );
+        }
+
+        // Domains with numeric labels but at least one non-numeric label stay
+        // legal.
+        for domain in ["123.com", "1.2.3.4.example.com", "3xample.com"] {
+            let target = Target::Domain(domain.to_owned(), 80);
+            assert!(
+                target.encode(&mut out).is_ok(),
+                "legitimate domain {domain} must stay accepted"
+            );
+        }
     }
 
     #[test]

@@ -308,10 +308,12 @@ impl PolicyRule {
                 match (self.action, self.private) {
                     // Nothing about this rule depends on the resolved
                     // addresses: a deny with no private predicate matches on
-                    // its fixed predicates alone, and an allow with an
-                    // explicit private opt-in skips the private-destination
-                    // rejection entirely.
-                    (PolicyDecision::Deny, None) | (PolicyDecision::Allow, Some(true)) => false,
+                    // its fixed predicates alone. An allow with an explicit
+                    // private opt-in skips the private-destination rejection,
+                    // but its own private predicate still needs the resolved
+                    // addresses to decide whether the rule matches at all, so
+                    // it stays resolution-dependent.
+                    (PolicyDecision::Deny, None) => false,
                     // Every other combination compares against the resolved
                     // addresses (or, for Allow rules, the private rejection
                     // verdict on them).
@@ -328,6 +330,13 @@ impl PolicyRule {
 /// tuple variants: they reject an out-of-range prefix up front. A prefix built
 /// past the address width is still handled safely, but it
 /// matches a single host rather than the network the caller meant.
+///
+/// Families are disjoint: an IPv6 CIDR never matches a plain IPv4 address
+/// (IPv4-mapped IPv6 addresses are canonicalized to their IPv4 form first,
+/// and only a `V4` CIDR then matches them). A rule that must deny both
+/// families needs two rules — `cidr = "0.0.0.0/0"` does not cover IPv6, and
+/// `cidr = "::/0"` does not cover IPv4. When neither rule matches, the
+/// default-deny verdict still applies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cidr {
     /// IPv4 CIDR. The prefix must be `0..=32`.
@@ -644,6 +653,17 @@ fn is_restricted_ipv4(ip: Ipv4Addr) -> bool {
         || is_ipv4_protocol_assignment(ip)
         || is_ipv4_6to4_relay_anycast(ip)
         || is_ipv4_reserved(ip)
+        || is_ipv4_this_network(ip)
+}
+
+/// 0.0.0.0/8, the RFC 791 "this network" block. Linux installs the whole
+/// block as a host-local route to loopback (`local 0.0.0.0/8 dev lo scope
+/// host`), so a dial to e.g. `0.1.2.3` is delivered to services bound on
+/// `127.0.0.1` or `0.0.0.0`. Only exact `0.0.0.0` is caught by
+/// [`Ipv4Addr::is_unspecified`]; the rest of the block must be classified
+/// restricted or a default allow rule reaches loopback through it.
+fn is_ipv4_this_network(ip: Ipv4Addr) -> bool {
+    ip.octets()[0] == 0
 }
 
 fn is_ipv4_documentation(ip: Ipv4Addr) -> bool {
@@ -1779,6 +1799,29 @@ mod tests {
     }
 
     #[test]
+    fn rejects_resolver_numeric_forms_as_policy_domain_patterns() {
+        // All of these resolve to IPv4 addresses under POSIX inet_aton
+        // semantics without a DNS query, so they can never legitimately
+        // match a Target::Domain.
+        for pattern in ["2130706433", "127.1", "0177.0.0.1", "0x7f.0.0.1"] {
+            let err = PolicySet::from_toml(&format!(
+                r#"
+                [[rules]]
+                action = "deny"
+                domain = "{pattern}"
+                "#
+            ))
+            .unwrap_err();
+
+            assert_eq!(
+                err,
+                PolicyError::InvalidDomain(pattern.to_owned()),
+                "numeric pattern {pattern} was accepted"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_ip_literal_policy_domain_suffix() {
         let err = PolicySet::from_toml(
             r#"
@@ -1946,6 +1989,10 @@ mod tests {
             Target::Ipv4(Ipv4Addr::new(10, 0, 0, 1), 80),
             Target::Ipv4(Ipv4Addr::new(172, 16, 0, 1), 80),
             Target::Ipv4(Ipv4Addr::new(192, 168, 1, 1), 80),
+            // The rest of 0.0.0.0/8 reaches loopback services on Linux via
+            // the kernel's local route, so it must be restricted too.
+            Target::Ipv4(Ipv4Addr::new(0, 1, 2, 3), 80),
+            Target::Ipv4(Ipv4Addr::new(0, 255, 255, 254), 80),
             Target::Ipv6(Ipv6Addr::LOCALHOST, 80),
         ];
         for target in private_targets {
