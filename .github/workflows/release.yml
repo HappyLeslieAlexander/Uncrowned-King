@@ -37,6 +37,32 @@ jobs:
             exit 1
           fi
           echo "tag ${GITHUB_REF_NAME} matches workspace version ${version}"
+      # A tag alone says nothing about test status: without this gate a
+      # semver tag pushed onto a red main would still publish binaries,
+      # images and signatures. Polls the tagged commit's check runs (the
+      # normal flow pushes the tag after CI is green, so this exits
+      # immediately) and fails the release if any check failed.
+      - name: Require green CI on the tagged commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha="${GITHUB_SHA}"
+          for attempt in $(seq 1 30); do
+            conclusions="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs" --paginate -q '[.check_runs[].conclusion] | join(" ")' | tr '\n' ' ')"
+            if echo "${conclusions}" | grep -Eq 'failure|cancelled|timed_out|startup_failure'; then
+              echo "::error::CI on ${sha} has failing checks: ${conclusions}"
+              exit 1
+            fi
+            if [ -n "$(echo "${conclusions}" | tr -d ' ')" ] && ! echo "${conclusions}" | grep -q 'null'; then
+              echo "All checks on ${sha} concluded successfully: ${conclusions}"
+              exit 0
+            fi
+            echo "Checks on ${sha} still running (attempt ${attempt}/30); waiting..."
+            sleep 20
+          done
+          echo "::error::Timed out waiting for CI on ${sha}; push the release tag after CI is green"
+          exit 1
       - name: Create release from CHANGELOG
         uses: taiki-e/create-gh-release-action@eba8ea96c86cca8a37f1b56e94b4d13301fba651 # v1.11.0
         with:
@@ -83,7 +109,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Install cargo-cyclonedx
-        run: cargo install cargo-cyclonedx --locked
+        run: cargo install cargo-cyclonedx --locked --version 0.5.9
       - name: Generate SBOM
         run: |
           cargo cyclonedx --format json --all

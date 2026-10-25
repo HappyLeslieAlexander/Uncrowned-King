@@ -49,7 +49,7 @@ jobs:
           rustc --version
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz --locked --version 0.13.2
 
       - name: Run fuzz targets
         working-directory: crates/uk-proto/fuzz

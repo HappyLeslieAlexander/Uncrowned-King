@@ -72,7 +72,7 @@ jobs:
         uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
 
       - name: Helm Lint
-        run: helm lint deploy/helm/uncrowned-king
+        run: helm lint deploy/helm/uncrowned-king --values deploy/helm/uncrowned-king/ci-values.yaml --strict
 
       - name: Assert Placeholder Secret Fails Closed
         run: |
@@ -92,6 +92,36 @@ jobs:
             echo "Helm correctly rejected placeholder client credentials"
           else
             echo "Helm failed to reject placeholder client credentials"
+            exit 1
+          fi
+          # Case-insensitive placeholder prefixes must fail closed too.
+          if helm template test deploy/helm/uncrowned-king \
+            --set server.existingTlsSecret=my-tls \
+            --set 'server.credentials[0].id=server-id' \
+            --set 'server.credentials[0].secret=CHANGEME-CHANGEME-CHANGEME-CHANGEME' 2>&1 | grep -q "placeholder or empty credential secret found"; then
+            echo "Helm correctly rejected uppercase placeholder credentials"
+          else
+            echo "Helm failed to reject uppercase placeholder credentials"
+            exit 1
+          fi
+          # TOML-breaking characters must fail at render time, not CrashLoop.
+          if helm template test deploy/helm/uncrowned-king \
+            --set server.existingTlsSecret=my-tls \
+            --set 'server.credentials[0].id=server-id' \
+            --set 'server.credentials[0].secret=abc"def-0123456789abcdef-0123456789abcdef-01234567' 2>&1 | grep -q "characters outside"; then
+            echo "Helm correctly rejected TOML-breaking secret characters"
+          else
+            echo "Helm failed to reject TOML-breaking secret characters"
+            exit 1
+          fi
+          # Whitespace-padded secrets must fail closed.
+          if helm template test deploy/helm/uncrowned-king \
+            --set server.existingTlsSecret=my-tls \
+            --set 'server.credentials[0].id=server-id' \
+            --set 'server.credentials[0].secret=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde ' 2>&1 | grep -q "surrounded by whitespace"; then
+            echo "Helm correctly rejected whitespace-padded secrets"
+          else
+            echo "Helm failed to reject whitespace-padded secrets"
             exit 1
           fi
 
