@@ -313,19 +313,34 @@ impl UdpAssociation {
 
     /// Hands the datagram to its target's worker, spawning the worker (and
     /// its bounded queue) on first sight of the target.
+    ///
+    /// Workers exit by design (idle timeout, server `UDP_CLOSE`, inbound
+    /// termination) and drop their queue receiver; a closed sender here means
+    /// the worker for this target has ended, so it is evicted and replaced
+    /// before delivering. Without this the dead sender would stay in the map
+    /// forever and every later datagram to the target would be silently
+    /// dropped for the association's lifetime.
     pub(crate) fn enqueue_datagram(
         &mut self,
         target: &Target,
         payload: Bytes,
         sessions: &Arc<ClientSessionManager>,
     ) {
-        if !self.senders.contains_key(target) {
-            if let Some(sender) = self.spawn_target_worker(target, sessions) {
-                self.senders.insert(target.clone(), sender);
+        if let Some(sender) = self.senders.get(target) {
+            if sender.is_closed() {
+                debug!(
+                    event = "socks5.udp_associate.worker_ended",
+                    target = %target.log_safe()
+                );
+                self.senders.remove(target);
+            } else {
+                try_enqueue_datagram(sender, target, payload, &self.metrics);
+                return;
             }
         }
-        if let Some(sender) = self.senders.get(target) {
-            let _ = try_enqueue_datagram(sender, target, payload, &self.metrics);
+        if let Some(sender) = self.spawn_target_worker(target, sessions) {
+            try_enqueue_datagram(&sender, target, payload, &self.metrics);
+            self.senders.insert(target.clone(), sender);
         }
         // No worker could be spawned (no learned client endpoint yet): drop.
     }
@@ -444,7 +459,8 @@ async fn udp_target_worker(
                     continue;
                 };
                 // With no flow there is nothing to keep alive; exiting frees
-                // the task, and the association respawns it on demand.
+                // the task, and the association replaces the worker (evicting
+                // this one's closed queue feed) on the next datagram.
                 let Some(flow) = current.as_ref() else {
                     break;
                 };
@@ -887,7 +903,13 @@ pub(crate) fn udp_association_bind_addr(tcp_local_addr: SocketAddr) -> SocketAdd
 
 pub(crate) fn udp_idle_interval(idle_timeout: Option<Duration>) -> Option<time::Interval> {
     let idle_timeout = idle_timeout?;
-    Some(time::interval(idle_timeout.min(Duration::from_secs(1))))
+    // `interval`'s first tick completes immediately, which would race the
+    // queued first datagram in the worker's `select!` and could end the
+    // worker before it ever processes one. Anchoring the first tick one
+    // period out keeps the immediate tick from firing before the worker has
+    // had a chance to drain its queue.
+    let period = idle_timeout.min(Duration::from_secs(1));
+    Some(time::interval_at(time::Instant::now() + period, period))
 }
 
 pub(crate) async fn tick_udp_idle_interval(interval: &mut Option<time::Interval>) {

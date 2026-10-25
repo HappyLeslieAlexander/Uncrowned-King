@@ -1302,6 +1302,62 @@ async fn udp_association_enqueue_returns_without_awaiting_stalled_workers() {
     stalled.abort();
 }
 
+#[tokio::test]
+async fn udp_idle_interval_first_tick_does_not_fire_immediately() {
+    let mut interval = udp_idle_interval(Some(Duration::from_secs(1)));
+
+    // A pending first tick leaves the worker free to process its queued first
+    // datagram; an immediate one could win the select! race and end the worker
+    // before it ever sends anything.
+    assert!(
+        time::timeout(
+            Duration::from_millis(100),
+            tick_udp_idle_interval(&mut interval),
+        )
+        .await
+        .is_err(),
+        "first idle tick must be one period away, not immediate"
+    );
+}
+
+#[tokio::test]
+async fn udp_association_replaces_dead_target_worker() {
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let metrics = Arc::new(ClientMetrics::default());
+    let mut association = UdpAssociation::new(
+        socket,
+        None,
+        socks5::SocksEndpoint::Ipv4(Ipv4Addr::UNSPECIFIED, 0),
+        CONTROL_PEER_IP,
+        Arc::clone(&metrics),
+    );
+    // A worker that has already exited: its queue feed is closed.
+    let (dead_tx, dead_rx) = mpsc::channel(1);
+    drop(dead_rx);
+    let target = Target::Domain("respawn.example".to_owned(), 53);
+    association.senders.insert(target.clone(), dead_tx);
+
+    association.enqueue_datagram(
+        &target,
+        Bytes::from_static(b"payload"),
+        &Arc::new(test_session_manager(minimal_config())),
+    );
+
+    // The dead feed must be evicted (no learned client endpoint here, so no
+    // replacement worker can spawn yet); a later datagram with a learned
+    // endpoint would then spawn one instead of writing into the dead channel.
+    assert!(
+        !association.senders.contains_key(&target),
+        "closed sender must be evicted so the target is not blackholed"
+    );
+    assert!(
+        metrics
+            .render()
+            .contains("uncrowned_king_client_udp_association_queue_full_total 0\n"),
+        "a closed worker is a respawn, not a queue-full drop"
+    );
+}
+
 #[test]
 fn allocates_client_flow_ids_up_to_varint_limit() {
     let next_flow_id = AtomicU64::new(MAX_VARINT - FLOW_ID_STEP);

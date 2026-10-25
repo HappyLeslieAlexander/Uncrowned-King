@@ -277,6 +277,15 @@ async fn releases_idle_udp_flow_for_new_target() -> Result<(), TestError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn respawns_udp_target_worker_after_idle_exit() -> Result<(), TestError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_udp_flow_same_target_respawn_e2e(),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keeps_udp_flow_alive_on_downstream_activity() -> Result<(), TestError> {
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -1203,6 +1212,57 @@ async fn run_udp_flow_idle_reuse_e2e() -> Result<(), TestError> {
     assert_eq!(reply_payload, second_payload);
 
     second_echo_task.await??;
+    Ok(())
+}
+
+/// Regression: a UDP target worker that exits on the client-side idle timeout
+/// must be replaced on the next datagram to the *same* target. Before the
+/// eviction fix the closed queue feed stayed in the association's sender map
+/// forever, silently blackholing every later datagram to that target.
+async fn run_udp_flow_same_target_respawn_e2e() -> Result<(), TestError> {
+    init_tracing();
+
+    let (target_addr, echo_task) = spawn_udp_echo_target_roundtrips(2).await?;
+    let harness = RelayHarness::start_with_client_udp_idle_timeout(
+        Some(allow_loopback_any_port_policy()),
+        test_limits(),
+        1,
+    )
+    .await?;
+    let (_socks_control, udp_relay_addr) = open_socks_udp_associate(harness.socks_addr).await?;
+    let udp_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let first_payload = b"Uncrowned King udp respawn before idle";
+    let second_payload = b"Uncrowned King udp respawn after idle";
+
+    udp_client
+        .send_to(
+            &socks_udp_datagram(target_addr, first_payload),
+            udp_relay_addr,
+        )
+        .await?;
+    let (reply_target, reply_payload) =
+        recv_socks_udp_datagram(&udp_client, udp_relay_addr).await?;
+    assert_eq!(reply_target, target_addr);
+    assert_eq!(reply_payload, first_payload);
+
+    // Long enough for the 1s client idle timeout to end the worker and close
+    // its flow, and for the echo target task to finish.
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+
+    // Same target: the association must spawn a replacement worker and reopen
+    // the flow instead of dropping the datagram into the dead feed.
+    udp_client
+        .send_to(
+            &socks_udp_datagram(target_addr, second_payload),
+            udp_relay_addr,
+        )
+        .await?;
+    let (reply_target, reply_payload) =
+        recv_socks_udp_datagram(&udp_client, udp_relay_addr).await?;
+    assert_eq!(reply_target, target_addr);
+    assert_eq!(reply_payload, second_payload);
+
+    echo_task.await??;
     Ok(())
 }
 
