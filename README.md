@@ -32,6 +32,11 @@ The repository ships the 1.0 TLS/TCP and QUIC carriers (SOCKS5 client, multiplex
 - nonce-matched PING/PONG keepalive for active relay flows
 - negotiated UDP flow limits and idle UDP flow cleanup on both client and server
 - SETTINGS-advertised UDP stream fallback capability for the TLS/TCP carrier
+- opt-in transport masking (new `uk-mask` crate): authenticated preludes gate
+  the TLS handshake and per-credential ChaCha20 keystreams mask the TLS stream
+  and QUIC datagrams, so unauthenticated observers cannot identify the
+  protocol or elicit any response; disabled by default
+  (`docs/masking-spec.md`)
 
 The first runnable proxy targets are:
 
@@ -294,12 +299,23 @@ for example `[::1]:9443`; port `0` is rejected by config validation.
 
 ```text
 docs/
-  whitepaper.md      Original protocol whitepaper
-  spec-v1.0.md       Frozen 1.0 wire specification
-  test-vectors.md    Fixed examples for protocol tests
+  whitepaper.md               Original protocol whitepaper
+  spec-v1.0.md                Frozen 1.0 wire specification
+  masking-spec.md             Optional transport masking extension spec
+  test-vectors.md             Fixed examples for protocol tests
+  threat-model.md             Threats defended, and non-goals
+  architecture.md             System architecture and crate layering
+  key-management.md           Secret/certificate operational procedures
+  operations.md               Day-2 operations runbook
+  tuning.md                   Capacity sizing and tuning
+  performance.md              Benchmark methodology and results
+  launch-gate.md              Go-live gate and rollback playbook
+  transport-masking-plan.md   Masking design plan (Phases 0-3 complete)
+  audits/                     Historical audit and remediation archives
 crates/
   uk-proto/          Frame, varint, target, settings, and errors
   uk-auth/           Challenge-response authentication
+  uk-mask/           Optional transport masking (prelude, keystream, replay)
   uk-policy/         Server-side policy decisions
   uk-server/         Server binary entry point
   uk-client/         Client binary entry point

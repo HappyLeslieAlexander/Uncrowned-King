@@ -2,7 +2,7 @@
 {{- /* Unknown top-level keys in server.config are rejected: a typo like
      `quic_lisen` would otherwise be silently ignored and the deployment
      would run with defaults instead of the intended value. */}}
-{{- $knownServerFields := list "listen" "quic_listen" "observability_listen" "auth_skew_seconds" "limits" "log_format" }}
+{{- $knownServerFields := list "listen" "quic_listen" "observability_listen" "auth_skew_seconds" "limits" "log_format" "masking" }}
 {{- range $key, $val := .Values.server.config }}
 {{- if not (has $key $knownServerFields) }}
 {{- fail (printf "Unknown server.config field %q (known fields: %s); refusing to silently ignore it" $key (join ", " $knownServerFields)) }}
@@ -44,6 +44,34 @@ data:
     {{ $key }} = {{ int64 $val }}
     {{- end }}
     {{- end }}
+    {{- end }}
+    {{- end }}
+
+    {{- if .Values.server.config.masking }}
+    {{- $knownMasking := list "enabled" "replay_identities" "quic" "quic_key_id" }}
+    {{- $masking := .Values.server.config.masking }}
+    [masking]
+    {{- range $key, $val := $masking }}
+    {{- if not (has $key $knownMasking) }}
+    {{- fail (printf "Unknown server masking field %q in server.config.masking (known: enabled, replay_identities, quic, quic_key_id)" $key) }}
+    {{- end }}
+    {{- end }}
+    {{- if kindIs "invalid" $masking.enabled }}
+    {{- fail "server.config.masking.enabled must be set explicitly (true or false)" }}
+    {{- end }}
+    enabled = {{ $masking.enabled }}
+    {{- if $masking.replay_identities }}
+    replay_identities = {{ int64 $masking.replay_identities }}
+    {{- end }}
+    {{- if $masking.quic }}
+    quic = {{ $masking.quic }}
+    {{- if not $masking.quic_key_id }}
+    {{- fail "server.config.masking.quic_key_id is required when masking.quic is enabled" }}
+    {{- end }}
+    {{- if not (has $masking.quic_key_id .Values.server.credentials) }}
+    {{- fail (printf "server.config.masking.quic_key_id %q must name a key in server.credentials" $masking.quic_key_id) }}
+    {{- end }}
+    quic_key_id = "{{ $masking.quic_key_id }}"
     {{- end }}
     {{- end }}
 

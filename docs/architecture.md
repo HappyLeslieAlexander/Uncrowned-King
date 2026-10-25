@@ -36,12 +36,13 @@ graph TB
 
 ## 2. 工作区与 Crate 分层依赖关系
 
-项目严格按职责划分为 5 个核心 Crate：
+项目严格按职责划分为 6 个核心 Crate：
 
 ```mermaid
 graph TD
     uk_proto["uk-proto<br/>(帧编解码、合并写入、协议常量、Observability)"]
     uk_auth["uk-auth<br/>(HMAC-SHA256 挑战-响应认证、重放缓存、密钥管理)"]
+    uk_mask["uk-mask<br/>(可选传输掩码：prelude 准入、ChaCha20 流/数据报包装、重放注册表)"]
     uk_policy["uk-policy<br/>(CIDR / 域名 / 端口 / 权限组访问控制)"]
     uk_server["uk-server<br/>(多载体侦听、防爆破限流、会话解复用、出站转发)"]
     uk_client["uk-client<br/>(SOCKS5 协议服务、连接池、流管理、双向中继)"]
@@ -49,19 +50,34 @@ graph TD
     uk_server --> uk_proto
     uk_server --> uk_auth
     uk_server --> uk_policy
+    uk_server --> uk_mask
 
     uk_client --> uk_proto
     uk_client --> uk_auth
     uk_client --> uk_policy
+    uk_client --> uk_mask
 ```
 
 | Crate | 职责与设计原则 |
 | :--- | :--- |
 | **`uk-proto`** | 纯协议层：定义 Frame 格式、常量、零拷贝编码解码器、批量帧写入辅助函数与通用 HTTP 探针 |
 | **`uk-auth`** | 鉴权安全层：基于 TLS Keying Material Exporter (RFC 5705) 的双向 HMAC 身份认证，带防重放与密钥零化 (`zeroize`) |
+| **`uk-mask`** | 可选传输掩码层（默认关闭）：64 字节认证 prelude 在 TLS 握手前完成准入，双载体流量经按凭证派生的 ChaCha20 密钥流掩码；规范见 [`masking-spec.md`](masking-spec.md) |
 | **`uk-policy`** | 策略规则引擎：高性能 CIDR 前缀树、通配符域名匹配与 ACL 规则过滤 |
 | **`uk-server`** | 服务端中继核心：支持 TLS 和 QUIC 双载体、防暴力破解速率限制 (`AuthRateLimiter`)、热重载与会话流控 |
 | **`uk-client`** | 客户端中继核心：SOCKS5 服务器实现、自动保活、跨载体连接池负载均衡与重连降级 |
+
+### 2.1 传输掩码层的位置
+
+`uk-mask` 是**可选**模块（`[masking] enabled`，两端默认关闭），位于 TLS/QUIC **之下**：
+掩码层只重塑线路字节图像，不触碰 TLS/QUIC 会话内部，因此 Exporter 通道绑定、
+ALPN 校验与 0-RTT 禁用策略完全不受影响。启用后，TLS/TCP 载体的每个连接必须先通过
+64 字节认证 prelude（在占用握手许可与 rustls 之前），未认证探测被静默排空；
+QUIC 载体的每个数据报被包装为 `nonce(12) ‖ ChaCha20(segment)`。
+
+**§3 时序图中掩码启用时的差别**：在 ClientHello 之前，服务端先收到 prelude + nonce 并
+验证通过（失败即静默断开，无任何响应字节）；成功后 TLS 握手如常进行，掩码 keystream
+对握手内容透明。
 
 ---
 
@@ -120,3 +136,4 @@ sequenceDiagram
 | **重放攻击** | 结合 TLS Exporter 绑定会话密钥 + 时间戳窗口校验 + `ReplayCache` 唯一性缓存 |
 | **内存泄露与 DoS 攻击** | 严格配置 `max_sessions`、`max_streams`、`max_buffered_bytes_per_session`，背压流控机制 |
 | **内存凭证残留** | 密钥结构体全生命周期实现 `ZeroizeOnDrop`，使用完毕即刻安全覆写抹除 |
+| **被动协议指纹识别**（可选启用） | 传输掩码：prelude 准入门 + 按凭证 ChaCha20 密钥流使 ClientHello/ALPN/证书与 QUIC Initial 不可辨识；掩码拒绝计入防爆破限流 |

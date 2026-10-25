@@ -9,7 +9,9 @@
 use std::{future::Future, io, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use quinn::{ClientConfig as QuinnClientConfig, Endpoint, crypto::rustls::QuicClientConfig};
+use quinn::{
+    ClientConfig as QuinnClientConfig, Endpoint, crypto::rustls::QuicClientConfig, default_runtime,
+};
 use rustls::ClientConfig as RustlsClientConfig;
 use tokio::net::lookup_host;
 use uk_auth::EXPORTER_LABEL;
@@ -48,17 +50,22 @@ pub const CLIENT_QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE: usize = 256 * 1024;
 const MIN_QUIC_PER_ADDRESS_ATTEMPT: Duration = Duration::from_secs(1);
 
 /// Optional overrides for QUIC transport keep-alive and idle timeout.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct QuicTransportOverrides {
     /// Keep-alive packet interval. `None` disables transport keep-alives.
     pub keep_alive: Option<Duration>,
     /// Maximum idle timeout before declaring path failure.
     pub max_idle: Duration,
+    /// When set, the endpoint socket is wrapped in the transport masking
+    /// layer under these per-credential keys and MTU discovery is capped for
+    /// the masking overhead.
+    pub mask_keys: Option<std::sync::Arc<uk_mask::MaskKeys>>,
 }
 
 impl Default for QuicTransportOverrides {
     fn default() -> Self {
         Self {
+            mask_keys: None,
             keep_alive: Some(DEFAULT_CLIENT_QUIC_KEEP_ALIVE),
             max_idle: DEFAULT_CLIENT_QUIC_MAX_IDLE,
         }
@@ -116,7 +123,7 @@ pub async fn connect(
     QuicError,
 > {
     let quinn_client_config = client_config(rustls_config)?;
-    connect_with_client_config(quinn_client_config, endpoint, server_name, None).await
+    connect_with_client_config(quinn_client_config, endpoint, server_name, None, None).await
 }
 
 /// Connects to `endpoint` over QUIC with optional transport parameter overrides.
@@ -140,14 +147,34 @@ pub async fn connect_with_overrides(
     ),
     QuicError,
 > {
+    let mask_keys = overrides.as_ref().and_then(|opts| opts.mask_keys.clone());
     match overrides {
         Some(opts) => {
-            let quinn_client_config =
-                client_config_with_transport(rustls_config, opts.keep_alive, opts.max_idle)?;
-            connect_with_client_config(quinn_client_config, endpoint, server_name, attempt_budget)
-                .await
+            let quinn_client_config = client_config_with_transport_masked(
+                rustls_config,
+                opts.keep_alive,
+                opts.max_idle,
+                mask_keys.is_some(),
+            )?;
+            connect_with_client_config(
+                quinn_client_config,
+                endpoint,
+                server_name,
+                attempt_budget,
+                mask_keys,
+            )
+            .await
         }
-        None => connect(rustls_config, endpoint, server_name).await,
+        None => {
+            connect_with_client_config(
+                client_config(rustls_config)?,
+                endpoint,
+                server_name,
+                attempt_budget,
+                mask_keys,
+            )
+            .await
+        }
     }
 }
 
@@ -181,6 +208,7 @@ pub async fn connect_with_client_config(
     endpoint: &str,
     server_name: &str,
     attempt_budget: Option<Duration>,
+    mask_keys: Option<std::sync::Arc<uk_mask::MaskKeys>>,
 ) -> Result<
     (
         BoxedCarrierReader,
@@ -195,7 +223,8 @@ pub async fn connect_with_client_config(
 
     let mut last_err = None;
     for addr in addrs {
-        let mut client_endpoint = match Endpoint::client(unspecified_addr(addr)) {
+        let mut client_endpoint = match client_endpoint(unspecified_addr(addr), mask_keys.as_ref())
+        {
             Ok(endpoint) => endpoint,
             Err(err) => {
                 last_err =
@@ -311,10 +340,23 @@ pub fn client_config_with_transport(
     keep_alive: Option<Duration>,
     max_idle: Duration,
 ) -> Result<QuinnClientConfig, QuicError> {
+    client_config_with_transport_masked(rustls_config, keep_alive, max_idle, false)
+}
+
+/// Like [`client_config_with_transport`], with masking-aware MTU discovery.
+pub fn client_config_with_transport_masked(
+    rustls_config: RustlsClientConfig,
+    keep_alive: Option<Duration>,
+    max_idle: Duration,
+    masked: bool,
+) -> Result<QuinnClientConfig, QuicError> {
     let crypto = QuicClientConfig::try_from(rustls_config)
         .map_err(|err| format!("QUIC client crypto config rejected: {err}"))?;
     let mut config = QuinnClientConfig::new(Arc::new(crypto));
-    let transport = client_transport_config(keep_alive, max_idle)?;
+    let mut transport = client_transport_config(keep_alive, max_idle)?;
+    if masked {
+        uk_mask::udp::apply_masked_mtu(&mut transport);
+    }
     config.transport_config(Arc::new(transport));
     Ok(config)
 }
@@ -328,6 +370,27 @@ async fn resolve(endpoint: &str) -> Result<Vec<SocketAddr>, QuicError> {
         return Err(format!("QUIC endpoint {endpoint} resolved to no addresses").into());
     }
     Ok(addrs)
+}
+
+/// Binds the client's QUIC endpoint, optionally wrapping the socket in the
+/// transport masking layer under the credential's keys.
+fn client_endpoint(
+    addr: SocketAddr,
+    mask_keys: Option<&std::sync::Arc<uk_mask::MaskKeys>>,
+) -> Result<Endpoint, QuicError> {
+    let Some(keys) = mask_keys else {
+        return Endpoint::client(addr).map_err(QuicError::from);
+    };
+    let socket = std::net::UdpSocket::bind(addr)
+        .map_err(|err| format!("failed to bind local QUIC socket for {addr}: {err}"))?;
+    let runtime =
+        default_runtime().ok_or("no compatible async runtime found for the QUIC endpoint")?;
+    let wrapped = runtime
+        .wrap_udp_socket(socket)
+        .map_err(|err| format!("failed to wrap QUIC socket: {err}"))?;
+    let masked = uk_mask::udp::MaskedUdpSocket::new_client(wrapped, keys, &mut rand::rngs::OsRng);
+    Endpoint::new_with_abstract_socket(quinn::EndpointConfig::default(), None, masked, runtime)
+        .map_err(|err| format!("failed to create QUIC endpoint: {err}").into())
 }
 
 fn unspecified_addr(addr: SocketAddr) -> SocketAddr {

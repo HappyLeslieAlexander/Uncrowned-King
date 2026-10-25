@@ -98,6 +98,10 @@ Gate the release on all of the following. Record who signed and when.
 - [ ] Threat model reviewed; `cargo-deny` + audit + fuzz smoke green in CI.
 - [ ] TLS identity and credentials issued per [`docs/key-management.md`](key-management.md); files `0600` (any group/other bit is rejected at startup), owned by the service user.
 - [ ] Policy denies private/reserved ranges first; allow-list scoped to real targets.
+- [ ] If transport masking is enabled: server/client settings match, the
+      masked TCP listener holds ≤ 64 credentials, and the QUIC designated
+      credential (`masking.quic_key_id`) is rotated with the release plan
+      ([`docs/masking-spec.md`](masking-spec.md)).
 
 **Release artifacts**
 - [ ] Tagged release built by `release.yml`: binaries + checksums + multi-arch image + SBOM + cosign signatures.

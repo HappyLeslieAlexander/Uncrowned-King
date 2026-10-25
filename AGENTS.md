@@ -58,6 +58,14 @@ This document establishes the non-negotiable architectural invariants, security 
 
 ---
 
+- **Transport Masking Discipline (`uk-mask`)**:
+  - Masking is **opt-in** (`[masking]`, default off) and sits strictly **below** TLS/QUIC: it must never touch the TLS/QUIC session state, exporter binding, ALPN verification, or 0-RTT policy.
+  - Prelude verification must scan **all** credentials in a padded constant-cost loop with **no early exit**; tag comparison must use `subtle::ConstantTimeEq`; every rejection must collapse into one indistinguishable error (`MaskError::PreludeRejected`).
+  - The masking admission gate runs **before** the handshake permit is taken; rejected connections are drained under a bounded budget (4 KiB / 64 reads) and closed abortively (`SO_LINGER=0`).
+  - Replay counters commit **two-phase**: only immediately before the first non-alert TLS record write (after rustls parses the ClientHello), never on admission alone; the replay registry is preallocated and performs no per-connection allocation.
+  - Masked QUIC endpoints are pinned to exactly one designated credential (`masking.quic_key_id`); MTU discovery must stay capped at 1452 − 12, and unsupported QUIC versions must be dropped **silently** (no Version Negotiation) before quinn sees them.
+  - Changing the `[masking]` section requires a restart; credential reloads rotate TCP mask keys for new connections only. Masking rejections count into the `auth_rate_limit_*` failure limiter.
+
 ## 4. Operational Readiness & Deployment Standards
 
 - **Strict File Permissions (`mode & 0o077 == 0`)**:

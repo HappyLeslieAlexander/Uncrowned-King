@@ -109,10 +109,29 @@ pub fn server_config_with_idle_timeout(
 /// Builds a QUIC server config from a TLS 1.3 rustls config and sets transport
 /// idle timeout and receive window parameters.
 pub fn server_config_with_transport_params(
+    rustls_config: RustlsServerConfig,
+    idle_timeout: Option<Duration>,
+    stream_receive_window: u32,
+    connection_receive_window: u32,
+) -> Result<QuinnServerConfig, QuicError> {
+    server_config_with_transport_params_masked(
+        rustls_config,
+        idle_timeout,
+        stream_receive_window,
+        connection_receive_window,
+        false,
+    )
+}
+
+/// Builds a QUIC server config with masking-aware transport parameters: when
+/// the endpoint socket is masked, MTU discovery is capped so a masked
+/// datagram (segment + nonce) never exceeds the unmasked path-MTU budget.
+pub fn server_config_with_transport_params_masked(
     mut rustls_config: RustlsServerConfig,
     idle_timeout: Option<Duration>,
     stream_receive_window: u32,
     connection_receive_window: u32,
+    masked: bool,
 ) -> Result<QuinnServerConfig, QuicError> {
     rustls_config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
     rustls_config.max_early_data_size = 0;
@@ -126,6 +145,9 @@ pub fn server_config_with_transport_params(
     transport.stream_receive_window(quinn::VarInt::from_u32(stream_receive_window));
     transport.receive_window(quinn::VarInt::from_u32(connection_receive_window));
     transport.datagram_receive_buffer_size(Some(QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE));
+    if masked {
+        uk_mask::udp::apply_masked_mtu(&mut transport);
+    }
     let quic_idle_timeout = idle_timeout
         .map(quinn::IdleTimeout::try_from)
         .transpose()
@@ -138,16 +160,41 @@ pub fn server_config_with_transport_params(
 
 /// Binds a QUIC server endpoint to `addr` using the tokio runtime.
 pub fn bind_endpoint(config: QuinnServerConfig, addr: SocketAddr) -> Result<Endpoint, QuicError> {
+    bind_endpoint_masked(config, addr, None)
+}
+
+/// Binds a QUIC server endpoint, optionally wrapping the socket in the
+/// transport masking layer under the designated credential's keys.
+pub fn bind_endpoint_masked(
+    config: QuinnServerConfig,
+    addr: SocketAddr,
+    mask_keys: Option<std::sync::Arc<uk_mask::MaskKeys>>,
+) -> Result<Endpoint, QuicError> {
     let socket = std::net::UdpSocket::bind(addr)
         .map_err(|err| format!("failed to bind QUIC endpoint to {addr}: {err}"))?;
     let runtime =
         default_runtime().ok_or("no compatible async runtime found for the QUIC endpoint")?;
-    let endpoint = Endpoint::new(
-        quinn::EndpointConfig::default(),
-        Some(config),
-        socket,
-        runtime,
-    )
+    let endpoint = match mask_keys {
+        None => Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(config),
+            socket,
+            runtime,
+        ),
+        Some(keys) => {
+            let wrapped = runtime
+                .wrap_udp_socket(socket)
+                .map_err(|err| format!("failed to wrap QUIC socket: {err}"))?;
+            let masked =
+                uk_mask::udp::MaskedUdpSocket::new_server(wrapped, &keys, &mut rand::rngs::OsRng);
+            Endpoint::new_with_abstract_socket(
+                quinn::EndpointConfig::default(),
+                Some(config),
+                masked,
+                runtime,
+            )
+        }
+    }
     .map_err(|err| format!("failed to create QUIC endpoint: {err}"))?;
     Ok(endpoint)
 }

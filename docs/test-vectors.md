@@ -129,3 +129,49 @@ An unknown required flag example:
 ```
 
 The receiver must reject it with `ERROR_UNSUPPORTED_FLAG`.
+
+## 8. Masking Prelude (docs/masking-spec.md §2)
+
+The following fixed vectors were produced by `uk_mask::MaskKeys` itself and are
+verified by `crates/uk-mask` unit tests; re-deriving them with an independent
+implementation must reproduce these bytes exactly.
+
+Input:
+
+```text
+secret = "0123456789abcdef0123456789abcdef"
+key_id = "client-a"
+policy = full8
+identity = 0x0102030405060708
+counter = 42
+prelude randomness: StdRng (rand 0.8, ChaCha12) seeded with 0x0042
+```
+
+Root/auth/mask key derivation (hex of the first 8 bytes of each):
+
+```text
+root             = HMAC-SHA256(secret, "uk/1/mask/root\x01" || "client-a")
+tcp_auth_key     = HMAC-SHA256(root, "uk/1/mask/tcp-auth\x01")
+prelude_mask_key = HMAC-SHA256(root, "uk/1/mask/tcp-prelude-mask\x01")
+tcp_c2s_key      = HMAC-SHA256(root, "uk/1/mask/tcp-c2s\x01")
+tcp_s2c_key      = HMAC-SHA256(root, "uk/1/mask/tcp-s2c\x01")
+udp_c2s_key      = HMAC-SHA256(root, "uk/1/mask/udp-c2s\x01")
+udp_s2c_key      = HMAC-SHA256(root, "uk/1/mask/udp-s2c\x01")
+```
+
+Encoded prelude (64 bytes) and nonce (12 bytes):
+
+```text
+prelude =
+  58 50 1d c3 0e 99 8b 78 74 d0 3f 54 41 c5 e0 95
+  2a 8e 9c fd 89 6d 5f 68 ab c4 64 8e 46 97 c7 01
+  39 cf 2a 8d c6 21 dd 14 80 50 eb 5f 8d 19 10 d3
+  b9 31 44 d8 e5 1a 4f 06 eb e5 f8 a7 4b 06 31 6f
+nonce  =
+  6e 86 4c 49 01 23 a7 b3 0c e8 24 6e
+```
+
+Decoding `prelude` with `nonce` under the same credential yields
+`identity = 0x0102030405060708`, `counter = 42`. Decoding under any other
+credential (different `key_id` or `secret`), or after flipping any bit of the
+prelude or nonce, must fail with the single indistinguishable rejection.

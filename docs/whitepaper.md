@@ -59,6 +59,14 @@ The initial version supports four carriers:
 
 All carriers must provide confidentiality and integrity. Plaintext UK is invalid.
 
+Carriers may optionally be wrapped in the transport masking extension
+([`masking-spec.md`](masking-spec.md)): an opt-in layer (default off) below
+TLS/QUIC that shapes the wire image — authenticated preludes gate the TCP
+handshake and per-credential ChaCha20 keystreams mask streams and QUIC
+datagrams — so passive observers cannot identify the protocol. Masking is not a
+cryptographic boundary; the carrier's TLS/QUIC protection remains mandatory and
+unmodified.
+
 ### 3.2 ALPN
 
 Native carriers should use:

@@ -128,3 +128,17 @@ cargo bench
 # 2. 运行 E2E 吞吐与隔离测试（包含 --ignored 基准测试）
 cargo test -p uk-client --test tcp_relay_e2e -- --ignored --nocapture
 ```
+
+## 5. Transport masking interactions
+
+- **QUIC MTU**: with `masking.quic` enabled, MTU discovery's upper bound is
+  capped at 1440 (unmasked default 1452 minus the 12-byte per-segment nonce),
+  so masked datagrams never exceed the plain carrier's path-MTU budget. QUIC's
+  clamped initial/min MTU (1200) is unaffected; `1200 + 12` stays below every
+  realistic path MTU.
+- **Handshake budgets**: the masking prelude is read under
+  `handshake_timeout_seconds`; rejected connections are drained until the same
+  deadline, so raising it also lengthens the silent-drain window (bounded by
+  the 4 KiB / 64-read budget).
+- **Credential count**: see `docs/operations.md` — prelude verification is
+  linear in the credential count with no early exit.

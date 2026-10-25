@@ -1911,6 +1911,7 @@ async fn half_close_timeout_notifies_client_with_error_close() {
     let security = SecurityState::new(
         crate::security::test_tls_acceptor(),
         vec![cred],
+        Vec::new(),
         uk_policy::PolicySet::new(vec![policy]),
         Duration::from_secs(30),
     );
@@ -2012,6 +2013,7 @@ async fn server_session_graceful_drain_completes_active_flows_and_rejects_new() 
     let security = SecurityState::new(
         crate::security::test_tls_acceptor(),
         vec![cred],
+        Vec::new(),
         uk_policy::PolicySet::new(vec![policy]),
         Duration::from_secs(30),
     );
@@ -2127,6 +2129,7 @@ async fn server_session_drain_timeout_aborts_hung_flows() {
     let security = SecurityState::new(
         crate::security::test_tls_acceptor(),
         vec![cred],
+        Vec::new(),
         uk_policy::PolicySet::new(vec![policy]),
         Duration::from_secs(30),
     );
@@ -2193,6 +2196,7 @@ async fn server_session_zero_flows_instant_shutdown() {
     let security = SecurityState::new(
         crate::security::test_tls_acceptor(),
         vec![cred],
+        Vec::new(),
         uk_policy::PolicySet::default(),
         Duration::from_secs(30),
     );
@@ -2595,6 +2599,7 @@ async fn review_real_relay_drain_loses_tail_of_upload() {
     let security = SecurityState::new(
         crate::security::test_tls_acceptor(),
         vec![cred],
+        Vec::new(),
         PolicySet::new(vec![rule]),
         Duration::from_secs(30),
     );
@@ -2710,6 +2715,7 @@ async fn carrier_disconnect_without_client_close_flushes_pending_writes() {
     let security = SecurityState::new(
         crate::security::test_tls_acceptor(),
         vec![cred],
+        Vec::new(),
         PolicySet::new(vec![rule]),
         Duration::from_secs(30),
     );

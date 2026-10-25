@@ -101,6 +101,18 @@ server:
       secret: "replace-with-a-64-character-hex-secret-in-production-00000000000000"
       policy_group: "default"
 
+  # Opt-in transport masking (default off). When enabled, every carrier
+  # connection must authenticate before the TLS/QUIC handshake; unauthenticated
+  # probes are silently drained. Requires a restart to change. QUIC masking is
+  # endpoint-wide under one designated credential (quic_key_id must name a key
+  # in server.credentials); clients must enable masking with the same
+  # credential or the connection fails closed as a handshake timeout.
+  # masking:
+  #   enabled: true
+  #   replay_identities: 16384
+  #   quic: true
+  #   quic_key_id: "client-default"
+
   # Access policies
   # WARNING: Configure allowed destination CIDRs, domains, and ports according to your
   # environment. The default rule below denies private targets and allows example.com on port 443.

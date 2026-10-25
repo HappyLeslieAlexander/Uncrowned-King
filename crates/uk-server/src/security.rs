@@ -9,6 +9,7 @@ use std::{
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use uk_auth::{AuthenticatedIdentity, Credential};
+use uk_mask::MaskKeys;
 use uk_policy::PolicySet;
 
 const INITIAL_GENERATION: u64 = 1;
@@ -23,6 +24,11 @@ struct SecurityGeneration {
     generation: u64,
     tls_acceptor: TlsAcceptor,
     credentials: Arc<Vec<Credential>>,
+    /// Per-credential masking keys derived from the same generation's
+    /// credentials; empty when masking is disabled. New connections derive
+    /// their keystreams from this snapshot, so a reload swaps mask keys only
+    /// for connections admitted afterwards.
+    mask_keys: Arc<Vec<MaskKeys>>,
     policy_set: Arc<PolicySet>,
     auth_skew: Duration,
 }
@@ -31,6 +37,7 @@ pub(crate) struct AuthenticationSnapshot {
     pub(crate) generation: u64,
     pub(crate) tls_acceptor: TlsAcceptor,
     pub(crate) credentials: Arc<Vec<Credential>>,
+    pub(crate) mask_keys: Arc<Vec<MaskKeys>>,
     pub(crate) auth_skew: Duration,
 }
 
@@ -43,6 +50,7 @@ impl SecurityState {
     pub(crate) fn new(
         tls_acceptor: TlsAcceptor,
         credentials: Vec<Credential>,
+        mask_keys: Vec<MaskKeys>,
         policy_set: PolicySet,
         auth_skew: Duration,
     ) -> Self {
@@ -50,6 +58,7 @@ impl SecurityState {
             generation: INITIAL_GENERATION,
             tls_acceptor,
             credentials: Arc::new(credentials),
+            mask_keys: Arc::new(mask_keys),
             policy_set: Arc::new(policy_set),
             auth_skew,
         });
@@ -70,6 +79,7 @@ impl SecurityState {
             generation: state.generation,
             tls_acceptor: state.tls_acceptor.clone(),
             credentials: Arc::clone(&state.credentials),
+            mask_keys: Arc::clone(&state.mask_keys),
             auth_skew: state.auth_skew,
         }
     }
@@ -91,10 +101,12 @@ impl SecurityState {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn replace(
         &self,
         tls_acceptor: TlsAcceptor,
         credentials: Vec<Credential>,
+        mask_keys: Vec<MaskKeys>,
         policy_set: PolicySet,
         auth_skew: Duration,
     ) -> u64 {
@@ -103,6 +115,7 @@ impl SecurityState {
             generation,
             tls_acceptor,
             credentials: Arc::new(credentials),
+            mask_keys: Arc::new(mask_keys),
             policy_set: Arc::new(policy_set),
             auth_skew,
         }));
@@ -135,6 +148,7 @@ mod tests {
         let security = SecurityState::new(
             test_tls_acceptor(),
             vec![credential(b"old", b"0123456789abcdef0123456789abcdef")],
+            Vec::new(),
             PolicySet::default(),
             Duration::from_secs(30),
         );
@@ -145,6 +159,7 @@ mod tests {
         let generation = security.replace(
             test_tls_acceptor(),
             vec![credential(b"new", b"fedcba9876543210fedcba9876543210")],
+            Vec::new(),
             PolicySet::default(),
             Duration::from_secs(60),
         );
@@ -174,6 +189,7 @@ mod tests {
         let security = SecurityState::new(
             test_tls_acceptor(),
             vec![active],
+            Vec::new(),
             PolicySet::default(),
             Duration::from_secs(30),
         );
@@ -185,6 +201,7 @@ mod tests {
         security.replace(
             test_tls_acceptor(),
             vec![disabled],
+            Vec::new(),
             PolicySet::default(),
             Duration::from_secs(30),
         );
@@ -195,6 +212,7 @@ mod tests {
         security.replace(
             test_tls_acceptor(),
             vec![reassigned],
+            Vec::new(),
             PolicySet::default(),
             Duration::from_secs(30),
         );

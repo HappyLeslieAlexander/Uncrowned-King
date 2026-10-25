@@ -2,6 +2,7 @@
 members = [
     "crates/uk-auth",
     "crates/uk-client",
+    "crates/uk-mask",
     "crates/uk-policy",
     "crates/uk-proto",
     "crates/uk-server",
@@ -33,10 +34,12 @@ must_use_candidate = "allow"
 
 [workspace.dependencies]
 bytes = "1"
+chacha20 = "0.10"
 clap = { version = "4", features = ["derive"] }
 criterion = "0.7"
 hmac = "0.12"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+quinn-proto = { version = "0.11", default-features = false }
 rand = "0.8"
 rustls = "0.23"
 rustls-pki-types = { version = "1.11", features = ["std"] }

@@ -1,5 +1,14 @@
 # Uncrowned King 生产修复 TODO
 
+> [!NOTE]
+> **历史归档声明 (Archival Notice & Scope of Applicability)**
+> 本文档为 2026-10-24 基线 `v1.0.2` + HEAD 的生产修复任务清单(中文),源于上一轮生产就绪审查。
+> Wave 1(P0-1~P0-5)、Wave 2(P1-1~P1-8)、Wave 3(P2-1~P2-12)已全部实现并通过回归测试
+> (948 项测试、clippy -D warnings、cargo deny、helm lint/template + 二进制 config-check、
+> interop-curl TLS/QUIC 双通道全绿),随后工作转入传输掩码功能(`docs/transport-masking-plan.md`)。
+> 仅作审计溯源归档保留;最新状态请参阅主文档、[CHANGELOG.md](../../../CHANGELOG.md) 与
+> [docs/operations.md](../../operations.md)。
+
 > 基线：`v1.0.2` + 当前 HEAD（2026-10-24）
 > 范围：把上一轮生产就绪审查中的发现转化为可执行、可验收的修复任务。
 > 原则：先修阻断项，再做安全/运维加固，最后处理低风险与文档问题；每一项都必须带回归测试。

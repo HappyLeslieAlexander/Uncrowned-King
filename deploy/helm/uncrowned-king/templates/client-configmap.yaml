@@ -1,5 +1,5 @@
 {{- if .Values.client.enabled }}
-{{- $knownClientFields := list "server_addr" "server_addrs" "server_name" "observability_listen" "relay_buffer_size" "handshake_timeout_seconds" "server_connect_retry_delay_millis" "socks_handshake_timeout_seconds" "tcp_open_timeout_seconds" "udp_flow_idle_timeout_seconds" "shutdown_timeout_seconds" "max_pending_open_bytes" "max_socks_connections" "max_buffered_bytes_per_session" "max_buffered_bytes_per_flow" "max_carrier_sessions" }}
+{{- $knownClientFields := list "server_addr" "server_addrs" "server_name" "observability_listen" "relay_buffer_size" "handshake_timeout_seconds" "server_connect_retry_delay_millis" "socks_handshake_timeout_seconds" "tcp_open_timeout_seconds" "udp_flow_idle_timeout_seconds" "shutdown_timeout_seconds" "max_pending_open_bytes" "max_socks_connections" "max_buffered_bytes_per_session" "max_buffered_bytes_per_flow" "max_carrier_sessions" "masking" }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -31,8 +31,32 @@ dial address from the NetworkPolicy egress rules. */}}
     {{- fail (printf "Unknown client config field %q in client.config" $key) }}
     {{- end }}
     {{- end }}
-    {{- if and (not (has $key (list "server_addr" "server_addrs" "server_name" "observability_listen" "key_id" "secret"))) (not (kindIs "invalid" $val)) }}
+    {{- if and (not (has $key (list "server_addr" "server_addrs" "server_name" "observability_listen" "key_id" "secret" "masking"))) (not (kindIs "invalid" $val)) }}
     {{ $key }} = {{ int64 $val }}
+    {{- end }}
+    {{- end }}
+
+    {{- if .Values.client.config.masking }}
+    {{- $knownClientMasking := list "enabled" "prelude_policy" "quic" }}
+    {{- $clientMasking := .Values.client.config.masking }}
+    [masking]
+    {{- range $key, $val := $clientMasking }}
+    {{- if not (has $key $knownClientMasking) }}
+    {{- fail (printf "Unknown client masking field %q in client.config.masking (known: enabled, prelude_policy, quic)" $key) }}
+    {{- end }}
+    {{- end }}
+    {{- if kindIs "invalid" $clientMasking.enabled }}
+    {{- fail "client.config.masking.enabled must be set explicitly (true or false)" }}
+    {{- end }}
+    enabled = {{ $clientMasking.enabled }}
+    {{- if $clientMasking.prelude_policy }}
+    {{- if not (has $clientMasking.prelude_policy (list "fade" "full8" "low7")) }}
+    {{- fail (printf "client.config.masking.prelude_policy %q must be one of fade, full8, low7" $clientMasking.prelude_policy) }}
+    {{- end }}
+    prelude_policy = "{{ $clientMasking.prelude_policy }}"
+    {{- end }}
+    {{- if $clientMasking.quic }}
+    quic = {{ $clientMasking.quic }}
     {{- end }}
     {{- end }}
 {{- end }}

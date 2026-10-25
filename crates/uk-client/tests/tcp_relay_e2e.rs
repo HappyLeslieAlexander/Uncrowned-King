@@ -1101,6 +1101,7 @@ async fn run_udp_associate_server_unavailable_e2e() -> Result<(), TestError> {
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
         relay_buffer_size: None,
+        masking: None,
     })
     .await?;
 
@@ -3707,6 +3708,7 @@ async fn run_server_observability_e2e() -> Result<(), TestError> {
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
         relay_buffer_size: None,
+        masking: None,
     })
     .await?;
 
@@ -3807,6 +3809,7 @@ async fn quic_carrier_round_trips_tcp_relay() -> Result<(), TestError> {
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
         relay_buffer_size: None,
+        masking: None,
     })
     .await?;
 
@@ -3879,6 +3882,7 @@ async fn quic_transport_keep_alive_preserves_idle_connection() -> Result<(), Tes
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
         relay_buffer_size: None,
+        masking: None,
     };
 
     // QUIC transport idle timeout is min(2s, 5s) = 2s.
@@ -3891,6 +3895,7 @@ async fn quic_transport_keep_alive_preserves_idle_connection() -> Result<(), Tes
         Some(QuicTransportOverrides {
             keep_alive: Some(Duration::from_millis(200)),
             max_idle: Duration::from_secs(2),
+            mask_keys: None,
         }),
     )
     .await?;
@@ -3977,6 +3982,7 @@ async fn quic_transport_without_keep_alive_times_out_on_idle() -> Result<(), Tes
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
         relay_buffer_size: None,
+        masking: None,
     };
 
     // Keep-alive is disabled (None); max_idle is 1s.
@@ -3985,6 +3991,7 @@ async fn quic_transport_without_keep_alive_times_out_on_idle() -> Result<(), Tes
         Some(QuicTransportOverrides {
             keep_alive: None,
             max_idle: Duration::from_secs(1),
+            mask_keys: None,
         }),
     )
     .await?;
@@ -4205,6 +4212,7 @@ async fn quic_carrier_relays_udp_over_datagram() -> Result<(), TestError> {
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
         relay_buffer_size: None,
+        masking: None,
     })
     .await?;
 
@@ -4293,6 +4301,7 @@ async fn quic_carrier_falls_back_to_udp_frame_for_large_payload() -> Result<(), 
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
         relay_buffer_size: None,
+        masking: None,
     })
     .await?;
 
@@ -4456,6 +4465,7 @@ async fn run_quic_multiple_udp_associations_e2e() -> Result<(), TestError> {
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
         relay_buffer_size: None,
+        masking: None,
     })
     .await?;
 
@@ -5391,6 +5401,7 @@ async fn run_server_active_session_shutdown_e2e() -> Result<(), TestError> {
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
         relay_buffer_size: None,
+        masking: None,
     })
     .await?
     .0;
@@ -5437,6 +5448,7 @@ async fn run_socks_listener_shutdown_e2e() -> Result<(), TestError> {
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
             relay_buffer_size: None,
+            masking: None,
         },
         async {
             let _ = shutdown_rx.await;
@@ -5492,6 +5504,7 @@ async fn run_socks_listener_shutdown_cancels_pending_open_e2e() -> Result<(), Te
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
             relay_buffer_size: None,
+            masking: None,
         },
         async {
             let _ = shutdown_rx.await;
@@ -5560,6 +5573,7 @@ async fn run_socks_listener_shutdown_cancels_pending_udp_open_e2e() -> Result<()
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
             relay_buffer_size: None,
+            masking: None,
         },
         async {
             let _ = shutdown_rx.await;
@@ -5647,6 +5661,7 @@ async fn run_socks_listener_shutdown_during_connect_with_request(
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
             relay_buffer_size: None,
+            masking: None,
         },
         async {
             let _ = shutdown_rx.await;
@@ -5729,6 +5744,7 @@ async fn run_socks_udp_datagram_shutdown_during_reconnect_e2e() -> Result<(), Te
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
             relay_buffer_size: None,
+            masking: None,
         },
         async {
             let _ = shutdown_rx.await;
@@ -5823,6 +5839,7 @@ async fn run_udp_carrier_recovery_e2e() -> Result<(), TestError> {
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
         relay_buffer_size: None,
+        masking: None,
     })
     .await?;
 
@@ -5947,6 +5964,7 @@ impl ServerHarness {
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
             relay_buffer_size: None,
+            masking: None,
         }
     }
 }
@@ -6083,6 +6101,7 @@ impl MalformedFrameServerHarness {
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
             relay_buffer_size: None,
+            masking: None,
         })
         .await?;
 
@@ -6155,6 +6174,7 @@ impl ClientBufferedLimitServerHarness {
             max_buffered_bytes_per_flow: Some(1),
             max_carrier_sessions: None,
             relay_buffer_size: None,
+            masking: None,
         })
         .await?;
 
@@ -6242,6 +6262,7 @@ impl UdpStreamFallbackDisabledServerHarness {
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
             relay_buffer_size: None,
+            masking: None,
         })
         .await?;
 
@@ -6327,6 +6348,7 @@ impl AckGatedOpenServerHarness {
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
             relay_buffer_size: None,
+            masking: None,
         })
         .await?;
 
@@ -6417,6 +6439,7 @@ impl PendingOpenCancelServerHarness {
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
             relay_buffer_size: None,
+            masking: None,
         })
         .await?;
 
@@ -6492,6 +6515,7 @@ impl PendingUdpOpenCancelServerHarness {
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
             relay_buffer_size: None,
+            masking: None,
         })
         .await?;
 
@@ -6594,6 +6618,7 @@ impl MissingPongServerHarness {
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
             relay_buffer_size: None,
+            masking: None,
         })
         .await?;
 
@@ -7322,6 +7347,7 @@ impl RelayHarness {
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions,
             relay_buffer_size: None,
+            masking: None,
         })
         .await?;
 
@@ -7716,6 +7742,7 @@ fn test_server_config(
             not_after: None,
             policy_group: Some("default".to_owned()),
         }],
+        masking: None,
     }
 }
 
@@ -7746,6 +7773,7 @@ fn test_client_config(server_addr: SocketAddr, cert_path: &Path, secret: &str) -
         max_buffered_bytes_per_flow: None,
         max_carrier_sessions: None,
         relay_buffer_size: None,
+        masking: None,
     }
 }
 

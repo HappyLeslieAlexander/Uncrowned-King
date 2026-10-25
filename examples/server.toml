@@ -40,3 +40,11 @@ key_id = "local-dev"
 secret = "replace-with-a-long-random-shared-secret"
 status = "active"
 policy_group = "default"
+
+# Opt-in transport masking for the TLS/TCP carrier. When enabled, every
+# connection must open with a valid authenticated prelude; unauthenticated
+# probes are silently drained and never reach the TLS handshake. Requires a
+# restart to change. The QUIC carrier is not masked yet.
+[masking]
+# enabled = true
+# replay_identities = 16384

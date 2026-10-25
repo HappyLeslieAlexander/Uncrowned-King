@@ -75,6 +75,33 @@ locked out.
 - Rotate the affected secret (§1.4) and audit logs for the key id
   (`key_id_hex` appears in `auth.success` events).
 
+### 1.6 Masking keys (opt-in transport masking)
+
+When `[masking]` is enabled (default off), every credential additionally
+derives a family of transport-masking keys via domain-separated HMAC-SHA256
+(wire format and labels: [`masking-spec.md`](masking-spec.md) §1). Operational
+consequences:
+
+- **Authority follows the credential.** Masking keys are derived from the same
+  `key_id`/secret, so rotating or revoking a credential (§1.4, §1.5) rotates or
+  revokes its masking authority. The `[masking]` *section itself* is static:
+  changing `enabled`/`quic`/`quic_key_id`/`replay_identities` requires a
+  restart on both server and client.
+- **Credential reloads rotate TCP mask keys for new connections only.**
+  Established connections keep the keystreams they were admitted with, exactly
+  like the TLS identity rotation semantics (§2.3).
+- **QUIC masking pins one credential.** UDP datagrams carry no per-packet
+  credential authentication, so a masked QUIC endpoint is masked under exactly
+  one designated credential (`masking.quic_key_id`, must name a configured
+  credential; validated at config load and in the Helm chart). Rotating the
+  designated credential requires a restart. Clients dialing a masked QUIC
+  endpoint must use that same credential.
+- **Masked TCP listener credential budget.** The server verifies preludes
+  against every credential with no early exit (microseconds at ≤ 8 credentials,
+  ~88 µs at 64). Keep masked listeners at or below 64 credentials.
+- A masked client cannot interoperate with an unmasked listener or vice versa:
+  both fail closed as a handshake timeout. There is no downgrade path.
+
 ## 2. Server TLS/QUIC certificate and key
 
 Both carriers (TLS/TCP and QUIC) share one certificate and private key and the
@@ -119,8 +146,9 @@ configuration on both the server and the client.
   new-session limits. Existing flows continue; new flows use the new
   configuration.
 - **Requires a restart** (not reloadable): listener addresses (`listen`,
-  `quic_listen`), resource-limit and timeout values, and the observability
-  listener.
+  `quic_listen`), resource-limit and timeout values, the observability
+  listener, and the whole `[masking]` section (though credential reloads still
+  rotate the TCP mask keys derived per credential).
 
 Verify a reload succeeded via the `server.config.reload_success` log event and
 the security-generation / reload-success metrics before retiring old material.
@@ -149,3 +177,7 @@ the Helm release; still run `kubectl rollout restart` after rotating it.
 - [ ] Revocation sets `status = "disabled"` (or removes) + `SIGHUP`.
 - [ ] Production certificate from a real CA; CA distributed to clients.
 - [ ] Reload success confirmed via logs/metrics before retiring old material.
+- [ ] If transport masking is enabled on either side: both ends match, the
+      masked TCP listener holds ≤ 64 credentials, and `masking.quic_key_id`
+      (when `masking.quic` is on) names a configured credential
+      ([`masking-spec.md`](masking-spec.md)).

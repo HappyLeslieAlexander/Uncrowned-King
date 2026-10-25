@@ -65,6 +65,8 @@ pub struct ServerConfig {
     pub policy_path: Option<String>,
     /// Static credential list.
     pub credentials: Vec<CredentialConfig>,
+    /// Optional transport masking. Disabled by default.
+    pub masking: Option<MaskingConfig>,
 }
 
 impl ServerConfig {
@@ -127,6 +129,7 @@ impl ServerConfig {
 
     /// Validates configured resource limits.
     pub fn validate_limits(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.validate_masking()?;
         reject_zero_limit("max_pre_auth_bytes", self.max_pre_auth_bytes())?;
         reject_small_limit(
             "max_pre_auth_bytes",
@@ -306,6 +309,42 @@ impl ServerConfig {
     /// are neither counted nor banned; every other source keeps the default
     /// `5 failures / 60s -> 300s ban` protection. Changing the list requires
     /// a restart (it is part of the static admission path).
+    /// Validates the `[masking]` section.
+    fn validate_masking(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if let Some(masking) = &self.masking {
+            if let Some(replay_identities) = masking.replay_identities {
+                reject_small_limit("masking.replay_identities", replay_identities as u64, 1024)?;
+                reject_large_limit(
+                    "masking.replay_identities",
+                    replay_identities as u64,
+                    uk_mask::MAX_REPLAY_IDENTITIES as u64,
+                )?;
+            }
+            if masking.enabled.unwrap_or(false) && self.credentials.is_empty() {
+                return Err("masking.enabled requires at least one credential".into());
+            }
+            if masking.quic.unwrap_or(false) {
+                let Some(key_id) = &masking.quic_key_id else {
+                    return Err(
+                        "masking.quic_key_id is required when masking.quic is enabled".into(),
+                    );
+                };
+                let matches = self
+                    .credentials
+                    .iter()
+                    .any(|credential| &credential.key_id == key_id);
+                if !matches {
+                    return Err(format!(
+                        "masking.quic_key_id {key_id:?} does not match any configured credential"
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Configured authentication-failure rate-limit allowlist entries.
     pub fn auth_rate_limit_allowlist(&self) -> Vec<String> {
         self.limits
             .as_ref()
@@ -584,6 +623,37 @@ impl ServerConfig {
         }
     }
 
+    /// Whether transport masking is enabled for the TLS/TCP carrier.
+    pub fn masking_enabled(&self) -> bool {
+        self.masking
+            .as_ref()
+            .and_then(|masking| masking.enabled)
+            .unwrap_or(false)
+    }
+
+    /// Whether transport masking is enabled for the QUIC carrier.
+    pub fn masking_quic_enabled(&self) -> bool {
+        self.masking
+            .as_ref()
+            .is_some_and(|masking| masking.quic.unwrap_or(false))
+    }
+
+    /// The credential whose keys mask the QUIC endpoint (validated at config
+    /// load when `masking.quic` is on).
+    pub fn masking_quic_key_id(&self) -> Option<&str> {
+        self.masking
+            .as_ref()
+            .and_then(|masking| masking.quic_key_id.as_deref())
+    }
+
+    /// Replay registry capacity in tracked client identities.
+    pub fn masking_replay_identities(&self) -> usize {
+        self.masking
+            .as_ref()
+            .and_then(|masking| masking.replay_identities)
+            .unwrap_or(uk_mask::DEFAULT_REPLAY_IDENTITIES)
+    }
+
     /// QUIC stream receive window in bytes.
     pub fn quic_stream_receive_window(&self) -> u32 {
         self.limits
@@ -668,6 +738,25 @@ fn reject_usize_limit(name: &str, value: u64) -> Result<(), Box<dyn Error + Send
     usize::try_from(value)
         .map(|_| ())
         .map_err(|_| format!("{name} is too large for this platform").into())
+}
+
+/// Server transport masking configuration. Changing any field requires a
+/// restart; mask keys are derived per credential, so credential reloads
+/// rotate masking authority for new connections without touching this section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaskingConfig {
+    /// Enable masking on the TLS/TCP carrier listener.
+    pub enabled: Option<bool>,
+    /// Replay registry capacity in tracked client identities. Default 16384.
+    pub replay_identities: Option<usize>,
+    /// Enable masking on the QUIC carrier listener. UDP datagrams carry no
+    /// per-packet authentication, so the endpoint is masked under exactly one
+    /// designated credential's keys.
+    pub quic: Option<bool>,
+    /// The `key_id` whose keys mask the QUIC endpoint. Required when
+    /// `quic = true`; clients must use the same credential.
+    pub quic_key_id: Option<String>,
 }
 
 /// Server resource limits.
@@ -917,6 +1006,7 @@ mod tests {
             limits: None,
             policy_path: None,
             credentials: Vec::new(),
+            masking: None,
         }
     }
 

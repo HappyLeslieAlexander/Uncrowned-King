@@ -27,6 +27,7 @@ toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uk-auth = { path = "../uk-auth" }
+uk-mask = { path = "../uk-mask" }
 uk-policy = { path = "../uk-policy" }
 uk-proto = { path = "../uk-proto" }
 zeroize.workspace = true

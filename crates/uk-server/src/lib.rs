@@ -1,6 +1,7 @@
 //! Uncrowned King server library.
 
 pub mod config;
+pub(crate) mod masking;
 mod observability;
 pub mod quic;
 pub mod rate_limit;
@@ -14,6 +15,7 @@ use std::{
     future::Future,
     io,
     net::SocketAddr,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -23,7 +25,7 @@ use std::{
 
 use bytes::BytesMut;
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     task::JoinSet,
@@ -47,6 +49,15 @@ use crate::security::{AuthenticationSnapshot, SecurityState};
 
 /// Server error type.
 pub type AnyError = Box<dyn Error + Send + Sync>;
+
+/// Carrier halves plus authenticated identity produced by a completed
+/// carrier handshake (TLS/TCP or QUIC).
+type HandshakeOutput = (
+    BoxedCarrierReader,
+    BoxedCarrierWriter,
+    Option<BoxedDatagramChannel>,
+    AuthenticatedIdentity,
+);
 
 const ACCEPT_RETRY_BASE_MILLIS: u64 = 10;
 const ACCEPT_RETRY_MAX_MILLIS: u64 = 1_000;
@@ -179,6 +190,9 @@ struct ServerRuntime {
     auth_rate_limiter: Arc<rate_limit::AuthRateLimiter>,
     max_sessions: usize,
     max_handshakes: usize,
+    /// Built while the config still holds its credentials (before they are
+    /// moved into the security state and zeroized in the config).
+    masking: Option<Arc<masking::MaskingState>>,
 }
 
 #[derive(Clone)]
@@ -194,22 +208,18 @@ struct ConnectionRuntime {
     global_buffer: relay::GlobalBufferControl,
     global_flows: relay::GlobalFlowBudget,
     metrics: Arc<ServerMetrics>,
+    /// Present only when `[masking] enabled = true`: the TLS/TCP admission
+    /// gate with its prelude replay registry.
+    masking: Option<Arc<masking::MaskingState>>,
 }
 
 impl ConnectionRuntime {
     /// Runs the admission checks shared by the TCP and QUIC accept paths:
-    /// the handshake-DoS rate limiter, then session permits, then handshake
-    /// permits. Metrics are recorded and rejections logged here; the caller
-    /// only has to refuse the pending connection in its carrier-specific
-    /// way (`drop` the TCP stream to send RST, `refuse()` the QUIC
-    /// incoming).
-    ///
-    /// Returns the acquired handshake permit when admitted.
-    fn admit_connection(
-        &self,
-        peer: SocketAddr,
-        carrier: &'static str,
-    ) -> Option<OwnedSemaphorePermit> {
+    /// the handshake-DoS rate limiter, then session-permit availability.
+    /// Metrics are recorded and rejections logged here; the caller only has
+    /// to refuse the pending connection in its carrier-specific way (`drop`
+    /// the TCP stream to send RST, `refuse()` the QUIC incoming).
+    fn admit_precheck(&self, peer: SocketAddr, carrier: &'static str) -> bool {
         if !self.auth_rate_limiter.check(peer.ip()) {
             self.metrics.record_rate_limited_connection();
             warn!(
@@ -218,7 +228,7 @@ impl ConnectionRuntime {
                 carrier = carrier,
                 "IP is temporarily banned due to excessive authentication failures"
             );
-            return None;
+            return false;
         }
 
         self.metrics.record_accepted_connection();
@@ -230,8 +240,17 @@ impl ConnectionRuntime {
                 carrier = carrier,
                 max_sessions = self.max_sessions
             );
-            return None;
+            return false;
         }
+        true
+    }
+
+    /// Takes a handshake permit, recording the rejection when none remain.
+    fn acquire_handshake_permit(
+        &self,
+        peer: SocketAddr,
+        carrier: &'static str,
+    ) -> Option<OwnedSemaphorePermit> {
         let Ok(handshake_permit) = Arc::clone(&self.handshake_permits).try_acquire_owned() else {
             self.metrics.record_rejected_handshake();
             warn!(
@@ -252,25 +271,20 @@ impl ConnectionRuntime {
         peer: SocketAddr,
         shutdown_rx: watch::Receiver<bool>,
     ) {
-        let Some(handshake_permit) = self.admit_connection(peer, "tcp") else {
+        // No handshake permit yet: when masking is enabled the connection
+        // must clear the prelude gate first, so silently drained probes never
+        // hold handshake budget. handle_connection takes the permit itself.
+        if !self.admit_precheck(peer, "tcp") {
             // Drop the stream immediately (sending RST) instead of awaiting a
             // graceful shutdown. A malicious peer that holds the TCP half-close
             // open would otherwise block the entire accept loop.
             drop(tcp);
             return;
-        };
+        }
         let runtime = self.clone();
         let connection_id = next_connection_correlation_id();
         let connection = async move {
-            if let Err(err) = Box::pin(handle_connection(
-                runtime,
-                tcp,
-                handshake_permit,
-                peer,
-                shutdown_rx,
-            ))
-            .await
-            {
+            if let Err(err) = Box::pin(handle_connection(runtime, tcp, peer, shutdown_rx)).await {
                 if is_clean_tls_handshake_disconnect(&err) {
                     debug!(event = "tls.handshake.closed", peer = %peer);
                 } else {
@@ -302,7 +316,11 @@ impl ConnectionRuntime {
             self.metrics.record_quic_retry();
             return;
         }
-        let Some(handshake_permit) = self.admit_connection(peer, "quic") else {
+        if !self.admit_precheck(peer, "quic") {
+            incoming.refuse();
+            return;
+        }
+        let Some(handshake_permit) = self.acquire_handshake_permit(peer, "quic") else {
             incoming.refuse();
             return;
         };
@@ -410,6 +428,7 @@ where
         auth_rate_limiter,
         max_sessions,
         max_handshakes,
+        masking,
     } = runtime;
     let listen = listener.local_addr()?;
     let session_permits = Arc::new(Semaphore::new(max_sessions));
@@ -436,11 +455,12 @@ where
         global_buffer: relay::GlobalBufferControl::new(global_buffer_limit, global_buffered_bytes),
         global_flows: relay::GlobalFlowBudget::new(global_flow_limit, global_active_flows),
         metrics: Arc::clone(&metrics),
+        masking,
     };
 
     info!(event = "server.listen", listen = %listen);
 
-    let quic_endpoint = bind_and_log_quic_endpoint(&config)?;
+    let quic_endpoint = bind_and_log_quic_endpoint(&config, connection_runtime.masking.as_ref())?;
 
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
     let (observability_shutdown_tx, observability_shutdown_rx) = watch::channel(false);
@@ -544,16 +564,24 @@ fn shutdown_deadline(shutdown_timeout: Option<Duration>) -> Option<time::Instant
 }
 
 /// Builds the QUIC endpoint (when configured) and logs its listen address.
-fn bind_and_log_quic_endpoint(config: &ServerConfig) -> Result<Option<quinn::Endpoint>, AnyError> {
-    let endpoint = build_quic_endpoint(config)?;
+fn bind_and_log_quic_endpoint(
+    config: &ServerConfig,
+    masking: Option<&Arc<masking::MaskingState>>,
+) -> Result<Option<quinn::Endpoint>, AnyError> {
+    let endpoint = build_quic_endpoint(config, masking)?;
     if let Some(endpoint) = &endpoint {
         info!(event = "server.listen.quic", listen = %endpoint.local_addr()?);
     }
     Ok(endpoint)
 }
 
-/// Builds the QUIC server endpoint when `quic_listen` is configured.
-fn build_quic_endpoint(config: &ServerConfig) -> Result<Option<quinn::Endpoint>, AnyError> {
+/// Builds the QUIC server endpoint when `quic_listen` is configured. With
+/// `masking.quic` enabled, the endpoint socket is wrapped in the masking
+/// layer under the designated credential's keys.
+fn build_quic_endpoint(
+    config: &ServerConfig,
+    masking: Option<&Arc<masking::MaskingState>>,
+) -> Result<Option<quinn::Endpoint>, AnyError> {
     let Some(listen) = &config.quic_listen else {
         return Ok(None);
     };
@@ -561,13 +589,15 @@ fn build_quic_endpoint(config: &ServerConfig) -> Result<Option<quinn::Endpoint>,
         .parse()
         .map_err(|err| format!("invalid quic_listen address {listen}: {err}"))?;
     let rustls_config = tls::server_config(&config.cert_path, &config.key_path)?;
-    let quic_config = quic::server_config_with_transport_params(
+    let masked_keys = masking.and_then(|state| state.quic_keys());
+    let quic_config = quic::server_config_with_transport_params_masked(
         rustls_config,
         idle_timeout(config.idle_timeout_seconds()),
         config.quic_stream_receive_window(),
         config.quic_connection_receive_window(),
+        masked_keys.is_some(),
     )?;
-    let endpoint = quic::bind_endpoint(quic_config, addr)?;
+    let endpoint = quic::bind_endpoint_masked(quic_config, addr, masked_keys.cloned())?;
     Ok(Some(endpoint))
 }
 
@@ -683,13 +713,16 @@ fn prepare_server_runtime(mut config: ServerConfig) -> Result<ServerRuntime, Any
     config.validate_network_endpoints()?;
     config.validate_limits()?;
     config.validate_sensitive_paths()?;
+    let masking = build_masking_state(&config);
     let tls_config = tls::server_config(&config.cert_path, &config.key_path)?;
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
     let credentials = take_runtime_credentials(&mut config)?;
+    let mask_keys = derive_mask_keys(&config, &credentials);
     let policy_set = config.policy_set()?;
     let security = SecurityState::new(
         tls_acceptor,
         credentials,
+        mask_keys,
         policy_set,
         Duration::from_secs(config.auth_skew_seconds()),
     );
@@ -714,6 +747,7 @@ fn prepare_server_runtime(mut config: ServerConfig) -> Result<ServerRuntime, Any
         auth_rate_limiter,
         max_sessions,
         max_handshakes,
+        masking,
     })
 }
 
@@ -726,6 +760,63 @@ fn take_runtime_credentials(
     }
     config.credentials.clear();
     credentials
+}
+
+/// Derives the per-credential masking keys when masking is enabled. Key
+/// rotation follows credential rotation for new connections only; established
+/// connections keep the keystreams they were admitted with.
+fn derive_mask_keys(
+    config: &ServerConfig,
+    credentials: &[uk_auth::Credential],
+) -> Vec<uk_mask::MaskKeys> {
+    if !config.masking_enabled() && !config.masking_quic_enabled() {
+        return Vec::new();
+    }
+    credentials
+        .iter()
+        .map(|credential| uk_mask::MaskKeys::derive(&credential.key_id, &credential.secret))
+        .collect()
+}
+
+/// Builds the masking admission state: the TCP prelude registry plus, when
+/// `masking.quic` is on, the QUIC endpoint's designated credential keys.
+fn build_masking_state(config: &ServerConfig) -> Option<Arc<masking::MaskingState>> {
+    let masking_config = config.masking.as_ref()?;
+    let quic_keys = if config.masking_quic_enabled() {
+        let key_id = masking_config
+            .quic_key_id
+            .as_deref()
+            .expect("validated in validate_limits");
+        let credential = config
+            .credentials
+            .iter()
+            .find(|credential| credential.key_id == key_id)
+            .expect("validated in validate_limits");
+        Some(uk_mask::MaskKeys::derive(
+            credential.key_id.as_bytes(),
+            credential.secret.as_bytes(),
+        ))
+    } else {
+        None
+    };
+    if config.masking_enabled() {
+        info!(
+            event = "server.masking.enabled",
+            replay_identities = config.masking_replay_identities(),
+            quic = config.masking_quic_enabled(),
+            "transport masking is active"
+        );
+    } else if config.masking_quic_enabled() {
+        info!(
+            event = "server.masking.enabled",
+            quic = true,
+            "transport masking is active on the QUIC listener"
+        );
+    }
+    Some(Arc::new(masking::MaskingState::new(
+        config.masking_replay_identities(),
+        quic_keys,
+    )))
 }
 
 fn apply_security_reload(
@@ -756,10 +847,12 @@ fn apply_security_reload(
         None
     };
     let credentials = take_runtime_credentials(&mut candidate)?;
+    let mask_keys = derive_mask_keys(&candidate, &credentials);
     let policy_set = candidate.policy_set()?;
     let generation = security.replace(
         tls_acceptor,
         credentials,
+        mask_keys,
         policy_set,
         Duration::from_secs(candidate.auth_skew_seconds()),
     );
@@ -802,6 +895,8 @@ fn changed_static_config_field(
         Some("quic_listen")
     } else if current.observability_listen != candidate.observability_listen {
         Some("observability_listen")
+    } else if current.masking != candidate.masking {
+        Some("masking")
     } else {
         None
     }
@@ -931,7 +1026,6 @@ async fn join_connection_tasks(connections: &mut JoinSet<()>) {
 async fn handle_connection(
     runtime: ConnectionRuntime,
     tcp: tokio::net::TcpStream,
-    handshake_permit: OwnedSemaphorePermit,
     peer: SocketAddr,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), AnyError> {
@@ -940,11 +1034,54 @@ async fn handle_connection(
     if *shutdown_rx.borrow() {
         return Ok(());
     }
+    // The masking gate runs before the handshake permit: a rejected prelude
+    // is silently drained and abortively closed without ever holding
+    // handshake budget or reaching rustls.
+    let shutdown_rx = shutdown_rx;
+    // The handshake future is boxed because the masked and plain branches
+    // wrap the TCP stream in different types.
     let authentication = runtime.security.authentication_snapshot();
     let replay_cache = Arc::clone(&runtime.replay_cache);
     let config = Arc::clone(&runtime.config);
-    let handshake =
-        async move { complete_handshake(tcp, authentication, replay_cache, &config).await };
+    let handshake: Pin<Box<dyn Future<Output = Result<HandshakeOutput, AnyError>> + Send>> =
+        if let Some(masking) = &runtime.masking {
+            let mask_keys = Arc::clone(&authentication.mask_keys);
+            let metrics = Arc::clone(&runtime.metrics);
+            let limiter = Arc::clone(&runtime.auth_rate_limiter);
+            let admission_timeout = Duration::from_secs(runtime.config.handshake_timeout_seconds());
+            match masking
+                .admit(
+                    tcp,
+                    &mask_keys,
+                    &metrics,
+                    &limiter,
+                    peer,
+                    admission_timeout,
+                    shutdown_rx.clone(),
+                )
+                .await
+            {
+                Ok(masked) => Box::pin(async move {
+                    complete_handshake(masked, authentication, replay_cache, &config).await
+                }),
+                Err(rejected) => {
+                    debug!(
+                        event = "server.mask.rejected",
+                        peer = %peer,
+                        reason = %rejected,
+                        "masking admission rejected the connection"
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            Box::pin(
+                async move { complete_handshake(tcp, authentication, replay_cache, &config).await },
+            )
+        };
+    let Some(handshake_permit) = runtime.acquire_handshake_permit(peer, "tcp") else {
+        return Ok(());
+    };
     Box::pin(serve_authenticated_carrier(
         runtime,
         handshake_permit,
@@ -1226,8 +1363,8 @@ pub fn check_config(config: &ServerConfig) -> Result<(), AnyError> {
     Ok(())
 }
 
-async fn complete_handshake(
-    tcp: tokio::net::TcpStream,
+async fn complete_handshake<S>(
+    stream: S,
     authentication: AuthenticationSnapshot,
     replay_cache: Arc<Mutex<ReplayCache>>,
     config: &ServerConfig,
@@ -1239,10 +1376,13 @@ async fn complete_handshake(
         AuthenticatedIdentity,
     ),
     AnyError,
-> {
+>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let stream = authentication
         .tls_acceptor
-        .accept(tcp)
+        .accept(stream)
         .await
         .map_err(|err| phase_error("tls accept", HandshakeFailureReason::Tls, err))?;
     tls::verify_alpn(&stream)
@@ -1731,6 +1871,7 @@ mod tests {
                 not_after: None,
                 policy_group: None,
             }],
+            masking: None,
         }
     }
 
@@ -1833,6 +1974,7 @@ mod tests {
         let security = SecurityState::new(
             test_tls_acceptor(),
             current.credentials().unwrap(),
+            Vec::new(),
             current.policy_set().unwrap(),
             Duration::from_secs(current.auth_skew_seconds()),
         );
@@ -1854,6 +1996,7 @@ mod tests {
         let security = SecurityState::new(
             test_tls_acceptor(),
             current.credentials().unwrap(),
+            Vec::new(),
             current.policy_set().unwrap(),
             Duration::from_secs(current.auth_skew_seconds()),
         );
@@ -1874,6 +2017,7 @@ mod tests {
         let security = SecurityState::new(
             test_tls_acceptor(),
             current.credentials().unwrap(),
+            Vec::new(),
             current.policy_set().unwrap(),
             Duration::from_secs(current.auth_skew_seconds()),
         );
@@ -1911,6 +2055,7 @@ mod tests {
         let security = SecurityState::new(
             test_tls_acceptor(),
             current.credentials().unwrap(),
+            Vec::new(),
             current.policy_set().unwrap(),
             Duration::from_secs(current.auth_skew_seconds()),
         );
@@ -2197,6 +2342,7 @@ mod tests {
         let security = SecurityState::new(
             crate::security::test_tls_acceptor(),
             vec![],
+            Vec::new(),
             uk_policy::PolicySet::default(),
             Duration::from_secs(30),
         );
@@ -2213,6 +2359,7 @@ mod tests {
             global_buffer: relay::GlobalBufferControl::default(),
             global_flows: relay::GlobalFlowBudget::default(),
             metrics: Arc::clone(&metrics),
+            masking: None,
         };
 
         let mut connections = JoinSet::new();
@@ -2252,6 +2399,7 @@ mod tests {
             generation: 1,
             tls_acceptor: test_tls_acceptor(),
             credentials: Arc::new(vec![cred.clone()]),
+            mask_keys: Arc::new(Vec::new()),
             auth_skew: Duration::from_secs(5),
         };
         let replay_cache = Arc::new(Mutex::new(ReplayCache::new(Duration::from_secs(60))));
@@ -2322,6 +2470,7 @@ mod tests {
             generation: 1,
             tls_acceptor: test_tls_acceptor(),
             credentials: Arc::new(vec![cred.clone()]),
+            mask_keys: Arc::new(Vec::new()),
             auth_skew: Duration::from_secs(1),
         };
         let replay_cache = Arc::new(Mutex::new(ReplayCache::new(Duration::from_secs(60))));
@@ -2420,6 +2569,7 @@ mod settings_write_tests {
         let security = SecurityState::new(
             crate::security::test_tls_acceptor(),
             vec![cred],
+            Vec::new(),
             uk_policy::PolicySet::default(),
             Duration::from_secs(30),
         );
@@ -2482,6 +2632,7 @@ mod settings_write_tests {
         let security = SecurityState::new(
             crate::security::test_tls_acceptor(),
             vec![cred],
+            Vec::new(),
             uk_policy::PolicySet::default(),
             Duration::from_secs(30),
         );
@@ -2544,6 +2695,7 @@ mod settings_write_tests {
         let security = SecurityState::new(
             crate::security::test_tls_acceptor(),
             vec![cred],
+            Vec::new(),
             uk_policy::PolicySet::default(),
             Duration::from_secs(30),
         );

@@ -6,7 +6,6 @@ use rustls::{
     ServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
 };
-use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 use uk_auth::EXPORTER_LABEL;
 use uk_proto::ALPN_PROTOCOL;
@@ -43,12 +42,12 @@ pub fn server_config_from_memory(
 }
 
 /// Verifies that the TLS handshake negotiated the UK ALPN protocol.
-pub fn verify_alpn(stream: &TlsStream<TcpStream>) -> Result<(), TlsError> {
+pub fn verify_alpn<IO>(stream: &TlsStream<IO>) -> Result<(), TlsError> {
     ensure_alpn(stream.get_ref().1.alpn_protocol())
 }
 
 /// Exports the UK auth channel binding.
-pub fn exporter(stream: &TlsStream<TcpStream>) -> Result<[u8; 32], TlsError> {
+pub fn exporter<IO>(stream: &TlsStream<IO>) -> Result<[u8; 32], TlsError> {
     let mut out = [0_u8; 32];
     stream
         .get_ref()

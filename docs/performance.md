@@ -173,6 +173,32 @@ The pool roughly halves median interactive latency and cuts the p99 tail by
 the shared per-session writer and carrier reader. This is the measurable payoff
 of the §13 bulk/latency separation.
 
+## Transport masking micro-benchmarks
+
+`cargo bench -p uk-mask` (Apple M-series, release). The masking layer's
+steady-state cost is one ChaCha20 pass per direction; the admission gate's cost
+is a handful of HMAC-SHA256 evaluations — both are far below a rustls
+certificate signature, which is exactly the point of gating admission on the
+prelude.
+
+| Benchmark | Result | Notes |
+| --- | --- | --- |
+| prelude verify, 1 credential | ~1.4 µs/connection | full scan of all credentials, no early exit |
+| prelude verify, 8 credentials | ~11 µs/connection | linear in credential count; keep masked listeners at ≤ 64 credentials |
+| prelude verify, 64 credentials | ~88 µs/connection | documented operational cap for masked TCP |
+| replay commit | ~37 ns | sliding-window bitmap commit |
+| masked stream, 16 KiB blocks | ~712 MiB/s | ChaCha20 wrapper both directions, in-process duplex |
+| plain stream, 16 KiB blocks | ~1.59 GiB/s | same harness without the wrapper |
+| masked stream, 256 KiB blocks | ~1.22 GiB/s | wrapper overhead amortizes at larger writes |
+| plain stream, 256 KiB blocks | ~10.1 GiB/s | in-memory duplex ceiling |
+
+Takeaways: the wrapper roughly halves small-block duplex throughput in an
+in-process harness where the cipher is the dominant cost; real relay paths
+also pay TLS/QUIC AEAD and socket costs, so the relative overhead is smaller.
+Admission cost stays in microseconds for realistic credential counts and is
+paid instead of (not in addition to) a millisecond-scale TLS handshake for
+every blind probe.
+
 ## Outstanding performance work
 
 1. **Vectored/coalesced writes** across frames (measure with the harness first).

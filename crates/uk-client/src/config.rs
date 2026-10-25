@@ -62,6 +62,25 @@ pub struct ClientConfig {
     pub max_carrier_sessions: Option<u64>,
     /// Optional relay chunk buffer size in bytes. Default: 16 KiB (16384).
     pub relay_buffer_size: Option<usize>,
+    /// Optional transport masking for TLS/TCP endpoints. Disabled by default;
+    /// the QUIC carrier is not masked yet.
+    pub masking: Option<ClientMaskingConfig>,
+}
+
+/// Client transport masking configuration. Must match the server's
+/// `[masking] enabled` setting: a masked client cannot talk to an unmasked
+/// listener and vice versa (both fail closed as a handshake timeout).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientMaskingConfig {
+    /// Enable masking on `tls://` (and bare host:port) endpoints.
+    pub enabled: Option<bool>,
+    /// Prelude shaping policy: `fade` (default), `full8`, or `low7`.
+    pub prelude_policy: Option<String>,
+    /// Enable masking on `quic://` endpoints. Must match the server's
+    /// `masking.quic` and use the credential the server designated via
+    /// `masking.quic_key_id`.
+    pub quic: Option<bool>,
 }
 
 impl Drop for ClientConfig {
@@ -112,6 +131,7 @@ impl fmt::Debug for ClientConfig {
             )
             .field("max_carrier_sessions", &self.max_carrier_sessions)
             .field("relay_buffer_size", &self.relay_buffer_size)
+            .field("masking", &self.masking)
             .finish()
     }
 }
@@ -193,6 +213,37 @@ impl ClientConfig {
             .unwrap_or(DEFAULT_MAX_CARRIER_SESSIONS)
     }
 
+    /// Whether transport masking is enabled for QUIC endpoints.
+    pub fn masking_quic_enabled(&self) -> bool {
+        self.masking
+            .as_ref()
+            .is_some_and(|masking| masking.quic.unwrap_or(false))
+    }
+
+    /// Whether transport masking is enabled for TLS/TCP endpoints.
+    pub fn masking_enabled(&self) -> bool {
+        self.masking
+            .as_ref()
+            .and_then(|masking| masking.enabled)
+            .unwrap_or(false)
+    }
+
+    /// Prelude shaping policy (defaults to `fade`).
+    ///
+    /// # Errors
+    /// Returns an error when `masking.prelude_policy` is not a known policy.
+    pub fn masking_prelude_policy(
+        &self,
+    ) -> Result<uk_mask::PreludePolicy, Box<dyn Error + Send + Sync>> {
+        let policy = self
+            .masking
+            .as_ref()
+            .and_then(|masking| masking.prelude_policy.as_deref())
+            .unwrap_or(uk_mask::PreludePolicy::default().as_str());
+        uk_mask::PreludePolicy::parse(policy)
+            .ok_or_else(|| "masking.prelude_policy must be one of fade, full8, low7".into())
+    }
+
     /// Validates local authentication material before opening a network session.
     pub fn validate_auth_material(&self) -> Result<(), AuthError> {
         validate_key_id(self.key_id.as_bytes())?;
@@ -245,6 +296,7 @@ impl ClientConfig {
 
     /// Validates local client resource limits.
     pub fn validate_resource_limits(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.masking_prelude_policy()?;
         let max_socks_connections = self.max_socks_connections();
         if max_socks_connections == 0 {
             return Err("max_socks_connections must be greater than zero".into());
@@ -430,6 +482,7 @@ mod tests {
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
             relay_buffer_size: None,
+            masking: None,
         }
     }
 

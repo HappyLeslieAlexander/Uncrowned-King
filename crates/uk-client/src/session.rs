@@ -6,7 +6,7 @@ use std::{
     fmt,
     pin::Pin,
     sync::{
-        Arc, LazyLock, Mutex as StdMutex,
+        Arc, LazyLock, Mutex as StdMutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
@@ -16,13 +16,14 @@ use std::{
 use bytes::BytesMut;
 use rustls::{ClientConfig as TlsClientConfig, pki_types::ServerName};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream,
     time,
 };
 use tokio_rustls::TlsConnector;
 use tracing::{info, warn};
 use uk_auth::{AuthChallenge, AuthResponse, unix_now};
+use uk_mask::{NONCE_LEN, PRELUDE_LEN};
 use uk_proto::{
     BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, ErrorCode, ErrorPayload, Frame,
     FrameLimits, FrameType, MAX_FRAME_PAYLOAD_SIZE, MAX_NEGOTIATED_FLOWS, PROTOCOL_REVISION_V1_0,
@@ -35,6 +36,15 @@ use crate::{
 };
 
 type AnyError = Box<dyn Error + Send + Sync>;
+
+/// Process-wide masking identity and counter allocator, shared by every
+/// masked connection attempt (the server's replay registry tracks one
+/// sliding window per identity).
+static MASK_SEQUENCE: OnceLock<uk_mask::ClientSequence> = OnceLock::new();
+
+fn mask_sequence() -> &'static uk_mask::ClientSequence {
+    MASK_SEQUENCE.get_or_init(|| uk_mask::ClientSequence::new(&mut rand::rngs::OsRng))
+}
 
 /// A live, authenticated client carrier presented as a single duplex stream.
 ///
@@ -388,7 +398,7 @@ where
             server_name.clone(),
             endpoint,
             endpoint_timeout,
-            overrides,
+            overrides.clone(),
         )
         .await
         {
@@ -502,7 +512,7 @@ async fn connect_authenticated_endpoint(
             // Wrapping the shared config in a connector is a pointer copy, so
             // each attempt can have its own without re-reading the CA bundle.
             let connector = tls::connector_from(Arc::clone(tls_config));
-            establish_tls_carrier(&connector, server_name, addr).await?
+            establish_tls_carrier(&connector, server_name, addr, config).await?
         }
         CarrierKind::Quic => {
             establish_quic_carrier(config, tls_config, addr, overrides, endpoint_timeout).await?
@@ -515,6 +525,7 @@ async fn establish_tls_carrier(
     connector: &TlsConnector,
     server_name: ServerName<'static>,
     addr: &str,
+    config: &ClientConfig,
 ) -> Result<
     (
         BoxedCarrierReader,
@@ -529,10 +540,73 @@ async fn establish_tls_carrier(
         .map_err(|err| phase_error("tcp connect", EndpointFailurePhase::Tcp, err))?;
     tcp.set_nodelay(true)
         .map_err(|err| phase_error("tcp nodelay", EndpointFailurePhase::Tcp, err))?;
+    if config.masking_enabled() {
+        return establish_masked_tls_carrier(connector, server_name, tcp, config).await;
+    }
     let stream = connector
         .connect(server_name, tcp)
         .await
         .map_err(|err| phase_error("tls connect", EndpointFailurePhase::Tls, err))?;
+    finish_tls_carrier(stream)
+}
+
+/// Opens the TLS carrier through the masking layer: writes the prelude and
+/// nonce before the ClientHello, then wraps the stream so every TLS byte in
+/// both directions runs under the per-credential keystreams.
+async fn establish_masked_tls_carrier(
+    connector: &TlsConnector,
+    server_name: ServerName<'static>,
+    tcp: TcpStream,
+    config: &ClientConfig,
+) -> Result<
+    (
+        BoxedCarrierReader,
+        BoxedCarrierWriter,
+        [u8; 32],
+        Option<BoxedDatagramChannel>,
+    ),
+    AnyError,
+> {
+    let keys = uk_mask::MaskKeys::derive(config.key_id.as_bytes(), config.secret.as_bytes());
+    let sequence = mask_sequence();
+    let counter = sequence
+        .allocate()
+        .map_err(|err| phase_error("mask counter allocate", EndpointFailurePhase::Other, err))?;
+    let policy = config
+        .masking_prelude_policy()
+        .map_err(|err| phase_error("mask prelude policy", EndpointFailurePhase::Other, err))?;
+    let prelude = keys
+        .encode_prelude(policy, &mut rand::rngs::OsRng, sequence.identity(), counter)
+        .map_err(|err| phase_error("mask prelude encode", EndpointFailurePhase::Other, err))?;
+    let mut wire = [0_u8; PRELUDE_LEN + NONCE_LEN];
+    wire[..PRELUDE_LEN].copy_from_slice(&prelude.bytes);
+    wire[PRELUDE_LEN..].copy_from_slice(&prelude.nonce);
+    let mut tcp = tcp;
+    tcp.write_all(&wire)
+        .await
+        .map_err(|err| phase_error("mask prelude write", EndpointFailurePhase::Tcp, err))?;
+    let masked = uk_mask::MaskedStream::new_client(tcp, &keys, &prelude.nonce);
+    let stream = connector
+        .connect(server_name, masked)
+        .await
+        .map_err(|err| phase_error("tls connect", EndpointFailurePhase::Tls, err))?;
+    finish_tls_carrier(stream)
+}
+
+fn finish_tls_carrier<S>(
+    stream: tokio_rustls::client::TlsStream<S>,
+) -> Result<
+    (
+        BoxedCarrierReader,
+        BoxedCarrierWriter,
+        [u8; 32],
+        Option<BoxedDatagramChannel>,
+    ),
+    AnyError,
+>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     tls::verify_alpn(&stream)
         .map_err(|err| phase_error("tls alpn verify", EndpointFailurePhase::Tls, err))?;
     let exporter = tls::exporter(&stream)
@@ -557,11 +631,18 @@ async fn establish_quic_carrier(
     ),
     AnyError,
 > {
+    let mut overrides = overrides.unwrap_or_default();
+    if config.masking_quic_enabled() {
+        overrides.mask_keys = Some(Arc::new(uk_mask::MaskKeys::derive(
+            config.key_id.as_bytes(),
+            config.secret.as_bytes(),
+        )));
+    }
     let (reader, writer, exporter, datagrams) = crate::quic::connect_with_overrides(
         tls_config.as_ref().clone(),
         addr,
         &config.server_name,
-        overrides,
+        Some(overrides),
         endpoint_timeout,
     )
     .await
@@ -1178,6 +1259,7 @@ mod tests {
             max_buffered_bytes_per_flow: None,
             max_carrier_sessions: None,
             relay_buffer_size: None,
+            masking: None,
         };
         // Capture the epoch the connect will run under: parallel tests bump
         // it via clear_degraded_endpoints(), which must not mask this mark.

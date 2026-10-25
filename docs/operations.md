@@ -122,3 +122,30 @@ Both binaries stop on Ctrl+C/SIGTERM: readiness drops first (so load balancers
 stop sending traffic), then in-flight sessions drain up to
 `shutdown_timeout_seconds`, then remaining tasks are aborted. Set
 `shutdown_timeout_seconds = 0` to wait indefinitely.
+
+## Transport masking (opt-in)
+
+`[masking]` (server and client, default off) hides the carrier's wire image
+from observers without a credential: preludes gate the TLS handshake, streams
+and QUIC datagrams run under per-credential ChaCha20 keystreams. Wire format
+and limits: [`masking-spec.md`](masking-spec.md). Operations checklist:
+
+- **Enable on both ends or neither.** A masked client against an unmasked
+  listener (or the reverse) fails closed as a handshake timeout — there is no
+  downgrade path by design.
+- **Credential count on masked TCP listeners.** The server verifies preludes
+  against every credential with no early exit (~1.4 µs at 1, ~88 µs at 64);
+  keep masked listeners at or below 64 credentials or split the listener.
+- **QUIC masking pins one credential.** `masking.quic_key_id` must name a
+  configured credential; that credential's keys mask the whole QUIC endpoint.
+  Rotating it requires a restart. Clients dialing a masked QUIC endpoint must
+  use the same credential.
+- **Changing `[masking]` requires a restart** on both server and client;
+  credential reloads rotate TCP mask keys for new connections only.
+- **Replay registry sizing.** `masking.replay_identities` (default 16 384,
+  preallocated ~150 B/identity) bounds in-memory replay history; restarts and
+  evictions reset it. Established connections are unaffected.
+- **Observability.** `uncrowned_king_server_mask_prelude_rejects_total` and
+  `…_mask_replay_rejects_total` count silent rejections; rejections also feed
+  the `auth_rate_limit_*` failure limiter, so blind probing bans exactly like
+  credential guessing does.

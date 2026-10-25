@@ -133,9 +133,21 @@ SOCKS5 app ──(loopback)──▶ uk-client ══(TLS/TCP or QUIC, uk/1)═�
 
 ## 6. Residual risks and non-goals
 
-- **Traffic analysis / fingerprinting**: UK does not hide that a TLS/QUIC
-  connection exists or obfuscate timing and volume beyond what the transport
-  provides. It is not a pluggable-transport obfuscation layer.
+- **Traffic analysis / fingerprinting**: by default UK does not hide that a
+  TLS/QUIC connection exists (SNI and the `uk/1` ALPN are visible on the wire;
+  QUIC Initials are decryptable by passive observers) and does not obfuscate
+  timing and volume beyond what the transport provides; it is not a
+  pluggable-transport framework. The opt-in transport masking layer
+  (`[masking] enabled = true`, TLS/TCP carrier only) removes *passive
+  protocol identification* — ClientHello, ALPN, and record boundaries become
+  indistinguishable from random bytes behind a per-credential keystream, and
+  unauthenticated probes are silently drained before the TLS handshake — but
+  it is not traffic-analysis resistance: connection counts, timing, and
+  volume remain observable, and the documented prelude limits (no forward
+  secrecy for identity/counter metadata, in-memory replay history, key
+  holders can churn their own windows) still apply. See
+  [`transport-masking-plan.md`](transport-masking-plan.md) and the `uk-mask`
+  crate documentation.
 - **Shared-secret compromise**: a leaked secret allows full client
   impersonation until the credential is rotated/revoked (see
   [`key-management.md`](key-management.md)). There is no per-message forward

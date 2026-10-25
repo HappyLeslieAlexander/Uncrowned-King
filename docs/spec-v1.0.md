@@ -13,6 +13,13 @@ missing or different ALPN as a connection error before accepting UK frames.
 UK frames must only be processed after the transport handshake completes. TLS
 0-RTT data must not be accepted as UK application data.
 
+Implementations may additionally wrap the carrier in the optional transport
+masking extension ([`masking-spec.md`](masking-spec.md)). Masking sits below
+TLS/QUIC and does not modify any frame, encoding, or requirement in this
+specification; with masking enabled the carrier connection additionally begins
+with the masking prelude/nonce (TCP) or masked datagrams (QUIC) defined there.
+The masking layer is out of scope for this frozen wire contract.
+
 ## 1. Common Encoding
 
 All fixed-width integers are unsigned and encoded in network byte order
