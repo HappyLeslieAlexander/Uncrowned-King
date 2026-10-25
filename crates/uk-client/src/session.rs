@@ -456,7 +456,14 @@ async fn connect_authenticated_endpoint_with_timeout(
     if let Some(timeout) = endpoint_timeout {
         match time::timeout(
             timeout,
-            connect_authenticated_endpoint(config, tls_config, server_name, endpoint, overrides),
+            connect_authenticated_endpoint(
+                config,
+                tls_config,
+                server_name,
+                endpoint,
+                overrides,
+                endpoint_timeout,
+            ),
         )
         .await
         {
@@ -468,7 +475,15 @@ async fn connect_authenticated_endpoint_with_timeout(
             )),
         }
     } else {
-        connect_authenticated_endpoint(config, tls_config, server_name, endpoint, overrides).await
+        connect_authenticated_endpoint(
+            config,
+            tls_config,
+            server_name,
+            endpoint,
+            overrides,
+            endpoint_timeout,
+        )
+        .await
     }
 }
 
@@ -478,6 +493,7 @@ async fn connect_authenticated_endpoint(
     server_name: ServerName<'static>,
     endpoint: &str,
     overrides: Option<crate::quic::QuicTransportOverrides>,
+    endpoint_timeout: Option<Duration>,
 ) -> Result<(ClientCarrier, Settings), AnyError> {
     let (carrier, addr) = crate::config::parse_endpoint(endpoint)
         .map_err(|err| phase_error("parse endpoint", EndpointFailurePhase::Other, err))?;
@@ -488,7 +504,9 @@ async fn connect_authenticated_endpoint(
             let connector = tls::connector_from(Arc::clone(tls_config));
             establish_tls_carrier(&connector, server_name, addr).await?
         }
-        CarrierKind::Quic => establish_quic_carrier(config, tls_config, addr, overrides).await?,
+        CarrierKind::Quic => {
+            establish_quic_carrier(config, tls_config, addr, overrides, endpoint_timeout).await?
+        }
     };
     authenticate_over_carrier(config, reader, writer, exporter, datagrams).await
 }
@@ -529,6 +547,7 @@ async fn establish_quic_carrier(
     tls_config: &Arc<TlsClientConfig>,
     addr: &str,
     overrides: Option<crate::quic::QuicTransportOverrides>,
+    endpoint_timeout: Option<Duration>,
 ) -> Result<
     (
         BoxedCarrierReader,
@@ -543,6 +562,7 @@ async fn establish_quic_carrier(
         addr,
         &config.server_name,
         overrides,
+        endpoint_timeout,
     )
     .await
     .map_err(|err| phase_error("quic connect", EndpointFailurePhase::Tls, err))?;

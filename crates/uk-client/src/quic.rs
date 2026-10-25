@@ -42,6 +42,11 @@ pub const CLIENT_QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 1024 * 1024;
 /// Datagram receive buffer size for QUIC client UDP datagram relay (256 KiB).
 pub const CLIENT_QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE: usize = 256 * 1024;
 
+/// Floor for one address's share of the endpoint handshake budget when the
+/// endpoint resolves to several addresses (see
+/// `per_address_attempt_timeout`).
+const MIN_QUIC_PER_ADDRESS_ATTEMPT: Duration = Duration::from_secs(1);
+
 /// Optional overrides for QUIC transport keep-alive and idle timeout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QuicTransportOverrides {
@@ -111,15 +116,21 @@ pub async fn connect(
     QuicError,
 > {
     let quinn_client_config = client_config(rustls_config)?;
-    connect_with_client_config(quinn_client_config, endpoint, server_name).await
+    connect_with_client_config(quinn_client_config, endpoint, server_name, None).await
 }
 
 /// Connects to `endpoint` over QUIC with optional transport parameter overrides.
+///
+/// `attempt_budget` is the endpoint-level handshake deadline; it is split
+/// across the resolved addresses so one unreachable address cannot starve the
+/// rest (see `per_address_attempt_timeout`). `None` leaves each attempt
+/// unbounded.
 pub async fn connect_with_overrides(
     rustls_config: RustlsClientConfig,
     endpoint: &str,
     server_name: &str,
     overrides: Option<QuicTransportOverrides>,
+    attempt_budget: Option<Duration>,
 ) -> Result<
     (
         BoxedCarrierReader,
@@ -133,17 +144,43 @@ pub async fn connect_with_overrides(
         Some(opts) => {
             let quinn_client_config =
                 client_config_with_transport(rustls_config, opts.keep_alive, opts.max_idle)?;
-            connect_with_client_config(quinn_client_config, endpoint, server_name).await
+            connect_with_client_config(quinn_client_config, endpoint, server_name, attempt_budget)
+                .await
         }
         None => connect(rustls_config, endpoint, server_name).await,
     }
 }
 
+/// Splits an endpoint-level handshake budget across the addresses it
+/// resolved to.
+///
+/// The dial loop is sequential, so without a per-address bound a single
+/// blackholed address (the typical dual-stack v6-before-v4 failure) consumes
+/// the whole budget and the remaining addresses are never dialled — exactly
+/// when the fallback is needed. Single-address endpoints keep the full
+/// budget; the floor keeps a tiny split (e.g. short test budgets) from
+/// preempting handshakes to live servers. The outer endpoint timeout still
+/// governs the total.
+fn per_address_attempt_timeout(budget: Option<Duration>, address_count: usize) -> Option<Duration> {
+    let budget = budget?;
+    if address_count <= 1 {
+        return Some(budget);
+    }
+    Some(
+        (budget / u32::try_from(address_count).unwrap_or(u32::MAX))
+            .max(MIN_QUIC_PER_ADDRESS_ATTEMPT),
+    )
+}
+
 /// Connects to `endpoint` over QUIC with a custom Quinn client configuration.
+///
+/// `attempt_budget` bounds the whole address loop and is split per address
+/// (see `per_address_attempt_timeout`); `None` leaves attempts unbounded.
 pub async fn connect_with_client_config(
     quinn_client_config: QuinnClientConfig,
     endpoint: &str,
     server_name: &str,
+    attempt_budget: Option<Duration>,
 ) -> Result<
     (
         BoxedCarrierReader,
@@ -154,6 +191,7 @@ pub async fn connect_with_client_config(
     QuicError,
 > {
     let addrs = resolve(endpoint).await?;
+    let per_address_deadline = per_address_attempt_timeout(attempt_budget, addrs.len());
 
     let mut last_err = None;
     for addr in addrs {
@@ -168,14 +206,30 @@ pub async fn connect_with_client_config(
         client_endpoint.set_default_client_config(quinn_client_config.clone());
 
         let connection = match client_endpoint.connect(addr, server_name) {
-            Ok(connecting) => match connecting.await {
-                Ok(conn) => conn,
-                Err(err) => {
-                    client_endpoint.close(0u32.into(), b"");
-                    last_err = Some(format!("QUIC handshake with {addr} failed: {err}").into());
-                    continue;
+            Ok(connecting) => {
+                // `Duration::MAX` keeps the unbudgeted case effectively
+                // deadline-free while sharing one code path.
+                let deadline = per_address_deadline.unwrap_or(Duration::MAX);
+                match tokio::time::timeout(deadline, connecting).await {
+                    Ok(result) => match result {
+                        Ok(conn) => conn,
+                        Err(err) => {
+                            client_endpoint.close(0u32.into(), b"");
+                            last_err =
+                                Some(format!("QUIC handshake with {addr} failed: {err}").into());
+                            continue;
+                        }
+                    },
+                    Err(elapsed) => {
+                        client_endpoint.close(0u32.into(), b"");
+                        last_err = Some(format!(
+                            "QUIC handshake with {addr} exceeded per-address budget {deadline:?} ({elapsed})"
+                        )
+                        .into());
+                        continue;
+                    }
                 }
-            },
+            }
             Err(err) => {
                 client_endpoint.close(0u32.into(), b"");
                 last_err = Some(format!("failed to start QUIC connection to {addr}: {err}").into());
@@ -352,5 +406,32 @@ mod tests {
             .expect("valid transport config without keep alive");
         let debug = format!("{transport:?}");
         assert!(debug.contains("keep_alive_interval: None"));
+    }
+
+    #[test]
+    fn per_address_budget_splits_across_addresses_with_floor() {
+        // Single address keeps the whole endpoint budget.
+        assert_eq!(
+            per_address_attempt_timeout(Some(Duration::from_secs(10)), 1),
+            Some(Duration::from_secs(10))
+        );
+        // Two addresses split the budget so a blackholed first address leaves
+        // room for the second within the same overall deadline.
+        assert_eq!(
+            per_address_attempt_timeout(Some(Duration::from_secs(10)), 2),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            per_address_attempt_timeout(Some(Duration::from_secs(10)), 4),
+            Some(Duration::from_millis(2500))
+        );
+        // Tiny budgets clamp to the floor rather than preempting live
+        // handshakes; the outer endpoint timeout still bounds the total.
+        assert_eq!(
+            per_address_attempt_timeout(Some(Duration::from_millis(300)), 3),
+            Some(MIN_QUIC_PER_ADDRESS_ATTEMPT)
+        );
+        // No endpoint budget: per-address attempts stay unbounded.
+        assert_eq!(per_address_attempt_timeout(None, 4), None);
     }
 }
