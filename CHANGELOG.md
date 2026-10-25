@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-25
+
+First release of the 2.x line. The repository history was consolidated into a
+single signed root commit (`Uncrowned-King v2.0.0`); the complete prior
+history remains available in the `v0.1.0`–`v1.0.2` tags and the remote
+`backup0`/`backup1` branches.
+
 ### Added
 
 - **Historical remediation archive (`docs`)**: moved the completed 2026-10-24 production remediation TODO (all P0/P1/P2 waves verified) to `docs/audits/2026-10-24/` with an archival notice, matching the existing audit archive convention.
@@ -461,7 +468,8 @@ policy-enforced SOCKS5 → UK → target relay over TLS/TCP and QUIC.
   saturating bulk flow); and a soak/chaos harness showing flat memory across
   sustained load. See `docs/performance.md`.
 
-[Unreleased]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v1.0.2...HEAD
+[Unreleased]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v1.0.2...v2.0.0
 [1.0.2]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/HappyLeslieAlexander/Uncrowned-King/compare/v0.1.3...v1.0.0

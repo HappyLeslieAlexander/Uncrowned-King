@@ -151,7 +151,7 @@ spec:
               mountPath: /etc/uncrowned-king
       containers:
         - name: uk-server
-          image: ghcr.io/happylesliealexander/uncrowned-king-server:v1.0.2
+          image: ghcr.io/happylesliealexander/uncrowned-king-server:v2.0.0
           args:
             - "--config"
             - "/etc/uncrowned-king/server.toml"
