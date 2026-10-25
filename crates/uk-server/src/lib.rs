@@ -642,7 +642,11 @@ async fn start_observability(
     let Some(listen) = &config.observability_listen else {
         return Ok(None);
     };
-    let listener = TcpListener::bind(listen).await?;
+    // Bind the resolved — wildcard-checked — addresses rather than the raw
+    // string: resolver semantics accept numeric forms ("0:9090") the static
+    // validator cannot see, and those bind 0.0.0.0.
+    let addrs = uk_proto::resolve_observability_bind("observability_listen", listen)?;
+    let listener = TcpListener::bind(addrs.as_slice()).await?;
     Ok(Some(tokio::spawn(observability::serve(
         listener,
         metrics,

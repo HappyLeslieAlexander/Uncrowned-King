@@ -3,7 +3,7 @@
 use std::{
     error::Error,
     fmt,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
 };
 
 /// Error returned when a configured endpoint is malformed.
@@ -53,6 +53,73 @@ impl fmt::Display for EndpointError {
 }
 
 impl Error for EndpointError {}
+
+/// Error while resolving a validated observability bind to bindable
+/// addresses.
+#[derive(Debug)]
+pub enum ObservabilityBindError {
+    /// The configured value failed static validation (including wildcard
+    /// rejection against the resolved addresses).
+    Endpoint(EndpointError),
+    /// The value could not be resolved, or resolved to no addresses.
+    Resolve(std::io::Error),
+}
+
+impl fmt::Display for ObservabilityBindError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Endpoint(err) => write!(f, "{err}"),
+            Self::Resolve(err) => write!(f, "resolving observability bind failed: {err}"),
+        }
+    }
+}
+
+impl Error for ObservabilityBindError {}
+
+impl From<EndpointError> for ObservabilityBindError {
+    fn from(err: EndpointError) -> Self {
+        Self::Endpoint(err)
+    }
+}
+
+/// Resolves an observability bind that already passed
+/// [`validate_observability_bind`] into concrete socket addresses, failing
+/// closed if any resolved address is a wildcard.
+///
+/// The static validator only sees the configured string, but the eventual
+/// bind re-parses it through `getaddrinfo`, whose `inet_aton` semantics
+/// accept numeric forms Rust's strict parser rejects (`"0"`,
+/// `"000.000.000.000"`, `"0x7f.0.0.1"`). Those pass validation with only a
+/// non-loopback warning yet bind `0.0.0.0` — exposing the unauthenticated
+/// metrics endpoint on every interface. Binding the resolved (and here
+/// re-checked) addresses instead of the raw string closes that gap: a
+/// wildcard can only reach the socket if a resolver actually produced it,
+/// and this is where that is caught.
+pub fn resolve_observability_bind(
+    name: &'static str,
+    value: &str,
+) -> Result<Vec<SocketAddr>, ObservabilityBindError> {
+    validate_observability_bind(name, value)?;
+    let addrs: Vec<SocketAddr> = value
+        .to_socket_addrs()
+        .map_err(ObservabilityBindError::Resolve)?
+        .collect();
+    if addrs.is_empty() {
+        return Err(ObservabilityBindError::Resolve(std::io::Error::other(
+            format!("{name} resolved to no addresses"),
+        )));
+    }
+    if addrs
+        .iter()
+        .any(|addr| addr.ip().to_canonical().is_unspecified())
+    {
+        return Err(ObservabilityBindError::Endpoint(EndpointError::new(
+            name,
+            EndpointErrorKind::WildcardBind,
+        )));
+    }
+    Ok(addrs)
+}
 
 /// Validates a `host:port` endpoint without resolving DNS.
 pub fn validate_host_port_endpoint(name: &'static str, value: &str) -> Result<(), EndpointError> {
@@ -275,5 +342,53 @@ mod tests {
             validate_observability_bind("observability_listen", "metrics.internal:9090"),
             Ok(BindExposure::NonLoopback)
         );
+    }
+
+    #[test]
+    fn resolve_bind_accepts_specific_loopback() {
+        let addrs = resolve_observability_bind("observability_listen", "127.0.0.1:9090")
+            .expect("loopback literal resolves");
+        assert!(!addrs.is_empty());
+        assert!(
+            addrs
+                .iter()
+                .all(|addr| addr.ip().to_canonical().is_loopback())
+        );
+        assert!(addrs.iter().all(|addr| addr.port() == 9090));
+    }
+
+    #[test]
+    fn resolve_bind_still_rejects_static_wildcard() {
+        assert!(matches!(
+            resolve_observability_bind("observability_listen", "0.0.0.0:9090"),
+            Err(ObservabilityBindError::Endpoint(_))
+        ));
+    }
+
+    /// POSIX resolvers interpret the single-label numeric host `"0"` as
+    /// `0.0.0.0`, which the strict static validator cannot see.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_bind_rejects_numeric_form_that_resolves_to_wildcard() {
+        assert!(matches!(
+            resolve_observability_bind("observability_listen", "0:9090"),
+            Err(ObservabilityBindError::Endpoint(EndpointError {
+                kind: EndpointErrorKind::WildcardBind,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn resolve_bind_rejects_values_that_do_not_resolve() {
+        // A syntactically valid hostname that does not exist must fail closed
+        // rather than bind something unexpected.
+        assert!(matches!(
+            resolve_observability_bind(
+                "observability_listen",
+                "definitely-not-a-host.invalid:9090"
+            ),
+            Err(ObservabilityBindError::Resolve(_))
+        ));
     }
 }

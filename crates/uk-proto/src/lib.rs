@@ -32,7 +32,8 @@ pub use carrier::{
     DatagramSendOutcome,
 };
 pub use endpoint::{
-    BindExposure, EndpointError, validate_host_port_endpoint, validate_observability_bind,
+    BindExposure, EndpointError, ObservabilityBindError, resolve_observability_bind,
+    validate_host_port_endpoint, validate_observability_bind,
 };
 pub use error::{ProtocolError, ProtocolResult};
 pub use flow::{
