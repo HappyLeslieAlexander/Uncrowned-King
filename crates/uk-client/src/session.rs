@@ -1233,11 +1233,7 @@ mod tests {
         clear_degraded_endpoints();
         let path =
             std::env::temp_dir().join(format!("quic-degraded-test-ca-{}.pem", std::process::id()));
-        std::fs::write(
-            &path,
-            include_str!("../../../docs/audits/2026-09-09/evidence/client/audit-ca-one.pem"),
-        )
-        .unwrap();
+        std::fs::write(&path, include_str!("../tests/fixtures/audit-ca-one.pem")).unwrap();
         let quic_ep = "quic://127.0.0.1:1";
         let config = ClientConfig {
             server_addr: quic_ep.to_owned(),

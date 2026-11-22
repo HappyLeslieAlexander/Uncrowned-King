@@ -2305,11 +2305,7 @@ async fn audit_rejected_reload_must_preserve_active_ca_cache() {
         "audit-ca-rejected-reload-{}.pem",
         std::process::id()
     ));
-    std::fs::write(
-        &path,
-        include_str!("../../../../docs/audits/2026-09-09/evidence/client/audit-ca-one.pem"),
-    )
-    .unwrap();
+    std::fs::write(&path, include_str!("../../tests/fixtures/audit-ca-one.pem")).unwrap();
     let mut config = minimal_config();
     config.ca_cert_path = path.to_string_lossy().into_owned();
     crate::check_config(&config).unwrap();
@@ -2317,11 +2313,7 @@ async fn audit_rejected_reload_must_preserve_active_ca_cache() {
         .await
         .unwrap();
     let manager = test_session_manager(config.clone());
-    std::fs::write(
-        &path,
-        include_str!("../../../../docs/audits/2026-09-09/evidence/client/audit-ca-two.pem"),
-    )
-    .unwrap();
+    std::fs::write(&path, include_str!("../../tests/fixtures/audit-ca-two.pem")).unwrap();
     config.max_socks_connections = Some(config.max_socks_connections() + 1);
     let error = manager.reload(config.clone()).await.unwrap_err();
     assert!(error.to_string().contains("requires a restart"));
