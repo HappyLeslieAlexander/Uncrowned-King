@@ -6,3 +6,5 @@ target/
 .vscode/
 *.log
 .agents/
+__pycache__/
+*.pyc
