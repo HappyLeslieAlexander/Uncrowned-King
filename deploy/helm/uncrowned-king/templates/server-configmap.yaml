@@ -26,12 +26,12 @@ data:
     cert_path = "/etc/uncrowned-king/tls/tls.crt"
     key_path = "/etc/uncrowned-king/tls/tls.key"
     policy_path = "/etc/uncrowned-king/policy/policy.toml"
-    {{- if .Values.server.config.auth_skew_seconds }}
+    {{- if not (kindIs "invalid" .Values.server.config.auth_skew_seconds) }}
     auth_skew_seconds = {{ int64 .Values.server.config.auth_skew_seconds }}
     {{- end }}
 
     {{- if .Values.server.config.limits }}
-    {{- $knownLimits := list "max_pre_auth_bytes" "max_frame_size" "max_sessions" "max_handshakes" "max_streams" "max_udp_flows" "max_outbound_dials_per_session" "max_buffered_bytes_per_session" "max_buffered_bytes_per_flow" "max_total_streams" "max_total_buffered_bytes" "relay_buffer_size" "idle_timeout_seconds" "handshake_timeout_seconds" "target_connect_timeout_seconds" "tcp_half_close_timeout_seconds" "carrier_write_timeout_seconds" "tcp_keepalive_seconds" "udp_flow_idle_timeout_seconds" "shutdown_timeout_seconds" "auth_rate_limit_failures" "auth_rate_limit_window_seconds" "auth_rate_limit_ban_seconds" "auth_rate_limit_allowlist" "replay_cache_window_seconds" "replay_cache_max_entries" "quic_stream_receive_window" "quic_connection_receive_window" }}
+    {{- $knownLimits := list "max_pre_auth_bytes" "max_frame_size" "max_sessions" "max_handshakes" "max_pre_auth_connections" "max_pre_auth_per_source" "max_streams" "max_udp_flows" "max_outbound_dials_per_session" "max_buffered_bytes_per_session" "max_buffered_bytes_per_flow" "max_total_streams" "max_total_buffered_bytes" "relay_buffer_size" "idle_timeout_seconds" "handshake_timeout_seconds" "target_connect_timeout_seconds" "tcp_half_close_timeout_seconds" "carrier_write_timeout_seconds" "tcp_keepalive_seconds" "udp_flow_idle_timeout_seconds" "shutdown_timeout_seconds" "auth_rate_limit_failures" "auth_rate_limit_window_seconds" "auth_rate_limit_ban_seconds" "auth_rate_limit_global_failures" "auth_rate_limit_allowlist" "replay_cache_window_seconds" "replay_cache_max_entries" "quic_stream_receive_window" "quic_connection_receive_window" }}
     [limits]
     {{- range $key, $val := .Values.server.config.limits }}
     {{- if not (has $key $knownLimits) }}
@@ -60,7 +60,7 @@ data:
     {{- fail "server.config.masking.enabled must be set explicitly (true or false)" }}
     {{- end }}
     enabled = {{ $masking.enabled }}
-    {{- if $masking.replay_identities }}
+    {{- if not (kindIs "invalid" $masking.replay_identities) }}
     replay_identities = {{ int64 $masking.replay_identities }}
     {{- end }}
     {{- if $masking.quic }}
@@ -68,8 +68,17 @@ data:
     {{- if not $masking.quic_key_id }}
     {{- fail "server.config.masking.quic_key_id is required when masking.quic is enabled" }}
     {{- end }}
-    {{- if not (has $masking.quic_key_id .Values.server.credentials) }}
+    {{- if not .Values.server.existingSecret }}
+    {{- $credKeyIds := list }}
+    {{- range .Values.server.credentials }}
+    {{- $credKeyId := .key_id | default .id | default .keyId }}
+    {{- if $credKeyId }}
+    {{- $credKeyIds = append $credKeyIds $credKeyId }}
+    {{- end }}
+    {{- end }}
+    {{- if not (has $masking.quic_key_id $credKeyIds) }}
     {{- fail (printf "server.config.masking.quic_key_id %q must name a key in server.credentials" $masking.quic_key_id) }}
+    {{- end }}
     {{- end }}
     quic_key_id = "{{ $masking.quic_key_id }}"
     {{- end }}

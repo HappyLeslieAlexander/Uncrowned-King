@@ -39,7 +39,6 @@ dial address from the NetworkPolicy egress rules. */}}
     {{- if .Values.client.config.masking }}
     {{- $knownClientMasking := list "enabled" "prelude_policy" "quic" }}
     {{- $clientMasking := .Values.client.config.masking }}
-    [masking]
     {{- range $key, $val := $clientMasking }}
     {{- if not (has $key $knownClientMasking) }}
     {{- fail (printf "Unknown client masking field %q in client.config.masking (known: enabled, prelude_policy, quic)" $key) }}
@@ -48,15 +47,16 @@ dial address from the NetworkPolicy egress rules. */}}
     {{- if kindIs "invalid" $clientMasking.enabled }}
     {{- fail "client.config.masking.enabled must be set explicitly (true or false)" }}
     {{- end }}
-    enabled = {{ $clientMasking.enabled }}
+    {{- $maskingParts := list (printf "enabled = %v" $clientMasking.enabled) }}
     {{- if $clientMasking.prelude_policy }}
     {{- if not (has $clientMasking.prelude_policy (list "fade" "full8" "low7")) }}
     {{- fail (printf "client.config.masking.prelude_policy %q must be one of fade, full8, low7" $clientMasking.prelude_policy) }}
     {{- end }}
-    prelude_policy = "{{ $clientMasking.prelude_policy }}"
+    {{- $maskingParts = append $maskingParts (printf "prelude_policy = %q" $clientMasking.prelude_policy) }}
     {{- end }}
-    {{- if $clientMasking.quic }}
-    quic = {{ $clientMasking.quic }}
+    {{- if not (kindIs "invalid" $clientMasking.quic) }}
+    {{- $maskingParts = append $maskingParts (printf "quic = %v" $clientMasking.quic) }}
     {{- end }}
+    masking = { {{ join ", " $maskingParts }} }
     {{- end }}
 {{- end }}
