@@ -15,12 +15,14 @@
 //! restarts. Established connections survive eviction — only admission uses
 //! this registry.
 
-use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 
 use crate::REPLAY_WINDOW;
 
 /// Words in a 1024-bit window bitmap.
 const WINDOW_WORDS: usize = (REPLAY_WINDOW as usize) / 64;
+const EMPTY: u32 = u32::MAX;
 
 /// Why a prelude was rejected by replay checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,7 +44,7 @@ pub enum ReplayDecision {
     Rejected(Replayed),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct ReplayEntry {
     highest: u64,
     /// Sliding window of seen counters; bit `d` set means `highest - d` was seen.
@@ -74,14 +76,19 @@ impl ReplayEntry {
             self.seen = [0; WINDOW_WORDS];
             return;
         }
-        let mut shifted = [0; WINDOW_WORDS];
-        for source in 0..REPLAY_WINDOW {
-            let target = source + advance;
-            if target < REPLAY_WINDOW && self.bit_is_set(source) {
-                shifted[(target / 64) as usize] |= 1 << (target % 64);
-            }
+        let words = (advance / 64) as usize;
+        let bits = (advance % 64) as u32;
+        for index in (0..WINDOW_WORDS).rev() {
+            self.seen[index] = if index < words {
+                0
+            } else {
+                let mut value = self.seen[index - words] << bits;
+                if bits != 0 && index > words {
+                    value |= self.seen[index - words - 1] >> (64 - bits);
+                }
+                value
+            };
         }
-        self.seen = shifted;
     }
 
     fn admits(&self, counter: u64) -> ReplayDecision {
@@ -102,44 +109,108 @@ impl ReplayEntry {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    identity: u64,
+    entry: ReplayEntry,
+    next: u32,
+}
+
 /// Bounded FIFO registry of prelude identities with per-identity sliding
 /// replay windows. All state is preallocated at construction; admission
 /// commits allocate nothing.
 #[derive(Debug)]
 pub struct ReplayRegistry {
-    order: std::collections::VecDeque<u64>,
-    entries: HashMap<u64, ReplayEntry>,
-    capacity: usize,
+    entries: Box<[Slot]>,
+    buckets: Box<[u32]>,
+    hash: RandomState,
+    len: usize,
+    oldest: usize,
 }
 
 impl ReplayRegistry {
     /// Creates a registry tracking up to `capacity` identities.
     ///
     /// # Panics
-    /// Panics if `capacity` is zero.
+    /// Panics if `capacity` is zero, does not fit in `u32` index space, or if
+    /// the power-of-two bucket table size overflows `usize`.
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "replay registry capacity must be positive");
+        assert!(
+            capacity < u32::MAX as usize,
+            "replay registry capacity must fit in u32 index space"
+        );
+        let bucket_count = capacity
+            .checked_mul(2)
+            .and_then(usize::checked_next_power_of_two)
+            .expect("replay registry bucket count overflow");
         Self {
-            order: std::collections::VecDeque::with_capacity(capacity),
-            entries: HashMap::with_capacity(capacity),
-            capacity,
+            entries: vec![
+                Slot {
+                    identity: 0,
+                    entry: ReplayEntry {
+                        highest: 0,
+                        seen: [0; WINDOW_WORDS],
+                    },
+                    next: EMPTY,
+                };
+                capacity
+            ]
+            .into_boxed_slice(),
+            buckets: vec![EMPTY; bucket_count].into_boxed_slice(),
+            hash: RandomState::new(),
+            len: 0,
+            oldest: 0,
         }
     }
 
     /// Number of tracked identities.
-    pub fn len(&self) -> usize {
-        self.entries.len()
+    pub const fn len(&self) -> usize {
+        self.len
     }
 
     /// Whether no identities are tracked.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn bucket(&self, identity: u64) -> usize {
+        (self.hash.hash_one(identity) as usize) & (self.buckets.len() - 1)
+    }
+
+    fn find(&self, identity: u64) -> Option<usize> {
+        let mut index = self.buckets[self.bucket(identity)];
+        while index != EMPTY {
+            let slot = &self.entries[index as usize];
+            if slot.identity == identity {
+                return Some(index as usize);
+            }
+            index = slot.next;
+        }
+        None
+    }
+
+    fn unlink(&mut self, index: usize) {
+        let bucket = self.bucket(self.entries[index].identity);
+        let mut current = self.buckets[bucket];
+        let mut previous = None;
+        while current as usize != index {
+            assert!(current != EMPTY, "replay bucket chain is corrupt");
+            previous = Some(current as usize);
+            current = self.entries[current as usize].next;
+        }
+        let next = self.entries[index].next;
+        if let Some(previous) = previous {
+            self.entries[previous].next = next;
+        } else {
+            self.buckets[bucket] = next;
+        }
     }
 
     /// Checks admissibility without mutating state.
     pub fn precheck(&self, identity: u64, counter: u64) -> ReplayDecision {
-        match self.entries.get(&identity) {
-            Some(entry) => entry.admits(counter),
+        match self.find(identity) {
+            Some(index) => self.entries[index].entry.admits(counter),
             None if counter == 0 => ReplayDecision::Rejected(Replayed::Zero),
             None => ReplayDecision::Accepted,
         }
@@ -148,11 +219,12 @@ impl ReplayRegistry {
     /// Atomically re-validates and commits a counter. Returns
     /// [`ReplayDecision::Accepted`] when committed.
     pub fn commit(&mut self, identity: u64, counter: u64) -> ReplayDecision {
-        let decision = self.precheck(identity, counter);
-        if !matches!(decision, ReplayDecision::Accepted) {
-            return decision;
-        }
-        if let Some(entry) = self.entries.get_mut(&identity) {
+        if let Some(index) = self.find(identity) {
+            let entry = &mut self.entries[index].entry;
+            let decision = entry.admits(counter);
+            if !matches!(decision, ReplayDecision::Accepted) {
+                return decision;
+            }
             if counter > entry.highest {
                 entry.advance(counter - entry.highest);
                 entry.highest = counter;
@@ -160,15 +232,28 @@ impl ReplayRegistry {
             } else {
                 entry.set_bit(entry.highest - counter);
             }
-        } else {
-            if self.entries.len() == self.capacity {
-                if let Some(evicted) = self.order.pop_front() {
-                    self.entries.remove(&evicted);
-                }
-            }
-            self.order.push_back(identity);
-            self.entries.insert(identity, ReplayEntry::fresh(counter));
+            return ReplayDecision::Accepted;
         }
+        if counter == 0 {
+            return ReplayDecision::Rejected(Replayed::Zero);
+        }
+        let index = if self.len < self.entries.len() {
+            let index = self.len;
+            self.len += 1;
+            index
+        } else {
+            let index = self.oldest;
+            self.unlink(index);
+            self.oldest = (index + 1) % self.entries.len();
+            index
+        };
+        let bucket = self.bucket(identity);
+        self.entries[index] = Slot {
+            identity,
+            entry: ReplayEntry::fresh(counter),
+            next: self.buckets[bucket],
+        };
+        self.buckets[bucket] = index as u32;
         ReplayDecision::Accepted
     }
 }
@@ -300,5 +385,187 @@ mod tests {
             registry.commit(1, 102),
             ReplayDecision::Rejected(Replayed::Duplicate)
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "replay registry capacity must be positive")]
+    fn zero_capacity_panics() {
+        let _ = ReplayRegistry::new(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "replay registry capacity must fit in u32 index space")]
+    fn oversized_capacity_panics() {
+        let _ = ReplayRegistry::new(u32::MAX as usize);
+    }
+
+    #[test]
+    fn non_power_of_two_capacity_and_zero_identity() {
+        for capacity in [1_usize, 3, 5] {
+            let mut registry = ReplayRegistry::new(capacity);
+            assert!(registry.is_empty());
+            assert!(accepted(&mut registry, 0, 10));
+            assert_eq!(
+                registry.commit(0, 10),
+                ReplayDecision::Rejected(Replayed::Duplicate)
+            );
+            assert!(accepted(&mut registry, 0, 9));
+            for offset in 1..=capacity as u64 {
+                assert!(accepted(&mut registry, offset, 1));
+            }
+            assert_eq!(registry.len(), capacity);
+            // Identity 0 was the oldest and should be evicted once capacity+1
+            // distinct identities have been committed.
+            assert_eq!(registry.precheck(0, 10), ReplayDecision::Accepted);
+            assert!(accepted(&mut registry, 0, 10));
+            assert_eq!(
+                registry.commit(0, 10),
+                ReplayDecision::Rejected(Replayed::Duplicate)
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_fifo_and_repeated_rotation_keep_storage_fixed() {
+        let capacity = 64_usize;
+        let mut registry = ReplayRegistry::new(capacity);
+        let entries_ptr = registry.entries.as_ptr();
+        let buckets_ptr = registry.buckets.as_ptr();
+
+        for identity in 0..capacity as u64 {
+            assert!(accepted(&mut registry, identity, 1));
+        }
+        // In-place update of identity 0 must not refresh its FIFO position.
+        assert!(accepted(&mut registry, 0, 2));
+        // Inserting capacity evicts identity 0.
+        assert!(accepted(&mut registry, capacity as u64, 1));
+        assert_eq!(registry.precheck(0, 1), ReplayDecision::Accepted);
+        assert_eq!(
+            registry.precheck(1, 1),
+            ReplayDecision::Rejected(Replayed::Duplicate)
+        );
+        // Re-inserting identity 0 evicts identity 1.
+        assert!(accepted(&mut registry, 0, 1));
+        assert_eq!(registry.precheck(1, 1), ReplayDecision::Accepted);
+
+        for identity in (capacity as u64 + 1)..(capacity as u64 * 5) {
+            assert!(accepted(&mut registry, identity, 1));
+        }
+        assert_eq!(registry.len(), capacity);
+        assert_eq!(registry.entries.len(), capacity);
+        assert_eq!(registry.entries.as_ptr(), entries_ptr);
+        assert_eq!(registry.buckets.as_ptr(), buckets_ptr);
+        for identity in (capacity as u64 * 4)..(capacity as u64 * 5) {
+            assert!(registry.find(identity).is_some());
+        }
+    }
+
+    #[test]
+    fn collisions_preserve_links_when_fifo_removes_head_middle_and_tail() {
+        let mut registry = ReplayRegistry::new(8);
+        let colliding: Vec<u64> = (0_u64..)
+            .filter(|&identity| registry.bucket(identity) == 0)
+            .take(4)
+            .collect();
+        for &identity in &colliding {
+            assert!(accepted(&mut registry, identity, 1));
+        }
+        // Bucket 0 chain is head -> colliding[3] -> colliding[2] -> colliding[1] -> colliding[0].
+        // Unlink middle (slot 1 = colliding[1]), head (slot 3 = colliding[3]), tail (slot 0 = colliding[0]).
+        registry.unlink(1);
+        registry.unlink(3);
+        registry.unlink(0);
+        assert!(registry.find(colliding[1]).is_none());
+        assert!(registry.find(colliding[3]).is_none());
+        assert!(registry.find(colliding[0]).is_none());
+        assert_eq!(registry.find(colliding[2]), Some(2));
+    }
+
+    #[test]
+    fn commit_evicts_and_reinserts_colliding_bucket_entries() {
+        let mut registry = ReplayRegistry::new(8);
+        let colliding: Vec<u64> = (0_u64..)
+            .filter(|&identity| registry.bucket(identity) == 0)
+            .take(5)
+            .collect();
+        let non_colliding: Vec<u64> = (0_u64..)
+            .filter(|&identity| registry.bucket(identity) != 0)
+            .take(6)
+            .collect();
+
+        // Fill capacity=8: [c0, c1, c2, n0, n1, n2, n3, n4].
+        for &id in &colliding[..3] {
+            assert!(accepted(&mut registry, id, 1));
+        }
+        for &id in &non_colliding[..5] {
+            assert!(accepted(&mut registry, id, 1));
+        }
+        assert_eq!(registry.len(), 8);
+
+        // Committing c3 into bucket 0 evicts oldest FIFO slot (c0, tail of bucket 0).
+        assert!(accepted(&mut registry, colliding[3], 1));
+        assert_eq!(registry.precheck(colliding[0], 1), ReplayDecision::Accepted);
+        for &id in &[colliding[1], colliding[2], colliding[3]] {
+            assert_eq!(
+                registry.precheck(id, 1),
+                ReplayDecision::Rejected(Replayed::Duplicate)
+            );
+        }
+
+        // Evict c1 (via n5) and c2 (via c4 into same bucket 0), then re-insert c0.
+        assert!(accepted(&mut registry, non_colliding[5], 1));
+        assert_eq!(registry.precheck(colliding[1], 1), ReplayDecision::Accepted);
+        assert!(accepted(&mut registry, colliding[4], 1));
+        assert_eq!(registry.precheck(colliding[2], 1), ReplayDecision::Accepted);
+        for &id in &[colliding[3], colliding[4]] {
+            assert_eq!(
+                registry.precheck(id, 1),
+                ReplayDecision::Rejected(Replayed::Duplicate)
+            );
+        }
+
+        assert!(accepted(&mut registry, colliding[0], 1));
+        assert_eq!(
+            registry.commit(colliding[0], 1),
+            ReplayDecision::Rejected(Replayed::Duplicate)
+        );
+    }
+
+    #[test]
+    fn every_window_advance_matches_individual_bit_reference() {
+        let seen: [u64; WINDOW_WORDS] = std::array::from_fn(|index| {
+            0x9e37_79b9_7f4a_7c15_u64.wrapping_mul(index as u64 + 1) | 1
+        });
+        for advance in 0..=(REPLAY_WINDOW * 2) {
+            let mut entry = ReplayEntry {
+                highest: 10_000,
+                seen,
+            };
+            let new_highest = entry.highest + advance;
+            entry.advance(advance);
+            entry.highest = new_highest;
+            entry.set_bit(0);
+            for offset in 0..REPLAY_WINDOW {
+                let expected_seen = offset == 0
+                    || (offset >= advance && {
+                        let old = (offset - advance) as usize;
+                        seen[old / 64] & (1_u64 << (old % 64)) != 0
+                    });
+                let expected = if expected_seen {
+                    ReplayDecision::Rejected(Replayed::Duplicate)
+                } else {
+                    ReplayDecision::Accepted
+                };
+                assert_eq!(
+                    entry.admits(new_highest - offset),
+                    expected,
+                    "advance={advance}, offset={offset}"
+                );
+            }
+            assert_eq!(
+                entry.admits(new_highest - REPLAY_WINDOW),
+                ReplayDecision::Rejected(Replayed::BelowWindow)
+            );
+        }
     }
 }

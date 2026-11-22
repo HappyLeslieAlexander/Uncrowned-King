@@ -16,14 +16,13 @@ use std::{
 use bytes::BytesMut;
 use rustls::{ClientConfig as TlsClientConfig, pki_types::ServerName};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
     time,
 };
 use tokio_rustls::TlsConnector;
 use tracing::{info, warn};
 use uk_auth::{AuthChallenge, AuthResponse, unix_now};
-use uk_mask::{NONCE_LEN, PRELUDE_LEN};
 use uk_proto::{
     BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, ErrorCode, ErrorPayload, Frame,
     FrameLimits, FrameType, MAX_FRAME_PAYLOAD_SIZE, MAX_NEGOTIATED_FLOWS, PROTOCOL_REVISION_V1_0,
@@ -550,9 +549,10 @@ async fn establish_tls_carrier(
     finish_tls_carrier(stream)
 }
 
-/// Opens the TLS carrier through the masking layer: writes the prelude and
-/// nonce before the ClientHello, then wraps the stream so every TLS byte in
-/// both directions runs under the per-credential keystreams.
+/// Opens the TLS carrier through the masking layer: buffers the prelude and
+/// nonce in `uk_mask::MaskedStream::new_client_with_prelude` so they coalesce
+/// with the first encrypted ClientHello write, then runs every TLS byte in
+/// both directions under the per-credential keystreams.
 async fn establish_masked_tls_carrier(
     connector: &TlsConnector,
     server_name: ServerName<'static>,
@@ -578,14 +578,7 @@ async fn establish_masked_tls_carrier(
     let prelude = keys
         .encode_prelude(policy, &mut rand::rngs::OsRng, sequence.identity(), counter)
         .map_err(|err| phase_error("mask prelude encode", EndpointFailurePhase::Other, err))?;
-    let mut wire = [0_u8; PRELUDE_LEN + NONCE_LEN];
-    wire[..PRELUDE_LEN].copy_from_slice(&prelude.bytes);
-    wire[PRELUDE_LEN..].copy_from_slice(&prelude.nonce);
-    let mut tcp = tcp;
-    tcp.write_all(&wire)
-        .await
-        .map_err(|err| phase_error("mask prelude write", EndpointFailurePhase::Tcp, err))?;
-    let masked = uk_mask::MaskedStream::new_client(tcp, &keys, &prelude.nonce);
+    let masked = uk_mask::MaskedStream::new_client_with_prelude(tcp, &keys, &prelude);
     let stream = connector
         .connect(server_name, masked)
         .await
@@ -869,7 +862,214 @@ fn handshake_timeout(seconds: u64) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ClientMaskingConfig;
+    use rustls::{
+        RootCertStore, ServerConfig as TlsServerConfig,
+        pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    use tokio_rustls::TlsAcceptor;
+    use uk_mask::{MaskKeys, MaskedStream, NONCE_LEN, PRELUDE_LEN, WriteReady, verify_prelude};
     use uk_proto::{MAX_FRAME_PAYLOAD_SIZE, MIN_TCP_RELAY_FRAME_SIZE, SettingKey};
+
+    const TEST_CERT_PEM: &str = r"-----BEGIN CERTIFICATE-----
+MIIDSTCCAjGgAwIBAgIUEX51v2igsFngMQTuqhBx+gKL2MswDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcwMzEzNTM0MVoXDTM2MDYz
+MDEzNTM0MVowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEAhf3zqFeac7mRJTkyoPMwXUtvgnKcY3ydON4Q3cMrxrd0
+qn2leXJObMP846YgGBtKYu3cDo01qK+cN1rY4l/3iNqa4VOYJ3ckmUTEQhmCG78i
+XIxR9+488rWsxrhJ4GtGj/jd7UaJM9RMs2bb+7KzSj8t6t+Q1MEKsPeqQZ1wBW9S
+wgYLMmrP5eNYFgEgt8KI2r/p+Lf2rbGqu/OdzWkekDbuJq+wqUsEtEnE4x5ELJEE
+axEv+savJVWGSvBUkU6sWU8s0iLNiQKMBjAd/vTbqD+NVGihNrE0S0o0S4oxtHhu
+wwPbfk3bkGV2Z5QwTMI48AhrcoELMuQjO9wZygLHKQIDAQABo4GSMIGPMB0GA1Ud
+DgQWBBT8yAuXKconl4iNVuGmhUJIuVZW5zAfBgNVHSMEGDAWgBT8yAuXKconl4iN
+VuGmhUJIuVZW5zAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwDAYDVR0TAQH/
+BAIwADAOBgNVHQ8BAf8EBAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDQYJKoZI
+hvcNAQELBQADggEBAESMmK/ln9SXy8uevLxfdf0oKE4UC9CyyMj2FPOWSnpvwLJ4
+KI5axpyV3uP4Afd/lH6W47OcvQ9Ah0hSEVY/Xi+sAfLdjPmp3YpTtHP605Bj0y+A
+O2F21JkBh/ZVA2SbI9MCg13XBPfrmqarPxIVlye4kxbD4ZDN5Zp0DLjoIIWWGv2n
+6MuVnlvftL6nyPvc8EyPLM6wxiisxlB/D7jx9tL+GuLHcvXDuxQIkjB7MMWWfERM
+hpwf7QVVYCCnRNdlxk/xa6pr54CMysA75BlDBaVjyqK8Uy74DHL7APCN9opoV5ws
+vX1BONgh2gSRGBFiii6imzEAwefkUtYAvAQy1xw=
+-----END CERTIFICATE-----
+";
+
+    const TEST_KEY_PEM: &str = r"-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCF/fOoV5pzuZEl
+OTKg8zBdS2+CcpxjfJ043hDdwyvGt3SqfaV5ck5sw/zjpiAYG0pi7dwOjTWor5w3
+WtjiX/eI2prhU5gndySZRMRCGYIbvyJcjFH37jzytazGuEnga0aP+N3tRokz1Eyz
+Ztv7srNKPy3q35DUwQqw96pBnXAFb1LCBgsyas/l41gWASC3wojav+n4t/atsaq7
+853NaR6QNu4mr7CpSwS0ScTjHkQskQRrES/6xq8lVYZK8FSRTqxZTyzSIs2JAowG
+MB3+9NuoP41UaKE2sTRLSjRLijG0eG7DA9t+TduQZXZnlDBMwjjwCGtygQsy5CM7
+3BnKAscpAgMBAAECggEAPjqsP+G3rMlhHJ2M4u0u6BVRy465DQdh6XhQ8v1ixl6L
+g2bpRBcPTzpSp9OOkkOSb5Gyott4MUilz5uUoMYbK2cDiWSOhL2ztK8YSu6X25UQ
+O1U7+F6f1cUEYiJSxTRtSA4326vnqreNi8BYqHPdCr1+8Nc152lkMr5DR0f8L7lQ
+8v7nLryHxGyKZb6Pu75m8Fm8hV4OGG6n1e4jo83+arS3LAppRZVukQkjShHD9+ol
+lPKcYsc9hbqojE8gXyOk4xyvlqxdxXuq/tDpfxMxfH5jbsIqnYZ4NDBGOWtT4Hzh
+q+pMcRj3iPwbvTybPUTNJHDB8MyqG/hRRvC58NeLpQKBgQC8OV8fG7Za+6FiBQel
+2IVYyBEAwpqchyhvKPNUnGz+0h5dJ2q2ANWcLwU56/1U6dpPLNJj42Sjq97fUdX9
+156JmFUMT2YKY3ffsR31WFvA91FXRSAkR/g8uXLAEKIr0mYsRB7yopY31f/QWH25
+RvD+UTUf1r0g7m+3T7ezyXrrLwKBgQC2PW1MWFhnjPiArJVYXkiC6+3O4nkAPByl
+lm7VNw+AKquJu3TgSCHNsuHQXqG2WOisJndfvWyOScOke9W+KvCFNFfo/OV71SW9
+Rqn61Cl87p3SOwGF15eR62EPVicaAwBvlnhOX5zA1p5MPs7M/8cqi5ld6gOx8XhW
+xF4OOv19JwKBgQCX7idd0NytLBfkKvM1Z0SbmUJAPtTWLDLzJzbiwTEprylbQAne
+x2WlID8ztc1S0UCqUB+zCUWe54iK8l+s+nK51gAwY5aWJBwKr8ji1WOaqwc5Tk7X
+elBhk7+QUNzWSoq2iHYCnEJs54wJ/KPe/ehhH+Olw4v+HPiIGwzJToSteQKBgFiJ
+v3A3+7tTYegh8Ozd4Zy5wu+gV+klS0WnsHEmLwG1uWFREZdldAbbwZnaX/aXe3Mn
+vRdmkDcQ31wqTc32TqRoqc0oENX42Dz899hE+2MXCtX4lOTRuXHLSXyJ/rVEgBG2
+qPxqt114569jVFWEbt7cs8ZMyz7Icg61mHyRbFZBAoGBAKiV5tDUJewK9oZluSsV
+jiIVN0rJ1/EWIoJClBZEQ+uZHiAbwEevcPjJD6Pp9xFjfujebQDLep3RKIMuyi7o
+s1BW++ZOOL/nM71C5A1D2kYi9etevjp2qg/P2FOhhKSBAM+oyy6KR2HR3OnRpBfF
+VODOlcdwgEkE3j5MxS0brpI9
+-----END PRIVATE KEY-----
+";
+
+    const OTHER_TEST_CERT_PEM: &str = r"-----BEGIN CERTIFICATE-----
+MIIDSTCCAjGgAwIBAgIUbKiGvhPFpGKNHR7j/6IXUhFdHiswDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcxMzA5MTEzMloXDTM2MDcx
+MDA5MTEzMlowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEAkFhamPCkNJ11kWw3cFy+/8mokhXfr21B6uD5uCXYru+2
+RxnV0ALFBzfA42ZcRuesSmlwauQKBnwYD6VfYNJWL0n+UibPI57cNW5yDQg04PY9
+hMoexD9Ls9e2DSpP7Xa2ROx5kbI+1epR1Couu7vFcIVHahz7y8O/QH97xqrMBzmP
+4EEEQKYi61YvUbHRYdFLOJZA2qe2T9CMJVQkwGI2vGHlUpNdP7BYFqj787Y/d+DI
+2nnS/UFm7Hr1S3oBdwkcoqdPC4wqSq4akyYppKuWS9/fpyC+Oo2XCAFQ47YsPguV
+2UjmoBG4hIycdi9ffAKUH9O3lzp7FYT5uIhwG4PwywIDAQABo4GSMIGPMB0GA1Ud
+DgQWBBQgGGr6Btii4e151B3kGUK0enNy9DAfBgNVHSMEGDAWgBQgGGr6Btii4e15
+1B3kGUK0enNy9DAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwDAYDVR0TAQH/
+BAIwADAOBgNVHQ8BAf8EBAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDQYJKoZI
+hvcNAQELBQADggEBABhyQN2prI40OBsUAMkNtwIGP1ApVuTMKHd7KyA/NB+WIW1Q
+W5tBG2g375X5BX8H9+FlVV57Y5lLf0ypUI7Dp6Kwx3Opd77r1IUGT4/SltUxAa04
+0epEQiIKXl/m7dV+XqKMzftn/q92ZXib3/Cy+3SdYoUoD/p4sXcvJ27Dt6pZFHru
+Eyk0ziHhZXvMWYm8k5HUx4/KJrJ14v50Y3ySU7B9FnqwMztL4voIQpA7GeSfsQZY
+a2QH+2MZeMVBaZQ8jAjq24WcpAM1Hx26UOmIy85/NvPFZBbT8ggH2r8CKYjiDqcL
+C2n4SLoR1xpiEaImSSin581IyIJ4vFLJYsUfPJ8=
+-----END CERTIFICATE-----
+";
+
+    struct PrefixedTcpStream {
+        prefix: Vec<u8>,
+        offset: usize,
+        inner: TcpStream,
+    }
+
+    impl AsyncRead for PrefixedTcpStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.offset < self.prefix.len() {
+                let remaining = &self.prefix[self.offset..];
+                let take = remaining.len().min(buf.remaining());
+                buf.put_slice(&remaining[..take]);
+                self.offset += take;
+                return Poll::Ready(Ok(()));
+            }
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for PrefixedTcpStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl WriteReady for PrefixedTcpStream {
+        fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.inner.poll_write_ready(cx)
+        }
+    }
+
+    fn masked_test_client_config(addr: std::net::SocketAddr) -> ClientConfig {
+        ClientConfig {
+            server_addr: addr.to_string(),
+            server_addrs: None,
+            server_name: "localhost".to_owned(),
+            observability_listen: None,
+            ca_cert_path: String::new(),
+            key_id: "coalesce-client".to_owned(),
+            secret: "0123456789abcdef0123456789abcdef".to_owned(),
+            handshake_timeout_seconds: Some(5),
+            server_connect_retry_delay_millis: Some(0),
+            socks_handshake_timeout_seconds: None,
+            tcp_open_timeout_seconds: None,
+            udp_flow_idle_timeout_seconds: None,
+            shutdown_timeout_seconds: None,
+            max_pending_open_bytes: None,
+            max_socks_connections: None,
+            max_buffered_bytes_per_session: None,
+            max_buffered_bytes_per_flow: None,
+            max_carrier_sessions: None,
+            relay_buffer_size: None,
+            masking: Some(ClientMaskingConfig {
+                enabled: Some(true),
+                prelude_policy: None,
+                quic: None,
+            }),
+        }
+    }
+
+    fn test_tls_connector(cert_pem: &str) -> TlsConnector {
+        let mut roots = RootCertStore::empty();
+        for cert in CertificateDer::pem_slice_iter(cert_pem.as_bytes()) {
+            roots.add(cert.expect("valid PEM cert")).expect("add root");
+        }
+        let mut tls_config =
+            TlsClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        tls_config.alpn_protocols = vec![uk_proto::ALPN_PROTOCOL.to_vec()];
+        tls_config.enable_early_data = false;
+        TlsConnector::from(Arc::new(tls_config))
+    }
+
+    fn test_tls_acceptor() -> TlsAcceptor {
+        let certs: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_slice_iter(TEST_CERT_PEM.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .expect("valid server cert");
+        let key = PrivateKeyDer::from_pem_slice(TEST_KEY_PEM.as_bytes()).expect("valid server key");
+        let mut server_config =
+            TlsServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .expect("build server TLS config");
+        server_config.alpn_protocols = vec![uk_proto::ALPN_PROTOCOL.to_vec()];
+        server_config.max_early_data_size = 0;
+        TlsAcceptor::from(Arc::new(server_config))
+    }
+
+    fn split_coalesced_prelude(buf: &[u8]) -> ([u8; PRELUDE_LEN], [u8; NONCE_LEN], &[u8]) {
+        assert!(
+            buf.len() >= PRELUDE_LEN + NONCE_LEN + 5,
+            "initial read must coalesce 76B prelude+nonce with encrypted ClientHello, got {} bytes",
+            buf.len()
+        );
+        let prelude: [u8; PRELUDE_LEN] = buf[..PRELUDE_LEN].try_into().expect("64B prelude");
+        let nonce: [u8; NONCE_LEN] = buf[PRELUDE_LEN..PRELUDE_LEN + NONCE_LEN]
+            .try_into()
+            .expect("12B nonce");
+        (prelude, nonce, &buf[PRELUDE_LEN + NONCE_LEN..])
+    }
 
     fn settings_frame(settings: &Settings) -> Frame {
         let mut payload = BytesMut::new();
@@ -1269,5 +1469,174 @@ mod tests {
             "failed QUIC connection attempt must mark endpoint as degraded"
         );
         clear_degraded_endpoints();
+    }
+
+    #[tokio::test]
+    async fn establish_masked_tls_carrier_coalesces_prelude_and_client_hello_into_initial_read() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let config = masked_test_client_config(addr);
+        let server_keys = [MaskKeys::derive(
+            config.key_id.as_bytes(),
+            config.secret.as_bytes(),
+        )];
+        let expected_identity = mask_sequence().identity();
+        let acceptor = test_tls_acceptor();
+
+        let server_task = tokio::spawn(async move {
+            let (mut server_tcp, _) = listener.accept().await.expect("accept client");
+            let mut first_buf = [0_u8; 4096];
+            // Read before writing anything to verify the 76B prelude+nonce and
+            // encrypted ClientHello were coalesced into the client's initial write.
+            let first_read = server_tcp.read(&mut first_buf).await.expect("initial read");
+            let (prelude, nonce, initial_cipher) =
+                split_coalesced_prelude(&first_buf[..first_read]);
+            let (matched_keys, auth) =
+                verify_prelude(&server_keys, &prelude, &nonce).expect("valid coalesced prelude");
+            assert_eq!(auth.identity, expected_identity);
+            assert!(auth.counter >= 1);
+
+            let prefixed = PrefixedTcpStream {
+                prefix: initial_cipher.to_vec(),
+                offset: 0,
+                inner: server_tcp,
+            };
+            let masked_server = MaskedStream::new_server(prefixed, matched_keys, &nonce);
+            let mut tls_server = acceptor.accept(masked_server).await.expect("TLS accept");
+            assert_eq!(
+                tls_server.get_ref().1.alpn_protocol(),
+                Some(uk_proto::ALPN_PROTOCOL)
+            );
+            let mut server_exporter = [0_u8; 32];
+            tls_server
+                .get_ref()
+                .1
+                .export_keying_material(&mut server_exporter, uk_auth::EXPORTER_LABEL, None)
+                .expect("server exporter");
+
+            let mut ping = [0_u8; 4];
+            tls_server.read_exact(&mut ping).await.expect("read ping");
+            assert_eq!(&ping, b"ping");
+            tls_server.write_all(b"pong").await.expect("write pong");
+            tls_server.flush().await.expect("flush pong");
+            server_exporter
+        });
+
+        let connector = test_tls_connector(TEST_CERT_PEM);
+        let server_name = ServerName::try_from("localhost").expect("valid server name");
+        let (mut client_reader, mut client_writer, client_exporter, datagrams) = time::timeout(
+            Duration::from_secs(5),
+            establish_tls_carrier(&connector, server_name, &addr.to_string(), &config),
+        )
+        .await
+        .expect("client TLS connect within timeout")
+        .expect("masked TLS carrier should succeed");
+        assert!(datagrams.is_none());
+
+        client_writer.write_all(b"ping").await.expect("write ping");
+        client_writer.flush().await.expect("flush ping");
+        let mut pong = [0_u8; 4];
+        time::timeout(Duration::from_secs(5), client_reader.read_exact(&mut pong))
+            .await
+            .expect("read pong within timeout")
+            .expect("read pong");
+        assert_eq!(&pong, b"pong");
+
+        let server_exporter = time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server task within timeout")
+            .expect("server task join");
+        assert_eq!(client_exporter, server_exporter);
+    }
+
+    #[tokio::test]
+    async fn establish_masked_tls_carrier_rejects_untrusted_server_cert_as_tls_phase() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let config = masked_test_client_config(addr);
+        let server_keys = [MaskKeys::derive(
+            config.key_id.as_bytes(),
+            config.secret.as_bytes(),
+        )];
+        let acceptor = test_tls_acceptor();
+
+        let server_task = tokio::spawn(async move {
+            let (mut server_tcp, _) = listener.accept().await.expect("accept client");
+            let mut first_buf = [0_u8; 4096];
+            let first_read = server_tcp.read(&mut first_buf).await.expect("initial read");
+            let (prelude, nonce, initial_cipher) =
+                split_coalesced_prelude(&first_buf[..first_read]);
+            let (matched_keys, _) =
+                verify_prelude(&server_keys, &prelude, &nonce).expect("valid coalesced prelude");
+            let prefixed = PrefixedTcpStream {
+                prefix: initial_cipher.to_vec(),
+                offset: 0,
+                inner: server_tcp,
+            };
+            let masked_server = MaskedStream::new_server(prefixed, matched_keys, &nonce);
+            let _ = acceptor.accept(masked_server).await;
+        });
+
+        let untrusted_connector = test_tls_connector(OTHER_TEST_CERT_PEM);
+        let server_name = ServerName::try_from("localhost").expect("valid server name");
+        let err = time::timeout(
+            Duration::from_secs(5),
+            establish_tls_carrier(
+                &untrusted_connector,
+                server_name,
+                &addr.to_string(),
+                &config,
+            ),
+        )
+        .await
+        .expect("client TLS connect within timeout")
+        .err()
+        .expect("untrusted server cert must fail");
+        assert_eq!(endpoint_failure_phase(&err), EndpointFailurePhase::Tls);
+
+        time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server task within timeout")
+            .expect("server task join");
+    }
+
+    #[tokio::test]
+    async fn establish_masked_tls_carrier_maps_immediate_server_eof_to_tls_phase() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let config = masked_test_client_config(addr);
+        let server_keys = MaskKeys::derive(config.key_id.as_bytes(), config.secret.as_bytes());
+
+        let server_task = tokio::spawn(async move {
+            let (mut server_tcp, _) = listener.accept().await.expect("accept client");
+            let mut first_buf = [0_u8; 4096];
+            let first_read = server_tcp.read(&mut first_buf).await.expect("initial read");
+            let (prelude, nonce, _) = split_coalesced_prelude(&first_buf[..first_read]);
+            assert!(verify_prelude(&[server_keys], &prelude, &nonce).is_some());
+            drop(server_tcp);
+        });
+
+        let connector = test_tls_connector(TEST_CERT_PEM);
+        let server_name = ServerName::try_from("localhost").expect("valid server name");
+        let err = time::timeout(
+            Duration::from_secs(5),
+            establish_tls_carrier(&connector, server_name, &addr.to_string(), &config),
+        )
+        .await
+        .expect("client TLS connect within timeout")
+        .err()
+        .expect("immediate server EOF must fail");
+        assert_eq!(endpoint_failure_phase(&err), EndpointFailurePhase::Tls);
+
+        time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server task within timeout")
+            .expect("server task join");
     }
 }

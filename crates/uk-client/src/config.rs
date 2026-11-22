@@ -65,8 +65,7 @@ pub struct ClientConfig {
     pub max_carrier_sessions: Option<u64>,
     /// Optional relay chunk buffer size in bytes. Default: 16 KiB (16384).
     pub relay_buffer_size: Option<usize>,
-    /// Optional transport masking for TLS/TCP endpoints. Disabled by default;
-    /// the QUIC carrier is not masked yet.
+    /// Optional transport masking for TLS/TCP and QUIC endpoints. Disabled by default.
     pub masking: Option<ClientMaskingConfig>,
 }
 

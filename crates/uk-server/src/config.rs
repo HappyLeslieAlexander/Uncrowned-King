@@ -159,6 +159,7 @@ impl ServerConfig {
         reject_semaphore_permit_limit("max_sessions", self.max_sessions())?;
         reject_zero_limit("max_handshakes", self.max_handshakes())?;
         reject_semaphore_permit_limit("max_handshakes", self.max_handshakes())?;
+        self.validate_pre_auth_limits()?;
         reject_zero_limit("max_streams", self.max_streams())?;
         reject_large_limit("max_streams", self.max_streams(), MAX_NEGOTIATED_FLOWS)?;
         reject_large_limit("max_udp_flows", self.max_udp_flows(), self.max_streams())?;
@@ -227,6 +228,20 @@ impl ServerConfig {
         }
         self.validate_quic_window_limits()?;
         self.validate_auth_rate_limits()?;
+        Ok(())
+    }
+
+    fn validate_pre_auth_limits(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        reject_zero_limit("max_pre_auth_connections", self.max_pre_auth_connections())?;
+        reject_semaphore_permit_limit("max_pre_auth_connections", self.max_pre_auth_connections())?;
+        reject_usize_limit("max_pre_auth_connections", self.max_pre_auth_connections())?;
+        reject_zero_limit("max_pre_auth_per_source", self.max_pre_auth_per_source())?;
+        reject_large_limit(
+            "max_pre_auth_per_source",
+            self.max_pre_auth_per_source(),
+            self.max_pre_auth_connections(),
+        )?;
+        reject_usize_limit("max_pre_auth_per_source", self.max_pre_auth_per_source())?;
         Ok(())
     }
 
@@ -466,6 +481,26 @@ impl ServerConfig {
             .as_ref()
             .and_then(|limits| limits.max_handshakes)
             .unwrap_or_else(|| self.max_sessions())
+    }
+
+    /// Configured maximum concurrent unauthenticated connections across all sources.
+    pub fn max_pre_auth_connections(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.max_pre_auth_connections)
+            .unwrap_or(crate::admission::DEFAULT_MAX_PRE_AUTH_CONNECTIONS)
+    }
+
+    /// Configured maximum concurrent unauthenticated connections per source
+    /// (IPv4 address or IPv6 `/64` prefix).
+    pub fn max_pre_auth_per_source(&self) -> u64 {
+        self.limits
+            .as_ref()
+            .and_then(|limits| limits.max_pre_auth_per_source)
+            .unwrap_or_else(|| {
+                crate::admission::DEFAULT_MAX_PRE_AUTH_PER_SOURCE
+                    .min(self.max_pre_auth_connections())
+            })
     }
 
     /// Configured maximum concurrent TCP streams per authenticated session.
@@ -776,7 +811,9 @@ pub struct MaskingConfig {
     /// designated credential's keys.
     pub quic: Option<bool>,
     /// The `key_id` whose keys mask the QUIC endpoint. Required when
-    /// `quic = true`; clients must use the same credential.
+    /// `quic = true`; clients must use the same credential. Pinned at startup:
+    /// rotating this designated credential's secret requires a restart
+    /// (`SIGHUP` credential reloads rotate TCP mask keys for new connections only).
     pub quic_key_id: Option<String>,
 }
 
@@ -793,6 +830,10 @@ pub struct LimitConfig {
     pub max_sessions: Option<u64>,
     /// Maximum concurrent unauthenticated TLS/auth handshakes.
     pub max_handshakes: Option<u64>,
+    /// Maximum concurrent unauthenticated connections across all sources before handshake admission. Default: 256.
+    pub max_pre_auth_connections: Option<u64>,
+    /// Maximum concurrent unauthenticated connections per source (IPv4 address or IPv6 /64 prefix). Default: 32 (clamped to max_pre_auth_connections).
+    pub max_pre_auth_per_source: Option<u64>,
     /// Maximum concurrent TCP streams per authenticated session.
     pub max_streams: Option<u64>,
     /// Maximum concurrent UDP flows per authenticated session. Zero disables UDP relay.
@@ -2916,5 +2957,118 @@ policy_group = "bad\ngroup"
             config.credentials(),
             Err(AuthError::InvalidCredentialPolicyGroup)
         );
+    }
+
+    #[test]
+    fn defaults_max_pre_auth_limits() {
+        let config = minimal_config();
+        assert_eq!(config.max_pre_auth_connections(), 256);
+        assert_eq!(config.max_pre_auth_per_source(), 32);
+        assert!(config.validate_limits().is_ok());
+    }
+
+    #[test]
+    fn clamps_default_max_pre_auth_per_source_to_max_pre_auth_connections() {
+        let mut config = minimal_config();
+        config.limits = Some(LimitConfig {
+            max_pre_auth_connections: Some(8),
+            ..LimitConfig::default()
+        });
+        assert_eq!(config.max_pre_auth_connections(), 8);
+        assert_eq!(config.max_pre_auth_per_source(), 8);
+        assert!(config.validate_limits().is_ok());
+    }
+
+    #[test]
+    fn parses_max_pre_auth_limits() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+listen = "127.0.0.1:0"
+cert_path = "cert.pem"
+key_path = "key.pem"
+credentials = []
+
+[limits]
+max_pre_auth_connections = 128
+max_pre_auth_per_source = 16
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.max_pre_auth_connections(), 128);
+        assert_eq!(config.max_pre_auth_per_source(), 16);
+        assert!(config.validate_limits().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_max_pre_auth_limits() {
+        let mut zero_global = minimal_config();
+        zero_global.limits = Some(LimitConfig {
+            max_pre_auth_connections: Some(0),
+            ..LimitConfig::default()
+        });
+        assert!(zero_global.validate_limits().is_err());
+
+        let mut zero_source = minimal_config();
+        zero_source.limits = Some(LimitConfig {
+            max_pre_auth_per_source: Some(0),
+            ..LimitConfig::default()
+        });
+        assert!(zero_source.validate_limits().is_err());
+
+        let mut source_exceeds_global = minimal_config();
+        source_exceeds_global.limits = Some(LimitConfig {
+            max_pre_auth_connections: Some(16),
+            max_pre_auth_per_source: Some(17),
+            ..LimitConfig::default()
+        });
+        assert!(source_exceeds_global.validate_limits().is_err());
+
+        let mut exceeds_permits = minimal_config();
+        exceeds_permits.limits = Some(LimitConfig {
+            max_pre_auth_connections: Some((Semaphore::MAX_PERMITS as u64) + 1),
+            ..LimitConfig::default()
+        });
+        assert!(exceeds_permits.validate_limits().is_err());
+
+        let mut equal_source_and_global = minimal_config();
+        equal_source_and_global.limits = Some(LimitConfig {
+            max_pre_auth_connections: Some(16),
+            max_pre_auth_per_source: Some(16),
+            ..LimitConfig::default()
+        });
+        assert!(equal_source_and_global.validate_limits().is_ok());
+    }
+
+    #[test]
+    fn parses_example_server_config_has_masking_disabled() {
+        let config: ServerConfig =
+            toml::from_str(include_str!("../../../examples/server.toml")).unwrap();
+        assert!(config.masking.is_some());
+        assert!(!config.masking_enabled());
+        assert!(!config.masking_quic_enabled());
+    }
+
+    #[test]
+    fn accepts_zero_handshake_timeout_with_masking_enabled() {
+        let mut config = minimal_config();
+        config.credentials.push(CredentialConfig {
+            key_id: "client".to_owned(),
+            secret: "0123456789abcdef0123456789abcdef".to_owned(),
+            status: Some("active".to_owned()),
+            not_before: None,
+            not_after: None,
+            policy_group: None,
+        });
+        config.masking = Some(MaskingConfig {
+            enabled: Some(true),
+            replay_identities: None,
+            quic: None,
+            quic_key_id: None,
+        });
+        config.limits = Some(LimitConfig {
+            handshake_timeout_seconds: Some(0),
+            ..LimitConfig::default()
+        });
+        assert!(config.validate_limits().is_ok());
     }
 }

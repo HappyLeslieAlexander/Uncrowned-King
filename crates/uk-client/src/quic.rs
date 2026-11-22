@@ -385,6 +385,18 @@ async fn resolve(endpoint: &str) -> Result<Vec<SocketAddr>, QuicError> {
     Ok(addrs)
 }
 
+/// Builds the Quinn endpoint configuration for the client, reducing
+/// `max_udp_payload_size` by [`uk_mask::udp::UDP_SEGMENT_OVERHEAD`] when
+/// transport masking is enabled.
+fn client_endpoint_config(mask_enabled: bool) -> Result<quinn::EndpointConfig, QuicError> {
+    if mask_enabled {
+        uk_mask::udp::masked_endpoint_config()
+            .map_err(|err| format!("failed to build masked QUIC endpoint config: {err}").into())
+    } else {
+        Ok(quinn::EndpointConfig::default())
+    }
+}
+
 /// Binds the client's QUIC endpoint, optionally wrapping the socket in the
 /// transport masking layer under the credential's keys.
 fn client_endpoint(
@@ -394,6 +406,7 @@ fn client_endpoint(
     let Some(keys) = mask_keys else {
         return Endpoint::client(addr).map_err(QuicError::from);
     };
+    let endpoint_config = client_endpoint_config(true)?;
     let socket = std::net::UdpSocket::bind(addr)
         .map_err(|err| format!("failed to bind local QUIC socket for {addr}: {err}"))?;
     let runtime =
@@ -402,7 +415,7 @@ fn client_endpoint(
         .wrap_udp_socket(socket)
         .map_err(|err| format!("failed to wrap QUIC socket: {err}"))?;
     let masked = uk_mask::udp::MaskedUdpSocket::new_client(wrapped, keys, &mut rand::rngs::OsRng);
-    Endpoint::new_with_abstract_socket(quinn::EndpointConfig::default(), None, masked, runtime)
+    Endpoint::new_with_abstract_socket(endpoint_config, None, masked, runtime)
         .map_err(|err| format!("failed to create QUIC endpoint: {err}").into())
 }
 
@@ -528,5 +541,47 @@ mod tests {
         assert!(debug.contains(&format!(
             "receive_window: {CLIENT_QUIC_CONNECTION_RECEIVE_WINDOW}"
         )));
+    }
+
+    #[test]
+    fn endpoint_config_reduces_max_udp_payload_size_when_masked() {
+        let unmasked = client_endpoint_config(false).expect("unmasked endpoint config");
+        let masked = client_endpoint_config(true).expect("masked endpoint config");
+        let overhead = u64::try_from(uk_mask::udp::UDP_SEGMENT_OVERHEAD)
+            .expect("UDP masking overhead fits in u64");
+
+        assert_eq!(unmasked.get_max_udp_payload_size(), 1472);
+        assert_eq!(masked.get_max_udp_payload_size(), 1460);
+        assert_eq!(
+            masked.get_max_udp_payload_size() + overhead,
+            unmasked.get_max_udp_payload_size()
+        );
+    }
+
+    #[tokio::test]
+    async fn client_endpoint_configures_max_udp_payload_size_for_unmasked_and_masked() {
+        let loopback: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
+
+        let unmasked = client_endpoint(loopback, None).expect("unmasked endpoint should bind");
+        assert!(unmasked.local_addr().is_ok());
+        assert!(
+            format!("{unmasked:?}").contains("max_udp_payload_size: 1472"),
+            "unmasked endpoint must keep default 1472 max_udp_payload_size"
+        );
+        unmasked.close(0u32.into(), b"");
+        unmasked.wait_idle().await;
+
+        let keys = Arc::new(uk_mask::MaskKeys::derive(
+            b"quic-client-test",
+            b"0123456789abcdef0123456789abcdef",
+        ));
+        let masked = client_endpoint(loopback, Some(&keys)).expect("masked endpoint should bind");
+        assert!(masked.local_addr().is_ok());
+        assert!(
+            format!("{masked:?}").contains("max_udp_payload_size: 1460"),
+            "masked endpoint must reduce max_udp_payload_size by 12 to 1460"
+        );
+        masked.close(0u32.into(), b"");
+        masked.wait_idle().await;
     }
 }

@@ -186,6 +186,7 @@ pub(super) struct ServerMetrics {
     config_reload_failures_total: AtomicU64,
     accepted_connections_total: AtomicU64,
     rate_limited_connections_total: AtomicU64,
+    rejected_pre_auth_connections_total: AtomicU64,
     quic_retries_total: AtomicU64,
     mask_prelude_rejects_total: AtomicU64,
     mask_replay_rejects_total: AtomicU64,
@@ -265,6 +266,11 @@ impl ServerMetrics {
 
     pub(super) fn record_rate_limited_connection(&self) {
         self.rate_limited_connections_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_rejected_pre_auth_connection(&self) {
+        self.rejected_pre_auth_connections_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -366,6 +372,9 @@ impl ServerMetrics {
                 "# HELP uncrowned_king_server_rate_limited_connections_total Carrier connections rejected by authentication rate limiting.\n",
                 "# TYPE uncrowned_king_server_rate_limited_connections_total counter\n",
                 "uncrowned_king_server_rate_limited_connections_total {rate_limited_connections_total}\n",
+                "# HELP uncrowned_king_server_rejected_pre_auth_connections_total Incoming connections rejected by pre-authentication concurrency limits.\n",
+                "# TYPE uncrowned_king_server_rejected_pre_auth_connections_total counter\n",
+                "uncrowned_king_server_rejected_pre_auth_connections_total {rejected_pre_auth_connections_total}\n",
                 "# HELP uncrowned_king_server_quic_retries_total Stateless QUIC Retry tokens issued for source address validation.\n",
                 "# TYPE uncrowned_king_server_quic_retries_total counter\n",
                 "uncrowned_king_server_quic_retries_total {quic_retries_total}\n",
@@ -417,6 +426,9 @@ impl ServerMetrics {
             accepted_connections_total = self.accepted_connections_total.load(Ordering::Relaxed),
             rate_limited_connections_total =
                 self.rate_limited_connections_total.load(Ordering::Relaxed),
+            rejected_pre_auth_connections_total = self
+                .rejected_pre_auth_connections_total
+                .load(Ordering::Relaxed),
             quic_retries_total = self.quic_retries_total.load(Ordering::Relaxed),
             mask_prelude_rejects_total = self.mask_prelude_rejects_total.load(Ordering::Relaxed),
             mask_replay_rejects_total = self.mask_replay_rejects_total.load(Ordering::Relaxed),
@@ -690,6 +702,7 @@ mod tests {
         metrics.record_config_reload_success(2);
         metrics.record_config_reload_failure();
         metrics.record_accepted_connection();
+        metrics.record_rejected_pre_auth_connection();
         metrics.record_quic_retry();
         metrics.record_rejected_handshake();
         metrics.record_failed_handshake(HandshakeFailureReason::Auth);
@@ -719,6 +732,7 @@ mod tests {
         assert!(response.contains("uncrowned_king_server_config_reload_successes_total 1\n"));
         assert!(response.contains("uncrowned_king_server_config_reload_failures_total 1\n"));
         assert!(response.contains("uncrowned_king_server_accepted_connections_total 1\n"));
+        assert!(response.contains("uncrowned_king_server_rejected_pre_auth_connections_total 1\n"));
         assert!(response.contains("uncrowned_king_server_quic_retries_total 1\n"));
         assert!(response.contains("uncrowned_king_server_active_handshakes 1\n"));
         assert!(
@@ -828,9 +842,11 @@ mod tests {
         metrics.record_relay_bytes(RelayProtocol::Tcp, RelayDirection::ClientToTarget, 100);
         metrics.record_failed_handshake(HandshakeFailureReason::Auth);
         metrics.record_rate_limited_connection();
+        metrics.record_rejected_pre_auth_connection();
 
         let rendered = metrics.render();
         assert_prometheus_spec_conformance(&rendered);
         assert!(rendered.contains("uncrowned_king_server_rate_limited_connections_total 1\n"));
+        assert!(rendered.contains("uncrowned_king_server_rejected_pre_auth_connections_total 1\n"));
     }
 }

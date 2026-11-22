@@ -214,17 +214,14 @@ pub fn bind_endpoint_masked(
             runtime,
         ),
         Some(keys) => {
+            let endpoint_config = uk_mask::udp::masked_endpoint_config()
+                .map_err(|err| format!("failed to build masked QUIC endpoint config: {err}"))?;
             let wrapped = runtime
                 .wrap_udp_socket(socket)
                 .map_err(|err| format!("failed to wrap QUIC socket: {err}"))?;
             let masked =
                 uk_mask::udp::MaskedUdpSocket::new_server(wrapped, &keys, &mut rand::rngs::OsRng);
-            Endpoint::new_with_abstract_socket(
-                quinn::EndpointConfig::default(),
-                Some(config),
-                masked,
-                runtime,
-            )
+            Endpoint::new_with_abstract_socket(endpoint_config, Some(config), masked, runtime)
         }
     }
     .map_err(|err| format!("failed to create QUIC endpoint: {err}"))?;
@@ -395,5 +392,52 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap().to_string();
         assert!(err.contains("quic_connection_receive_window must be greater than or equal to quic_stream_receive_window"));
+    }
+
+    #[tokio::test]
+    async fn bind_endpoint_masked_sets_reduced_max_udp_payload_size_when_masked() {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let tls_config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let unmasked_config = server_config_with_transport_params_masked(
+            tls_config.clone(),
+            None,
+            DEFAULT_QUIC_STREAM_RECEIVE_WINDOW,
+            DEFAULT_QUIC_CONNECTION_RECEIVE_WINDOW,
+            false,
+        )
+        .unwrap();
+        let unmasked_endpoint = bind_endpoint_masked(unmasked_config, addr, None).unwrap();
+        assert!(
+            format!("{unmasked_endpoint:?}").contains("max_udp_payload_size: 1472"),
+            "unmasked endpoint must keep default 1472 payload size"
+        );
+        unmasked_endpoint.close(0_u32.into(), b"done");
+        unmasked_endpoint.wait_idle().await;
+
+        let masked_config = server_config_with_transport_params_masked(
+            tls_config,
+            None,
+            DEFAULT_QUIC_STREAM_RECEIVE_WINDOW,
+            DEFAULT_QUIC_CONNECTION_RECEIVE_WINDOW,
+            true,
+        )
+        .unwrap();
+        let keys = Arc::new(uk_mask::MaskKeys::derive(
+            b"quic-key",
+            b"0123456789abcdef0123456789abcdef",
+        ));
+        let masked_endpoint = bind_endpoint_masked(masked_config, addr, Some(keys)).unwrap();
+        assert!(
+            format!("{masked_endpoint:?}").contains("max_udp_payload_size: 1460"),
+            "masked endpoint must subtract 12-byte nonce overhead (1472 -> 1460)"
+        );
+        masked_endpoint.close(0_u32.into(), b"done");
+        masked_endpoint.wait_idle().await;
     }
 }

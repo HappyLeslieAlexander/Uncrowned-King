@@ -102,13 +102,13 @@ impl NonceGenerator {
     }
 }
 
-struct UdpIo {
+struct UdpSendState {
     send_scratch: Vec<u8>,
-    /// One scratch buffer per caller receive slot, sized for the caller's
-    /// buffer plus per-segment masking overhead.
-    recv_slots: Vec<Vec<u8>>,
-    recv_metas: Vec<RecvMeta>,
-    decoded: Vec<u8>,
+    nonces: NonceGenerator,
+}
+
+struct UdpReceiveState {
+    recv_slots: [Vec<u8>; quinn::udp::BATCH_SIZE],
 }
 
 /// A masking wrapper around quinn's UDP socket abstraction.
@@ -117,8 +117,8 @@ pub struct MaskedUdpSocket {
     send_key: Zeroizing<[u8; 32]>,
     recv_key: Zeroizing<[u8; 32]>,
     server_filter: bool,
-    nonces: Mutex<NonceGenerator>,
-    io: Mutex<UdpIo>,
+    send: Mutex<UdpSendState>,
+    receive: Mutex<UdpReceiveState>,
 }
 
 impl std::fmt::Debug for MaskedUdpSocket {
@@ -160,12 +160,12 @@ impl MaskedUdpSocket {
             send_key: Zeroizing::new(send_key),
             recv_key: Zeroizing::new(recv_key),
             server_filter: role == UdpRole::Server,
-            nonces: Mutex::new(NonceGenerator::new(rng)),
-            io: Mutex::new(UdpIo {
+            send: Mutex::new(UdpSendState {
                 send_scratch: Vec::new(),
-                recv_slots: Vec::new(),
-                recv_metas: Vec::new(),
-                decoded: Vec::new(),
+                nonces: NonceGenerator::new(rng),
+            }),
+            receive: Mutex::new(UdpReceiveState {
+                recv_slots: std::array::from_fn(|_| Vec::new()),
             }),
         })
     }
@@ -176,37 +176,81 @@ impl MaskedUdpSocket {
         UDP_SEGMENT_OVERHEAD
     }
 
-    fn mask_segment(&self, scratch: &mut Vec<u8>, plaintext: &[u8], nonce: [u8; NONCE_LEN]) {
-        let mut cipher = ChaCha20::new(&Key::from(*self.send_key), &Nonce::from(nonce));
-        scratch.extend_from_slice(&nonce);
-        let payload_start = scratch.len();
-        scratch.extend_from_slice(plaintext);
-        cipher
-            .try_apply_keystream(&mut scratch[payload_start..])
-            .expect("segment size is bounded by the UDP payload limit");
-    }
-
-    /// Unmasks one wire segment into `out`. Returns `None` when the segment
-    /// is too short to carry a nonce.
-    fn unmask_segment<'out>(
+    fn decode_datagram(
         &self,
-        segment: &[u8],
-        out: &'out mut Vec<u8>,
-    ) -> Option<&'out mut [u8]> {
-        if segment.len() <= NONCE_LEN {
-            return None;
+        storage: &[u8],
+        wire_meta: RecvMeta,
+        max_wire_len: usize,
+        out: &mut [u8],
+    ) -> io::Result<Option<RecvMeta>> {
+        let wire_stride = wire_meta.stride;
+        if wire_meta.len == 0
+            || wire_meta.len > max_wire_len
+            || wire_stride <= UDP_SEGMENT_OVERHEAD
+            || wire_stride > wire_meta.len
+        {
+            return Ok(None);
         }
-        let (nonce, payload) = segment.split_at(NONCE_LEN);
-        let nonce: [u8; NONCE_LEN] = nonce.try_into().expect("split at NONCE_LEN");
-        let start = out.len();
-        out.extend_from_slice(payload);
-        let mut cipher = ChaCha20::new(&Key::from(*self.recv_key), &Nonce::from(nonce));
-        cipher
-            .try_apply_keystream(&mut out[start..])
-            .expect("segment size is bounded by the UDP payload limit");
-        let end = out.len();
-        Some(&mut out[start..end])
+        let final_wire_len = wire_meta.len % wire_stride;
+        // A trailing segment shorter than or equal to the nonce overhead is
+        // garbage padding: trim it instead of discarding valid preceding segments.
+        let wire_len = if final_wire_len != 0 && final_wire_len <= UDP_SEGMENT_OVERHEAD {
+            wire_meta.len - final_wire_len
+        } else {
+            wire_meta.len
+        };
+        let segment_count = wire_len.div_ceil(wire_stride);
+        let Some(nonce_bytes) = segment_count.checked_mul(UDP_SEGMENT_OVERHEAD) else {
+            return Ok(None);
+        };
+        let Some(expected_len) = wire_len.checked_sub(nonce_bytes) else {
+            return Ok(None);
+        };
+        if expected_len == 0 || expected_len > out.len() {
+            return Ok(None);
+        }
+        let decoded_stride = wire_stride - UDP_SEGMENT_OVERHEAD;
+        let mut decoded_len = 0_usize;
+        for wire in storage[..wire_len].chunks(wire_stride) {
+            let (nonce, encrypted) = wire.split_at(NONCE_LEN);
+            let nonce: &[u8; NONCE_LEN] = nonce.try_into().expect("fixed nonce prefix");
+            let mut cipher = ChaCha20::new(&Key::from(*self.recv_key), &Nonce::from(*nonce));
+            let end = decoded_len + encrypted.len();
+            cipher
+                .try_apply_keystream_b2b(encrypted, &mut out[decoded_len..end])
+                .map_err(|_| io::Error::other("UDP segment exceeds ChaCha20 keystream limit"))?;
+            if self.server_filter && !supported_quic_packet(&out[decoded_len..end]) {
+                continue;
+            }
+            decoded_len = end;
+        }
+        if decoded_len == 0 {
+            return Ok(None);
+        }
+        Ok(Some(RecvMeta {
+            addr: wire_meta.addr,
+            len: decoded_len,
+            stride: decoded_stride.min(decoded_len),
+            ecn: wire_meta.ecn,
+            dst_ip: wire_meta.dst_ip,
+        }))
     }
+}
+
+/// Builds a [`quinn::EndpointConfig`] whose maximum accepted UDP payload size
+/// is reduced by [`UDP_SEGMENT_OVERHEAD`] so masked datagrams stay within the
+/// default endpoint MTU budget.
+pub fn masked_endpoint_config() -> Result<quinn::EndpointConfig, quinn::ConfigError> {
+    let mut config = quinn::EndpointConfig::default();
+    let overhead =
+        u64::try_from(UDP_SEGMENT_OVERHEAD).map_err(|_| quinn::ConfigError::OutOfBounds)?;
+    let maximum = config
+        .get_max_udp_payload_size()
+        .checked_sub(overhead)
+        .ok_or(quinn::ConfigError::OutOfBounds)?;
+    let maximum = u16::try_from(maximum)?;
+    config.max_udp_payload_size(maximum)?;
+    Ok(config)
 }
 
 /// Caps MTU discovery below the unmasked carrier's budget by the per-segment
@@ -243,40 +287,60 @@ impl AsyncUdpSocket for MaskedUdpSocket {
     }
 
     fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
-        let mut nonces = self
-            .nonces
+        let plain_stride = transmit.segment_size.unwrap_or(transmit.contents.len());
+        if plain_stride == 0 || transmit.contents.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty UDP datagram or zero-length GSO segment size",
+            ));
+        }
+        let segments = transmit.contents.len().div_ceil(plain_stride);
+        let overhead = segments
+            .checked_mul(UDP_SEGMENT_OVERHEAD)
+            .ok_or_else(|| io::Error::other("UDP datagram length overflow"))?;
+        let wire_len = transmit
+            .contents
+            .len()
+            .checked_add(overhead)
+            .ok_or_else(|| io::Error::other("UDP datagram length overflow"))?;
+        let wire_stride = transmit
+            .segment_size
+            .map(|size| {
+                size.checked_add(UDP_SEGMENT_OVERHEAD)
+                    .ok_or_else(|| io::Error::other("UDP segment length overflow"))
+            })
+            .transpose()?;
+
+        let mut send_state = self
+            .send
             .lock()
-            .map_err(|_| io::Error::other("nonce generator poisoned"))?;
-        let mut io_state = self
-            .io
-            .lock()
-            .map_err(|_| io::Error::other("udp io state poisoned"))?;
-        io_state.send_scratch.clear();
-        let wire_segment_size = match transmit.segment_size {
-            None => {
-                let nonce = nonces.next();
-                self.mask_segment(&mut io_state.send_scratch, transmit.contents, nonce);
-                None
-            }
-            Some(segment_size) => {
-                if segment_size == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "zero-length GSO segment size",
-                    ));
-                }
-                for segment in transmit.contents.chunks(segment_size) {
-                    let nonce = nonces.next();
-                    self.mask_segment(&mut io_state.send_scratch, segment, nonce);
-                }
-                Some(segment_size + UDP_SEGMENT_OVERHEAD)
-            }
-        };
+            .map_err(|_| io::Error::other("udp send state poisoned"))?;
+        let UdpSendState {
+            send_scratch,
+            nonces,
+        } = &mut *send_state;
+        if send_scratch.len() < wire_len {
+            send_scratch.resize(wire_len, 0);
+        }
+        let mut wire_offset = 0_usize;
+        for plain in transmit.contents.chunks(plain_stride) {
+            let wire_end = wire_offset + NONCE_LEN + plain.len();
+            let (nonce_slot, payload_slot) =
+                send_scratch[wire_offset..wire_end].split_at_mut(NONCE_LEN);
+            let nonce = nonces.next();
+            nonce_slot.copy_from_slice(&nonce);
+            let mut cipher = ChaCha20::new(&Key::from(*self.send_key), &Nonce::from(nonce));
+            cipher
+                .try_apply_keystream_b2b(plain, payload_slot)
+                .map_err(|_| io::Error::other("UDP segment exceeds ChaCha20 keystream limit"))?;
+            wire_offset = wire_end;
+        }
+        debug_assert_eq!(wire_offset, wire_len);
         let masked = Transmit {
             destination: transmit.destination,
             ecn: transmit.ecn,
-            contents: &io_state.send_scratch,
-            segment_size: wire_segment_size,
+            contents: &send_scratch[..wire_len],
+            segment_size: wire_stride,
             src_ip: transmit.src_ip,
         };
         self.inner.try_send(&masked)
@@ -294,89 +358,59 @@ impl AsyncUdpSocket for MaskedUdpSocket {
                 "empty receive buffers",
             )));
         }
+        let receive_count = bufs.len().min(meta.len()).min(quinn::udp::BATCH_SIZE);
         let max_segments = self.inner.max_receive_segments().max(1);
-        let Ok(mut io_state) = self.io.lock() else {
-            return Poll::Ready(Err(io::Error::other("udp io state poisoned")));
+        let Some(nonce_overhead) = UDP_SEGMENT_OVERHEAD.checked_mul(max_segments) else {
+            return Poll::Ready(Err(io::Error::other("UDP receive buffer length overflow")));
         };
-        // Split the guard's fields up front so the scratch slices, the
-        // metadata vector, and the decoded staging buffer can be borrowed
-        // independently below.
-        let UdpIo {
-            recv_slots,
-            recv_metas,
-            decoded,
-            ..
-        } = &mut *io_state;
-        loop {
-            if recv_slots.len() < bufs.len() {
-                recv_slots.resize_with(bufs.len(), Vec::new);
-            }
-            if recv_metas.len() < bufs.len() {
-                recv_metas.resize_with(bufs.len(), RecvMeta::default);
-            }
-            for (slot, buf) in recv_slots.iter_mut().zip(bufs.iter()) {
-                let needed = buf.len() + UDP_SEGMENT_OVERHEAD * max_segments;
-                if slot.len() < needed {
-                    slot.resize(needed, 0);
-                }
-            }
-            let received = {
-                let mut slices: Vec<std::io::IoSliceMut<'_>> = recv_slots
-                    .iter_mut()
-                    .map(|slot| std::io::IoSliceMut::new(slot.as_mut_slice()))
-                    .collect();
-                let mut metas = std::mem::take(recv_metas);
-                let result = self.inner.poll_recv(cx, &mut slices, &mut metas);
-                *recv_metas = metas;
-                match result {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                    Poll::Ready(Ok(received)) => received,
-                }
+        let Ok(mut receive_state) = self.receive.lock() else {
+            return Poll::Ready(Err(io::Error::other("udp receive state poisoned")));
+        };
+        let mut wire_lengths = [0_usize; quinn::udp::BATCH_SIZE];
+        for index in 0..receive_count {
+            let Some(wire_len) = bufs[index].len().checked_add(nonce_overhead) else {
+                return Poll::Ready(Err(io::Error::other("UDP receive buffer length overflow")));
             };
-            let mut produced = 0_usize;
-            for slot_index in 0..received {
-                let wire_meta = recv_metas[slot_index];
-                let wire_len = wire_meta.len.min(recv_slots[slot_index].len());
-                let wire = &recv_slots[slot_index][..wire_len];
-                if wire.is_empty() || wire_meta.stride <= UDP_SEGMENT_OVERHEAD {
-                    continue;
-                }
-                decoded.clear();
-                for segment in wire.chunks(wire_meta.stride) {
-                    let segment_start = decoded.len();
-                    if self.unmask_segment(segment, decoded).is_none() {
-                        continue;
-                    }
-                    if self.server_filter && !supported_quic_packet(&decoded[segment_start..]) {
-                        decoded.truncate(segment_start);
-                    }
-                }
-                if decoded.is_empty() {
-                    continue;
-                }
-                let decoded_len = decoded.len();
-                if decoded_len > bufs[produced].len() {
-                    // Defensive: never overflow the caller's buffer.
-                    continue;
-                }
-                bufs[produced][..decoded_len].copy_from_slice(decoded);
-                meta[produced] = RecvMeta {
-                    addr: wire_meta.addr,
-                    len: decoded_len,
-                    stride: (wire_meta.stride - UDP_SEGMENT_OVERHEAD).min(decoded_len),
-                    ecn: wire_meta.ecn,
-                    dst_ip: wire_meta.dst_ip,
-                };
-                produced += 1;
+            wire_lengths[index] = wire_len;
+            if receive_state.recv_slots[index].len() < wire_len {
+                receive_state.recv_slots[index].resize(wire_len, 0);
             }
-            if produced > 0 {
-                return Poll::Ready(Ok(produced));
-            }
-            // Every datagram in this batch was dropped (bad mask or, on the
-            // server, an unsupported version). Poll again; once the inner
-            // socket drains, its Pending re-arms the waker.
         }
+        let mut slot_index = 0_usize;
+        let mut wire_bufs = receive_state.recv_slots.each_mut().map(|slot| {
+            let wire_len = wire_lengths[slot_index];
+            slot_index += 1;
+            std::io::IoSliceMut::new(&mut slot[..wire_len])
+        });
+        let received = match self.inner.poll_recv(
+            cx,
+            &mut wire_bufs[..receive_count],
+            &mut meta[..receive_count],
+        ) {
+            Poll::Ready(Ok(received)) => received.min(receive_count),
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => return Poll::Pending,
+        };
+        let mut output = 0_usize;
+        for index in 0..received {
+            if let Some(decoded_meta) = self.decode_datagram(
+                &receive_state.recv_slots[index],
+                meta[index],
+                wire_lengths[index],
+                &mut bufs[output],
+            )? {
+                meta[output] = decoded_meta;
+                output += 1;
+            }
+        }
+        if output > 0 {
+            return Poll::Ready(Ok(output));
+        }
+        // Every datagram in this batch was dropped (bad mask or, on the
+        // server, an unsupported version). Yield to avoid starving co-scheduled
+        // tasks if the inner socket stays readable.
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -398,8 +432,9 @@ impl AsyncUdpSocket for MaskedUdpSocket {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::IoSliceMut, net::SocketAddr, sync::Arc, task::Poll, time::Duration};
+    use std::{io::IoSliceMut, net::SocketAddr, pin::Pin, sync::Arc, task::Poll, time::Duration};
 
+    use chacha20::{ChaCha20, Key, KeyIvInit, Nonce, cipher::StreamCipher};
     use quinn::{
         AsyncUdpSocket, UdpPoller,
         udp::{RecvMeta, Transmit},
@@ -408,7 +443,7 @@ mod tests {
     use rand::rngs::StdRng;
 
     use super::{MaskedUdpSocket, UDP_SEGMENT_OVERHEAD};
-    use crate::MaskKeys;
+    use crate::{MaskKeys, NONCE_LEN};
 
     fn keys() -> MaskKeys {
         MaskKeys::derive(b"udp-test", b"0123456789abcdef0123456789abcdef")
@@ -602,5 +637,591 @@ mod tests {
             let nonce = generator.next();
             assert!(seen.insert(nonce), "nonces must never repeat");
         }
+    }
+
+    use std::collections::VecDeque;
+    use std::future::poll_fn;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Waker};
+
+    use super::{UdpRole, masked_endpoint_config};
+
+    #[derive(Debug, Default)]
+    struct FakeUdpSocket {
+        sent: StdMutex<Vec<(Vec<u8>, Option<usize>)>>,
+        receive: StdMutex<VecDeque<(Vec<u8>, RecvMeta)>>,
+        receive_lengths: StdMutex<Vec<usize>>,
+        flood_until_stopped: Option<Arc<AtomicBool>>,
+    }
+
+    #[derive(Debug)]
+    struct ReadyPoller;
+
+    impl std::future::Future for ReadyPoller {
+        type Output = std::io::Result<()>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl UdpPoller for ReadyPoller {
+        fn poll_writable(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncUdpSocket for FakeUdpSocket {
+        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+            Box::pin(ReadyPoller)
+        }
+
+        fn try_send(&self, transmit: &Transmit<'_>) -> std::io::Result<()> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((transmit.contents.to_vec(), transmit.segment_size));
+            Ok(())
+        }
+
+        fn poll_recv(
+            &self,
+            _cx: &mut Context<'_>,
+            bufs: &mut [IoSliceMut<'_>],
+            meta: &mut [RecvMeta],
+        ) -> Poll<std::io::Result<usize>> {
+            if let Some(stop_flood) = &self.flood_until_stopped {
+                if !stop_flood.load(Ordering::Acquire) {
+                    // Emit a valid-length wire frame whose decrypted payload has an
+                    // unsupported QUIC version (version 0), simulating an attack flood.
+                    let key = keys().udp_c2s();
+                    let nonce = [0x42_u8; NONCE_LEN];
+                    let mut wire = Vec::with_capacity(NONCE_LEN + 8);
+                    wire.extend_from_slice(&nonce);
+                    let mut plain = [0xc0_u8, 0, 0, 0, 0, 1, 2, 3];
+                    ChaCha20::new(&Key::from(key), &Nonce::from(nonce)).apply_keystream(&mut plain);
+                    wire.extend_from_slice(&plain);
+                    bufs[0][..wire.len()].copy_from_slice(&wire);
+                    meta[0] = RecvMeta {
+                        addr: "127.0.0.1:9999".parse().unwrap(),
+                        len: wire.len(),
+                        stride: wire.len(),
+                        ecn: None,
+                        dst_ip: None,
+                    };
+                    return Poll::Ready(Ok(1));
+                }
+            }
+            let mut receive = self.receive.lock().unwrap();
+            let mut count = 0_usize;
+            for (buf, output_meta) in bufs.iter_mut().zip(meta.iter_mut()) {
+                let Some((packet, packet_meta)) = receive.pop_front() else {
+                    break;
+                };
+                self.receive_lengths.lock().unwrap().push(buf.len());
+                let copy_len = packet.len().min(buf.len());
+                buf[..copy_len].copy_from_slice(&packet[..copy_len]);
+                *output_meta = packet_meta;
+                count += 1;
+            }
+            if count == 0 {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(count))
+            }
+        }
+
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok("127.0.0.1:1".parse().unwrap())
+        }
+
+        fn max_transmit_segments(&self) -> usize {
+            2
+        }
+
+        fn max_receive_segments(&self) -> usize {
+            2
+        }
+    }
+
+    fn queue_masked_segments(
+        raw: &FakeUdpSocket,
+        key: [u8; 32],
+        plain: &[u8],
+        stride: usize,
+        addr: &str,
+    ) {
+        let mut wire = Vec::new();
+        for (index, segment) in plain.chunks(stride).enumerate() {
+            let nonce = [index as u8; NONCE_LEN];
+            wire.extend_from_slice(&nonce);
+            let start = wire.len();
+            wire.extend_from_slice(segment);
+            ChaCha20::new(&Key::from(key), &Nonce::from(nonce)).apply_keystream(&mut wire[start..]);
+        }
+        let len = wire.len();
+        raw.receive.lock().unwrap().push_back((
+            wire,
+            RecvMeta {
+                addr: addr.parse().unwrap(),
+                len,
+                stride: (stride + UDP_SEGMENT_OVERHEAD).min(len),
+                ecn: Some(quinn::udp::EcnCodepoint::Ect0),
+                dst_ip: Some("127.0.0.9".parse().unwrap()),
+            },
+        ));
+    }
+
+    #[test]
+    fn masked_endpoint_config_reserves_udp_segment_overhead() {
+        let plain = quinn::EndpointConfig::default();
+        let masked = masked_endpoint_config().unwrap();
+        assert_eq!(
+            masked.get_max_udp_payload_size() + UDP_SEGMENT_OVERHEAD as u64,
+            plain.get_max_udp_payload_size()
+        );
+        assert_eq!(masked.get_max_udp_payload_size(), 1460);
+    }
+
+    #[test]
+    fn try_send_validates_inputs_before_locking_send() {
+        let raw = Arc::new(FakeUdpSocket::default());
+        let keys = keys();
+        let mut rng = StdRng::seed_from_u64(1);
+        let socket = MaskedUdpSocket::new_client(
+            Arc::clone(&raw) as Arc<dyn AsyncUdpSocket>,
+            &keys,
+            &mut rng,
+        );
+        let destination: SocketAddr = "127.0.0.1:2".parse().unwrap();
+
+        // Hold `send` mutex on the same thread: input validation must reject
+        // immediately before attempting to acquire `socket.send`.
+        let _send_guard = socket.send.lock().unwrap();
+        for transmit_data in [
+            Transmit {
+                destination,
+                ecn: None,
+                contents: &[],
+                segment_size: None,
+                src_ip: None,
+            },
+            Transmit {
+                destination,
+                ecn: None,
+                contents: b"abc",
+                segment_size: Some(0),
+                src_ip: None,
+            },
+            Transmit {
+                destination,
+                ecn: None,
+                contents: &[],
+                segment_size: Some(8),
+                src_ip: None,
+            },
+        ] {
+            let err = socket.try_send(&transmit_data).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn send_and_receive_locks_are_independent() {
+        let raw = Arc::new(FakeUdpSocket::default());
+        let keys = keys();
+        let mut rng = StdRng::seed_from_u64(2);
+        let socket = MaskedUdpSocket::new_client(
+            Arc::clone(&raw) as Arc<dyn AsyncUdpSocket>,
+            &keys,
+            &mut rng,
+        );
+        let destination: SocketAddr = "127.0.0.1:2".parse().unwrap();
+
+        {
+            let _recv_guard = socket.receive.lock().unwrap();
+            socket.try_send(&transmit(b"hello", destination)).unwrap();
+        }
+        assert_eq!(raw.sent.lock().unwrap().len(), 1);
+
+        queue_masked_segments(&raw, keys.udp_s2c(), b"reply", 5, "127.0.0.1:2");
+        {
+            let _send_guard = socket.send.lock().unwrap();
+            let mut buf = [0_u8; 16];
+            let mut bufs = [IoSliceMut::new(&mut buf)];
+            let mut meta = [RecvMeta::default()];
+            let mut cx = Context::from_waker(Waker::noop());
+            let polled = socket.poll_recv(&mut cx, &mut bufs, &mut meta);
+            assert!(matches!(polled, Poll::Ready(Ok(1))));
+            assert_eq!(&buf[..5], b"reply");
+        }
+    }
+
+    async fn assert_server_gro_filtering(
+        raw: &Arc<FakeUdpSocket>,
+        keys: &MaskKeys,
+        rng: &mut StdRng,
+    ) {
+        let server =
+            MaskedUdpSocket::new_server(Arc::clone(raw) as Arc<dyn AsyncUdpSocket>, keys, rng);
+        let mut accepted = vec![0xc0_u8];
+        accepted.extend_from_slice(&quinn_proto::DEFAULT_SUPPORTED_VERSIONS[0].to_be_bytes());
+        accepted.extend_from_slice(&[1, 2, 3]);
+        let rejected = [0xc0_u8, 0xff, 0xff, 0xff, 0xff, 4, 5, 6];
+        let combined = [rejected.as_slice(), &accepted].concat();
+        queue_masked_segments(raw, keys.udp_c2s(), &combined, 8, "127.0.0.2:2345");
+        let mut out_srv = [0xa7_u8; 16];
+        let mut bufs_srv = [IoSliceMut::new(&mut out_srv)];
+        let mut meta_srv = [RecvMeta::default()];
+        let count_srv = poll_fn(|cx| server.poll_recv(cx, &mut bufs_srv, &mut meta_srv))
+            .await
+            .unwrap();
+        assert_eq!(count_srv, 1);
+        assert_eq!(&out_srv[..accepted.len()], accepted);
+        assert_eq!(meta_srv[0].len, accepted.len());
+        assert_eq!(meta_srv[0].stride, 8);
+        assert_eq!(meta_srv[0].addr, "127.0.0.2:2345".parse().unwrap());
+        assert_eq!(meta_srv[0].ecn, Some(quinn::udp::EcnCodepoint::Ect0));
+        assert_eq!(meta_srv[0].dst_ip, Some("127.0.0.9".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn try_send_and_poll_recv_preserve_gso_gro_boundaries_and_trim_padding() {
+        let raw = Arc::new(FakeUdpSocket::default());
+        let keys = keys();
+        let mut rng = StdRng::seed_from_u64(3);
+        let client = MaskedUdpSocket::new(
+            Arc::clone(&raw) as Arc<dyn AsyncUdpSocket>,
+            keys.udp_c2s(),
+            keys.udp_c2s(),
+            UdpRole::Client,
+            &mut rng,
+        );
+        let destination: SocketAddr = "127.0.0.1:2".parse().unwrap();
+
+        // 1. GSO segment preservation across uneven final segment.
+        for plain in [b"abcdef".as_slice(), b"abcde".as_slice()] {
+            client
+                .try_send(&Transmit {
+                    destination,
+                    ecn: None,
+                    contents: plain,
+                    segment_size: Some(3),
+                    src_ip: None,
+                })
+                .unwrap();
+            let (wire, stride) = raw.sent.lock().unwrap().pop().unwrap();
+            assert_eq!(stride, Some(3 + UDP_SEGMENT_OVERHEAD));
+            assert_eq!(wire.len(), plain.len() + 2 * UDP_SEGMENT_OVERHEAD);
+            assert_ne!(&wire[..NONCE_LEN], &wire[15..15 + NONCE_LEN]);
+
+            let wire_len = wire.len();
+            raw.receive.lock().unwrap().push_back((
+                wire,
+                RecvMeta {
+                    addr: destination,
+                    len: wire_len,
+                    stride: 15,
+                    ecn: None,
+                    dst_ip: None,
+                },
+            ));
+            let mut output = [0xa7_u8; 6];
+            let mut bufs = [IoSliceMut::new(&mut output)];
+            let mut meta = [RecvMeta::default()];
+            let count = poll_fn(|cx| client.poll_recv(cx, &mut bufs, &mut meta))
+                .await
+                .unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(&output[..plain.len()], plain);
+            assert!(output[plain.len()..].iter().all(|byte| *byte == 0xa7));
+            assert_eq!(meta[0].len, plain.len());
+            assert_eq!(meta[0].stride, 3);
+        }
+
+        // 2. Invalid frames (nonce-only, oversized expected_len > out.len(), stride <= 12,
+        // stride > len, len > wire_lengths[i]) are discarded before valid data.
+        let packet_meta = |len, stride| RecvMeta {
+            addr: destination,
+            len,
+            stride,
+            ecn: None,
+            dst_ip: None,
+        };
+        raw.receive
+            .lock()
+            .unwrap()
+            .push_back((vec![0; NONCE_LEN], packet_meta(NONCE_LEN, NONCE_LEN)));
+        client
+            .try_send(&transmit(b"oversized-payload", destination))
+            .unwrap();
+        let (oversized, _) = raw.sent.lock().unwrap().pop().unwrap();
+        let oversized_len = oversized.len();
+        raw.receive
+            .lock()
+            .unwrap()
+            .push_back((oversized, packet_meta(oversized_len, oversized_len)));
+        raw.receive
+            .lock()
+            .unwrap()
+            .push_back((vec![0; 20], packet_meta(20, UDP_SEGMENT_OVERHEAD)));
+        raw.receive
+            .lock()
+            .unwrap()
+            .push_back((vec![0; 20], packet_meta(20, 21)));
+        raw.receive
+            .lock()
+            .unwrap()
+            .push_back((vec![0; 20], packet_meta(5 + NONCE_LEN * 2 + 1, 20)));
+
+        // 3. Trailing <= 12B padding fragment on a GRO batch is trimmed, preserving valid prefix.
+        queue_masked_segments(&raw, keys.udp_c2s(), b"valid", 5, "127.0.0.1:2");
+        {
+            let mut queue = raw.receive.lock().unwrap();
+            let (mut padded_wire, mut padded_meta) = queue.pop_back().unwrap();
+            padded_wire.extend_from_slice(&[0xee_u8; 7]);
+            padded_meta.len += 7;
+            queue.push_back((padded_wire, padded_meta));
+        }
+
+        let mut output = [0_u8; 5];
+        let mut bufs = [IoSliceMut::new(&mut output)];
+        let mut meta = [RecvMeta::default()];
+        let count = poll_fn(|cx| client.poll_recv(cx, &mut bufs, &mut meta))
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(&output, b"valid");
+        assert_eq!(meta[0].len, 5);
+
+        // 4. Server-role per-segment GRO filtering + metadata preservation.
+        assert_server_gro_filtering(&raw, &keys, &mut rng).await;
+    }
+
+    #[tokio::test]
+    async fn poll_recv_reuses_slots_without_relaxing_receive_bounds_and_clamps_counts() {
+        let raw = Arc::new(FakeUdpSocket::default());
+        let keys = keys();
+        let mut rng = StdRng::seed_from_u64(4);
+        let socket = MaskedUdpSocket::new(
+            Arc::clone(&raw) as Arc<dyn AsyncUdpSocket>,
+            keys.udp_c2s(),
+            keys.udp_c2s(),
+            UdpRole::Client,
+            &mut rng,
+        );
+        let destination: SocketAddr = "127.0.0.1:2".parse().unwrap();
+
+        // Receive 32 -> 4 -> 48 bytes; verify inner receive slice length shrinks cleanly on 4-byte poll.
+        queue_masked_segments(&raw, keys.udp_c2s(), &[0x5a; 32], 32, "127.0.0.1:2");
+        let mut large_out = [0_u8; 32];
+        let mut large_bufs = [IoSliceMut::new(&mut large_out)];
+        let mut large_meta = [RecvMeta::default()];
+        assert_eq!(
+            poll_fn(|cx| socket.poll_recv(cx, &mut large_bufs, &mut large_meta))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(large_out, [0x5a; 32]);
+
+        queue_masked_segments(&raw, keys.udp_c2s(), b"x", 1, "127.0.0.1:2");
+        let mut small_out = [0xa7_u8; 4];
+        let mut small_bufs = [IoSliceMut::new(&mut small_out)];
+        let mut small_meta = [RecvMeta::default()];
+        assert_eq!(
+            poll_fn(|cx| socket.poll_recv(cx, &mut small_bufs, &mut small_meta))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(small_out, [b'x', 0xa7, 0xa7, 0xa7]);
+
+        queue_masked_segments(&raw, keys.udp_c2s(), &[0xa5; 48], 48, "127.0.0.1:2");
+        let mut grown_out = [0_u8; 48];
+        let mut grown_bufs = [IoSliceMut::new(&mut grown_out)];
+        let mut grown_meta = [RecvMeta::default()];
+        assert_eq!(
+            poll_fn(|cx| socket.poll_recv(cx, &mut grown_bufs, &mut grown_meta))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(grown_out, [0xa5; 48]);
+        assert_eq!(
+            *raw.receive_lengths.lock().unwrap(),
+            [
+                32 + 2 * UDP_SEGMENT_OVERHEAD,
+                4 + 2 * UDP_SEGMENT_OVERHEAD,
+                48 + 2 * UDP_SEGMENT_OVERHEAD
+            ]
+        );
+
+        // Mismatched bufs.len() > meta.len() and > BATCH_SIZE must clamp without panic.
+        let batch_plus = quinn::udp::BATCH_SIZE + 4;
+        for _ in 0..batch_plus {
+            queue_masked_segments(&raw, keys.udp_c2s(), b"ok", 2, "127.0.0.1:2");
+        }
+        let mut many_out = vec![[0_u8; 8]; batch_plus];
+        let mut many_bufs: Vec<IoSliceMut<'_>> = many_out
+            .iter_mut()
+            .map(|slot| IoSliceMut::new(slot))
+            .collect();
+        let mut few_meta = [RecvMeta::default()];
+        let count = poll_fn(|cx| socket.poll_recv(cx, &mut many_bufs, &mut few_meta))
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(&many_out[0][..2], b"ok");
+        assert_eq!(few_meta[0].destination_port_check(), destination.port());
+    }
+
+    trait RecvMetaExt {
+        fn destination_port_check(&self) -> u16;
+    }
+
+    impl RecvMetaExt for RecvMeta {
+        fn destination_port_check(&self) -> u16 {
+            self.addr.port()
+        }
+    }
+
+    struct TestWake(AtomicUsize);
+
+    impl std::task::Wake for TestWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_recv_wakes_and_returns_pending_on_zero_produced_without_starving_tasks() {
+        let raw = Arc::new(FakeUdpSocket::default());
+        let keys = keys();
+        let mut rng = StdRng::seed_from_u64(5);
+        let socket = MaskedUdpSocket::new_server(
+            Arc::clone(&raw) as Arc<dyn AsyncUdpSocket>,
+            &keys,
+            &mut rng,
+        );
+
+        let rejected = [0xc0_u8, 0xff, 0xff, 0xff, 0xff];
+        queue_masked_segments(&raw, keys.udp_c2s(), &rejected, 5, "127.0.0.2:2");
+        let mut output = [[0_u8; 16]; 2];
+        let mut bufs = output.each_mut().map(|buf| IoSliceMut::new(buf));
+        let mut meta = [RecvMeta::default(); 2];
+        let wake_counter = Arc::new(TestWake(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wake_counter));
+        let mut cx = Context::from_waker(&waker);
+        assert!(socket.poll_recv(&mut cx, &mut bufs, &mut meta).is_pending());
+        assert_eq!(wake_counter.0.load(Ordering::Relaxed), 1);
+
+        // Subsequent batch compacts out invalid leading packet and delivers valid one.
+        queue_masked_segments(&raw, keys.udp_c2s(), &rejected, 5, "127.0.0.2:2");
+        queue_masked_segments(&raw, keys.udp_c2s(), &[0x40_u8, 1, 2, 3], 4, "127.0.0.3:3");
+        assert_eq!(
+            poll_fn(|cx| socket.poll_recv(cx, &mut bufs, &mut meta))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(&bufs[0][..4], &[0x40, 1, 2, 3]);
+        assert_eq!(meta[0].addr, "127.0.0.3:3".parse().unwrap());
+
+        // Starvation check under continuous invalid-datagram flood on current_thread runtime:
+        // co-scheduled task must run and flip `stop_flood`, allowing a valid packet through.
+        let stop_flood = Arc::new(AtomicBool::new(false));
+        let flood_raw = Arc::new(FakeUdpSocket {
+            flood_until_stopped: Some(Arc::clone(&stop_flood)),
+            ..FakeUdpSocket::default()
+        });
+        let flood_socket = MaskedUdpSocket::new_server(
+            Arc::clone(&flood_raw) as Arc<dyn AsyncUdpSocket>,
+            &keys,
+            &mut rng,
+        );
+        let flood_task = tokio::spawn({
+            let flood_socket = Arc::clone(&flood_socket);
+            async move {
+                let mut buf = [0_u8; 16];
+                let mut bufs = [IoSliceMut::new(&mut buf)];
+                let mut meta = [RecvMeta::default()];
+                poll_fn(|cx| flood_socket.poll_recv(cx, &mut bufs, &mut meta)).await
+            }
+        });
+        let stop_task = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            queue_masked_segments(
+                &flood_raw,
+                keys.udp_c2s(),
+                &[0x40_u8, 9, 8],
+                3,
+                "127.0.0.4:4",
+            );
+            stop_flood.store(true, Ordering::Release);
+        });
+        let (flood_res, stop_res) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(flood_task, stop_task)
+        })
+        .await
+        .expect("poll_recv must yield and never starve co-scheduled tasks");
+        stop_res.unwrap();
+        assert_eq!(flood_res.unwrap().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn server_gro_filtering_drops_middle_invalid_segment_and_short_long_headers() {
+        assert!(!super::supported_quic_packet(&[0x80]));
+        assert!(!super::supported_quic_packet(&[0xc0, 0x00, 0x00, 0x01]));
+
+        let raw = Arc::new(FakeUdpSocket::default());
+        let keys = keys();
+        let mut rng = StdRng::seed_from_u64(9);
+        let server = MaskedUdpSocket::new_server(
+            Arc::clone(&raw) as Arc<dyn AsyncUdpSocket>,
+            &keys,
+            &mut rng,
+        );
+
+        let mut accepted_first = vec![0xc0_u8];
+        accepted_first.extend_from_slice(&quinn_proto::DEFAULT_SUPPORTED_VERSIONS[0].to_be_bytes());
+        accepted_first.extend_from_slice(&[1, 2, 3]);
+        let rejected_mid = [0xc0_u8, 0xff, 0xff, 0xff, 0xff, 4, 5, 6];
+        let mut accepted_last = vec![0xc0_u8];
+        accepted_last.extend_from_slice(&quinn_proto::DEFAULT_SUPPORTED_VERSIONS[0].to_be_bytes());
+        accepted_last.extend_from_slice(&[7, 8, 9]);
+        let combined = [accepted_first.as_slice(), &rejected_mid, &accepted_last].concat();
+        queue_masked_segments(&raw, keys.udp_c2s(), &combined, 8, "127.0.0.2:4567");
+
+        let mut out = [0xa7_u8; 48];
+        let mut bufs = [IoSliceMut::new(&mut out)];
+        let mut meta = [RecvMeta::default()];
+        let count = tokio::time::timeout(
+            Duration::from_secs(1),
+            poll_fn(|cx| server.poll_recv(cx, &mut bufs, &mut meta)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(meta[0].len, 16);
+        assert_eq!(meta[0].stride, 8);
+        assert_eq!(&bufs[0][..8], accepted_first.as_slice());
+        assert_eq!(&bufs[0][8..16], accepted_last.as_slice());
+
+        // Masked 4-byte long-header packet (< 5B) must be silently dropped (Poll::Pending).
+        queue_masked_segments(
+            &raw,
+            keys.udp_c2s(),
+            &[0xc0, 0x00, 0x00, 0x01],
+            4,
+            "127.0.0.2:4567",
+        );
+        let wake_counter = Arc::new(TestWake(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wake_counter));
+        let mut cx = Context::from_waker(&waker);
+        assert!(server.poll_recv(&mut cx, &mut bufs, &mut meta).is_pending());
+        assert_eq!(wake_counter.0.load(Ordering::Relaxed), 1);
     }
 }

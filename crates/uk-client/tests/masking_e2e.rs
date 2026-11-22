@@ -792,19 +792,21 @@ async fn unmasked_quic_client_cannot_talk_to_masked_quic_listener() -> Result<()
     let (cert_path, key_path) = write_identity(&dir)?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
+    let observability_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let observability_addr = observability_listener.local_addr()?;
+    drop(observability_listener);
     let quic_listener = std::net::UdpSocket::bind("127.0.0.1:0")?;
     let quic_addr = quic_listener.local_addr()?;
     drop(quic_listener);
-    let mut config = masked_server_config_with_quic(
+    let config = masked_server_config_with_quic(
         addr,
         Some(quic_addr),
-        addr,
+        observability_addr,
         &cert_path,
         &key_path,
         None,
         true,
     );
-    config.observability_listen = None;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         uk_server::run_on_listener_until_shutdown(config, listener, async {
@@ -813,14 +815,7 @@ async fn unmasked_quic_client_cannot_talk_to_masked_quic_listener() -> Result<()
         .await
         .map_err(|err| -> TestError { err.to_string().into() })
     });
-    // Wait for the QUIC port via the task + a short settle delay; probing a
-    // masked UDP listener yields nothing by design.
-    for _ in 0..200 {
-        if task.is_finished() {
-            return Err("masked QUIC server stopped early".into());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_until_observability_ready(observability_addr).await?;
 
     let client_config_base = masked_client_config(quic_addr, &cert_path, Some(2));
     let mut client = client_config_base;
@@ -837,5 +832,1015 @@ async fn unmasked_quic_client_cannot_talk_to_masked_quic_listener() -> Result<()
         outcome.is_err() || outcome.unwrap().is_err(),
         "unmasked QUIC client must fail against a masked listener"
     );
+    Ok(())
+}
+
+async fn spawn_custom_server(
+    mut config: ServerConfig,
+) -> Result<(TestServer, std::path::PathBuf), TestError> {
+    let dir = create_temp_dir()?;
+    let (cert_path, key_path) = write_identity(&dir)?;
+    let policy_path = write_policy(&dir)?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let observability_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let observability_addr = observability_listener.local_addr()?;
+    drop(observability_listener);
+
+    config.listen = addr.to_string();
+    config.observability_listen = Some(observability_addr.to_string());
+    config.cert_path = cert_path.display().to_string();
+    config.key_path = key_path.display().to_string();
+    config.policy_path = Some(policy_path.display().to_string());
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        uk_server::run_on_listener_until_shutdown(config, listener, async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .map_err(|err| -> TestError { err.to_string().into() })
+    });
+    let server = TestServer {
+        addr,
+        observability_addr,
+        shutdown: shutdown_tx,
+        task,
+    };
+    wait_until_observability_ready(server.observability_addr).await?;
+    Ok((server, cert_path))
+}
+
+async fn wait_for_metric_substring(
+    addr: std::net::SocketAddr,
+    needle: &str,
+    timeout: Duration,
+) -> Result<String, TestError> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if let Ok(metrics) = http_get_metrics(addr).await
+                && metrics.contains(needle)
+            {
+                return metrics;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| -> TestError { format!("timed out waiting for metric `{needle}`").into() })
+}
+
+async fn assert_echo_works(
+    mut carrier: uk_client::ClientCarrier,
+    payload_bytes: &[u8],
+    target_addr: std::net::SocketAddr,
+) -> Result<(), TestError> {
+    let open = TcpOpen::new(target_from_socket_addr(target_addr), TCP_OPEN_FLAGS_NONE);
+    let mut payload = BytesMut::new();
+    open.encode(&mut payload)?;
+    write_frame(
+        &mut carrier,
+        &Frame::new(FrameType::TcpOpen, 0, 1, payload.freeze())?,
+    )
+    .await?;
+    let ack = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(ack.header.frame_type, FrameType::TcpData);
+    assert!(ack.payload.is_empty());
+
+    write_frame(
+        &mut carrier,
+        &Frame::new(
+            FrameType::TcpData,
+            0,
+            1,
+            bytes::Bytes::copy_from_slice(payload_bytes),
+        )?,
+    )
+    .await?;
+    let echoed = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut carrier, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(&echoed.payload[..], payload_bytes);
+    Ok(())
+}
+
+struct RecordingTcp {
+    inner: TcpStream,
+    bytes_read: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl tokio::io::AsyncRead for RecordingTcp {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &poll {
+            let delta = buf.filled().len().saturating_sub(before);
+            self.bytes_read.fetch_add(delta, Ordering::Relaxed);
+        }
+        poll
+    }
+}
+
+impl tokio::io::AsyncWrite for RecordingTcp {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl uk_mask::stream::WriteReady for RecordingTcp {
+    fn poll_write_ready(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        self.inner.poll_write_ready(cx)
+    }
+}
+
+#[tokio::test]
+async fn masked_corrupted_and_alert_hellos_emit_zero_bytes_and_trigger_rate_limiter()
+-> Result<(), TestError> {
+    let mut cfg = masked_server_config(
+        "127.0.0.1:0".parse()?,
+        "127.0.0.1:0".parse()?,
+        std::path::Path::new("unused"),
+        std::path::Path::new("unused"),
+        None,
+    );
+    cfg.limits = Some(LimitConfig {
+        handshake_timeout_seconds: Some(1),
+        auth_rate_limit_failures: Some(2),
+        auth_rate_limit_window_seconds: Some(60),
+        auth_rate_limit_ban_seconds: Some(60),
+        ..LimitConfig::default()
+    });
+    let (server, cert_path) = spawn_custom_server(cfg).await?;
+    let keys = MaskKeys::derive(KEY_ID.as_bytes(), SECRET.as_bytes());
+    let prelude = keys
+        .encode_prelude(PreludePolicy::Full8, &mut rand::rngs::OsRng, 0x1001, 1)
+        .unwrap();
+
+    // Probe 1: valid prelude + malformed ClientHello triggering Acceptor alert.
+    let mut wire = [0_u8; PRELUDE_LEN + NONCE_LEN];
+    wire[..PRELUDE_LEN].copy_from_slice(&prelude.bytes);
+    wire[PRELUDE_LEN..].copy_from_slice(&prelude.nonce);
+
+    let mut tcp1 = TcpStream::connect(server.addr).await?;
+    tcp1.write_all(&wire).await?;
+    let mut masked1 = MaskedStream::new_client(tcp1, &keys, &prelude.nonce);
+    // TLS Handshake record with malformed ClientHello body (triggers alert in rustls::server::Acceptor).
+    masked1
+        .write_all(&[22_u8, 3, 1, 0, 5, 1, 0, 0, 1, 0xff])
+        .await?;
+    masked1.flush().await?;
+    let mut resp1 = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), masked1.read_to_end(&mut resp1)).await?;
+    assert!(resp1.is_empty(), "server must emit 0 bytes on TLS alert");
+
+    let metrics = wait_for_metric_substring(
+        server.observability_addr,
+        "uncrowned_king_server_handshake_failures_total{reason=\"tls\"} 1\n",
+        Duration::from_secs(3),
+    )
+    .await?;
+    assert!(metrics.contains("uncrowned_king_server_mask_replay_rejects_total 0\n"));
+
+    // Probe 2: reuse the SAME prelude (proving counter was not burned), send truncated invalid record.
+    let mut tcp2 = TcpStream::connect(server.addr).await?;
+    tcp2.write_all(&wire).await?;
+    let mut masked2 = MaskedStream::new_client(tcp2, &keys, &prelude.nonce);
+    masked2.write_all(&[22_u8, 3, 3, 0, 4, 0, 0, 0, 0]).await?;
+    masked2.flush().await?;
+    let mut resp2 = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), masked2.read_to_end(&mut resp2)).await?;
+    assert!(
+        resp2.is_empty(),
+        "server must emit 0 bytes on corrupted hello"
+    );
+
+    wait_for_metric_substring(
+        server.observability_addr,
+        "uncrowned_king_server_handshake_failures_total{reason=\"tls\"} 2\n",
+        Duration::from_secs(3),
+    )
+    .await?;
+
+    // Probe 3: IP is now banned after 2 pre-ClientHello failures.
+    let mut client = masked_client_config(server.addr, &cert_path, Some(2));
+    client.server_addr = format!("tls://{}", server.addr);
+    let banned_res = tokio::time::timeout(
+        Duration::from_secs(3),
+        connect_authenticated_carrier(client),
+    )
+    .await;
+    assert!(
+        banned_res.is_ok() && banned_res.unwrap().is_err(),
+        "banned source must be rejected immediately"
+    );
+    wait_for_metric_substring(
+        server.observability_addr,
+        "uncrowned_king_server_rate_limited_connections_total 1\n",
+        Duration::from_secs(3),
+    )
+    .await?;
+
+    server.stop().await;
+    Ok(())
+}
+
+fn build_test_client_hello(
+    versions: &[&'static rustls::SupportedProtocolVersion],
+    alpn_protocols: Vec<Vec<u8>>,
+) -> Result<Vec<u8>, TestError> {
+    let mut cfg = RustlsClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_protocol_versions(versions)?
+    .with_root_certificates(RootCertStore::empty())
+    .with_no_client_auth();
+    cfg.alpn_protocols = alpn_protocols;
+    let mut conn = rustls::ClientConnection::new(
+        std::sync::Arc::new(cfg),
+        ServerName::try_from("localhost")?,
+    )?;
+    let mut hello = Vec::new();
+    conn.write_tls(&mut hello)?;
+    Ok(hello)
+}
+
+#[tokio::test]
+async fn masked_tls12_and_alpn_mismatch_client_hellos_emit_zero_bytes_preserve_counter_and_rate_limit()
+-> Result<(), TestError> {
+    let mut cfg = masked_server_config(
+        "127.0.0.1:0".parse()?,
+        "127.0.0.1:0".parse()?,
+        std::path::Path::new("unused"),
+        std::path::Path::new("unused"),
+        None,
+    );
+    cfg.limits = Some(LimitConfig {
+        handshake_timeout_seconds: Some(1),
+        auth_rate_limit_failures: Some(2),
+        auth_rate_limit_window_seconds: Some(60),
+        auth_rate_limit_ban_seconds: Some(60),
+        ..LimitConfig::default()
+    });
+    let (server, cert_path) = spawn_custom_server(cfg).await?;
+    let keys = MaskKeys::derive(KEY_ID.as_bytes(), SECRET.as_bytes());
+    let prelude = keys
+        .encode_prelude(PreludePolicy::Full8, &mut rand::rngs::OsRng, 0x3001, 1)
+        .unwrap();
+
+    let mut wire = [0_u8; PRELUDE_LEN + NONCE_LEN];
+    wire[..PRELUDE_LEN].copy_from_slice(&prelude.bytes);
+    wire[PRELUDE_LEN..].copy_from_slice(&prelude.nonce);
+
+    // Probe 1: valid 76B prelude + syntactically valid TLS 1.2-only ClientHello.
+    let tls12_hello = build_test_client_hello(
+        &[&rustls::version::TLS12],
+        vec![uk_proto::ALPN_PROTOCOL.to_vec()],
+    )?;
+    let tcp1 = TcpStream::connect(server.addr).await?;
+    let mut tcp1 = tcp1;
+    tcp1.write_all(&wire).await?;
+    let mut masked1 = MaskedStream::new_client(tcp1, &keys, &prelude.nonce);
+    masked1.write_all(&tls12_hello).await?;
+    masked1.flush().await?;
+    let mut resp1 = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), masked1.read_to_end(&mut resp1)).await?;
+    assert!(
+        resp1.is_empty(),
+        "server must emit 0 bytes on TLS 1.2-only ClientHello"
+    );
+
+    let metrics = wait_for_metric_substring(
+        server.observability_addr,
+        "uncrowned_king_server_handshake_failures_total{reason=\"tls\"} 1\n",
+        Duration::from_secs(3),
+    )
+    .await?;
+    assert!(metrics.contains("uncrowned_king_server_mask_replay_rejects_total 0\n"));
+
+    // Probe 2: reuse the SAME (identity, counter) prelude + TLS 1.3 ClientHello with wrong ALPN.
+    let wrong_alpn_hello =
+        build_test_client_hello(&[&rustls::version::TLS13], vec![b"h2".to_vec()])?;
+    let mut tcp2 = TcpStream::connect(server.addr).await?;
+    tcp2.write_all(&wire).await?;
+    let mut masked2 = MaskedStream::new_client(tcp2, &keys, &prelude.nonce);
+    masked2.write_all(&wrong_alpn_hello).await?;
+    masked2.flush().await?;
+    let mut resp2 = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), masked2.read_to_end(&mut resp2)).await?;
+    assert!(
+        resp2.is_empty(),
+        "server must emit 0 bytes on wrong-ALPN ClientHello"
+    );
+
+    let metrics2 = wait_for_metric_substring(
+        server.observability_addr,
+        "uncrowned_king_server_handshake_failures_total{reason=\"tls\"} 2\n",
+        Duration::from_secs(3),
+    )
+    .await?;
+    assert!(metrics2.contains("uncrowned_king_server_mask_replay_rejects_total 0\n"));
+
+    // Probe 3: IP is now banned after 2 ServerConfig-rejected ClientHellos.
+    let mut client = masked_client_config(server.addr, &cert_path, Some(2));
+    client.server_addr = format!("tls://{}", server.addr);
+    let banned_res = tokio::time::timeout(
+        Duration::from_secs(3),
+        connect_authenticated_carrier(client),
+    )
+    .await;
+    assert!(
+        banned_res.is_ok() && banned_res.unwrap().is_err(),
+        "banned source must be rejected immediately"
+    );
+    wait_for_metric_substring(
+        server.observability_addr,
+        "uncrowned_king_server_rate_limited_connections_total 1\n",
+        Duration::from_secs(3),
+    )
+    .await?;
+
+    server.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn masked_oversized_client_hello_rejected_silently() -> Result<(), TestError> {
+    let mut cfg = masked_server_config(
+        "127.0.0.1:0".parse()?,
+        "127.0.0.1:0".parse()?,
+        std::path::Path::new("unused"),
+        std::path::Path::new("unused"),
+        None,
+    );
+    cfg.limits = Some(LimitConfig {
+        handshake_timeout_seconds: Some(1),
+        ..LimitConfig::default()
+    });
+    let (server, cert_path) = spawn_custom_server(cfg).await?;
+    let keys = MaskKeys::derive(KEY_ID.as_bytes(), SECRET.as_bytes());
+    let prelude = keys
+        .encode_prelude(PreludePolicy::Full8, &mut rand::rngs::OsRng, 0x2002, 1)
+        .unwrap();
+
+    let mut wire = [0_u8; PRELUDE_LEN + NONCE_LEN];
+    wire[..PRELUDE_LEN].copy_from_slice(&prelude.bytes);
+    wire[PRELUDE_LEN..].copy_from_slice(&prelude.nonce);
+
+    let mut tcp = TcpStream::connect(server.addr).await?;
+    tcp.write_all(&wire).await?;
+    let mut masked = MaskedStream::new_client(tcp, &keys, &prelude.nonce);
+
+    // Send fragmented 80,000-byte ClientHello (> 64 KiB cap).
+    let mut payload = vec![0_u8; 5 * 16_384];
+    payload[0] = 1;
+    let total_len: u32 = 80_000;
+    payload[1] = ((total_len >> 16) & 0xff) as u8;
+    payload[2] = ((total_len >> 8) & 0xff) as u8;
+    payload[3] = (total_len & 0xff) as u8;
+    for chunk in payload.chunks(16_384) {
+        let mut record = Vec::with_capacity(5 + chunk.len());
+        record.push(22);
+        record.extend_from_slice(&[3, 3]);
+        record.extend_from_slice(&(u16::try_from(chunk.len())?).to_be_bytes());
+        record.extend_from_slice(chunk);
+        if masked.write_all(&record).await.is_err() {
+            break;
+        }
+    }
+    let _ = masked.flush().await;
+
+    let mut resp = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(4), masked.read_to_end(&mut resp)).await?;
+    assert!(
+        resp.is_empty(),
+        "oversized ClientHello must receive 0 response bytes"
+    );
+
+    let metrics = wait_for_metric_substring(
+        server.observability_addr,
+        "uncrowned_king_server_handshake_failures_total{reason=\"tls\"} 1\n",
+        Duration::from_secs(3),
+    )
+    .await?;
+    assert!(metrics.contains("uncrowned_king_server_mask_replay_rejects_total 0\n"));
+
+    // The counter was not burned, so a real handshake with the same prelude succeeds.
+    let mut tls = masked_tls_handshake(server.addr, &cert_path, &keys, &prelude).await?;
+    let challenge = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame(&mut tls, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(challenge.header.frame_type, FrameType::AuthChallenge);
+
+    server.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn masked_concurrent_replay_race_commits_once_and_rejects_losers_silently()
+-> Result<(), TestError> {
+    let mut cfg = masked_server_config(
+        "127.0.0.1:0".parse()?,
+        "127.0.0.1:0".parse()?,
+        std::path::Path::new("unused"),
+        std::path::Path::new("unused"),
+        None,
+    );
+    cfg.limits = Some(LimitConfig {
+        handshake_timeout_seconds: Some(2),
+        auth_rate_limit_failures: Some(0),
+        ..LimitConfig::default()
+    });
+    let (server, cert_path) = spawn_custom_server(cfg).await?;
+    let keys = MaskKeys::derive(KEY_ID.as_bytes(), SECRET.as_bytes());
+    let prelude = keys
+        .encode_prelude(PreludePolicy::Full8, &mut rand::rngs::OsRng, 0x3003, 9)
+        .unwrap();
+
+    let mut wire = [0_u8; PRELUDE_LEN + NONCE_LEN];
+    wire[..PRELUDE_LEN].copy_from_slice(&prelude.bytes);
+    wire[PRELUDE_LEN..].copy_from_slice(&prelude.nonce);
+
+    let racers = 8_usize;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(racers));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..racers {
+        let addr = server.addr;
+        let cert_path = cert_path.clone();
+        let keys = keys.clone();
+        let nonce = prelude.nonce;
+        let barrier = std::sync::Arc::clone(&barrier);
+        tasks.spawn(async move {
+            let mut tcp = TcpStream::connect(addr).await.unwrap();
+            tcp.set_nodelay(true).unwrap();
+            let bytes_read = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            barrier.wait().await;
+            tcp.write_all(&wire).await.unwrap();
+            let rec = RecordingTcp {
+                inner: tcp,
+                bytes_read: std::sync::Arc::clone(&bytes_read),
+            };
+            let masked = MaskedStream::new_client(rec, &keys, &nonce);
+            let connector = trusting_tls_connector(&cert_path).unwrap();
+            match tokio::time::timeout(
+                Duration::from_secs(4),
+                connector.connect(ServerName::try_from("localhost").unwrap(), masked),
+            )
+            .await
+            {
+                Ok(Ok(mut tls)) => {
+                    let frame = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        read_frame(&mut tls, FrameLimits::default()),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(frame.header.frame_type, FrameType::AuthChallenge);
+                    (true, bytes_read.load(Ordering::Relaxed))
+                }
+                _ => (false, bytes_read.load(Ordering::Relaxed)),
+            }
+        });
+    }
+
+    let mut winners = 0_usize;
+    let mut losers_with_zero_bytes = 0_usize;
+    while let Some(res) = tasks.join_next().await {
+        let (won, read_bytes) = res?;
+        if won {
+            winners += 1;
+        } else {
+            assert_eq!(
+                read_bytes, 0,
+                "losing concurrent replay racers must receive zero wire bytes"
+            );
+            losers_with_zero_bytes += 1;
+        }
+    }
+    assert_eq!(winners, 1, "exactly one racer must commit the counter");
+    assert_eq!(losers_with_zero_bytes, racers - 1);
+
+    wait_for_metric_substring(
+        server.observability_addr,
+        "uncrowned_king_server_mask_replay_rejects_total 7\n",
+        Duration::from_secs(3),
+    )
+    .await?;
+
+    server.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn masked_handshake_shares_single_deadline_across_prelude_tls_and_auth_response()
+-> Result<(), TestError> {
+    let mut cfg = masked_server_config(
+        "127.0.0.1:0".parse()?,
+        "127.0.0.1:0".parse()?,
+        std::path::Path::new("unused"),
+        std::path::Path::new("unused"),
+        None,
+    );
+    cfg.limits = Some(LimitConfig {
+        handshake_timeout_seconds: Some(2),
+        ..LimitConfig::default()
+    });
+    let (server, cert_path) = spawn_custom_server(cfg).await?;
+    let keys = MaskKeys::derive(KEY_ID.as_bytes(), SECRET.as_bytes());
+    let prelude = keys
+        .encode_prelude(PreludePolicy::Full8, &mut rand::rngs::OsRng, 0x4004, 1)
+        .unwrap();
+
+    // Complete prelude + TLS 1.3 handshake, read AUTH_CHALLENGE, then stall AUTH_RESPONSE.
+    let start = std::time::Instant::now();
+    let mut tls = masked_tls_handshake(server.addr, &cert_path, &keys, &prelude).await?;
+    let challenge = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_frame(&mut tls, FrameLimits::default()),
+    )
+    .await??;
+    assert_eq!(challenge.header.frame_type, FrameType::AuthChallenge);
+
+    let mut buf = [0_u8; 64];
+    let closed = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut buf)).await;
+    let elapsed = start.elapsed();
+    assert!(
+        closed.is_ok(),
+        "stalled AUTH_RESPONSE must be closed at shared deadline"
+    );
+    assert!(
+        elapsed < Duration::from_millis(3200),
+        "masked handshake must share a single 2s deadline (not 2x = 4s); elapsed={elapsed:?}"
+    );
+
+    wait_for_metric_substring(
+        server.observability_addr,
+        "uncrowned_king_server_handshake_failures_total{reason=\"timeout\"} 1\n",
+        Duration::from_secs(3),
+    )
+    .await?;
+
+    // Full authenticated session completes cleanly and restores normal close semantics.
+    let (target_addr, target) = spawn_echo_target().await?;
+    let mut client = masked_client_config(server.addr, &cert_path, Some(5));
+    client.server_addr = format!("tls://{}", server.addr);
+    let (carrier, _settings) = connect_authenticated_carrier(client).await?;
+    assert_echo_works(carrier, b"r4-post-auth", target_addr).await?;
+    wait_for_metric_substring(
+        server.observability_addr,
+        "uncrowned_king_server_authenticated_sessions_total 1\n",
+        Duration::from_secs(3),
+    )
+    .await?;
+
+    target.abort();
+    server.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pre_admission_enforces_global_and_per_source_limits_without_ban() -> Result<(), TestError>
+{
+    // Part A: per-source pre-admission limit rejects 3rd silent probe immediately without AuthRateLimiter ban.
+    let mut cfg = masked_server_config(
+        "127.0.0.1:0".parse()?,
+        "127.0.0.1:0".parse()?,
+        std::path::Path::new("unused"),
+        std::path::Path::new("unused"),
+        None,
+    );
+    cfg.limits = Some(LimitConfig {
+        handshake_timeout_seconds: Some(5),
+        max_pre_auth_connections: Some(3),
+        max_pre_auth_per_source: Some(2),
+        auth_rate_limit_failures: Some(2),
+        auth_rate_limit_window_seconds: Some(60),
+        auth_rate_limit_ban_seconds: Some(60),
+        ..LimitConfig::default()
+    });
+    let (server, cert_path) = spawn_custom_server(cfg).await?;
+
+    let held1 = TcpStream::connect(server.addr).await?;
+    let held2 = TcpStream::connect(server.addr).await?;
+    wait_for_metric_substring(
+        server.observability_addr,
+        "uncrowned_king_server_accepted_connections_total 2\n",
+        Duration::from_secs(3),
+    )
+    .await?;
+
+    let mut rejected = TcpStream::connect(server.addr).await?;
+    let mut buf = [0_u8; 32];
+    let read = tokio::time::timeout(Duration::from_secs(1), rejected.read(&mut buf)).await;
+    assert!(
+        read.is_ok() && matches!(read.unwrap(), Ok(0) | Err(_)),
+        "3rd pre-auth connection must be dropped immediately (< 1s, well below 5s timeout)"
+    );
+    let metrics = wait_for_metric_substring(
+        server.observability_addr,
+        "uncrowned_king_server_rejected_pre_auth_connections_total 1\n",
+        Duration::from_secs(3),
+    )
+    .await?;
+    assert!(
+        metrics.contains("uncrowned_king_server_rate_limited_connections_total 0\n"),
+        "pre-admission overflow must not trigger AuthRateLimiter"
+    );
+    drop(held1);
+    drop(held2);
+    server.stop().await;
+
+    // Part B: authenticated sessions release their pre-auth slots so new clients still connect.
+    let mut cfg2 = masked_server_config(
+        "127.0.0.1:0".parse()?,
+        "127.0.0.1:0".parse()?,
+        std::path::Path::new("unused"),
+        std::path::Path::new("unused"),
+        None,
+    );
+    cfg2.limits = Some(LimitConfig {
+        handshake_timeout_seconds: Some(5),
+        max_sessions: Some(4),
+        max_pre_auth_connections: Some(2),
+        max_pre_auth_per_source: Some(2),
+        ..LimitConfig::default()
+    });
+    let (server2, cert_path2) = spawn_custom_server(cfg2).await?;
+    let mut client = masked_client_config(server2.addr, &cert_path2, Some(5));
+    client.server_addr = format!("tls://{}", server2.addr);
+    let (carrier1, _) = connect_authenticated_carrier(client.clone()).await?;
+    let (carrier2, _) = connect_authenticated_carrier(client.clone()).await?;
+    let (carrier3, _) = connect_authenticated_carrier(client).await?;
+    drop((carrier1, carrier2, carrier3));
+    let _ = cert_path;
+    server2.stop().await;
+    Ok(())
+}
+
+struct CountingUdpProxy {
+    addr: std::net::SocketAddr,
+    c2s_packets: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    s2c_lengths: std::sync::Arc<tokio::sync::Mutex<Vec<usize>>>,
+    tasks: tokio::task::JoinSet<()>,
+}
+
+async fn spawn_counting_udp_proxy(
+    upstream: std::net::SocketAddr,
+) -> Result<CountingUdpProxy, TestError> {
+    let proxy_sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await?);
+    let addr = proxy_sock.local_addr()?;
+    let upstream_sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await?);
+    upstream_sock.connect(upstream).await?;
+
+    let c2s_packets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let s2c_lengths = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<usize>::new()));
+    let client_peer: std::sync::Arc<tokio::sync::Mutex<Option<std::net::SocketAddr>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(None));
+
+    let mut tasks = tokio::task::JoinSet::new();
+    {
+        let proxy_sock = std::sync::Arc::clone(&proxy_sock);
+        let upstream_sock = std::sync::Arc::clone(&upstream_sock);
+        let c2s_packets = std::sync::Arc::clone(&c2s_packets);
+        let client_peer = std::sync::Arc::clone(&client_peer);
+        tasks.spawn(async move {
+            let mut buf = [0_u8; 2048];
+            while let Ok((n, peer)) = proxy_sock.recv_from(&mut buf).await {
+                *client_peer.lock().await = Some(peer);
+                c2s_packets.fetch_add(1, Ordering::Relaxed);
+                if upstream_sock.send(&buf[..n]).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    {
+        let proxy_sock = std::sync::Arc::clone(&proxy_sock);
+        let upstream_sock = std::sync::Arc::clone(&upstream_sock);
+        let s2c_lengths = std::sync::Arc::clone(&s2c_lengths);
+        let client_peer = std::sync::Arc::clone(&client_peer);
+        tasks.spawn(async move {
+            let mut buf = [0_u8; 2048];
+            while let Ok(n) = upstream_sock.recv(&mut buf).await {
+                s2c_lengths.lock().await.push(n);
+                if let Some(peer) = *client_peer.lock().await {
+                    let _ = proxy_sock.send_to(&buf[..n], peer).await;
+                }
+            }
+        });
+    }
+
+    Ok(CountingUdpProxy {
+        addr,
+        c2s_packets,
+        s2c_lengths,
+        tasks,
+    })
+}
+
+fn parse_metric_counter(metrics: &str, name: &str) -> usize {
+    metrics
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(name)
+                .and_then(|rest| rest.trim().parse::<usize>().ok())
+        })
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn masked_quic_silent_rejection_emits_zero_packets_on_overflow() -> Result<(), TestError> {
+    let dir = create_temp_dir()?;
+    let (cert_path, key_path) = write_identity(&dir)?;
+    let policy_path = write_policy(&dir)?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tcp_addr = listener.local_addr()?;
+    let quic_probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let quic_addr = quic_probe.local_addr()?;
+    drop(quic_probe);
+    let obs_probe = TcpListener::bind("127.0.0.1:0").await?;
+    let obs_addr = obs_probe.local_addr()?;
+    drop(obs_probe);
+
+    let mut config = masked_server_config_with_quic(
+        tcp_addr,
+        Some(quic_addr),
+        obs_addr,
+        &cert_path,
+        &key_path,
+        Some(&policy_path),
+        true,
+    );
+    config.limits = Some(LimitConfig {
+        max_sessions: Some(1),
+        handshake_timeout_seconds: Some(1),
+        ..LimitConfig::default()
+    });
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_task = tokio::spawn(async move {
+        let _ = uk_server::run_on_listener_until_shutdown(config, listener, async {
+            let _ = shutdown_rx.await;
+        })
+        .await;
+    });
+    wait_until_observability_ready(obs_addr).await?;
+
+    // Occupy the single session permit with a live masked QUIC carrier.
+    let mut client1 = masked_client_config(quic_addr, &cert_path, Some(5));
+    client1.server_addr = format!("quic://{quic_addr}");
+    client1.masking.as_mut().unwrap().quic = Some(true);
+    let (_held_carrier, _) = connect_authenticated_carrier(client1).await?;
+
+    let retries_before = parse_metric_counter(
+        &http_get_metrics(obs_addr).await?,
+        "uncrowned_king_server_quic_retries_total ",
+    );
+
+    // Interpose a UDP forwarder to count C2S vs S2C packets for the 2nd QUIC client.
+    let mut proxy = spawn_counting_udp_proxy(quic_addr).await?;
+
+    let mut client2 = masked_client_config(proxy.addr, &cert_path, Some(1));
+    client2.server_addr = format!("quic://{}", proxy.addr);
+    client2.masking.as_mut().unwrap().quic = Some(true);
+    let res2 = tokio::time::timeout(
+        Duration::from_secs(3),
+        connect_authenticated_carrier(client2),
+    )
+    .await;
+    let err2 = match &res2 {
+        Ok(Err(err)) => err.to_string(),
+        Err(_) => "timeout".to_owned(),
+        Ok(Ok(_)) => "unexpected ok".to_owned(),
+    };
+    assert!(
+        matches!(&res2, Ok(Err(_)) | Err(_)),
+        "over-limit masked QUIC client must fail"
+    );
+
+    proxy.tasks.abort_all();
+    while proxy.tasks.join_next().await.is_some() {}
+
+    let c2s = proxy.c2s_packets.load(Ordering::Relaxed);
+    let s2c_lens = proxy.s2c_lengths.lock().await.clone();
+    let metrics_snapshot = http_get_metrics(obs_addr).await?;
+    let retries_after = parse_metric_counter(
+        &metrics_snapshot,
+        "uncrowned_king_server_quic_retries_total ",
+    );
+    let rejected_sessions = parse_metric_counter(
+        &metrics_snapshot,
+        "uncrowned_king_server_rejected_sessions_total ",
+    );
+    let retries_delta = retries_after.saturating_sub(retries_before);
+    assert!(
+        c2s >= 2,
+        "client must have sent initial + retried packets (got {c2s})"
+    );
+    assert!(
+        rejected_sessions >= 1,
+        "over-limit QUIC attempt must reach admit_precheck and record rejected_sessions_total"
+    );
+    assert!(
+        !err2.contains("refused") && !err2.contains("Connection lost"),
+        "masked QUIC rejection must drop silently (timeout), never send CONNECTION_CLOSE: {err2}"
+    );
+    assert_eq!(
+        s2c_lens.len(),
+        retries_delta,
+        "masked QUIC rejection must emit zero non-Retry S2C packets (s2c={s2c_lens:?}, retries_delta={retries_delta}, err2={err2})"
+    );
+
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(5), server_task).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_masking_table_accepts_unmasked_tcp_flow() -> Result<(), TestError> {
+    let mut cfg = masked_server_config(
+        "127.0.0.1:0".parse()?,
+        "127.0.0.1:0".parse()?,
+        std::path::Path::new("unused"),
+        std::path::Path::new("unused"),
+        None,
+    );
+    // Equivalent to empty `[masking]` table in examples/server.toml
+    cfg.masking = Some(MaskingConfig::default());
+    let (server, cert_path) = spawn_custom_server(cfg).await?;
+    let (target_addr, target) = spawn_echo_target().await?;
+
+    let mut unmasked_client = masked_client_config(server.addr, &cert_path, Some(5));
+    unmasked_client.server_addr = format!("tls://{}", server.addr);
+    unmasked_client.masking = None;
+    let (carrier, _) = connect_authenticated_carrier(unmasked_client).await?;
+    assert_echo_works(carrier, b"empty-masking-unmasked-ok", target_addr).await?;
+
+    let mut masked_client = masked_client_config(server.addr, &cert_path, Some(2));
+    masked_client.server_addr = format!("tls://{}", server.addr);
+    let masked_res = tokio::time::timeout(
+        Duration::from_secs(4),
+        connect_authenticated_carrier(masked_client),
+    )
+    .await;
+    assert!(
+        masked_res.is_err() || masked_res.unwrap().is_err(),
+        "masked client must fail when [masking] has enabled unset"
+    );
+
+    target.abort();
+    server.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn split_mode_tcp_unmasked_and_quic_masked() -> Result<(), TestError> {
+    let dir = create_temp_dir()?;
+    let (cert_path, key_path) = write_identity(&dir)?;
+    let policy_path = write_policy(&dir)?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tcp_addr = listener.local_addr()?;
+    let quic_probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let quic_addr = quic_probe.local_addr()?;
+    drop(quic_probe);
+    let obs_probe = TcpListener::bind("127.0.0.1:0").await?;
+    let obs_addr = obs_probe.local_addr()?;
+    drop(obs_probe);
+
+    let mut config = masked_server_config_with_quic(
+        tcp_addr,
+        Some(quic_addr),
+        obs_addr,
+        &cert_path,
+        &key_path,
+        Some(&policy_path),
+        true,
+    );
+    // Split mode: TCP unmasked, QUIC masked.
+    config.masking.as_mut().unwrap().enabled = Some(false);
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_task = tokio::spawn(async move {
+        let _ = uk_server::run_on_listener_until_shutdown(config, listener, async {
+            let _ = shutdown_rx.await;
+        })
+        .await;
+    });
+    wait_until_observability_ready(obs_addr).await?;
+    let (target_addr1, target1) = spawn_echo_target().await?;
+    let (target_addr2, target2) = spawn_echo_target().await?;
+
+    // Unmasked TCP succeeds.
+    let mut tcp_unmasked = masked_client_config(tcp_addr, &cert_path, Some(5));
+    tcp_unmasked.server_addr = format!("tls://{tcp_addr}");
+    tcp_unmasked.masking = None;
+    let (tcp_carrier, _) = connect_authenticated_carrier(tcp_unmasked).await?;
+    assert_echo_works(tcp_carrier, b"split-tcp-unmasked", target_addr1).await?;
+
+    // Masked QUIC succeeds.
+    let mut quic_masked = masked_client_config(quic_addr, &cert_path, Some(5));
+    quic_masked.server_addr = format!("quic://{quic_addr}");
+    quic_masked.masking.as_mut().unwrap().quic = Some(true);
+    let (quic_carrier, _) = connect_authenticated_carrier(quic_masked).await?;
+    assert_echo_works(quic_carrier, b"split-quic-masked", target_addr2).await?;
+
+    // Masked TCP fails.
+    let mut tcp_masked = masked_client_config(tcp_addr, &cert_path, Some(2));
+    tcp_masked.server_addr = format!("tls://{tcp_addr}");
+    let masked_res = tokio::time::timeout(
+        Duration::from_secs(4),
+        connect_authenticated_carrier(tcp_masked),
+    )
+    .await;
+    assert!(
+        masked_res.is_err() || masked_res.unwrap().is_err(),
+        "masked TCP client must fail in split mode (enabled=false, quic=true)"
+    );
+
+    target1.abort();
+    target2.abort();
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(5), server_task).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn zero_handshake_timeout_with_masking_uses_nonzero_fallback_dwell() -> Result<(), TestError>
+{
+    let mut cfg = masked_server_config(
+        "127.0.0.1:0".parse()?,
+        "127.0.0.1:0".parse()?,
+        std::path::Path::new("unused"),
+        std::path::Path::new("unused"),
+        None,
+    );
+    cfg.limits = Some(LimitConfig {
+        handshake_timeout_seconds: Some(0),
+        ..LimitConfig::default()
+    });
+    let (server, cert_path) = spawn_custom_server(cfg).await?;
+    let (target_addr, target) = spawn_echo_target().await?;
+
+    // Valid masked client connects cleanly despite handshake_timeout_seconds = 0.
+    let mut client = masked_client_config(server.addr, &cert_path, Some(5));
+    client.server_addr = format!("tls://{}", server.addr);
+    let (carrier, _) = connect_authenticated_carrier(client).await?;
+    assert_echo_works(carrier, b"zero-timeout-fallback", target_addr).await?;
+
+    // 76-byte garbage probe must dwell for [5s, 10s] (never close instantly!).
+    let mut probe = TcpStream::connect(server.addr).await?;
+    probe.write_all(&[0xa5_u8; PRELUDE_LEN + NONCE_LEN]).await?;
+    let mut buf = [0_u8; 64];
+    let early = tokio::time::timeout(Duration::from_secs(4), probe.read(&mut buf)).await;
+    assert!(
+        early.is_err(),
+        "handshake_timeout_seconds = 0 with TCP masking must use 10s fallback dwell (>= 5s), not instant close"
+    );
+
+    let closed = tokio::time::timeout(Duration::from_secs(9), probe.read(&mut buf)).await;
+    assert!(
+        closed.is_ok(),
+        "probe must close within 10s fallback window"
+    );
+
+    wait_for_metric_substring(
+        server.observability_addr,
+        "uncrowned_king_server_mask_prelude_rejects_total 1\n",
+        Duration::from_secs(3),
+    )
+    .await?;
+
+    target.abort();
+    server.stop().await;
     Ok(())
 }

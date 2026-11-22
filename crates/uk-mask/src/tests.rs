@@ -283,3 +283,124 @@ fn policy_parse_round_trips() {
     assert_eq!(PreludePolicy::parse(" LOW7 "), Some(PreludePolicy::Low7));
     assert_eq!(PreludePolicy::default(), PreludePolicy::Fade);
 }
+
+fn bit_reference_encode_tail(
+    high_bits: [u8; 4],
+    masked_payload: [u8; TAIL_PAYLOAD_LEN],
+) -> [u8; TAIL_LEN] {
+    let mut tail = [0_u8; TAIL_LEN];
+    for (index, slot) in tail.iter_mut().enumerate() {
+        let high = ((high_bits[index / 8] >> (index % 8)) & 1) << 7;
+        let low = (0..7).fold(0_u8, |value, bit| {
+            let offset = index * 7 + bit;
+            let payload_bit = (masked_payload[offset / 8] >> (7 - (offset % 8))) & 1;
+            (value << 1) | payload_bit
+        });
+        *slot = high | low;
+    }
+    tail
+}
+
+#[test]
+fn extreme_field_encodings_match_independent_vectors() {
+    let keys = MaskKeys::derive(b"extreme-key", SECRET);
+    let cases = [
+        (
+            [0xff_u8; PREFIX_LEN],
+            [0xff_u8; NONCE_LEN],
+            [0xff_u8; 4],
+            u64::MAX,
+            MAX_COUNTER,
+        ),
+        (
+            [0_u8; PREFIX_LEN],
+            [0_u8; NONCE_LEN],
+            [0_u8; 4],
+            0_u64,
+            1_u64,
+        ),
+        (
+            std::array::from_fn(|index| 31_u8 - index as u8),
+            std::array::from_fn(|index| 11_u8 - index as u8),
+            [0x80, 0x00, 0x00, 0x01],
+            0x8000_0000_0000_0001_u64,
+            0x8000_0000_0001_u64,
+        ),
+    ];
+
+    for (prefix, nonce, high_bits, identity, counter) in cases {
+        let identity_bytes = identity.to_be_bytes();
+        let counter_bytes = counter_to_be_bytes(counter);
+        let tag =
+            keys.authentication_tag(&nonce, &prefix, high_bits, identity_bytes, counter_bytes);
+        let mask = keys.prelude_mask(&nonce, &prefix, high_bits);
+
+        let mut payload = [0_u8; TAIL_PAYLOAD_LEN];
+        payload[..IDENTITY_LEN].copy_from_slice(&identity_bytes);
+        payload[IDENTITY_LEN..IDENTITY_LEN + COUNTER_LEN].copy_from_slice(&counter_bytes);
+        payload[IDENTITY_LEN + COUNTER_LEN..].copy_from_slice(&tag[..TAG_LEN]);
+        let masked_payload: [u8; TAIL_PAYLOAD_LEN] =
+            std::array::from_fn(|index| payload[index] ^ mask[index]);
+
+        let expected_tail = bit_reference_encode_tail(high_bits, masked_payload);
+        let mut prelude = [0_u8; PRELUDE_LEN];
+        prelude[..PREFIX_LEN].copy_from_slice(&prefix);
+        prelude[PREFIX_LEN..].copy_from_slice(&expected_tail);
+
+        assert_eq!(pack_high_bits(&prelude[PREFIX_LEN..]), high_bits);
+        assert_eq!(read_tail_payload(&prelude[PREFIX_LEN..]), masked_payload);
+
+        let mut rewritten_tail = std::array::from_fn(|index| expected_tail[index] & 0x80);
+        write_tail_payload(&mut rewritten_tail, &masked_payload);
+        assert_eq!(rewritten_tail, expected_tail);
+
+        let decoded = keys.decode_prelude(&prelude, &nonce).unwrap();
+        assert_eq!(decoded.identity, identity);
+        assert_eq!(decoded.counter, counter);
+
+        let credential_set = [MaskKeys::derive(b"decoy", SECRET), keys.clone()];
+        let (_, verified) = verify_prelude(&credential_set, &prelude, &nonce).unwrap();
+        assert_eq!(verified, decoded);
+    }
+}
+
+#[test]
+fn concurrent_client_sequence_exhaustion_saturates() {
+    use std::sync::{Arc, Barrier};
+
+    let mut sequence = ClientSequence::new(&mut rng());
+    sequence.next = std::sync::atomic::AtomicU64::new(MAX_COUNTER - 1);
+    let sequence = Arc::new(sequence);
+    let workers = 16_usize;
+    let barrier = Arc::new(Barrier::new(workers));
+
+    let handles: Vec<_> = (0..workers)
+        .map(|_| {
+            let sequence = Arc::clone(&sequence);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                sequence.allocate()
+            })
+        })
+        .collect();
+
+    let mut successes = Vec::new();
+    let mut exhausted = 0_usize;
+    for handle in handles {
+        match handle.join().unwrap() {
+            Ok(counter) => successes.push(counter),
+            Err(MaskError::CounterExhausted) => exhausted += 1,
+            Err(other) => panic!("unexpected allocation error: {other}"),
+        }
+    }
+
+    successes.sort_unstable();
+    assert_eq!(successes, vec![MAX_COUNTER - 1, MAX_COUNTER]);
+    assert_eq!(exhausted, workers - 2);
+    assert!(matches!(
+        sequence.allocate(),
+        Err(MaskError::CounterExhausted)
+    ));
+    assert_eq!(sequence.next.load(Ordering::Relaxed), MAX_COUNTER + 1);
+}

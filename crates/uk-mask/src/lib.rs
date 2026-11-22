@@ -64,7 +64,7 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 pub use replay::{ReplayDecision, ReplayRegistry, Replayed};
-pub use stream::MaskedStream;
+pub use stream::{MaskedStream, WriteReady};
 
 /// Prelude length in bytes, sent before the nonce.
 pub const PRELUDE_LEN: usize = 64;
@@ -185,7 +185,7 @@ impl MaskKeys {
         let identity_bytes = identity.to_be_bytes();
         let counter_bytes = counter_to_be_bytes(counter);
         let tag = self.authentication_tag(&nonce, prefix, high_bits, identity_bytes, counter_bytes);
-        let mut payload = [0_u8; TAIL_PAYLOAD_LEN];
+        let mut payload = Zeroizing::new([0_u8; TAIL_PAYLOAD_LEN]);
         payload[..IDENTITY_LEN].copy_from_slice(&identity_bytes);
         payload[IDENTITY_LEN..IDENTITY_LEN + COUNTER_LEN].copy_from_slice(&counter_bytes);
         payload[IDENTITY_LEN + COUNTER_LEN..].copy_from_slice(&tag[..TAG_LEN]);
@@ -208,13 +208,19 @@ impl MaskKeys {
         prelude: &[u8; PRELUDE_LEN],
         nonce: &[u8; NONCE_LEN],
     ) -> Result<AuthenticatedPrelude, MaskError> {
-        let prefix = &prelude[..PREFIX_LEN];
-        let high_bits = pack_high_bits(&prelude[PREFIX_LEN..]);
-        let masked_payload = read_tail_payload(&prelude[PREFIX_LEN..]);
-        let mask = self.prelude_mask(nonce, prefix, high_bits);
-        let mut payload = [0_u8; TAIL_PAYLOAD_LEN];
+        let unpacked = UnpackedPrelude::unpack(prelude);
+        self.decode_unpacked(&unpacked, nonce)
+    }
+
+    fn decode_unpacked(
+        &self,
+        unpacked: &UnpackedPrelude<'_>,
+        nonce: &[u8; NONCE_LEN],
+    ) -> Result<AuthenticatedPrelude, MaskError> {
+        let mask = self.prelude_mask(nonce, unpacked.prefix, unpacked.high_bits);
+        let mut payload = Zeroizing::new([0_u8; TAIL_PAYLOAD_LEN]);
         for index in 0..TAIL_PAYLOAD_LEN {
-            payload[index] = masked_payload[index] ^ mask[index];
+            payload[index] = unpacked.masked_payload[index] ^ mask[index];
         }
         let mut identity_bytes = [0_u8; IDENTITY_LEN];
         identity_bytes.copy_from_slice(&payload[..IDENTITY_LEN]);
@@ -224,8 +230,13 @@ impl MaskKeys {
         // The tag is computed and compared before any rejection is decided:
         // an early `counter == 0` branch here would let a prober time the
         // HMAC skip and probe prelude structure without paying for it.
-        let expected =
-            self.authentication_tag(nonce, prefix, high_bits, identity_bytes, counter_bytes);
+        let expected = self.authentication_tag(
+            nonce,
+            unpacked.prefix,
+            unpacked.high_bits,
+            identity_bytes,
+            counter_bytes,
+        );
         let given: [u8; TAG_LEN] = payload[IDENTITY_LEN + COUNTER_LEN..]
             .try_into()
             .expect("tail payload layout guarantees 14 tag bytes");
@@ -281,6 +292,23 @@ impl MaskKeys {
     }
 }
 
+struct UnpackedPrelude<'a> {
+    prefix: &'a [u8],
+    high_bits: [u8; 4],
+    masked_payload: [u8; TAIL_PAYLOAD_LEN],
+}
+
+impl<'a> UnpackedPrelude<'a> {
+    fn unpack(prelude: &'a [u8; PRELUDE_LEN]) -> Self {
+        let tail = &prelude[PREFIX_LEN..];
+        Self {
+            prefix: &prelude[..PREFIX_LEN],
+            high_bits: pack_high_bits(tail),
+            masked_payload: read_tail_payload(tail),
+        }
+    }
+}
+
 /// Verifies a prelude against every credential's keys.
 ///
 /// Every key performs the full verification — there is no early exit — so the
@@ -291,9 +319,10 @@ pub fn verify_prelude<'keys>(
     prelude: &[u8; PRELUDE_LEN],
     nonce: &[u8; NONCE_LEN],
 ) -> Option<(&'keys MaskKeys, AuthenticatedPrelude)> {
+    let unpacked = UnpackedPrelude::unpack(prelude);
     let mut found = None;
     for key in keys {
-        if let Ok(authenticated) = key.decode_prelude(prelude, nonce) {
+        if let Ok(authenticated) = key.decode_unpacked(&unpacked, nonce) {
             found = Some((key, authenticated));
         }
     }
@@ -376,11 +405,20 @@ impl ClientSequence {
 
     /// Allocates the next counter. Monotonic, never reused, never wraps.
     pub fn allocate(&self) -> Result<u64, MaskError> {
-        let counter = self.next.fetch_add(1, Ordering::Relaxed);
-        if counter == 0 || counter > MAX_COUNTER {
-            Err(MaskError::CounterExhausted)
-        } else {
-            Ok(counter)
+        let mut current = self.next.load(Ordering::Relaxed);
+        loop {
+            if current == 0 || current > MAX_COUNTER {
+                return Err(MaskError::CounterExhausted);
+            }
+            match self.next.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(current),
+                Err(observed) => current = observed,
+            }
         }
     }
 }
@@ -409,24 +447,49 @@ fn pack_high_bits(tail: &[u8]) -> [u8; 4] {
 /// Writes the 224 payload bits into the low 7 bits of the 32 tail bytes,
 /// MSB-first, preserving each byte's high bit.
 fn write_tail_payload(tail: &mut [u8], payload: &[u8; TAIL_PAYLOAD_LEN]) {
-    for bit_index in 0..TAIL_PAYLOAD_LEN * 8 {
-        let bit = (payload[bit_index / 8] >> (7 - (bit_index % 8))) & 1;
-        let group = bit_index / 7;
-        let position = bit_index % 7;
-        let bit_mask = 1_u8 << (6 - position);
-        tail[group] = (tail[group] & !bit_mask) | (bit << (6 - position));
+    assert!(
+        tail.len() >= TAIL_LEN,
+        "prelude tail must be at least {TAIL_LEN} bytes"
+    );
+    let mut accumulator = 0_u16;
+    let mut bits = 0_u32;
+    let mut output = tail[..TAIL_LEN].iter_mut();
+    for &byte in payload {
+        accumulator = (accumulator << 8) | u16::from(byte);
+        bits += 8;
+        while bits >= 7 {
+            bits -= 7;
+            let slot = output
+                .next()
+                .expect("28 payload bytes produce exactly 32 seven-bit groups");
+            *slot = (*slot & 0x80) | (((accumulator >> bits) as u8) & 0x7f);
+        }
     }
+    debug_assert_eq!(bits, 0);
 }
 
 /// Reads the 224 payload bits back out of the tail's low 7 bits.
 fn read_tail_payload(tail: &[u8]) -> [u8; TAIL_PAYLOAD_LEN] {
+    assert!(
+        tail.len() >= TAIL_LEN,
+        "prelude tail must be at least {TAIL_LEN} bytes"
+    );
     let mut payload = [0_u8; TAIL_PAYLOAD_LEN];
-    for bit_index in 0..TAIL_PAYLOAD_LEN * 8 {
-        let group = bit_index / 7;
-        let position = bit_index % 7;
-        let bit = (tail[group] >> (6 - position)) & 1;
-        payload[bit_index / 8] |= bit << (7 - (bit_index % 8));
+    let mut accumulator = 0_u16;
+    let mut bits = 0_u32;
+    let mut output = payload.iter_mut();
+    for &byte in &tail[..TAIL_LEN] {
+        accumulator = (accumulator << 7) | u16::from(byte & 0x7f);
+        bits += 7;
+        if bits >= 8 {
+            bits -= 8;
+            *output
+                .next()
+                .expect("32 seven-bit groups produce exactly 28 payload bytes") =
+                (accumulator >> bits) as u8;
+        }
     }
+    debug_assert_eq!(bits, 0);
     payload
 }
 

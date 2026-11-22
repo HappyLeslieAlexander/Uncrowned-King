@@ -8477,6 +8477,8 @@ fn test_limits() -> LimitConfig {
         max_frame_size: Some(65_536),
         max_sessions: Some(32),
         max_handshakes: Some(32),
+        max_pre_auth_connections: None,
+        max_pre_auth_per_source: None,
         max_streams: Some(8),
         max_udp_flows: None,
         max_outbound_dials_per_session: Some(8),

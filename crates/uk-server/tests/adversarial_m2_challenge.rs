@@ -688,7 +688,7 @@ fn test_challenge_sighup_limits_comprehensive_immutability() {
     "#;
     let current: ServerConfig = toml::from_str(toml_str).unwrap();
 
-    // Verify all 28 static limits in reload_static_limits cannot be altered via SIGHUP
+    // Verify all 30 static limits in reload_static_limits cannot be altered via SIGHUP
     let test_limits = [
         (
             "max_sessions",
@@ -701,6 +701,20 @@ fn test_challenge_sighup_limits_comprehensive_immutability() {
             "max_handshakes",
             LimitConfig {
                 max_handshakes: Some(456),
+                ..LimitConfig::default()
+            },
+        ),
+        (
+            "max_pre_auth_connections",
+            LimitConfig {
+                max_pre_auth_connections: Some(128),
+                ..LimitConfig::default()
+            },
+        ),
+        (
+            "max_pre_auth_per_source",
+            LimitConfig {
+                max_pre_auth_per_source: Some(16),
                 ..LimitConfig::default()
             },
         ),
