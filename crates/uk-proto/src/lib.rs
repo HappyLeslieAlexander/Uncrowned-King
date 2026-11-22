@@ -1,0 +1,57 @@
+//! Core Uncrowned King wire encoding.
+
+/// TLS/QUIC ALPN protocol identifier for Uncrowned King v0.1.
+pub const ALPN_PROTOCOL: &[u8] = b"uk/1";
+
+/// Checks a TCP/UDP relay close code.
+///
+/// Both relay protocols define the same two close codes: 0 is a normal
+/// close, 1 is a generic error close. Anything else is a protocol
+/// violation. Shared by `tcp` and `udp` so the rule lives in one place.
+pub(crate) fn is_valid_close_code(close_code: u16) -> bool {
+    matches!(close_code, 0 | 1)
+}
+
+pub mod carrier;
+pub mod datagram;
+pub mod endpoint;
+pub mod error;
+pub mod flow;
+pub mod frame;
+pub mod io;
+pub mod observability;
+pub mod settings;
+pub mod status;
+pub mod target;
+pub mod tcp;
+pub mod udp;
+pub mod varint;
+
+pub use carrier::{
+    BoxedCarrierReader, BoxedCarrierWriter, BoxedDatagramChannel, DatagramChannel,
+    DatagramSendOutcome,
+};
+pub use endpoint::{
+    BindExposure, EndpointError, ObservabilityBindError, resolve_observability_bind,
+    validate_host_port_endpoint, validate_observability_bind,
+};
+pub use error::{ProtocolError, ProtocolResult};
+pub use flow::{
+    FIRST_CLIENT_FLOW_ID, FLOW_ID_STEP, is_client_initiated_flow_id, is_server_initiated_flow_id,
+};
+pub use frame::{
+    Frame, FrameHeader, FrameLimits, FrameType, MAX_FRAME_PAYLOAD_SIZE, VERSION,
+    validate_connection_frame,
+};
+pub use io::{FrameIoError, FrameIoResult, FrameReader, read_frame, write_frame, write_frames};
+pub use settings::{
+    DEFAULT_MAX_STREAMS, MAX_NEGOTIATED_FLOWS, MAX_NEGOTIATED_IDLE_TIMEOUT_SECONDS,
+    NegotiatedSettings, PROTOCOL_REVISION_V1_0, SettingKey, Settings,
+};
+pub use status::{ErrorCode, ErrorPayload};
+pub use target::{Target, validate_domain_name, validate_domain_pattern};
+pub use tcp::{
+    MIN_TCP_RELAY_FRAME_SIZE, TCP_CLOSE_ERROR, TCP_CLOSE_NORMAL, TCP_OPEN_FLAGS_NONE, TcpClose,
+    TcpOpen,
+};
+pub use udp::{UDP_CLOSE_ERROR, UDP_CLOSE_NORMAL, UdpClose, UdpOpen};

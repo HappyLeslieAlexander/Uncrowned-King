@@ -1,0 +1,84 @@
+# Hardened UK server configuration example.
+#
+# Compared with `server.toml`, this profile raises the bar against active
+# probing and credential replay:
+#
+# - Transport masking is ENABLED for the TLS/TCP carrier. Every connection
+#   must open with a valid authenticated prelude; blind probes are silently
+#   drained (uniform jittered dwell, zero response bytes) and never reach the
+#   TLS handshake or the certificate. Masking rejections count into the
+#   authentication rate limiter.
+# - QUIC masking stays off here only because `quic_listen` is removed: a
+#   masked QUIC endpoint is pinned to exactly one designated credential
+#   (`masking.quic_key_id`) and requires a restart to change. Re-add
+#   `quic_listen` together with `masking.quic = true` and a `quic_key_id`
+#   masking both carriers in one posture.
+# - Tighter admission budgets: fewer handshakes/sessions per source-class and
+#   a smaller pre-auth frame ceiling shrink the unauthenticated attack
+#   surface.
+# - Brute-force defense in depth: the per-source limiter keeps the default
+#   `5 failures / 60s -> 300s ban` with escalating ban durations (each repeat
+#   ban doubles, capped at 30 days), and the global failure governor engages
+#   enhanced mode (double-weight failures, maximal rejection drain) when
+#   failures from many sources exceed `auth_rate_limit_global_failures` in
+#   the window — the distributed brute-force dimension.
+#
+# Masking must be enabled on the client too (`[masking] enabled = true` in
+# client.toml); a masked client against an unmasked listener or the reverse
+# fails closed as a handshake timeout. Changing `[masking]` requires a
+# restart.
+
+listen = "127.0.0.1:9443"
+observability_listen = "127.0.0.1:9090"
+cert_path = "server-cert.pem"
+key_path = "server-key.pem"
+policy_path = "policy.toml"
+auth_skew_seconds = 30
+
+[limits]
+max_pre_auth_bytes = 4096
+max_frame_size = 65536
+max_sessions = 256
+max_handshakes = 128
+max_streams = 64
+max_udp_flows = 64
+max_outbound_dials_per_session = 16
+max_buffered_bytes_per_session = 16777216
+idle_timeout_seconds = 300
+max_buffered_bytes_per_flow = 2097152
+max_total_streams = 65536
+max_total_buffered_bytes = 536870912
+handshake_timeout_seconds = 10
+target_connect_timeout_seconds = 10
+tcp_half_close_timeout_seconds = 30
+carrier_write_timeout_seconds = 30
+tcp_keepalive_seconds = 60
+udp_flow_idle_timeout_seconds = 120
+shutdown_timeout_seconds = 30
+# The replay cache must cover 2 × auth_skew_seconds; keep it well above.
+replay_cache_window_seconds = 600
+replay_cache_max_entries = 131072
+# Per-source: 5 failures / 60s -> 300s ban (escalating on repeat offenses).
+auth_rate_limit_failures = 5
+auth_rate_limit_window_seconds = 60
+auth_rate_limit_ban_seconds = 300
+# Global governor: ~10× one source's budget. A distributed burst across many
+# sources crossing this engages enhanced mode (double-weight failures,
+# maximal rejection drain). 0 disables.
+auth_rate_limit_global_failures = 50
+# auth_rate_limit_allowlist = ["198.51.100.0/24"]
+
+[[credentials]]
+key_id = "local-dev"
+secret = "replace-with-a-long-random-shared-secret"
+status = "active"
+policy_group = "default"
+
+# Transport masking for the TLS/TCP carrier: enabled. Every connection must
+# open with a valid 64-byte authenticated prelude; probes without a
+# credential receive zero response bytes and an abortive close after a
+# jittered dwell. `replay_identities` bounds the prelude replay registry
+# (fully preallocated at startup). Changing this section requires a restart.
+[masking]
+enabled = true
+replay_identities = 16384

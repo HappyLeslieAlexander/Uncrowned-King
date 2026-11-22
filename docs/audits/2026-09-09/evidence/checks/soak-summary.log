@@ -1,0 +1,14 @@
+Command: UK_SOAK_SECONDS=60 cargo test -p uk-client --test tcp_relay_e2e --release --locked -- --ignored --nocapture soak_sustained_relay_and_chaos
+
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Finished `release` profile [optimized] target(s) in 0.09s
+     Running tests/tcp_relay_e2e.rs (target/release/deps/tcp_relay_e2e-a3136062b4f046e7)
+
+running 1 test
+test soak_sustained_relay_and_chaos has been running for over 60 seconds
+soak: 3702625 round trips across 16 flows + 1176 denied-flow chaos over 60s; session healthy
+test soak_sustained_relay_and_chaos ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 105 filtered out; finished in 60.01s
+

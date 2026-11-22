@@ -1,0 +1,107 @@
+{{- if .Values.server.enabled }}
+{{- /* Unknown top-level keys in server.config are rejected: a typo like
+     `quic_lisen` would otherwise be silently ignored and the deployment
+     would run with defaults instead of the intended value. */}}
+{{- $knownServerFields := list "listen" "quic_listen" "observability_listen" "auth_skew_seconds" "limits" "log_format" "masking" }}
+{{- range $key, $val := .Values.server.config }}
+{{- if not (has $key $knownServerFields) }}
+{{- fail (printf "Unknown server.config field %q (known fields: %s); refusing to silently ignore it" $key (join ", " $knownServerFields)) }}
+{{- end }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "uncrowned-king.server.fullname" . }}-config
+  labels:
+    {{- include "uncrowned-king.labels" . | nindent 4 }}
+data:
+  server.toml: |
+    listen = "{{ .Values.server.config.listen }}"
+    {{- if .Values.server.config.quic_listen }}
+    quic_listen = "{{ .Values.server.config.quic_listen }}"
+    {{- end }}
+    {{- if .Values.server.config.observability_listen }}
+    observability_listen = "{{ .Values.server.config.observability_listen }}"
+    {{- end }}
+    cert_path = "/etc/uncrowned-king/tls/tls.crt"
+    key_path = "/etc/uncrowned-king/tls/tls.key"
+    policy_path = "/etc/uncrowned-king/policy/policy.toml"
+    {{- if .Values.server.config.auth_skew_seconds }}
+    auth_skew_seconds = {{ int64 .Values.server.config.auth_skew_seconds }}
+    {{- end }}
+
+    {{- if .Values.server.config.limits }}
+    {{- $knownLimits := list "max_pre_auth_bytes" "max_frame_size" "max_sessions" "max_handshakes" "max_streams" "max_udp_flows" "max_outbound_dials_per_session" "max_buffered_bytes_per_session" "max_buffered_bytes_per_flow" "max_total_streams" "max_total_buffered_bytes" "relay_buffer_size" "idle_timeout_seconds" "handshake_timeout_seconds" "target_connect_timeout_seconds" "tcp_half_close_timeout_seconds" "carrier_write_timeout_seconds" "tcp_keepalive_seconds" "udp_flow_idle_timeout_seconds" "shutdown_timeout_seconds" "auth_rate_limit_failures" "auth_rate_limit_window_seconds" "auth_rate_limit_ban_seconds" "auth_rate_limit_allowlist" "replay_cache_window_seconds" "replay_cache_max_entries" "quic_stream_receive_window" "quic_connection_receive_window" }}
+    [limits]
+    {{- range $key, $val := .Values.server.config.limits }}
+    {{- if not (has $key $knownLimits) }}
+    {{- fail (printf "Unknown server limit %q in server.config.limits" $key) }}
+    {{- end }}
+    {{- if not (kindIs "invalid" $val) }}
+    {{- if eq $key "auth_rate_limit_allowlist" }}
+    {{ $key }} = [{{ range $item := $val }}"{{ $item }}", {{ end }}]
+    {{- else }}
+    {{ $key }} = {{ int64 $val }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+
+    {{- if .Values.server.config.masking }}
+    {{- $knownMasking := list "enabled" "replay_identities" "quic" "quic_key_id" }}
+    {{- $masking := .Values.server.config.masking }}
+    [masking]
+    {{- range $key, $val := $masking }}
+    {{- if not (has $key $knownMasking) }}
+    {{- fail (printf "Unknown server masking field %q in server.config.masking (known: enabled, replay_identities, quic, quic_key_id)" $key) }}
+    {{- end }}
+    {{- end }}
+    {{- if kindIs "invalid" $masking.enabled }}
+    {{- fail "server.config.masking.enabled must be set explicitly (true or false)" }}
+    {{- end }}
+    enabled = {{ $masking.enabled }}
+    {{- if $masking.replay_identities }}
+    replay_identities = {{ int64 $masking.replay_identities }}
+    {{- end }}
+    {{- if $masking.quic }}
+    quic = {{ $masking.quic }}
+    {{- if not $masking.quic_key_id }}
+    {{- fail "server.config.masking.quic_key_id is required when masking.quic is enabled" }}
+    {{- end }}
+    {{- if not (has $masking.quic_key_id .Values.server.credentials) }}
+    {{- fail (printf "server.config.masking.quic_key_id %q must name a key in server.credentials" $masking.quic_key_id) }}
+    {{- end }}
+    quic_key_id = "{{ $masking.quic_key_id }}"
+    {{- end }}
+    {{- end }}
+
+  policy.toml: |
+    {{- range .Values.server.policy.rules }}
+    [[rules]]
+    action = "{{ .action }}"
+    {{- if .key_id }}
+    key_id = "{{ .key_id }}"
+    {{- end }}
+    {{- if .policy_group }}
+    policy_group = "{{ .policy_group }}"
+    {{- end }}
+    {{- if .cidr }}
+    cidr = "{{ .cidr }}"
+    {{- end }}
+    {{- if .domain }}
+    domain = "{{ .domain }}"
+    {{- end }}
+    {{- if .domain_suffix }}
+    domain_suffix = "{{ .domain_suffix }}"
+    {{- end }}
+    {{- if .port_start }}
+    port_start = {{ int64 .port_start }}
+    {{- end }}
+    {{- if .port_end }}
+    port_end = {{ int64 .port_end }}
+    {{- end }}
+    {{- if hasKey . "private" }}
+    private = {{ .private }}
+    {{- end }}
+    {{- end }}
+{{- end }}

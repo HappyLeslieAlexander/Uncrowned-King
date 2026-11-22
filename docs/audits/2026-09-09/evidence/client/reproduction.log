@@ -1,0 +1,33 @@
+   Compiling uk-client v0.1.3 (/private/tmp/uk-client-audit-20260909/crates/uk-client)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.71s
+     Running unittests src/lib.rs (target/debug/deps/uk_client-26e6a9e4984b2000)
+
+running 3 tests
+
+thread 'relay::tests::audit_udp_old_session_completion_must_not_remove_new_session_flow' (342147) panicked at crates/uk-client/src/relay/tests.rs:2173:5:
+old carrier completion removed new carrier flow with the same id
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test relay::tests::audit_udp_old_session_completion_must_not_remove_new_session_flow ... FAILED
+audit rejected reload: error=client config field `max_socks_connections` requires a restart, generation=1, CA cache same=false
+audit control RST: routes retained=1, available_udp_permits=8
+
+thread 'relay::tests::audit_udp_control_reset_leaves_orphan_route' (342146) panicked at crates/uk-client/src/relay/tests.rs:2151:5:
+assertion `left == right` failed: association error must remove its routes
+  left: 1
+ right: 0
+
+thread 'relay::tests::audit_rejected_reload_must_preserve_active_ca_cache' (342145) panicked at crates/uk-client/src/relay/tests.rs:2193:5:
+rejected reload replaced active cached TLS trust
+test relay::tests::audit_udp_control_reset_leaves_orphan_route ... FAILED
+test relay::tests::audit_rejected_reload_must_preserve_active_ca_cache ... FAILED
+
+failures:
+
+failures:
+    relay::tests::audit_rejected_reload_must_preserve_active_ca_cache
+    relay::tests::audit_udp_control_reset_leaves_orphan_route
+    relay::tests::audit_udp_old_session_completion_must_not_remove_new_session_flow
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 255 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p uk-client --lib`

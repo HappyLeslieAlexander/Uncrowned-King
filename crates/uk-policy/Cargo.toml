@@ -1,0 +1,20 @@
+[package]
+name = "uk-policy"
+description = "TOML policy evaluation for Uncrowned King relay targets."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+uk-auth = { path = "../uk-auth" }
+uk-proto = { path = "../uk-proto" }
+
+[lints]
+workspace = true

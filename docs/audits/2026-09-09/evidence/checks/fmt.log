@@ -1,0 +1,16 @@
+Diff in /Users/lesliealexander/Uncrowned King/crates/uk-server/tests/adversarial_sec_challenge.rs:1271:
+     let mut reader = FrameReader::new(client_io, limits);
+ 
+     let payload_data = vec![0x42u8; 32 * 1024]; // 32 KB payload
+-    let test_frame = Frame::new(
+-        FrameType::TcpData,
+-        0,
+-        1,
+-        Bytes::from(payload_data.clone()),
+-    )
+-    .expect("frame creation");
++    let test_frame = Frame::new(FrameType::TcpData, 0, 1, Bytes::from(payload_data.clone()))
++        .expect("frame creation");
+ 
+     let encoded_frame = test_frame.encode().expect("frame encode");
+ 

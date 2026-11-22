@@ -1,0 +1,12 @@
+# Demo policy: deny private targets first, then allow a public HTTPS host.
+# Replace with the targets your deployment actually needs.
+
+[[rules]]
+action = "deny"
+private = true
+
+[[rules]]
+action = "allow"
+domain = "example.com"
+port_start = 443
+port_end = 443

@@ -1,0 +1,160 @@
+--- a/crates/uk-server/src/relay/tests.rs
++++ b/crates/uk-server/src/relay/tests.rs
+@@ -1976,3 +1976,122 @@
+         TARGET_WRITE_QUEUE_MAX_CAPACITY
+     );
+ }
++
++#[tokio::test]
++async fn review_drain_drops_data_after_both_half_closes() {
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let relay_socket = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
++    let (mut target, _) = listener.accept().await.unwrap();
++    let (_, target_writer) = relay_socket.into_split();
++    let (tx, rx) = mpsc::channel(10);
++    let flow_control = TargetFlowControl::default();
++    let mut flow = TargetFlow::new(TEST_FLOW_TOKEN, tx, flow_control.clone());
++    flow.mark_target_to_client_closed();
++    flow.enqueue_data(Bytes::from_static(b"last request bytes"), 1000, 1000).unwrap();
++    flow.close_client_to_target();
++    assert!(flow.is_fully_closed());
++    drop(flow); // Same remove_flow_slot path after client TCP_CLOSE.
++    let (event_tx, _event_rx) = mpsc::channel(10);
++    let shutdown = SessionShutdown::default();
++    let writer = CarrierWriter::new(Box::new(tokio::io::sink()), shutdown.clone(), Arc::new(ServerMetrics::default()), Some(Duration::from_secs(1)));
++    let mut tasks = SessionTasks::default();
++    spawn_target_writer(&mut tasks, TargetWriterTask { identity: TargetFlowIdentity { flow_id: 1, token: TEST_FLOW_TOKEN }, target_writer, commands: rx, flow_control, carrier_writer: writer.clone(), event_tx, shutdown: shutdown.clone(), write_timeout: Some(Duration::from_secs(1)) });
++    let mut state = ServerSessionState::Draining;
++    let mut table = FlowTable::new();
++    // Draining loop sees empty table and invokes this while writer has queued bytes.
++    close_session(&mut state, &shutdown, &mut table, &mut tasks, &writer, Some(Duration::from_secs(1))).await;
++    let mut received = Vec::new();
++    target.read_to_end(&mut received).await.unwrap();
++    assert_eq!(received, b"last request bytes", "drain acknowledged both closes but discarded queued target data");
++}
++
++#[tokio::test]
++async fn review_closed_flows_leave_half_close_timers() {
++    let mut tasks = SessionTasks::default();
++    let mut table = FlowTable::new();
++    let (event_tx, _event_rx) = mpsc::channel(1000);
++    let shutdown = SessionShutdown::default();
++    for id in (1..=199).step_by(2) {
++        assert!(check_open_slot(id, &table, 1).is_ok());
++        table.insert(id, test_open_flow_slot());
++        handle_target_read_closed(id, TEST_FLOW_TOKEN, Some(Duration::from_secs(30)), &event_tx, &shutdown, &mut table, &mut tasks);
++        handle_target_write_closed(id, TEST_FLOW_TOKEN, &mut table);
++        assert!(table.is_empty());
++    }
++    tokio::task::yield_now().await;
++    assert!(tasks.len() <= 1, "max_streams=1 but {} timers remain after 100 fully closed flows", tasks.len());
++}
++
++#[tokio::test]
++async fn review_aborted_flow_still_sends_queued_data() {
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let relay_socket = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
++    let (mut target, _) = listener.accept().await.unwrap();
++    let (reader, _) = relay_socket.into_split();
++    let shutdown = SessionShutdown::default();
++    let control = TargetFlowControl::default();
++    let (carrier_output, mut carrier_input) = tokio::io::duplex(1000);
++    let writer = CarrierWriter::new(Box::new(carrier_output), shutdown.clone(), Arc::new(ServerMetrics::default()), Some(Duration::from_secs(1)));
++    let guard = writer.inner.lock().await;
++    let (event_tx, _event_rx) = mpsc::channel(10);
++    let task_control = control.clone(); let task_writer = writer.clone(); let task_shutdown = shutdown.clone();
++    target.write_all(b"stale target bytes").await.unwrap();
++    let task = tokio::spawn(async move { relay_target_to_client(1, reader, task_control, &task_writer, &event_tx, &task_shutdown, 100).await });
++    tokio::time::sleep(Duration::from_millis(30)).await;
++    control.abort(); // Client closes ID 1 while old reader waits for carrier lock.
++    drop(guard);
++    task.await.unwrap().unwrap();
++    assert!(tokio::time::timeout(Duration::from_millis(30), read_frame(&mut carrier_input, FrameLimits::default())).await.is_err(), "old flow emitted data after abort instead of discarding queued frame");
++}
++
++#[tokio::test]
++async fn review_real_relay_drain_loses_tail_of_upload() {
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let address = listener.local_addr().unwrap();
++    let (client, server) = tokio::io::duplex(4 * 1024 * 1024);
++    let (server_reader, server_writer) = tokio::io::split(server);
++    let carrier = ServerCarrier::new(Box::new(server_reader), Box::new(server_writer), None);
++    let cred = uk_auth::Credential::active(b"user".to_vec(), b"0123456789abcdef0123456789abcdef".to_vec()).unwrap();
++    let identity = AuthenticatedIdentity::from(&cred);
++    let mut rule = uk_policy::PolicyRule::new(uk_policy::PolicyDecision::Allow);
++    rule.private = Some(true);
++    let security = SecurityState::new(crate::security::test_tls_acceptor(), vec![cred], PolicySet::new(vec![rule]), Duration::from_secs(30));
++    let mut limits = test_relay_limits(1);
++    limits.max_buffered_bytes_per_flow = 2 * 1024 * 1024;
++    limits.max_buffered_bytes_per_session = 16 * 1024 * 1024;
++    limits.carrier_write_timeout = Some(Duration::from_secs(30));
++    limits.tcp_half_close_timeout = Some(Duration::from_secs(30));
++    limits.session_task_shutdown_timeout = Some(Duration::from_secs(30));
++    let (shutdown_tx, shutdown_rx) = watch::channel(false);
++    let metrics = Arc::new(ServerMetrics::default());
++    let session = tokio::spawn(relay_session(carrier, identity, security, limits, None, shutdown_rx, metrics));
++    let (client_reader, mut client_writer) = tokio::io::split(client);
++    let mut frames = FrameReader::new(client_reader, FrameLimits::default());
++    let mut open = BytesMut::new();
++    TcpOpen::new(Target::Ipv4(Ipv4Addr::LOCALHOST, address.port()), TCP_OPEN_FLAGS_NONE).encode(&mut open).unwrap();
++    write_frame(&mut client_writer, &Frame::new(FrameType::TcpOpen, 0, 1, open.freeze()).unwrap()).await.unwrap();
++    let (mut target, _) = listener.accept().await.unwrap();
++    socket2::SockRef::from(&target).set_recv_buffer_size(1024).unwrap();
++    let ack = frames.read_frame().await.unwrap();
++    assert_eq!(ack.header.frame_type, FrameType::TcpData);
++    target.shutdown().await.unwrap(); // Target sends FIN but can still receive an upload.
++    let close = frames.read_frame().await.unwrap();
++    assert_eq!(close.header.frame_type, FrameType::TcpClose);
++    shutdown_tx.send(true).unwrap();
++    tokio::time::sleep(Duration::from_millis(20)).await;
++    let payload = Bytes::from(vec![0x6d; 1024 * 1024]);
++    for start in (0..payload.len()).step_by(65536) {
++        write_frame(&mut client_writer, &Frame::new(FrameType::TcpData, 0, 1, payload.slice(start..start+65536)).unwrap()).await.unwrap();
++    }
++    let mut closing = BytesMut::new();
++    TcpClose::new(TCP_CLOSE_NORMAL).encode(&mut closing).unwrap();
++    write_frame(&mut client_writer, &Frame::new(FrameType::TcpClose, 0, 1, closing.freeze()).unwrap()).await.unwrap();
++    // Delay consumption briefly to keep upload writes queued within the 30s drain budget.
++    time::sleep(Duration::from_millis(50)).await;
++    let _ = socket2::SockRef::from(&target).set_recv_buffer_size(128 * 1024);
++    let mut received = Vec::new();
++    let _ = time::timeout(Duration::from_secs(5), target.read_to_end(&mut received)).await.unwrap();
++    let session_result = time::timeout(Duration::from_secs(2), session).await.unwrap().unwrap();
++    assert!(session_result.is_ok(), "session failed: {session_result:?}");
++    assert_eq!(received.len(), payload.len(), "graceful shutdown reported success while truncating upload");
++}
+--- a/crates/uk-server/src/lib.rs
++++ b/crates/uk-server/src/lib.rs
+@@ -2013,3 +2013,32 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod review_settings_tests {
++    use super::*;
++    use std::pin::Pin;
++    use std::task::{Context, Poll};
++    struct Stall;
++    impl tokio::io::AsyncWrite for Stall {
++        fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, _: &[u8]) -> Poll<io::Result<usize>> { Poll::Pending }
++        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> { Poll::Pending }
++        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> { Poll::Pending }
++    }
++    #[tokio::test]
++    async fn review_settings_write_holds_session_after_shutdown() {
++        let config: ServerConfig = toml::from_str(include_str!("../../../examples/server.toml")).unwrap();
++        let cred = uk_auth::Credential::active(b"client".to_vec(), b"0123456789abcdef0123456789abcdef".to_vec()).unwrap();
++        let identity = AuthenticatedIdentity::from(&cred);
++        let security = SecurityState::new(crate::security::test_tls_acceptor(), vec![cred], uk_policy::PolicySet::default(), Duration::from_secs(30));
++        let permits = Arc::new(Semaphore::new(1));
++        let task_permits = permits.clone();
++        let (tx, rx) = watch::channel(false);
++        let handle = tokio::spawn(async move { run_authenticated_session(Box::new(tokio::io::empty()), Box::new(Stall), None, identity, security, &config, task_permits, 1, "127.0.0.1:1000".parse().unwrap(), rx, Arc::new(ServerMetrics::default())).await });
++        tokio::task::yield_now().await;
++        assert_eq!(permits.available_permits(), 0);
++        tx.send(true).unwrap();
++        let result = time::timeout(Duration::from_millis(100), handle).await;
++        assert!(result.is_ok(), "SETTINGS write ignores shutdown and has no write deadline; slot remains held");
++    }
++}

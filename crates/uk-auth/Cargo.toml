@@ -1,0 +1,31 @@
+[package]
+name = "uk-auth"
+description = "HMAC challenge-response authentication for Uncrowned King."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+hmac.workspace = true
+rand.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uk-proto = { path = "../uk-proto" }
+zeroize.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "auth"
+harness = false
+
+[lints]
+workspace = true
