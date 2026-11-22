@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **Silent `rustls::server::Acceptor` pre-hello parsing (`uk-server`)**: replaced `CommitGate` and `tokio_rustls::TlsAcceptor::accept` on the masked TCP path with `rustls::server::Acceptor` enforcing a 64 KiB cumulative `ClientHello` buffer limit. Malformed hellos and TLS alerts emit zero response bytes, leave the replay counter uncommitted, count into `AuthRateLimiter`, and drain under the uniform jittered dwell posture before abortive close; `Accepted::into_connection` and ALPN validation run prior to atomic replay commit and `ServerHello`.
+- **Unauthenticated pre-admission concurrency limits (`uk-server`, `deploy`)**: added `PreAdmissionLimiter` (`limits.max_pre_auth_connections`, default `256`; `limits.max_pre_auth_per_source`, default `32` per IPv4 / IPv6 `/64` with IPv4-mapped canonicalization) enforced synchronously on `accept()` before spawning tasks or acquiring handshake permits, with silent abortive/ignore drops and Prometheus metric `uncrowned_king_server_rejected_pre_auth_connections_total`.
+- **Full-handshake `SO_LINGER=0` & shared absolute deadline (`uk-server`)**: masked TCP connections now arm `SO_LINGER=0` immediately on `accept()`, share a single absolute `deadline = accepted_at + handshake_timeout` across prelude, TLS, ALPN, and `AUTH_RESPONSE`, and restore normal close semantics only after application-layer authentication succeeds via double-checked deadline validation.
+- **Silent masked QUIC rejection (`uk-server`)**: rate-limited or permit-exhausted attempts on masked QUIC listeners now call `incoming.ignore()` instead of `incoming.refuse()` so zero response packets are emitted.
+
+### Changed
+
+- **Zero-allocation fixed-size `ReplayRegistry` & hot-path hardening (`uk-mask`, `uk-client`)**: replaced `HashMap` + `VecDeque` in `ReplayRegistry` with a fixed-capacity preallocated ring array and open-chained hash buckets (`RandomState`), switched `ReplayEntry::advance` from 1024-iteration bit shifting to 16 `u64` word shifts, and updated `ClientSequence::allocate` to a saturating CAS loop. `MaskedStream` now checks `poll_write_ready` before encrypting, uses single-pass `try_apply_keystream_b2b`, clamps reads/writes to `STREAM_LIMIT`, hoists prelude bit unpacking outside the multi-credential verification loop, and coalesces the client's 76-byte prelude + nonce with the first encrypted `ClientHello` write into a single send.
+- **Split-lock, non-starving `MaskedUdpSocket` (`uk-mask`)**: separated send (owning nonce generation) and receive locks, replaced per-poll heap-allocated `Vec<IoSliceMut>` with bounded stack-allocated `[IoSliceMut; BATCH_SIZE]` and single-pass `try_apply_keystream_b2b` decryption directly into caller buffers, and yielded cleanly (`cx.waker().wake_by_ref(); Poll::Pending`) when a receive batch filters to zero valid packets.
+- **Opaque-box E2E hardening suite (`scripts/e2e_hardening`)**: added an 85-test Tiers 1–4 E2E suite verifying anti-probing silence, replay/concurrency boundaries, pairwise modes, and workload behavior against live `uk-server`/`uk-client` binaries.
+
+### Fixed
+
+- **Independent TCP vs. QUIC masking activation (`uk-server`)**: gated TCP masking strictly on `config.masking_enabled()`, preventing empty `[masking]` tables (such as `examples/server.toml`) or split `enabled = false, quic = true` configurations from enforcing TCP preludes and rejecting unmasked TCP connections.
+- **`handshake_timeout_seconds = 0` with TCP masking (`uk-server`)**: fall back to a safe 10-second masking admission timeout with a startup warning instead of `Duration::ZERO` instant timeouts.
+- **Masked QUIC `EndpointConfig::max_udp_payload_size` (`uk-server`, `uk-client`)**: reduced `max_udp_payload_size` by the 12-byte per-segment nonce overhead (`1472 -> 1460`) on both masked server and client endpoints.
+- **Helm masking ConfigMap rendering (`deploy/helm`)**: fixed `server-configmap.yaml` `quic_key_id` credential lookup, `client-configmap.yaml` inline `masking` table ordering, and explicit-zero rendering for `auth_skew_seconds` / `replay_identities`; synchronized new limit keys (`max_pre_auth_connections`, `max_pre_auth_per_source`, `auth_rate_limit_global_failures`) and extended `scripts/helm-config-check.sh` to cover masked and split-mode charts.
+
 ## [2.0.0] - 2026-10-25
 
 First release of the 2.x line. The repository history was consolidated into a

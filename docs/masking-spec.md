@@ -68,21 +68,40 @@ indistinguishable rejection and silently drained; nothing is written back.
 
 After the nonce, both directions are raw ChaCha20 keystreams (no per-record
 framing, no MAC): client→server keyed with `tcp_c2s_key`, server→client with
-`tcp_s2c_key`, both with nonce `N`. Partial writes roll the keystream back to
-the confirmed offset (`StreamCipherSeek`); the per-direction byte cap is
-`2^38 − 64`.
+`tcp_s2c_key`, both with nonce `N`. Clients buffer the 76-byte prelude + nonce
+and coalesce it with the first encrypted `ClientHello` write into a single send
+so no isolated 76-byte initial segment appears on the wire. Per-write chunks
+are capped at `64 KiB`, write readiness is checked prior to encrypting, partial
+writes roll the keystream back to the confirmed offset (`StreamCipherSeek`),
+and both directions clamp reads and writes to the `2^38 − 64` byte cap.
 
-### 2.3 Replay defense
+### 2.3 Replay defense and silent admission
 
-The server keeps a FIFO registry of up to `replay_identities` (default 16 384)
-entries. Each identity holds its highest committed counter plus a 1024-counter
-sliding window (bit 0 = highest). A counter is admissible when it is nonzero,
-above the highest, or unseen within the window; duplicates and
-below-window values are rejected. **Two-phase commit**: the prelude is only
-prechecked at admission; the counter commits immediately before the first
-non-alert TLS record (content type ≠ 21) is flushed — which rustls only
-produces after a ClientHello parsed successfully. Malformed hellos therefore
-never burn counters. Registry eviction and restarts reset history;
+The server enforces configurable unauthenticated pre-admission concurrency
+limits (`limits.max_pre_auth_connections` global, default 256;
+`limits.max_pre_auth_per_source` per IPv4 address or IPv6 `/64`, default 32)
+synchronously on `accept()` before spawning tasks or taking handshake permits.
+Masked TCP connections arm `SO_LINGER=0` immediately on accept and share a
+single absolute `deadline = accepted_at + handshake_timeout` across prelude,
+TLS, ALPN, and `AUTH_RESPONSE`; normal close semantics are restored only after
+application-layer authentication succeeds (with deadline checks before and
+after clearing `SO_LINGER`).
+
+The replay registry is a fixed-capacity preallocated ring array of up to
+`replay_identities` (default 16 384) entries indexed by open-chained hash
+buckets (`RandomState`), performing zero heap allocations after construction.
+Each identity holds its highest committed counter plus a 1024-counter sliding
+window (bit 0 = highest, shifted at 64-bit word granularity). A counter is
+admissible when it is nonzero, above the highest, or unseen within the window;
+duplicates and below-window values are rejected. **Two-phase commit with silent
+`ClientHello` parsing**: the prelude is only prechecked at admission; the
+server then parses `ClientHello` via `rustls::server::Acceptor` with a strict
+`64 KiB` cumulative buffer limit, swallowing all parse errors and TLS alerts
+(zero response bytes emitted, recorded into `AuthRateLimiter`, and drained
+under the uniform jittered dwell posture). The counter commits atomically only
+after `Accepted::into_connection` and ALPN validation succeed, strictly before
+`ServerHello` is flushed. Malformed hellos therefore never burn counters and
+never leak TLS alerts. Registry eviction and restarts reset history;
 established connections are unaffected. A jump of ≥ 1024 clears the window.
 
 ### 2.4 Prelude shaping policies
@@ -108,13 +127,18 @@ wire segment = nonce(12) || ChaCha20(segment)
 keyed with `udp_c2s_key` (client→server) or `udp_s2c_key` (server→client);
 nonces are drawn from a CSPRNG keystream generator (32-byte seed, reseeded
 before its 2^32nd byte). GSO/GRO strides carry the per-segment nonce
-(`wire stride = segment size + 12`), and MTU discovery is capped at
-`1452 − 12 = 1440` so masked datagrams stay within the unmasked path-MTU
-budget. The QUIC layer's own AEAD, Retry, and Version Negotiation are
-unaffected above the wrapper — an unauthenticated peer can never elicit a
-Version Negotiation packet because the server-side filter silently drops
-decrypted long headers whose version is not one of quinn's supported versions
-(including version 0) before quinn sees them.
+(`wire stride = segment size + 12`), both `EndpointConfig::max_udp_payload_size`
+(reduced by 12 bytes) and MTU discovery (`1452 − 12 = 1440`) account for the
+overhead so masked datagrams stay within the unmasked path-MTU budget. Send and
+receive paths use independent locks with single-pass decryption, and a receive
+batch whose segments all filter out yields cleanly back to the async runtime
+(`Poll::Pending` with waker re-arming) rather than spinning. The QUIC layer's
+own AEAD, Retry, and Version Negotiation are unaffected above the wrapper — an
+unauthenticated peer can never elicit a Version Negotiation packet because the
+server-side filter silently drops decrypted long headers whose version is not
+one of quinn's supported versions (including version 0) before quinn sees them,
+and rate-limited or permit-exhausted attempts on masked QUIC listeners are
+silently ignored (`incoming.ignore()`) with zero response packets.
 
 ## 4. Known limits (inherited from the construction)
 
